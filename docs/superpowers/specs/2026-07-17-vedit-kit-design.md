@@ -1,8 +1,8 @@
 # vedit キット(プロジェクト横断の制作設定) — ミニ仕様(W8 改)
 
-日付: 2026-07-17。実データ: ぽんしゃすの制作設定
-(/Users/ht/Documents/Codex/ぽんしゃす_まとめ/06_動画制作設定/)を第一級の
-対応対象とする。既存スキーマをそのまま読む(移行作業をユーザーに課さない)。
+日付: 2026-07-17。目的: **シリーズ/チャンネルごとの「設定フォルダ」を一度作れば、
+毎回の動画の見た目・トーン・テンポが安定する**こと。ぽんしゃすの制作設定
+(video-production-profile/v1 等)は参考例であり、互換対象は取り込みで扱う。
 
 ## 概念
 
@@ -13,20 +13,49 @@
 Manifest.kit?: { path: string }   // キットのルート(絶対パス)
 ```
 
-`vedit kit-link <dir> --base <rev>` / `vedit kit-unlink --base` / `vedit kit`(内容表示)。
-link 時に既知スキーマを走査して認識結果を返す:
+## vedit 標準キット形式(これが主)
 
-| ファイル(スキーマ) | 対応 |
-|---|---|
-| `*video-profile.json`(video-production-profile/v1) | 制作プロファイル |
-| `*design-presets.json`(*-video-design-presets/v1) | 文字・色・装飾プリセット |
-| `*asset-pack.json`(video-character-asset-pack/v1) | タグ付き素材パック |
-| `*GUIDE*.md` | 制作ガイド(ディレクター向け) |
+`vedit kit-init <dir> --name <シリーズ名>` が雛形を生成:
+
+```text
+<kit>/
+├─ kit.json          # 下記スキーマ(vedit-kit/v1)
+├─ GUIDE.md          # 制作ガイド(自由記述、ディレクターが Read する)
+├─ fonts/            # フォントファイル
+└─ assets/
+   ├─ characters/  ├─ backgrounds/  └─ props/
+```
+
+kit.json(vedit-kit/v1)のセクション — **すべて optional、書いた分だけ効く**:
+
+- `profile`: { tone_tags, language, duration_seconds{min,target,max},
+  pacing{average_shot_seconds}, spine[](構成ビートの語彙),
+  quiet_pause_policy } — 機械強制せずディレクターの判断材料
+- `styles`: [{ id, label, use_for[], palette{text,outline,box,accent},
+  caption{font,size_1080p,outline_width,background_opacity},
+  title{同}, motion{entry,duration_seconds} }] — 字幕/ASS/web に反映
+- `assets`: [{ id, path, type: sprite|background|prop, tags[], emotion?,
+  intensity?, visible_bounds_normalized?, ground_anchor_normalized?, sha256? }]
+  — bounds/anchor 未記入なら `vedit kit-scan` が PNG のアルファから自動計算して
+  kit.json に書き戻す(手作業ゼロで素材を足せる)
+- `audio`: { music_dir?, default_gain, duck_amount, target_lufs,
+  repair_preset } — audio-mix / audio-repair の既定値
+- `defaults`: { captions_style, export_preset, reframe_focus }
+
+## 既存スキーマの取り込み(互換レイヤ、二次)
+
+`vedit kit-import <srcDir> <kitDir>`: 既知スキーマ
+(video-production-profile/v1、*-video-design-presets/v1、
+video-character-asset-pack/v1、GUIDE md)を認識して vedit-kit/v1 に**変換**
+(元ファイルは不変、assets はパス参照のまま)。ぽんしゃす設定はこれで一発移行。
 
 ## 1. デザインプリセット → 字幕/タイトルスタイル
 
-- `vedit captions --style <kitPresetId> --base`: キットの preset id
-  (room-warmth 等)を既存 style と同列に指定可能に
+- `vedit kit-link <dir> --base <rev>` / `kit-unlink` / `vedit kit`(内容表示)。
+  link 時に kit.json を検証し、認識したセクションと defaults の適用結果を返す
+- `vedit captions --style <kitStyleId> --base`: キットの style id を
+  既存 style と同列に指定可能に。kit の defaults.captions_style は
+  プロジェクト作成/リンク時の初期値になる
 - ASS 生成: palette(text/outline/box/accent)、font(ファイルパス →
   ASS の fontname + `--attach` は使わず ffmpeg `ass` フィルタの
   `fontsdir=` でフォントディレクトリを渡す)、font_size_1080p
@@ -43,7 +72,7 @@ link 時に既知スキーマを走査して認識結果を返す:
 Timeline.sprites?: SpriteItem[];
 interface SpriteItem {
   id: string;                    // freshId('sp')
-  assetId: string;               // asset-pack の id(例 'ponshasu-neutral')
+  assetId: string;               // kit.json assets の id
   anchor: { sourceId: string; srcTime: number };  // B-roll と同じソース瞬間アンカー
   duration: number;
   position: { x: number; y: number };  // 0..1(ground_anchor_normalized を置く位置)
