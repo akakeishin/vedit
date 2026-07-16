@@ -439,12 +439,19 @@ export function resolveRenderParams(m: Manifest, opts: RenderParamOverrides = {}
  * pass 1 of 2-pass loudnorm normalization. Only audio needs to be mapped;
  * ffmpeg doesn't decode/encode the unmapped video side of the graph.
  */
-async function measureLoudnorm(inputPaths: string[], graph: string, audioLabel: string): Promise<LoudnormMeasured> {
+async function measureLoudnorm(
+  inputPaths: string[],
+  graph: string,
+  audioLabel: string,
+  videoLabel: string,
+): Promise<LoudnormMeasured> {
   const inputs: string[] = [];
   for (const p of inputPaths) inputs.push('-i', p);
   const { stderr } = await runCapture('ffmpeg', [
     '-y', ...inputs,
-    '-filter_complex', graph,
+    // ffmpeg refuses a graph with an unconnected named output — it does NOT
+    // prune the unmapped video side. Terminate it in-graph instead.
+    '-filter_complex', `${graph};${videoLabel}nullsink`,
     '-map', audioLabel,
     '-f', 'null', '-',
   ]);
@@ -514,7 +521,7 @@ export async function renderFinal(
       measureGraph += `;${measureLabel}${loudnormClause(musiclessTarget, { printJson: true })}[measure]`;
       measureLabel = '[measure]';
     }
-    measured = await measureLoudnorm(measureBuilt.inputPaths, measureGraph, measureLabel);
+    measured = await measureLoudnorm(measureBuilt.inputPaths, measureGraph, measureLabel, measureBuilt.videoLabel);
   }
 
   const loudnormOpts = fast || !wantsLoudnorm ? {} : { measured };

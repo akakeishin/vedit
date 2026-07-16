@@ -53,6 +53,9 @@ QC・アーカイブ)を先に埋める。✅=実装済み。
 
 ## プレビュー体験(Codex 採点 2/5)
 
+- [ ] loudnorm 計測パスの音声専用グラフ化(現在は映像を nullsink で終端し
+      decode コストだけ発生 — 長尺 4K で計測が遅い)
+
 - [ ] シーク/境界の計測基盤: seeking/seeked/waiting/canplay を計測し
       P50/P95 とクリップ境界 gap をログ(改善の前に測る)
 - [ ] 同一ソースで source-time が連続する境界では seek しない

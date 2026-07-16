@@ -36,11 +36,18 @@ export function ffmpegHasFilter(name: string): boolean {
   }
 }
 
+
+/** ffmpeg's stderr starts with ~2KB of version banner; the error is at the END. */
+function errExcerpt(stderr: string): string {
+  if (stderr.length <= 2000) return stderr;
+  return stderr.slice(0, 300) + '\n...[truncated]...\n' + stderr.slice(-1700);
+}
+
 export function run(cmd: string, args: string[], opts: { maxBuffer?: number } = {}): Promise<string> {
   if (cmd === 'ffmpeg') cmd = ffmpegBin();
   return new Promise((resolve, reject) => {
     execFile(cmd, args, { maxBuffer: opts.maxBuffer ?? 64 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) reject(new Error(`${cmd} failed: ${stderr.slice(0, 2000) || err.message}`));
+      if (err) reject(new Error(`${cmd} failed: ${errExcerpt(stderr) || err.message}`));
       else resolve(stdout);
     });
   });
@@ -55,7 +62,7 @@ export function runCapture(cmd: string, args: string[], opts: { maxBuffer?: numb
   if (cmd === 'ffmpeg') cmd = ffmpegBin();
   return new Promise((resolve, reject) => {
     execFile(cmd, args, { maxBuffer: opts.maxBuffer ?? 64 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) reject(new Error(`${cmd} failed: ${stderr.slice(0, 2000) || err.message}`));
+      if (err) reject(new Error(`${cmd} failed: ${errExcerpt(stderr) || err.message}`));
       else resolve({ stdout, stderr });
     });
   });
@@ -69,7 +76,7 @@ export function runBinary(cmd: string, args: string[]): Promise<Buffer> {
       args,
       { maxBuffer: 1024 * 1024 * 1024, encoding: 'buffer' },
       (err, stdout, stderr) => {
-        if (err) reject(new Error(`${cmd} failed: ${stderr.toString().slice(0, 2000)}`));
+        if (err) reject(new Error(`${cmd} failed: ${errExcerpt(stderr.toString())}`));
         else resolve(stdout);
       },
     );
