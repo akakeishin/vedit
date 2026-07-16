@@ -34,6 +34,12 @@ const S = {
   rangeOut: null, // timeline seconds
   previewStopAt: null, // timeline seconds; candidate "前後を再生" auto-stop point
   loadState: 'loading', // 'loading' | 'ok' | 'no-project' | 'error'
+  // Media pool panel (source preview mode): while non-null, #video plays the
+  // raw source proxy from an arbitrary point instead of the timeline mix.
+  // returnTl is the timeline position to restore on exit.
+  sourcePreview: null, // { sourceId, returnTl } | null
+  mediaFocusKey: null, // sourceId — roving-tabindex focus stop in #mediaList
+  expandedScenes: new Set(), // sourceIds whose scene grid is expanded
 };
 const PLAY_RATES = [1, 1.5, 2];
 
@@ -162,6 +168,9 @@ function updateFraming() {
   video.style.objectPosition = `${x}% ${y}%`;
 }
 function seekTl(tl, { play } = {}) {
+  // Any timeline seek/scrub ("playhead operation") returns from source
+  // preview mode to the timeline, at the position being sought.
+  if (S.sourcePreview) { S.sourcePreview = null; renderPreviewBanner(); }
   tl = Math.max(0, Math.min(tl, S.duration - 0.001));
   let i = segAt(tl);
   if (i < 0) i = S.segments.length - 1;
@@ -171,6 +180,15 @@ function seekTl(tl, { play } = {}) {
 
 // The frame loop: cross segment boundaries, drive playhead/captions/motion.
 function tick() {
+  if (S.sourcePreview) {
+    // Source preview mode: #video plays a raw source proxy that has no
+    // relation to S.segments/S.currentSeg, so skip all timeline-linked
+    // rendering (playhead, captions, motion, word highlight) and just show
+    // the source-relative timecode.
+    $('tc').textContent = `${fmtF(video.currentTime)} / ${fmtF(video.duration || 0)}`;
+    requestAnimationFrame(tick);
+    return;
+  }
   const i = S.currentSeg;
   if (i >= 0 && S.segments[i]) {
     const s = S.segments[i];
@@ -269,7 +287,17 @@ document.addEventListener('keydown', (e) => {
   if (key === 'i') { e.preventDefault(); setRangePoint('in'); return; }
   if (key === 'o') { e.preventDefault(); setRangePoint('out'); return; }
   if (e.key === '?') { e.preventDefault(); toggleShortcuts(); return; }
-  if (e.code === 'Escape') { e.preventDefault(); clearRange(); return; }
+  if (e.code === 'Escape') {
+    e.preventDefault();
+    if (S.sourcePreview) { exitSourcePreview(); return; }
+    clearRange();
+    return;
+  }
+});
+video.addEventListener('ended', () => {
+  if (!S.sourcePreview) return; // timeline-mode end-of-segment is handled in tick()
+  S.playing = false;
+  setPlayBtnState(false);
 });
 
 // ---------- timeline strip ----------
@@ -446,6 +474,203 @@ function drawWave() {
     }
   }
 }
+
+// ---------- source preview mode (media pool "行クリック") ----------
+function renderPreviewBanner() {
+  const active = !!S.sourcePreview;
+  $('previewBanner').hidden = !active;
+  $('timeline').classList.toggle('previewing', active);
+  // Reflect which (if any) media-pool row is the one currently previewing,
+  // without a full renderMediaPanel() (which would rebuild the DOM and drop
+  // focus/scroll position for no reason — nothing else about the row list
+  // changed).
+  for (const r of document.querySelectorAll('#mediaList .srcRow')) {
+    const previewing = S.sourcePreview?.sourceId === r.dataset.source;
+    r.classList.toggle('previewing', previewing);
+    r.setAttribute('aria-selected', String(previewing));
+  }
+}
+// Switch #video to source `sourceId`'s raw proxy at source-time `at` (default
+// 0) and start playing — independent of the timeline mix. Re-entrant: calling
+// again while already previewing (e.g. clicking a different scene/source)
+// keeps the ORIGINAL returnTl so Esc always restores the pre-preview position.
+function enterSourcePreview(sourceId, { at = 0 } = {}) {
+  const src = S.manifest?.sources.find((s) => s.id === sourceId);
+  if (!src) return;
+  if (!src.proxy) { toast('プロキシが未生成のため再生できません', { type: 'error' }); return; }
+  const returnTl = S.sourcePreview ? S.sourcePreview.returnTl : tlNow();
+  S.sourcePreview = { sourceId, returnTl };
+  renderPreviewBanner();
+  // Stale overlays/crop framing from timeline mode shouldn't linger over the
+  // preview video — it's the raw source, not a specific timeline clip.
+  const cap = $('captionLayer'); cap.innerHTML = ''; cap.dataset.cur = '';
+  const mo = $('motionLayer'); mo.innerHTML = ''; mo.dataset.cur = '';
+  video.style.objectPosition = '50% 50%';
+  video.pause();
+  const url = proxyUrl(sourceId);
+  const apply = () => { video.currentTime = at; video.play().catch(() => {}); };
+  if (!video.src.endsWith(url)) { video.src = url; video.addEventListener('loadedmetadata', apply, { once: true }); }
+  else apply();
+  S.playing = true;
+  setPlayBtnState(true);
+}
+function exitSourcePreview() {
+  if (!S.sourcePreview) return;
+  seekTl(S.sourcePreview.returnTl, { play: false }); // clears S.sourcePreview internally
+}
+$('previewBannerExit').onclick = exitSourcePreview;
+
+// ---------- media pool panel ("素材") ----------
+function sourceUsageSeconds(sourceId) {
+  return S.segments
+    .filter((s) => s.sourceId === sourceId)
+    .reduce((sum, s) => sum + (s.tlEnd - s.tlStart), 0);
+}
+function setMediaFocus(sourceId, { focus = true } = {}) {
+  S.mediaFocusKey = sourceId;
+  for (const r of document.querySelectorAll('#mediaList .srcRow')) {
+    r.tabIndex = r.dataset.source === sourceId ? 0 : -1;
+  }
+  if (focus) document.querySelector(`.srcRow[data-source="${CSS.escape(sourceId)}"]`)?.focus();
+}
+async function addSourceToTimeline(src) {
+  const name = basename(src.path);
+  const { ok } = await mutate({ op: 'clip-add', sourceId: src.id });
+  if (ok) toast(`${name} を追加 (+${src.duration.toFixed(1)}s)`);
+}
+async function addSceneToTimeline(src, sc) {
+  const name = basename(src.path);
+  const dur = Math.max(0, sc.t1 - sc.t0);
+  const { ok } = await mutate({ op: 'clip-add', sourceId: src.id, in: sc.t0, out: sc.t1 });
+  if (ok) toast(`${name} ${sc.id} を追加 (+${dur.toFixed(1)}s)`);
+}
+function toggleScenes(sourceId) {
+  if (S.expandedScenes.has(sourceId)) S.expandedScenes.delete(sourceId);
+  else S.expandedScenes.add(sourceId);
+  renderMediaPanel();
+  document.querySelector(`.srcRow[data-source="${CSS.escape(sourceId)}"] .btn-viewScenes`)?.focus();
+}
+function sceneGridRow(src, scenes) {
+  const wrap = document.createElement('div');
+  wrap.className = 'sceneGrid';
+  for (const sc of scenes) {
+    const dur = Math.max(0, sc.t1 - sc.t0);
+    const item = document.createElement('div');
+    item.className = 'sceneItem';
+    const seekBtn = document.createElement('button');
+    seekBtn.className = 'btn-sceneSeek';
+    seekBtn.textContent = `${sc.id} (${dur.toFixed(1)}s)`;
+    seekBtn.setAttribute('aria-label', `${sc.id}(${dur.toFixed(1)}秒)をプレビュー`);
+    seekBtn.onclick = () => enterSourcePreview(src.id, { at: sc.t0 });
+    item.appendChild(seekBtn);
+    if (sc.note?.text) {
+      const note = document.createElement('div');
+      note.className = 'sceneNote';
+      note.textContent = sc.note.text;
+      item.appendChild(note);
+    }
+    const addBtn = document.createElement('button');
+    addBtn.className = 'btn-sceneAdd';
+    addBtn.textContent = 'この区間を追加';
+    addBtn.setAttribute('aria-label', `${sc.id} をタイムラインへ追加`);
+    addBtn.onclick = () => addSceneToTimeline(src, sc);
+    item.appendChild(addBtn);
+    wrap.appendChild(item);
+  }
+  return wrap;
+}
+function mediaRow(src) {
+  const name = basename(src.path);
+  const used = sourceUsageSeconds(src.id);
+  const pct = src.duration > 0 ? Math.min(100, (used / src.duration) * 100) : 0;
+
+  const row = document.createElement('div');
+  row.className = 'srcRow' + (S.sourcePreview?.sourceId === src.id ? ' previewing' : '');
+  row.dataset.source = src.id;
+  row.setAttribute('role', 'option');
+  row.setAttribute('aria-selected', String(S.sourcePreview?.sourceId === src.id));
+  row.tabIndex = src.id === S.mediaFocusKey ? 0 : -1;
+
+  const img = document.createElement('img');
+  img.className = 'srcThumb';
+  img.loading = 'lazy';
+  img.alt = '';
+  img.src = `/media/thumb/${src.id}`;
+
+  const info = document.createElement('div');
+  info.className = 'srcInfo';
+  const nameRow = document.createElement('div');
+  nameRow.className = 'srcNameRow';
+  nameRow.innerHTML = `<span class="srcName">${esc(name)}</span><span class="srcDur">${fmt(src.duration)}</span>`;
+  const badges = document.createElement('div');
+  badges.className = 'srcBadges';
+  badges.innerHTML = [
+    src.transcribed ? '<span class="badge ok">文字起こし済み</span>' : '',
+    !src.hasAudio ? '<span class="badge warn">音声なし</span>' : '',
+    !src.proxy ? '<span class="badge warn">プロキシ未生成</span>' : '',
+  ].join('');
+  const usage = document.createElement('div');
+  usage.className = 'srcUsage';
+  usage.innerHTML = `<span class="srcUsageBar"><span class="srcUsageFill" style="width:${pct}%"></span></span><span class="srcUsageLabel">使用 ${used.toFixed(1)}s / ${src.duration.toFixed(1)}s</span>`;
+  info.append(nameRow, badges, usage);
+
+  const actions = document.createElement('div');
+  actions.className = 'srcActions';
+  const addBtn = document.createElement('button');
+  addBtn.textContent = 'タイムラインへ追加';
+  addBtn.setAttribute('aria-label', `${name} をタイムラインへ追加`);
+  addBtn.onclick = (e) => { e.stopPropagation(); addSourceToTimeline(src); };
+  actions.appendChild(addBtn);
+  if (S.scenes.has(src.id)) {
+    const expanded = S.expandedScenes.has(src.id);
+    const scenesBtn = document.createElement('button');
+    scenesBtn.className = 'btn-viewScenes';
+    scenesBtn.textContent = 'シーンを見る';
+    scenesBtn.setAttribute('aria-expanded', String(expanded));
+    scenesBtn.setAttribute('aria-label', `${name} のシーンを${expanded ? '閉じる' : '見る'}`);
+    scenesBtn.onclick = (e) => { e.stopPropagation(); toggleScenes(src.id); };
+    actions.appendChild(scenesBtn);
+  }
+
+  row.append(img, info, actions);
+  row.addEventListener('pointerdown', () => setMediaFocus(src.id, { focus: false }));
+  row.addEventListener('click', (e) => {
+    if (e.target.closest('button')) return;
+    setMediaFocus(src.id);
+    enterSourcePreview(src.id);
+  });
+  return row;
+}
+function renderMediaPanel() {
+  const el = $('mediaList');
+  el.innerHTML = '';
+  const sources = S.manifest.sources;
+  if (sources.length === 0) {
+    el.innerHTML = '<div class="hintText" style="padding:8px">素材がありません — `vedit ingest <file>` で取り込み</div>';
+    return;
+  }
+  if (S.mediaFocusKey && !sources.some((s) => s.id === S.mediaFocusKey)) S.mediaFocusKey = null;
+  if (!S.mediaFocusKey) S.mediaFocusKey = sources[0].id;
+  for (const src of sources) {
+    el.appendChild(mediaRow(src));
+    if (S.expandedScenes.has(src.id)) {
+      const scenes = S.scenes.get(src.id);
+      if (scenes) el.appendChild(sceneGridRow(src, scenes));
+    }
+  }
+}
+$('mediaList').addEventListener('keydown', (e) => {
+  const row = e.target.closest('.srcRow');
+  if (!row) return;
+  const sources = S.manifest.sources;
+  const idx = sources.findIndex((s) => s.id === row.dataset.source);
+  if (idx < 0) return;
+  if (e.key === 'ArrowDown') { e.preventDefault(); setMediaFocus(sources[Math.min(idx + 1, sources.length - 1)].id); }
+  else if (e.key === 'ArrowUp') { e.preventDefault(); setMediaFocus(sources[Math.max(idx - 1, 0)].id); }
+  else if (e.key === 'Home') { e.preventDefault(); setMediaFocus(sources[0].id); }
+  else if (e.key === 'End') { e.preventDefault(); setMediaFocus(sources[sources.length - 1].id); }
+  else if (e.key === 'Enter') { e.preventDefault(); enterSourcePreview(row.dataset.source); }
+});
 
 // ---------- clip inspector (±frame trim) ----------
 function selectClip(clipId) {
@@ -1113,7 +1338,10 @@ function connectWs() {
     if (msg.type === 'update' || msg.type === 'candidates' || msg.type === 'project') {
       $('ingestOverlay').hidden = true;
       $('stage').removeAttribute('aria-busy');
-      const tl = tlNow();
+      // tlNow() assumes #video is playing the timeline mix; during source
+      // preview mode it plays an unrelated source proxy, so fall back to the
+      // saved pre-preview position instead of deriving a bogus value from it.
+      const tl = S.sourcePreview ? S.sourcePreview.returnTl : tlNow();
       try {
         await reload();
         if (msg.type === 'update') seekTl(Math.min(tl, S.duration - 0.01), { play: false });
@@ -1149,6 +1377,7 @@ async function renderAll() {
   renderTranscript();
   renderCandidates();
   renderHistory();
+  renderMediaPanel();
   renderRange();
   updateFraming();
   renderStageState();

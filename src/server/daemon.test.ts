@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { mkdtempSync, promises as fsp } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import type { Server } from 'node:http';
+import http, { type Server } from 'node:http';
 import { Project } from '../core/project.js';
 import { startDaemon } from './daemon.js';
 import type { Word } from '../core/types.js';
@@ -30,6 +30,44 @@ async function getJson(base: string, pathname: string) {
 async function getText(base: string, pathname: string) {
   const res = await fetch(base + pathname);
   return { status: res.status, text: await res.text() };
+}
+
+/**
+ * Fire a POST whose headers land immediately (so the server's route()
+ * synchronously captures `p = ctx.project` right away) but whose body isn't
+ * sent until `delayMs` later — used to deterministically win a race against
+ * a concurrent /api/open that reassigns ctx.project while this request is
+ * still "parked" inside readBody(). Returns the eventual response promise
+ * plus a promise that resolves once headers have been flushed locally.
+ */
+function postJsonDelayedBody(base: string, pathname: string, body: unknown, delayMs: number) {
+  const bodyStr = JSON.stringify(body);
+  const u = new URL(base + pathname);
+  let resolveHeadersSent: () => void;
+  const headersSent = new Promise<void>((res) => {
+    resolveHeadersSent = res;
+  });
+  const promise = new Promise<{ status: number; body: any }>((resolve, reject) => {
+    const req = http.request(
+      {
+        hostname: u.hostname,
+        port: u.port,
+        path: u.pathname + u.search,
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(bodyStr) },
+      },
+      (res) => {
+        let data = '';
+        res.on('data', (c) => (data += c));
+        res.on('end', () => resolve({ status: res.statusCode!, body: JSON.parse(data) }));
+      },
+    );
+    req.on('error', reject);
+    req.flushHeaders(); // send headers now, without waiting for the body
+    resolveHeadersSent();
+    setTimeout(() => req.end(bodyStr), delayMs);
+  });
+  return { promise, headersSent };
 }
 
 // ---- Suite 1: two transcribed sources (id collision / ambiguity surface) ----
@@ -860,5 +898,146 @@ describe('daemon: http robustness', () => {
 
     const res2 = await fetch(`${BASE}/media/proxy/s1`, { headers: { range: 'not-a-range' } });
     expect(res2.status).toBe(200);
+  });
+});
+
+// ---- Suite 9: project-switch mid-edit race (item 3 in the revision-store audit) ----
+describe('daemon: project switch does not redirect an in-flight edit', () => {
+  const PORT = 18190;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let dir: string;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-race-'));
+    dir = path.join(root, 'proj');
+    await Project.create(dir, 'race-original');
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('a commit whose body arrives after a concurrent /api/open still lands on the original project', async () => {
+    const root2 = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-race-other-'));
+    const dir2 = path.join(root2, 'proj2');
+
+    const state = (await getJson(BASE, '/api/state')).body;
+    // Headers land immediately (so route() captures `p` = the ORIGINAL
+    // project synchronously), but the body — and therefore the actual
+    // mutate()/commit() call — is delayed well past when /api/open below
+    // has already reassigned ctx.project.
+    const { promise: editPromise, headersSent } = postJsonDelayedBody(
+      BASE,
+      '/api/edit',
+      { actor: 'claude', baseRev: state.revision, op: 'captions', patch: { style: 'race-should-land-here' } },
+      150,
+    );
+    await headersSent;
+    await new Promise((r) => setTimeout(r, 30)); // give the server time to actually receive/parse the headers
+
+    const openResult = await postJson(BASE, '/api/open', { dir: dir2, name: 'other' });
+    expect(openResult.status).toBe(200);
+
+    const editResult = await editPromise;
+    expect(editResult.status).toBe(200);
+
+    // ctx.project has genuinely moved on to the second project...
+    const ping = (await getJson(BASE, '/api/ping')).body;
+    expect(ping.project).toBe(dir2);
+
+    // ...but the edit committed against the ORIGINAL project directory, not
+    // the one opened while it was in flight.
+    const origRevsRaw = await fsp.readFile(path.join(dir, 'revisions.jsonl'), 'utf8');
+    const origRevs = origRevsRaw.split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    expect(origRevs.some((r: any) => r.op === 'captions' && r.summary.includes('race-should-land-here'))).toBe(true);
+
+    // The new project's own log must NOT have picked up this edit.
+    const newRevsRaw = await fsp.readFile(path.join(dir2, 'revisions.jsonl'), 'utf8').catch(() => '');
+    expect(newRevsRaw).not.toMatch(/race-should-land-here/);
+  });
+});
+
+// ---- Suite 10: captions patch maxCps validation (item 8) ----
+describe('daemon: captions patch maxCps validation', () => {
+  const PORT = 18192;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-maxcps-'));
+    const dir = path.join(root, 'proj');
+    await Project.create(dir, 'maxcps');
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('accepts a valid maxCps (1..30) and stores it on captions', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'captions', patch: { maxCps: 12 },
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.captions.maxCps).toBe(12);
+  });
+
+  it('rejects a maxCps outside 1..30', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'captions', patch: { maxCps: 31 },
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/maxCps must be a number between 1 and 30/);
+  });
+
+  it('rejects a non-numeric maxCps', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'captions', patch: { maxCps: 'fast' },
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/maxCps must be a number/);
+  });
+});
+
+// ---- Suite 11: restore over HTTP requires baseRev (item 5) ----
+describe('daemon: restore requires and validates baseRev', () => {
+  const PORT = 18193;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-restore-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'restore-http');
+    await project.commit(0, 'system', 'setup', {}, 'seed', (m) => ({ ...m, name: 'seeded' }));
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('restore without baseRev is rejected for actor=claude', async () => {
+    const { status, body } = await postJson(BASE, '/api/edit', { actor: 'claude', op: 'restore', rev: 1 });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/baseRev is required/);
+  });
+
+  it('restore with a stale baseRev is rejected with 409', async () => {
+    // rev1 exists (seeded), current is rev1 — pass an intentionally stale baseRev.
+    const { status, body } = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: 999, op: 'restore', rev: 1 });
+    expect(status).toBe(409);
+    expect(body.code).toBe('STALE_REVISION');
+  });
+
+  it('restore with a correct baseRev succeeds and advances the revision', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'restore', rev: 1 });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.revision).toBe(2);
   });
 });

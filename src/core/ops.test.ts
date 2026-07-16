@@ -239,7 +239,7 @@ describe('Project store', () => {
     m = await p.commit(1, 'ui', 'test-op2', {}, 'noop2', (x) => ({ ...x, name: 'changed' }));
     expect(m.name).toBe('changed');
 
-    m = await p.restore(1, 'claude');
+    m = await p.restore(1, 'claude', 2); // baseRev is required and checked like commit()
     expect(m.name).toBe('test');
     expect(m.revision).toBe(3); // restore is itself a new revision
 

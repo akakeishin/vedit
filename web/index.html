@@ -45,6 +45,10 @@
       <div id="rangeSel" hidden></div>
       <div id="playhead"></div>
     </div>
+    <div id="previewBanner" role="status" hidden>
+      <span>素材プレビュー中 — Esc で戻る</span>
+      <button id="previewBannerExit" aria-label="タイムラインモードに戻る">×</button>
+    </div>
     <div id="timelineHint" class="hintText">Alt+ホバーでスクラブ / I・Oで範囲選択 / ?でショートカット一覧</div>
     <div id="rangeBar" hidden>
       <span id="rangeInfo"></span>
@@ -67,6 +71,7 @@
       <button class="tab active" id="tab-transcriptPanel" role="tab" aria-selected="true" aria-controls="transcriptPanel" data-panel="transcriptPanel" tabindex="0">Transcript</button>
       <button class="tab" id="tab-candPanel" role="tab" aria-selected="false" aria-controls="candPanel" data-panel="candPanel" tabindex="-1">提案 <span id="candCount"></span></button>
       <button class="tab" id="tab-histPanel" role="tab" aria-selected="false" aria-controls="histPanel" data-panel="histPanel" tabindex="-1">履歴</button>
+      <button class="tab" id="tab-mediaPanel" role="tab" aria-selected="false" aria-controls="mediaPanel" data-panel="mediaPanel" tabindex="-1">素材</button>
     </div>
     <div id="transcriptPanel" class="panel active" role="tabpanel" aria-labelledby="tab-transcriptPanel" tabindex="0">
       <div class="panelbar">
@@ -90,6 +95,12 @@
     </div>
     <div id="histPanel" class="panel" role="tabpanel" aria-labelledby="tab-histPanel" tabindex="0">
       <div id="histList"></div>
+    </div>
+    <div id="mediaPanel" class="panel" role="tabpanel" aria-labelledby="tab-mediaPanel" tabindex="0">
+      <div class="panelbar">
+        <span class="hintText">クリック / Enter でソースプレビュー再生 / ↑↓で移動</span>
+      </div>
+      <div id="mediaList" role="listbox" aria-label="素材"></div>
     </div>
   </aside>
 </main>

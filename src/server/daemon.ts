@@ -135,6 +135,9 @@ async function stateSummary(p: Project) {
     sources: m.sources.map((s) => ({ id: s.id, path: s.path, duration: s.duration, transcribed: !!s.transcribed })),
     pendingCandidates: pending,
     captions: m.captions,
+    // Set only when Project.open() had to repair a crash-damaged
+    // revisions.jsonl (see Project.reconcile); absent otherwise.
+    ...(p.warning ? { warning: p.warning } : {}),
   };
 }
 
@@ -144,6 +147,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
   if (opts.projectDir) {
     const { project } = await openOrCreateProject(opts.projectDir, path.basename(opts.projectDir));
     ctx.project = project;
+    if (project.warning) console.warn(`[vedit] ${project.dir}: ${project.warning}`);
   }
 
   const server = http.createServer(async (req, res) => {
@@ -162,17 +166,22 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
     ws.on('close', () => ctx.clients.delete(ws));
   });
 
-  // The single mutation wrapper: commit + notify everyone.
+  // The single mutation wrapper: commit + notify everyone. `p` is always the
+  // project the caller captured at the top of route() for THIS request — not
+  // `ctx.project` re-read at call time — so a /api/open that swaps the
+  // globally-open project mid-request can never redirect an in-flight edit
+  // onto a different project directory.
   async function mutate(
+    p: Project,
     actor: 'claude' | 'ui' | 'system',
     baseRev: number,
     op: string,
     params: unknown,
     summary: string,
     fn: (m: Manifest) => Manifest,
+    motionSpecUpdates?: Record<string, unknown>,
   ) {
-    const p = ctx.project!;
-    const m = await p.commit(baseRev, actor, op, params, summary, fn);
+    const m = await p.commit(baseRev, actor, op, params, summary, fn, motionSpecUpdates);
     broadcast(ctx, { type: 'update', revision: m.revision, op, summary });
     return m;
   }
@@ -372,7 +381,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
           // commit a revision that changes nothing.
           return json(res, 400, { error: 'range does not intersect source media' });
         }
-        await mutate(actor, baseRev, 'remove-words', b, `removed ${removed} words (${removedSeconds.toFixed(1)}s): "${text.slice(0, 40)}"`, (m) =>
+        await mutate(p, actor, baseRev, 'remove-words', b, `removed ${removed} words (${removedSeconds.toFixed(1)}s): "${text.slice(0, 40)}"`, (m) =>
           removeSourceRange(m, sourceId!, r.t0, r.t1),
         );
         return json(res, 200, { removedSeconds, state: await stateSummary(p) });
@@ -393,19 +402,30 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         if (removedSeconds < 1 / m0.fps) {
           return json(res, 400, { error: 'range does not intersect source media' });
         }
-        await mutate(actor, baseRev, 'remove-range', b, `removed ${removedSeconds.toFixed(1)}s of source ${sourceId}`, (m) =>
+        await mutate(p, actor, baseRev, 'remove-range', b, `removed ${removedSeconds.toFixed(1)}s of source ${sourceId}`, (m) =>
           removeSourceRange(m, sourceId!, b.t0, b.t1),
         );
         return json(res, 200, { removedSeconds, state: await stateSummary(p) });
       }
       if (b.op === 'trim') {
-        await mutate(actor, baseRev, 'trim', b, `trim ${b.clipId} ${b.edge} ${b.frames}f`, (m) =>
+        await mutate(p, actor, baseRev, 'trim', b, `trim ${b.clipId} ${b.edge} ${b.frames}f`, (m) =>
           trimClip(m, b.clipId, b.edge, b.frames),
         );
         return json(res, 200, { state: await stateSummary(p) });
       }
       if (b.op === 'captions') {
-        await mutate(actor, baseRev, 'captions', b, `captions ${JSON.stringify(b.patch)}`, (m) => ({
+        // maxCps is a recognized, validated patch field (CLI integration
+        // support) — everything else stays an unvalidated passthrough merge
+        // as before, so this doesn't tighten the contract for existing
+        // callers (presets, the web UI) that may send other captions
+        // fields.
+        if (b.patch && Object.prototype.hasOwnProperty.call(b.patch, 'maxCps')) {
+          const v = b.patch.maxCps;
+          if (typeof v !== 'number' || !Number.isFinite(v) || v < 1 || v > 30) {
+            return json(res, 400, { error: 'captions.maxCps must be a number between 1 and 30' });
+          }
+        }
+        await mutate(p, actor, baseRev, 'captions', b, `captions ${JSON.stringify(b.patch)}`, (m) => ({
           ...m,
           captions: { ...m.captions, ...b.patch },
         }));
@@ -413,45 +433,59 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       }
       if (b.op === 'motion-add') {
         const specId = freshId('mo');
-        const specFile = `${specId}.json`;
-        await fs.writeFile(path.join(p.motionDir, specFile), JSON.stringify({ id: specId, ...b.spec }, null, 2));
-        const item: MotionItem = { id: specId, spec: specFile, tlStart: b.tlStart, duration: b.duration };
-        await mutate(actor, baseRev, 'motion-add', b, `motion ${b.spec.type} at ${b.tlStart}s`, (m) => ({
-          ...m,
-          timeline: { ...m.timeline, motion: [...m.timeline.motion, item] },
-        }));
+        const specContent = { id: specId, ...b.spec };
+        const item: MotionItem = { id: specId, spec: `${specId}.json`, tlStart: b.tlStart, duration: b.duration };
+        // The sidecar file itself is written by commit() only after the
+        // commit is durable (motionSpecUpdates), so a stale-baseRev 400
+        // never leaves an orphan spec file with no timeline reference.
+        await mutate(
+          p, actor, baseRev, 'motion-add', b, `motion ${b.spec.type} at ${b.tlStart}s`,
+          (m) => ({ ...m, timeline: { ...m.timeline, motion: [...m.timeline.motion, item] } }),
+          { [specId]: specContent },
+        );
         return json(res, 200, { id: specId, state: await stateSummary(p) });
       }
       if (b.op === 'motion-update') {
         // Only an id that's actually on the timeline may be touched — this
-        // is the allowlist; motionSpecPath below is a second, independent
-        // guard that the resolved file stays inside motion/.
+        // is the allowlist; motionSpecPath (inside readMotionSpec) is a
+        // second, independent guard that the resolved file stays inside
+        // motion/.
         if (!m0.timeline.motion.some((x) => x.id === b.id)) {
           return json(res, 400, { error: `unknown motion item: ${b.id}` });
         }
+        // The spec file is NOT written here: reading the old content is
+        // fine (read-only), but the merged new content is only handed to
+        // commit() as `motionSpecUpdates`, which writes it to disk after
+        // the commit succeeds. Previously this wrote the sidecar file
+        // before knowing whether the commit would even be accepted, so a
+        // 409 (stale baseRev) still left the file mutated.
+        let motionSpecUpdates: Record<string, unknown> | undefined;
         if (b.spec) {
-          const specPath = await resolveWithinDir(p.motionDir, `${b.id}.json`);
-          const old = JSON.parse(await fs.readFile(specPath, 'utf8'));
-          await fs.writeFile(specPath, JSON.stringify({ ...old, ...b.spec, id: b.id }, null, 2));
+          const old = await p.readMotionSpec(b.id);
+          motionSpecUpdates = { [b.id]: { ...(old as Record<string, unknown>), ...b.spec, id: b.id } };
         }
-        await mutate(actor, baseRev, 'motion-update', b, `motion ${b.id} updated`, (m) => ({
-          ...m,
-          timeline: {
-            ...m.timeline,
-            motion: m.timeline.motion.map((x) =>
-              x.id === b.id
-                ? { ...x, tlStart: b.tlStart ?? x.tlStart, duration: b.duration ?? x.duration }
-                : x,
-            ),
-          },
-        }));
+        await mutate(
+          p, actor, baseRev, 'motion-update', b, `motion ${b.id} updated`,
+          (m) => ({
+            ...m,
+            timeline: {
+              ...m.timeline,
+              motion: m.timeline.motion.map((x) =>
+                x.id === b.id
+                  ? { ...x, tlStart: b.tlStart ?? x.tlStart, duration: b.duration ?? x.duration }
+                  : x,
+              ),
+            },
+          }),
+          motionSpecUpdates,
+        );
         return json(res, 200, { state: await stateSummary(p) });
       }
       if (b.op === 'motion-remove') {
         if (!m0.timeline.motion.some((x) => x.id === b.id)) {
           return json(res, 400, { error: `unknown motion item: ${b.id}` });
         }
-        await mutate(actor, baseRev, 'motion-remove', b, `motion ${b.id} removed`, (m) => ({
+        await mutate(p, actor, baseRev, 'motion-remove', b, `motion ${b.id} removed`, (m) => ({
           ...m,
           timeline: { ...m.timeline, motion: m.timeline.motion.filter((x) => x.id !== b.id) },
         }));
@@ -459,17 +493,17 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       }
       if (b.op === 'clip-add') {
         const clipId = freshId('c');
-        await mutate(actor, baseRev, 'clip-add', b, `clip-add ${b.sourceId} [${b.in ?? 0}-${b.out ?? '*'}]`, (m) =>
+        await mutate(p, actor, baseRev, 'clip-add', b, `clip-add ${b.sourceId} [${b.in ?? 0}-${b.out ?? '*'}]`, (m) =>
           addClip(m, b.sourceId, { in: b.in, out: b.out, at: b.at, id: clipId }),
         );
         return json(res, 200, { clipId, state: await stateSummary(p) });
       }
       if (b.op === 'clip-remove') {
-        await mutate(actor, baseRev, 'clip-remove', b, `clip-remove ${b.clipId}`, (m) => removeClip(m, b.clipId));
+        await mutate(p, actor, baseRev, 'clip-remove', b, `clip-remove ${b.clipId}`, (m) => removeClip(m, b.clipId));
         return json(res, 200, { state: await stateSummary(p) });
       }
       if (b.op === 'clip-move') {
-        await mutate(actor, baseRev, 'clip-move', b, `clip-move ${b.clipId} before ${b.before}`, (m) =>
+        await mutate(p, actor, baseRev, 'clip-move', b, `clip-move ${b.clipId} before ${b.before}`, (m) =>
           moveClip(m, b.clipId, b.before),
         );
         return json(res, 200, { state: await stateSummary(p) });
@@ -477,19 +511,23 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       if (b.op === 'reframe') {
         const output = parseReframeSpec(b.spec);
         const focus = parseFocus(b.focus);
-        await mutate(actor, baseRev, 'reframe', b, `reframe ${output.width}x${output.height} focus=${b.focus ?? 'center'}`, (m) =>
+        await mutate(p, actor, baseRev, 'reframe', b, `reframe ${output.width}x${output.height} focus=${b.focus ?? 'center'}`, (m) =>
           applyReframe(m, output, focus),
         );
         return json(res, 200, { output, state: await stateSummary(p) });
       }
       if (b.op === 'clip-crop') {
-        await mutate(actor, baseRev, 'clip-crop', b, `clip-crop ${b.clipId} x=${b.x ?? '-'} y=${b.y ?? '-'}`, (m) =>
+        await mutate(p, actor, baseRev, 'clip-crop', b, `clip-crop ${b.clipId} x=${b.x ?? '-'} y=${b.y ?? '-'}`, (m) =>
           setClipCrop(m, b.clipId, { x: b.x, y: b.y }),
         );
         return json(res, 200, { state: await stateSummary(p) });
       }
       if (b.op === 'restore') {
-        const m = await p.restore(b.rev, actor);
+        // `baseRev` here is the same value every other /api/edit op uses
+        // (b.baseRev, falling back to the pre-request revision for
+        // actor=ui) — the wire contract is unchanged; restore() now just
+        // requires it explicitly instead of always racing onto "latest".
+        const m = await p.restore(b.rev, actor, baseRev);
         broadcast(ctx, { type: 'update', revision: m.revision, op: 'restore', summary: `restored r${b.rev}` });
         return json(res, 200, { state: await stateSummary(p) });
       }
@@ -556,30 +594,52 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       if (actor === 'claude' && typeof b.baseRev !== 'number') {
         return json(res, 400, { error: 'baseRev is required; run `vedit status` and pass --base <revision>' });
       }
-      const all = await p.candidates();
-      const target = b.ids === 'all' ? all.filter((c) => c.status === 'proposed') : all.filter((c) => b.ids.includes(c.id));
-      if (target.length === 0) return json(res, 400, { error: 'no matching pending candidates' });
-      if (b.decision === 'approve') {
-        const m0 = await p.manifest();
-        const baseRev = b.baseRev ?? m0.revision;
-        // Apply all approved cuts in ONE revision so undo is atomic. Compute
-        // the real (frame-snapped) delta up front so the summary and
-        // response agree with what actually lands on the timeline.
-        const before = timelineDuration(m0);
-        let preview = m0;
-        for (const c of target) preview = removeSourceRange(preview, c.sourceId, c.t0, c.t1);
-        const removedSeconds = before - timelineDuration(preview);
-        await mutate(actor, baseRev, 'apply-candidates', { ids: target.map((c) => c.id) },
-          `applied ${target.length} cuts (-${removedSeconds.toFixed(1)}s)`, (m) => {
-            let cur = m;
-            for (const c of target) cur = removeSourceRange(cur, c.sourceId, c.t0, c.t1);
-            return cur;
-          });
+      // Candidate selection, the approve-commit, and the candidates.json
+      // rewrite all happen inside ONE critical section (Project.decideCandidates)
+      // so a concurrent /api/detect or another decide can't interleave a
+      // stale read of candidates.json between "decide what to apply" and
+      // "write the result".
+      const result = await p.decideCandidates(
+        (all) => (b.ids === 'all' ? all.filter((c) => c.status === 'proposed') : all.filter((c) => b.ids.includes(c.id))),
+        b.decision,
+        b.decision === 'approve'
+          ? (target, before) => {
+              const baseRev = b.baseRev ?? before.revision;
+              // Compute the real (frame-snapped) delta against `before` —
+              // the manifest as of right now, inside the same critical
+              // section as the commit itself — so the summary/response
+              // agree with what actually lands on the timeline, and can't
+              // be thrown off by a concurrent write between "preview" and
+              // "commit" (the bug this whole method exists to close).
+              let preview = before;
+              for (const c of target) preview = removeSourceRange(preview, c.sourceId, c.t0, c.t1);
+              const removedSeconds = timelineDuration(before) - timelineDuration(preview);
+              return {
+                baseRev,
+                actor,
+                op: 'apply-candidates',
+                params: { ids: target.map((c) => c.id) },
+                summary: `applied ${target.length} cuts (-${removedSeconds.toFixed(1)}s)`,
+                mutate: (m: Manifest) => {
+                  let cur = m;
+                  for (const c of target) cur = removeSourceRange(cur, c.sourceId, c.t0, c.t1);
+                  return cur;
+                },
+              };
+            }
+          : undefined,
+      );
+      if (result.manifest && result.before) {
+        const removedSeconds = timelineDuration(result.before) - timelineDuration(result.manifest);
+        broadcast(ctx, {
+          type: 'update',
+          revision: result.manifest.revision,
+          op: 'apply-candidates',
+          summary: `applied ${result.target.length} cuts (-${removedSeconds.toFixed(1)}s)`,
+        });
       }
-      for (const c of target) c.status = b.decision === 'approve' ? 'approved' : 'rejected';
-      await p.writeCandidates(all);
-      broadcast(ctx, { type: 'candidates', pending: all.filter((c) => c.status === 'proposed').length });
-      return json(res, 200, { decided: target.length, state: await stateSummary(p) });
+      broadcast(ctx, { type: 'candidates', pending: result.all.filter((c) => c.status === 'proposed').length });
+      return json(res, 200, { decided: result.target.length, state: await stateSummary(p) });
     }
 
     // ---- scene index (non-destructive: no baseRev, like candidates.json) ----

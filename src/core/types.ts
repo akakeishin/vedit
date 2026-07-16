@@ -110,6 +110,14 @@ export interface RevisionEntry {
   summary: string;
   /** Full manifest snapshot after applying the op (manifests are small). */
   snapshot: Manifest;
+  /**
+   * Content of every motion/*.json sidecar referenced by
+   * `snapshot.timeline.motion`, keyed by MotionItem.id, as of this
+   * revision. Lets restore() roll motion sidecars back in lockstep with
+   * the manifest. Optional so revisions written before this field existed
+   * still parse; restore() just can't roll sidecars back for those.
+   */
+  motionSpecs?: Record<string, unknown>;
 }
 
 // ---- playback mapping ----
