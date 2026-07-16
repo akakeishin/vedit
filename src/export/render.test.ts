@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { Manifest, MusicItem, Transcript } from '../core/types.js';
+import { mkdtempSync, promises as fsp } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import type { KitFile, Manifest, MusicItem, Transcript } from '../core/types.js';
 
 // renderFinal shells out to ffmpeg via run()/runCapture(); stub both (and
 // ffmpegHasFilter/ffmpegBin) so the 2-pass-loudnorm orchestration tests below
@@ -19,8 +22,20 @@ vi.mock('../ingest/run.js', () => ({
   ffmpegHasFilter: () => true,
 }));
 
-import { addOverlay } from '../core/ops.js';
-import { buildFilterGraph, buildRepairChain, loudnormClause, overlayAudioClause, overlayVideoClause, planExportPreset, renderFinal, resolveRenderParams, toAss } from './render.js';
+import { addOverlay, addSprite } from '../core/ops.js';
+import {
+  buildFilterGraph,
+  buildRepairChain,
+  loudnormClause,
+  overlayAudioClause,
+  overlayVideoClause,
+  planExportPreset,
+  renderFinal,
+  resolveRenderParams,
+  spriteVideoClause,
+  toAss,
+} from './render.js';
+import { writeKitFile, type ResolvedKitAsset } from '../core/kit.js';
 
 function manifest(style: string): Manifest {
   return {
@@ -78,6 +93,55 @@ describe('toAss', () => {
   it('falls back to the clean style for an unrecognized captions.style id', () => {
     const ass = toAss(manifest('some-web-only-preset'), [transcript()]);
     expect(ass).toMatch(/^Dialogue: 0,.*,clean,,/m);
+  });
+
+  // ---- W8: kit style -> ASS style ----
+
+  function kitWithStyle(overrides: Record<string, unknown> = {}): KitFile {
+    return {
+      version: 'vedit-kit/v1',
+      styles: [
+        {
+          id: 'kitStyle1',
+          palette: { text: '#112233', outline: '#aabbcc', box: '#000000' },
+          caption: { font: 'fonts/MyFont-Bold.ttf', size_1080p: 60, outline_width: 5, background_opacity: 0.5 },
+          ...overrides,
+        },
+      ],
+    };
+  }
+
+  it('adds the kit style ALONGSIDE the 4 built-in presets (never replaces them) and routes Dialogue to it', () => {
+    const ass = toAss(manifest('kitStyle1'), [transcript()], kitWithStyle());
+    for (const name of ['clean', 'bold', 'outline', 'boxed', 'kitStyle1']) {
+      expect(ass).toMatch(new RegExp(`^Style: ${name},`, 'm'));
+    }
+    expect(ass).toMatch(/^Dialogue: 0,.*,kitStyle1,,/m);
+  });
+
+  it('converts palette hex to ASS BGR order and background_opacity to the box colour\'s alpha channel', () => {
+    const ass = toAss(manifest('kitStyle1'), [transcript()], kitWithStyle());
+    const line = ass.split('\n').find((l) => l.startsWith('Style: kitStyle1,'))!;
+    const fields = line.replace('Style: kitStyle1,', '').split(',');
+    // Format after Name: Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, ...
+    expect(fields[2]).toBe('&H00332211'); // #112233 text -> BGR 332211, alpha 00 (opaque)
+    expect(fields[4]).toBe('&H00CCBBAA'); // #aabbcc outline -> BGR CCBBAA
+    expect(fields[5]).toBe('&H80000000'); // box #000000, background_opacity 0.5 -> alpha 0x80
+  });
+
+  it('uses the font FILE\'s basename (no extension) as the ASS Fontname, and scales size_1080p to the actual output height', () => {
+    const m = { ...manifest('kitStyle1'), output: { width: 1280, height: 720 } };
+    const ass = toAss(m, [transcript()], kitWithStyle());
+    const line = ass.split('\n').find((l) => l.startsWith('Style: kitStyle1,'))!;
+    const fields = line.replace('Style: kitStyle1,', '').split(',');
+    expect(fields[0]).toBe('MyFont-Bold'); // Fontname
+    expect(Number(fields[1])).toBe(Math.round(60 * (720 / 1080))); // Fontsize scaled to 720p
+  });
+
+  it('a kit with no style matching captions.style leaves toAss byte-for-byte the same as passing no kit at all', () => {
+    const withoutKit = toAss(manifest('clean'), [transcript()]);
+    const withUnrelatedKit = toAss(manifest('clean'), [transcript()], kitWithStyle());
+    expect(withUnrelatedKit).toBe(withoutKit);
   });
 });
 
@@ -340,6 +404,130 @@ describe('overlayVideoClause / overlayAudioClause (pure helpers)', () => {
   it('overlayAudioClause rounds tlStart to milliseconds for adelay', () => {
     const clause = overlayAudioClause(2, 0, 0, 2, 1.2345, -18);
     expect(clause).toBe('[2:a]atrim=start=0:end=2,asetpts=PTS-STARTPTS,adelay=1235:all=1,volume=-18dB[ova0]');
+  });
+});
+
+// ---- buildFilterGraph: W8 kit sprite compositing ----
+//
+// baseManifest()'s A-roll timeline is seg1 tl[0,5)<-src[0,5) and
+// seg2 tl[5,15)<-src[10,20) (a 5s cut sits between them, src[5,10)) — same
+// shape overlayManifest() above builds on.
+
+function spriteManifest(
+  sprites: { anchorSrcTime: number; id?: string; duration?: number; position?: { x: number; y: number }; scale?: number; opacity?: number; flip?: boolean }[],
+): Manifest {
+  let m = baseManifest();
+  for (const s of sprites) {
+    m = addSprite(m, 'char1', {
+      id: s.id,
+      anchor: { sourceId: 's1', srcTime: s.anchorSrcTime },
+      duration: s.duration,
+      position: s.position,
+      scale: s.scale,
+      opacity: s.opacity,
+      flip: s.flip,
+    });
+  }
+  return m;
+}
+
+function fakeAsset(id: string, overrides: Partial<ResolvedKitAsset> = {}): ResolvedKitAsset {
+  return {
+    id, path: `assets/characters/${id}.png`, type: 'sprite', absPath: `/kit/assets/characters/${id}.png`,
+    width: 200, height: 400,
+    visible_bounds_normalized: { x0: 0, y0: 0, x1: 1, y1: 1 },
+    ground_anchor_normalized: { x: 0.5, y: 1 },
+    ...overrides,
+  };
+}
+
+describe('buildFilterGraph: W8 kit sprite compositing', () => {
+  it('a sprite-less project (or omitting kitAssets entirely) reaches byte-for-byte the same graph as before W8 (regression)', () => {
+    const noSprites = buildFilterGraph(baseManifest());
+    expect(noSprites.graph).not.toMatch(/\bsv\d|\bsvc\d/);
+    expect(noSprites.spriteInputIndices).toBeUndefined();
+
+    const m = spriteManifest([{ anchorSrcTime: 2 }]);
+    const built = buildFilterGraph(m); // sprites exist on the timeline but no kitAssets map is passed
+    expect(built.graph).not.toMatch(/\bsv\d|\bsvc\d/);
+    expect(built.inputPaths).toEqual(['/x.mp4']);
+    expect(built.spriteInputIndices).toBeUndefined();
+  });
+
+  it('an unresolved sprite (assetId missing from kitAssets) is silently skipped', () => {
+    const m = spriteManifest([{ anchorSrcTime: 2 }]);
+    const built = buildFilterGraph(m, { kitAssets: new Map() });
+    expect(built.graph).not.toMatch(/\bsv\d/);
+    expect(built.inputPaths).toEqual(['/x.mp4']);
+  });
+
+  it('an orphaned sprite (anchor cut away) is excluded entirely — same regression guarantee as no sprites', () => {
+    const m = spriteManifest([{ anchorSrcTime: 7 }]); // src[5,10) is the cut gap
+    const built = buildFilterGraph(m, { kitAssets: new Map([['char1', fakeAsset('char1')]]) });
+    expect(built.graph).not.toMatch(/\bsv\d/);
+    expect(built.inputPaths).toEqual(['/x.mp4']);
+  });
+
+  it('composites a resolved sprite at exactly the geometry spriteGeometry computes, and records spriteInputIndices for -loop 1', () => {
+    const m = spriteManifest([{ anchorSrcTime: 2, id: 'sp1', duration: 3, position: { x: 0.5, y: 1 }, scale: 0.5, opacity: 1 }]);
+    const built = buildFilterGraph(m, { kitAssets: new Map([['char1', fakeAsset('char1')]]) });
+    expect(built.inputPaths).toEqual(['/x.mp4', '/kit/assets/characters/char1.png']);
+    expect(built.spriteInputIndices).toEqual([1]);
+    // asset aspect 200/400=0.5, scale 0.5 * output height 1080 -> display/full height 540, full width 270.
+    expect(built.graph).toContain('[1:v]scale=270:540,format=rgba[sv0]');
+    // ground_anchor (0.5,1) of the 270x540 image at position (0.5,1)*1920x1080=(960,1080) -> top-left (960-135, 1080-540)=(825,540).
+    expect(built.graph).toContain("[vc][sv0]overlay=x=825:y=540:enable='between(t,2,5)'[svc0]");
+    expect(built.videoLabel).toBe('[svc0]');
+  });
+
+  it('opacity 1 (default) omits colorchannelmixer; opacity < 1 adds it', () => {
+    const kitAssets = new Map([['char1', fakeAsset('char1')]]);
+    const opaque = buildFilterGraph(spriteManifest([{ anchorSrcTime: 2, opacity: 1 }]), { kitAssets });
+    expect(opaque.graph).not.toContain('colorchannelmixer');
+    const translucent = buildFilterGraph(spriteManifest([{ anchorSrcTime: 2, opacity: 0.4 }]), { kitAssets });
+    expect(translucent.graph).toContain('colorchannelmixer=aa=0.4');
+  });
+
+  it('flip adds hflip to the sprite\'s video chain', () => {
+    const kitAssets = new Map([['char1', fakeAsset('char1')]]);
+    const built = buildFilterGraph(spriteManifest([{ anchorSrcTime: 2, flip: true }]), { kitAssets });
+    expect(built.graph).toContain('hflip');
+  });
+
+  it('multiple sprites chain the composite and each gets its own input; sprites MAY overlap (unlike B-roll V2)', () => {
+    const kitAssets = new Map([['char1', fakeAsset('char1')], ['char2', fakeAsset('char2')]]);
+    let m = baseManifest();
+    m = addSprite(m, 'char1', { id: 'sp1', anchor: { sourceId: 's1', srcTime: 1 }, duration: 2 });
+    m = addSprite(m, 'char2', { id: 'sp2', anchor: { sourceId: 's1', srcTime: 1 }, duration: 2 }); // same window as sp1 — deliberately overlapping
+    const built = buildFilterGraph(m, { kitAssets });
+    expect(built.inputPaths).toEqual(['/x.mp4', '/kit/assets/characters/char1.png', '/kit/assets/characters/char2.png']);
+    expect(built.spriteInputIndices).toEqual([1, 2]);
+    expect(built.videoLabel).toBe('[svc1]');
+  });
+
+  it('sprite compositing is applied on top of (after) B-roll overlay compositing', () => {
+    let m = overlayManifest([{ anchorSrcTime: 2, id: 'ov1', audioMode: 'mute' }]);
+    m = addSprite(m, 'char1', { id: 'sp1', anchor: { sourceId: 's1', srcTime: 2 }, duration: 2 });
+    const built = buildFilterGraph(m, { kitAssets: new Map([['char1', fakeAsset('char1')]]) });
+    expect(built.graph).toContain("[vc][ov0]overlay=enable='between(t,2,4)'[ovc0]");
+    expect(built.graph).toContain('[ovc0][sv0]overlay=x=');
+    expect(built.videoLabel).toBe('[svc0]');
+  });
+});
+
+describe('spriteVideoClause (pure helper)', () => {
+  it('scales (rounding to the nearest pixel) and forces format=rgba', () => {
+    expect(spriteVideoClause(2, 0, 100.4, 200.6)).toBe('[2:v]scale=100:201,format=rgba[sv0]');
+  });
+
+  it('adds hflip only when flip is requested', () => {
+    expect(spriteVideoClause(2, 0, 100, 200, { flip: true })).toBe('[2:v]scale=100:200,hflip,format=rgba[sv0]');
+    expect(spriteVideoClause(2, 0, 100, 200, { flip: false })).toBe('[2:v]scale=100:200,format=rgba[sv0]');
+  });
+
+  it('adds colorchannelmixer only when opacity is below 1', () => {
+    expect(spriteVideoClause(2, 0, 100, 200, { opacity: 0.3 })).toBe('[2:v]scale=100:200,format=rgba,colorchannelmixer=aa=0.3[sv0]');
+    expect(spriteVideoClause(2, 0, 100, 200, { opacity: 1 })).not.toContain('colorchannelmixer');
   });
 });
 
@@ -668,5 +856,81 @@ describe('renderFinal: 2-pass loudnorm (music present)', () => {
     const renderGraph = renderArgs[renderArgs.indexOf('-filter_complex') + 1];
     expect(renderGraph).toContain('measured_I=-23.5');
     expect(renderGraph).toContain('offset=0.10[final]');
+  });
+});
+
+// ---- renderFinal: W8 kit (loads kit.json for real off disk via readKitFile;
+// ffmpeg itself stays mocked via run.js, but sha256File/fs reads are real, so
+// these use a real tmpdir kit directory — same approach daemon.test.ts uses
+// for path-containment tests). ----
+
+function freshKitDir(prefix: string): string {
+  return mkdtempSync(path.join(tmpdir(), `vedit-render-kit-${prefix}-`));
+}
+
+describe('renderFinal: W8 kit (styles + sprites)', () => {
+  it('degrades gracefully (warning, not a thrown error) when manifest.kit points at a directory with no kit.json', async () => {
+    runMock.mockClear();
+    runCaptureMock.mockClear();
+    const dir = freshKitDir('missing');
+    const m = { ...baseManifest(), kit: { path: dir } };
+    const res = await renderFinal(m, [], outPathIn('/tmp'));
+    expect(res.warnings.some((w) => w.startsWith('kit:'))).toBe(true);
+    expect(runMock).toHaveBeenCalledTimes(1); // still rendered — just without kit styles/sprites
+  });
+
+  it('resolves and composites a linked kit sprite: -loop 1 precedes the PNG input, and the graph overlays it', async () => {
+    runMock.mockClear();
+    runCaptureMock.mockClear();
+    const dir = freshKitDir('sprite');
+    await fsp.mkdir(path.join(dir, 'assets', 'characters'), { recursive: true });
+    await fsp.writeFile(path.join(dir, 'assets', 'characters', 'char1.png'), 'fake-png-bytes');
+    const kit: KitFile = {
+      version: 'vedit-kit/v1',
+      assets: [{
+        id: 'char1', path: 'assets/characters/char1.png', type: 'sprite',
+        width: 200, height: 400,
+        visible_bounds_normalized: { x0: 0, y0: 0, x1: 1, y1: 1 },
+        ground_anchor_normalized: { x: 0.5, y: 1 },
+      }],
+    };
+    await writeKitFile(dir, kit);
+
+    let m = { ...baseManifest(), kit: { path: dir } };
+    const { addSprite } = await import('../core/ops.js');
+    m = addSprite(m, 'char1', { id: 'sp1', anchor: { sourceId: 's1', srcTime: 2 }, duration: 3 });
+
+    const res = await renderFinal(m, [], outPathIn('/tmp'));
+    expect(res.warnings.some((w) => w.includes('sha256') || w.includes('not found'))).toBe(false);
+
+    const args = runMock.mock.calls[0][1] as string[];
+    const pngIdx = args.indexOf(path.join(dir, 'assets', 'characters', 'char1.png'));
+    expect(pngIdx).toBeGreaterThan(0);
+    expect(args[pngIdx - 1]).toBe('-i');
+    expect(args[pngIdx - 2]).toBe('1');
+    expect(args[pngIdx - 3]).toBe('-loop');
+    const graph = args[args.indexOf('-filter_complex') + 1];
+    expect(graph).toMatch(/overlay=x=\d+:y=\d+:enable='between\(t,2,5\)'/);
+  });
+
+  it('burnCaptions with a kit style carrying a font passes fontsdir= pointing at the kit\'s font directory', async () => {
+    runMock.mockClear();
+    runCaptureMock.mockClear();
+    const dir = freshKitDir('font');
+    await fsp.mkdir(path.join(dir, 'fonts'), { recursive: true });
+    await fsp.writeFile(path.join(dir, 'fonts', 'MyFont-Bold.ttf'), 'fake-font-bytes');
+    const kit: KitFile = {
+      version: 'vedit-kit/v1',
+      styles: [{ id: 'kitStyle1', caption: { font: 'fonts/MyFont-Bold.ttf' } }],
+    };
+    await writeKitFile(dir, kit);
+
+    const m = manifest('kitStyle1');
+    (m as Manifest).kit = { path: dir };
+    await renderFinal(m, [transcript()], outPathIn('/tmp'), { burnCaptions: true });
+
+    const args = runMock.mock.calls[0][1] as string[];
+    const graph = args[args.indexOf('-filter_complex') + 1];
+    expect(graph).toContain(`fontsdir='${path.join(dir, 'fonts')}'`);
   });
 });

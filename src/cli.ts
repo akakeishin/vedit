@@ -31,6 +31,16 @@ import {
 import { ffmpegBin, ffmpegHasFilter, run } from './ingest/run.js';
 import { buildResume } from './core/resume.js';
 import type { Transcript } from './core/types.js';
+import {
+  kitProfileHighlights,
+  packKitAssets,
+  readKitFile,
+  recognizedKitSections,
+  scaffoldKit,
+  scanKit,
+  searchKitAssets,
+  writeKitFile,
+} from './core/kit.js';
 
 const PORT = Number(process.env.VEDIT_PORT ?? 7799);
 const BASE = `http://localhost:${PORT}`;
@@ -43,7 +53,7 @@ const BOOLEAN_FLAGS = new Set([
   'no-transcribe', 'no-add', 'no-fillers', 'no-silence',
   'latest', 'full', 'all', 'burn-captions', 'no-duck',
   'no-repair', 'fast-loudnorm', 'deess', 'confirm',
-  'plan', 'link', 'no-verify',
+  'plan', 'link', 'no-verify', 'force', 'flip', 'no-flip',
 ]);
 const argv = process.argv.slice(2);
 const cmd = argv[0];
@@ -212,16 +222,18 @@ async function resolveScene(dir: string, sceneId: string, explicitSource?: strin
 }
 
 /**
- * Resolve a B-roll overlay's anchor sugar — at most one of --at-word /
- * --at-src / --at-tl — to {sourceId, srcTime}. Returns undefined when none
- * were given (broll-update: "don't change the anchor"); broll-add's caller
- * additionally requires the result to be present.
+ * Resolve a B-roll overlay's (or W8 sprite's — same anchor contract) anchor
+ * sugar — at most one of --at-word / --at-src / --at-tl — to
+ * {sourceId, srcTime}. Returns undefined when none were given (broll-update
+ * / sprite-update: "don't change the anchor"); broll-add's/sprite-add's
+ * caller additionally requires the result to be present.
  *
  * --at-src's syntax is `--at-src <aRollSrc> <秒>`: the tiny flag parser at
  * the top of this file only ever consumes ONE token as a flag's value, so
  * `<aRollSrc>` lands in flags['at-src'] and the trailing `<秒>` token falls
  * through to the positional list — it's pos[1] here since pos[0] is always
- * the command's own id/sourceId positional for broll-add/broll-update.
+ * the command's own id positional (brollSourceId / assetId) for
+ * broll-add/broll-update/sprite-add/sprite-update.
  */
 async function resolveAnchorFlags(dir: string): Promise<{ sourceId: string; srcTime: number } | undefined> {
   const given = ['at-word', 'at-src', 'at-tl'].filter((k) => flags[k] !== undefined);
@@ -289,7 +301,7 @@ culling:   review <sceneId...> keep|reject|clear [--source id] --base <rev>   # 
            selects --base <rev> [--confirm]         # keep シーンだけの仮タイムラインでタイムラインを置換(--confirm 無しはプレビューのみ)
 reframe:   reframe <9:16|1:1|16:9|WxH> [--focus left|center|right|0..1]
            clip-crop <clipId> [--x 0..1] [--y 0..1]
-captions:  captions [--enabled true|false] [--style clean|bold] [--max-chars 24]
+captions:  captions [--enabled true|false] [--style clean|bold|<kitStyleId>] [--max-chars 24]
 motion:    motion-add --type chapter-card --text "..." --at 12 --duration 4 [--subtitle ...]
            motion-update <id> [--text ...] [--at ...] [--duration ...] | motion-remove <id>
 music:     music-add <file> [--at 0] [--duration N] [--src-in 0] [--gain -12] [--fade-in 1] [--fade-out 2] [--no-duck]
@@ -303,6 +315,13 @@ broll:     broll-add <brollSourceId> [--in s --out s | --scene sX]
              (--at-word wXXXX [--source aRollSrc] | --at-src aRollSrc t | --at-tl t)
              [--audio mute|mix|replace] [--gain -18] --base <rev>        # B-roll V2 トラック(重複不可・話者音声に張り付く)
            broll-update <id> [同フラグ] --base <rev> | broll-remove <id> --base <rev>
+kit:       kit-init <dir> [--name n]                  # 雛形生成(kit.json + GUIDE.md + fonts/ + assets/{characters,backgrounds,props})
+           kit-link <dir> --base <rev> | kit-unlink --base <rev> | kit   # リンク/解除/内容表示(profile要点含む)
+           kit-scan [dir] [--force]                    # assets/ の PNG からアルファ境界・足元アンカーを自動計算
+           kit-assets [--tag t] [--emotion e]           # キット素材の検索(read-only)
+sprites:   sprite-add <assetId> (--at-word wXXXX [--source aRollSrc] | --at-src aRollSrc t | --at-tl t)
+             [--pos x,y] [--scale 0..1] [--opacity 0..1] [--duration s] [--flip] --base <rev>
+           sprite-update <id> [同フラグ] --base <rev> | sprite-remove <id> --base <rev>
 inspect:   view [--from a] [--to b] [--domain timeline|source] [--source id] [--scene id] (prints PNG path)
 export:    export otio <out.otio> | export render <out.mp4> [--burn-captions] [--preset youtube|shorts|x]
            export render ... [--no-repair] [--fast-loudnorm]   # 乾音A/B比較 / 1-passループドネスに落とす
@@ -360,7 +379,13 @@ async function main() {
       const m = await p.manifest();
       const revs = await p.revisions();
       const cands = await p.candidates();
-      return out(buildResume(m, dir, revs, cands));
+      let kit = null;
+      if (m.kit) {
+        try {
+          kit = await readKitFile(m.kit.path);
+        } catch { /* kit unreadable — resume() surfaces no kitProfile rather than failing the whole command */ }
+      }
+      return out(buildResume(m, dir, revs, cands, kit));
     }
 
     case 'projects': {
@@ -791,9 +816,26 @@ async function main() {
       return out({ ...res, ...preview, applied: true, hint: MUTATE_HINT });
     }
 
-    case 'reframe':
+    case 'reframe': {
       if (pos.length === 0) fail('usage: vedit reframe <9:16|1:1|16:9|WxH> [--focus left|center|right|0..1]');
-      return edit({ op: 'reframe', spec: pos[0], focus: flags.focus });
+      // kit defaults.reframe_focus (W8): consulted only when --focus is
+      // omitted AND a kit is linked — never overrides an explicit flag. No
+      // manifest field stores this (unlike defaults.captions_style, applied
+      // once at kit-link time), so it's re-consulted on every reframe call.
+      let focus = flags.focus;
+      if (focus === undefined) {
+        const dir = projectDir();
+        const p = await Project.open(dir);
+        const m = await p.manifest();
+        if (m.kit) {
+          try {
+            const kit = await readKitFile(m.kit.path);
+            if (kit.defaults?.reframe_focus) focus = kit.defaults.reframe_focus;
+          } catch { /* kit unreadable — fall back to reframe's own default (center) */ }
+        }
+      }
+      return edit({ op: 'reframe', spec: pos[0], focus });
+    }
 
     case 'clip-crop':
       if (pos.length === 0) fail('usage: vedit clip-crop <clipId> [--x 0..1] [--y 0..1]');
@@ -995,6 +1037,131 @@ async function main() {
     case 'broll-remove':
       return edit({ op: 'broll-remove', id: pos[0] ?? fail('usage: vedit broll-remove <id>') });
 
+    case 'kit-init': {
+      const dir = path.resolve(pos[0] ?? fail('usage: vedit kit-init <dir> [--name n]'));
+      const name = (flags.name as string) ?? path.basename(dir);
+      const result = await scaffoldKit(dir, name);
+      return out({
+        ok: true, dir, ...result,
+        hint: `assets/{characters,backgrounds,props} にPNGを置いて \`vedit kit-scan ${dir}\`、その後 \`vedit kit-link ${dir} --base <rev>\``,
+      });
+    }
+
+    case 'kit-link':
+      return edit({ op: 'kit-link', path: path.resolve(pos[0] ?? fail('usage: vedit kit-link <dir> --base <rev>')) });
+
+    case 'kit-unlink':
+      return edit({ op: 'kit-unlink' });
+
+    case 'kit': {
+      // Read-only display — reads project.json + kit.json directly, like
+      // `resume`/`sources`, no daemon required.
+      const dir = projectDir();
+      const p = await Project.open(dir);
+      const m = await p.manifest();
+      if (!m.kit) {
+        return out({ linked: false, hint: 'キット未リンク — `vedit kit-init <dir>` → `vedit kit-link <dir> --base <rev>`' });
+      }
+      let kit;
+      try {
+        kit = await readKitFile(m.kit.path);
+      } catch (e: any) {
+        return out({ linked: true, path: m.kit.path, error: e?.message ?? String(e) });
+      }
+      return out({
+        linked: true,
+        path: m.kit.path,
+        recognizedSections: recognizedKitSections(kit),
+        profile: kitProfileHighlights(kit),
+        styles: (kit.styles ?? []).map((s) => ({ id: s.id, label: s.label, use_for: s.use_for })),
+        assetCount: (kit.assets ?? []).length,
+        defaults: kit.defaults,
+      });
+    }
+
+    case 'kit-scan': {
+      let dir: string;
+      if (pos[0]) {
+        dir = path.resolve(pos[0]);
+      } else {
+        const projDir = projectDir();
+        const p = await Project.open(projDir);
+        const m = await p.manifest();
+        if (!m.kit) fail('usage: vedit kit-scan <dir> (or link a kit first: `vedit kit-link <dir> --base <rev>`)');
+        dir = m.kit.path;
+      }
+      const kit = await readKitFile(dir);
+      const result = await scanKit(dir, kit, { force: Boolean(flags.force) });
+      await writeKitFile(dir, result.kit);
+      return out({
+        ok: true, dir,
+        added: result.added, scanned: result.scanned, skipped: result.skipped,
+        ...(result.warnings.length ? { warnings: result.warnings } : {}),
+      });
+    }
+
+    case 'kit-assets': {
+      const dir = projectDir();
+      const p = await Project.open(dir);
+      const m = await p.manifest();
+      if (!m.kit) fail('no kit linked; run `vedit kit-link <dir> --base <rev>` first');
+      const kit = await readKitFile(m.kit.path);
+      const results = searchKitAssets(kit.assets, {
+        tag: flags.tag as string | undefined,
+        emotion: flags.emotion as string | undefined,
+      });
+      return out(packKitAssets(results));
+    }
+
+    case 'sprite-add': {
+      const USAGE =
+        'usage: vedit sprite-add <assetId> (--at-word wXXXX [--source aRollSrc] | --at-src aRollSrc t | --at-tl t) ' +
+        '[--pos x,y] [--scale 0..1] [--opacity 0..1] [--duration s] [--flip] --base <rev>';
+      const assetId = pos[0] ?? fail(USAGE);
+      const dir = projectDir();
+      const anchor = await resolveAnchorFlags(dir);
+      if (!anchor) fail(`sprite-add requires an anchor: --at-word / --at-src / --at-tl\n${USAGE}`);
+      let position: { x: number; y: number } | undefined;
+      if (flags.pos !== undefined) {
+        const [xs, ys] = String(flags.pos).split(',');
+        position = { x: numArg('--pos x', xs), y: numArg('--pos y', ys) };
+      }
+      return edit({
+        op: 'sprite-add',
+        assetId,
+        anchor,
+        duration: numFlag('duration', flags.duration),
+        position,
+        scale: numFlag('scale', flags.scale),
+        opacity: numFlag('opacity', flags.opacity),
+        flip: flags.flip ? true : undefined,
+      });
+    }
+
+    case 'sprite-update': {
+      const id = pos[0] ?? fail('usage: vedit sprite-update <id> [--pos x,y] [--scale ..] [--opacity ..] [--duration s] [--flip|--no-flip] [anchor flags] --base <rev>');
+      const dir = projectDir();
+      const anchor = await resolveAnchorFlags(dir);
+      let position: { x: number; y: number } | undefined;
+      if (flags.pos !== undefined) {
+        const [xs, ys] = String(flags.pos).split(',');
+        position = { x: numArg('--pos x', xs), y: numArg('--pos y', ys) };
+      }
+      return edit({
+        op: 'sprite-update',
+        id,
+        anchor,
+        duration: numFlag('duration', flags.duration),
+        position,
+        scale: numFlag('scale', flags.scale),
+        opacity: numFlag('opacity', flags.opacity),
+        flip: flags.flip ? true : flags['no-flip'] ? false : undefined,
+      });
+    }
+
+    case 'sprite-remove':
+      return edit({ op: 'sprite-remove', id: pos[0] ?? fail('usage: vedit sprite-remove <id>') });
+
     case 'preset-save': {
       const name = pos[0] ?? fail('usage: vedit preset-save <name> [--data \'{"k":"v"}\']');
       const dir = projectDir();
@@ -1089,7 +1256,15 @@ async function main() {
         });
       }
       if (kind === 'render') {
-        const presetRaw = flags.preset as string | undefined;
+        let presetRaw = flags.preset as string | undefined;
+        // kit defaults.export_preset (W8): consulted only when --preset is
+        // omitted AND a kit is linked — never overrides an explicit flag.
+        if (presetRaw === undefined && m.kit) {
+          try {
+            const kit = await readKitFile(m.kit.path);
+            if (kit.defaults?.export_preset) presetRaw = kit.defaults.export_preset;
+          } catch { /* kit unreadable — fall back to no preset */ }
+        }
         if (presetRaw !== undefined && !['youtube', 'shorts', 'x'].includes(presetRaw)) {
           fail(`unknown --preset: ${presetRaw} (use youtube, shorts, or x)`);
         }
@@ -1119,7 +1294,15 @@ async function main() {
         return out({ ok: true, file: dest });
       }
       if (kind === 'ass') {
-        await fs.writeFile(path.resolve(dest), toAss(m, await transcriptsOf()));
+        let kit = null;
+        if (m.kit) {
+          try {
+            kit = await readKitFile(m.kit.path);
+          } catch (e: any) {
+            console.error(`警告: kit: ${e?.message ?? e} — キットスタイルなしで書き出します`);
+          }
+        }
+        await fs.writeFile(path.resolve(dest), toAss(m, await transcriptsOf(), kit));
         return out({ ok: true, file: dest });
       }
       fail(`unknown export kind: ${kind}`);

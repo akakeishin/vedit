@@ -12,6 +12,8 @@ const S = {
   segments: [],
   duration: 0,
   overlays: [], // B-roll V2 (W3): [{overlay, tlStart}] from /api/project; tlStart null = orphan
+  sprites: [], // W8 kit sprites: [{sprite, tlStart}] from /api/project; tlStart null = orphan
+  kit: { path: null, kit: null }, // W8: /api/kit response (kit.json content, or null when unlinked/unreadable)
   transcripts: new Map(), // sourceId -> words[]
   cues: [],
   candidates: [],
@@ -70,6 +72,8 @@ async function reload() {
     S.segments = pr.segments;
     S.duration = pr.duration;
     S.overlays = pr.overlays ?? [];
+    S.sprites = pr.sprites ?? [];
+    S.kit = await api('/api/kit').catch(() => ({ path: null, kit: null }));
     S.cues = await api('/api/captions');
     S.candidates = await api('/api/candidates');
     S.candidatesAll = await api('/api/candidates?all=1');
@@ -208,6 +212,7 @@ function tick() {
     $('tc').textContent = `${fmtF(tl)} / ${fmtF(S.duration)}`;
     renderCaption(tl);
     renderMotion(tl);
+    renderSprites(tl);
     highlightWord(tl);
     syncMusicPlayback(tl);
     syncOverlayVideo(tl);
@@ -446,6 +451,7 @@ function renderTimeline() {
     murow.appendChild(d);
   }
   renderOverlayRow();
+  renderSpriteRow();
   drawWave();
 }
 
@@ -482,6 +488,43 @@ function renderOverlayRow() {
       d.style.width = `${(dur / S.duration) * 100}%`;
       d.title = `${ov.id} (${dur.toFixed(1)}s, ${ov.audioMode})`;
       d.textContent = ov.id;
+    }
+    row.appendChild(d);
+  }
+}
+
+// W8 kit sprite row: one pink block per resolved sprite, same shape as
+// renderOverlayRow above (orphans as fixed left-edge warning chips). Sprites
+// may overlap each other (unlike the exclusive B-roll V2 track), so blocks
+// simply stack visually via z-order — no collision handling needed.
+function renderSpriteRow() {
+  const row = $('spriteRow');
+  if (!row) return;
+  row.innerHTML = '';
+  if (!S.duration) return;
+  let orphanIdx = 0;
+  for (const r of S.sprites) {
+    const sp = r.sprite;
+    const d = document.createElement('div');
+    if (r.tlStart == null) {
+      d.className = 'spBlock orphan';
+      d.style.left = `${orphanIdx * 14}px`;
+      d.textContent = '!';
+      d.title = `orphan: ${sp.id} — クリックで理由を表示`;
+      d.onclick = (e) => {
+        e.stopPropagation();
+        toast(
+          `スプライト ${sp.id} は orphan です — アンカー(${sp.anchor.sourceId}@${sp.anchor.srcTime.toFixed(2)}s)がカットで失われました。再アンカーしてください(vedit sprite-update)`,
+          { type: 'error' },
+        );
+      };
+      orphanIdx++;
+    } else {
+      d.className = 'spBlock';
+      d.style.left = `${(r.tlStart / S.duration) * 100}%`;
+      d.style.width = `${(sp.duration / S.duration) * 100}%`;
+      d.title = `${sp.id} (${sp.assetId}, ${sp.duration.toFixed(1)}s)`;
+      d.textContent = sp.assetId;
     }
     row.appendChild(d);
   }
@@ -674,6 +717,7 @@ function enterSourcePreview(sourceId, { at = 0 } = {}) {
   // preview video — it's the raw source, not a specific timeline clip.
   const cap = $('captionLayer'); cap.innerHTML = ''; cap.dataset.cur = '';
   const mo = $('motionLayer'); mo.innerHTML = ''; mo.dataset.cur = '';
+  const sp = $('spriteLayer'); if (sp) { sp.innerHTML = ''; sp.dataset.cur = ''; } // W8 sprites don't apply to raw source preview either
   video.style.objectPosition = '50% 50%';
   video.pause();
   if (!videoOverlay.hidden) { videoOverlay.hidden = true; videoOverlay.pause(); } // B-roll V2 preview doesn't apply to raw source preview
@@ -1005,15 +1049,112 @@ $('clipRemoveBtn').onclick = async () => {
   await mutate({ op: 'clip-remove', clipId });
 };
 
+// ---------- W8 kit: caption style palette/font + sprite stage rendering ----------
+
+// One shared <style> element carrying every @font-face rule registered so
+// far this session (fonts are served from the kit via /media/kit/<relPath>,
+// sandboxed to the kit root server-side — see serveKitMedia in daemon.ts).
+// The family name is the font FILE's basename without extension — the SAME
+// convention render.ts's toAss/kitAssStyle uses for the ASS Fontname, so the
+// web preview and the burned-in captions resolve to visually the same font.
+const kitFontFamilies = new Set();
+function ensureKitFontFace(fontRelPath) {
+  const family = fontRelPath.split('/').pop().replace(/\.[^.]+$/, '');
+  if (!kitFontFamilies.has(family)) {
+    kitFontFamilies.add(family);
+    let styleEl = document.getElementById('kitFontFaces');
+    if (!styleEl) {
+      styleEl = document.createElement('style');
+      styleEl.id = 'kitFontFaces';
+      document.head.appendChild(styleEl);
+    }
+    const url = `/media/kit/${fontRelPath.split('/').map(encodeURIComponent).join('/')}`;
+    styleEl.appendChild(document.createTextNode(`@font-face { font-family: '${family}'; src: url('${url}'); }\n`));
+  }
+  return family;
+}
+function kitStyleFor(styleId) {
+  return (S.kit?.kit?.styles ?? []).find((s) => s.id === styleId) ?? null;
+}
+
 // ---------- captions & motion overlays ----------
 function renderCaption(tl) {
   const layer = $('captionLayer');
-  layer.className = `style-${S.manifest?.captions.style ?? 'clean'}`;
+  const styleId = S.manifest?.captions.style ?? 'clean';
+  const kitStyle = kitStyleFor(styleId);
+  if (kitStyle) {
+    // Kit style: approximate the ASS palette/font as CSS custom properties
+    // (see #captionLayer.style-kit in style.css) rather than a fixed named
+    // class — kit style ids are arbitrary, unlike the built-in presets.
+    layer.className = 'style-kit';
+    const p = kitStyle.palette ?? {};
+    layer.style.setProperty('--kit-text', p.text || '#fff');
+    layer.style.setProperty('--kit-outline', p.outline || 'transparent');
+    layer.style.setProperty('--kit-box', p.box || 'rgba(0,0,0,0.55)');
+    const bgOpacity = kitStyle.caption?.background_opacity;
+    layer.style.setProperty('--kit-box-opacity', bgOpacity != null ? String(bgOpacity) : '1');
+    if (kitStyle.caption?.font) {
+      layer.style.setProperty('--kit-font', `'${ensureKitFontFace(kitStyle.caption.font)}'`);
+    } else {
+      layer.style.removeProperty('--kit-font');
+    }
+  } else {
+    layer.className = `style-${styleId}`;
+  }
   const cue = S.manifest?.captions.enabled ? S.cues.find((c) => tl >= c.tlStart && tl < c.tlEnd) : null;
   const text = cue ? cue.text : '';
   if (layer.dataset.cur !== text) {
     layer.dataset.cur = text;
     layer.innerHTML = text ? `<span class="cue">${esc(text)}</span>` : '';
+  }
+}
+
+// Absolute-positioned <img> per resolved (non-orphan) sprite active at `tl`
+// — a JS port of ops.ts's spriteGeometry (pure math kept in sync by hand;
+// see that function's doc for the placement rationale). Orphans are simply
+// excluded, same as render/OTIO. Positions are expressed as % of the
+// videoBox so they track reframe/letterboxing the same way captionLayer
+// does (both are children of #videoBox, sized to the OUTPUT aspect).
+function spriteGeometryJS(asset, position, scale, outputWH, flip) {
+  const bounds = asset.visible_bounds_normalized ?? { x0: 0, y0: 0, x1: 1, y1: 1 };
+  const anchor = asset.ground_anchor_normalized ?? { x: 0.5, y: 1 };
+  const aspect = asset.width && asset.height ? asset.width / asset.height : 1;
+  const visibleHeightFrac = Math.max(1e-6, bounds.y1 - bounds.y0);
+  const displayHeight = Math.max(0, scale) * outputWH.height;
+  const fullHeight = displayHeight / visibleHeightFrac;
+  const fullWidth = fullHeight * aspect;
+  const anchorXFrac = flip ? 1 - anchor.x : anchor.x;
+  const x = position.x * outputWH.width - anchorXFrac * fullWidth;
+  const y = position.y * outputWH.height - anchor.y * fullHeight;
+  return { x, y, width: fullWidth, height: fullHeight };
+}
+function renderSprites(tl) {
+  const layer = $('spriteLayer');
+  if (!layer) return;
+  const active = S.sprites.filter((r) => r.tlStart != null && tl >= r.tlStart && tl < r.tlStart + r.sprite.duration);
+  const key = active.map((r) => r.sprite.id).join(',');
+  if (layer.dataset.cur === key) return;
+  layer.dataset.cur = key;
+  layer.innerHTML = '';
+  if (active.length === 0) return;
+  const out = S.manifest?.output ?? { width: S.manifest?.width ?? 1920, height: S.manifest?.height ?? 1080 };
+  const assets = S.kit?.kit?.assets ?? [];
+  for (const r of active) {
+    const sp = r.sprite;
+    const asset = assets.find((a) => a.id === sp.assetId);
+    if (!asset) continue;
+    const geo = spriteGeometryJS(asset, sp.position, sp.scale, out, sp.flip);
+    const img = document.createElement('img');
+    img.className = 'spriteImg';
+    img.src = `/media/kit/${asset.path.split('/').map(encodeURIComponent).join('/')}`;
+    img.alt = '';
+    img.style.left = `${(geo.x / out.width) * 100}%`;
+    img.style.top = `${(geo.y / out.height) * 100}%`;
+    img.style.width = `${(geo.width / out.width) * 100}%`;
+    img.style.height = `${(geo.height / out.height) * 100}%`;
+    img.style.opacity = String(sp.opacity);
+    if (sp.flip) img.style.transform = 'scaleX(-1)';
+    layer.appendChild(img);
   }
 }
 function renderMotion(tl) {

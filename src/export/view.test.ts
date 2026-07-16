@@ -16,7 +16,7 @@ vi.mock('../ingest/run.js', () => ({
   ffmpegHasFilter: (...args: unknown[]) => hasFilterMock(...args),
 }));
 
-import { addOverlay } from '../core/ops.js';
+import { addOverlay, addSprite } from '../core/ops.js';
 import { renderView } from './view.js';
 
 function manifest(): Manifest {
@@ -91,6 +91,60 @@ describe('renderView: B-roll V2 overlay sample points (W3)', () => {
     const m = addOverlay(manifest(), 's2', { id: 'ov1', srcIn: 0, srcOut: 4, anchor: { sourceId: 's1', srcTime: 2 } });
     const { grid } = await renderView(m, '/proj', { domain: 'source', sourceId: 's1', from: 0, to: 10, cols: 5, rows: 1 });
     expect(grid.every((g) => g.includes('@s1') && !g.includes('overlay'))).toBe(true);
+  });
+});
+
+describe('renderView: W8 kit sprite grid-legend annotation', () => {
+  // Sprites are a translucent compositing layer, not a frame-source swap
+  // like B-roll — renderView deliberately does NOT draw sprite pixels into
+  // the filmstrip (spec leaves this to implementer judgment); it only notes
+  // which sample points fall inside a resolved sprite's window, same spirit
+  // as the `[overlay <id>]` annotation above.
+  it('tags grid cells inside a resolved sprite window with [sprite <id>], without changing which media each cell reads from', async () => {
+    runMock.mockClear();
+    // anchor src=2 -> tlStart=2 (1:1 mapping); dur=4 -> resolved tl[2,6).
+    const m = addSprite(manifest(), 'char1', { id: 'sp1', anchor: { sourceId: 's1', srcTime: 2 }, duration: 4 });
+    const { grid } = await renderView(m, '/proj', { domain: 'timeline', from: 0, to: 10, cols: 5, rows: 1 });
+    // 5 sample centers at tl = 1,3,5,7,9 — only 3 and 5 fall inside [2,6).
+    expect(grid[0]).not.toContain('sprite');
+    expect(grid[1]).toContain('[sprite sp1]');
+    expect(grid[2]).toContain('[sprite sp1]');
+    expect(grid[3]).not.toContain('sprite');
+    expect(grid[4]).not.toContain('sprite');
+    // Every cell still reads from the A-roll — sprites never swap the sampled source (unlike B-roll).
+    expect(grid.every((g) => g.includes('@s1'))).toBe(true);
+    expect(frameCalls().every((c) => (c[1] as string[]).some((a) => a === '/aroll.mp4'))).toBe(true);
+  });
+
+  it('multiple overlapping sprites at the same sample point are all listed, comma-separated', async () => {
+    runMock.mockClear();
+    let m = addSprite(manifest(), 'char1', { id: 'spA', anchor: { sourceId: 's1', srcTime: 2 }, duration: 4 });
+    m = addSprite(m, 'char2', { id: 'spB', anchor: { sourceId: 's1', srcTime: 2 }, duration: 4 });
+    const { grid } = await renderView(m, '/proj', { domain: 'timeline', from: 0, to: 10, cols: 5, rows: 1 });
+    expect(grid[1]).toContain('[sprite spA,spB]');
+  });
+
+  it('an orphaned sprite never affects the grid legend', async () => {
+    runMock.mockClear();
+    // src=50 is past the A-roll's only clip (tl[0,10)<-src[0,10)) -> unresolvable.
+    const m = addSprite(manifest(), 'char1', { id: 'sp1', anchor: { sourceId: 's1', srcTime: 50 } });
+    const { grid } = await renderView(m, '/proj', { domain: 'timeline', from: 0, to: 10, cols: 5, rows: 1 });
+    expect(grid.every((g) => !g.includes('sprite'))).toBe(true);
+  });
+
+  it('a sprite-less project never tags any grid cell with [sprite ...] (regression)', async () => {
+    runMock.mockClear();
+    const { grid } = await renderView(manifest(), '/proj', { domain: 'timeline', from: 0, to: 10, cols: 5, rows: 1 });
+    expect(grid.every((g) => !g.includes('sprite'))).toBe(true);
+  });
+
+  it('overlay and sprite annotations coexist on the same cell', async () => {
+    runMock.mockClear();
+    let m = addOverlay(manifest(), 's2', { id: 'ov1', srcIn: 0, srcOut: 4, anchor: { sourceId: 's1', srcTime: 2 } });
+    m = addSprite(m, 'char1', { id: 'sp1', anchor: { sourceId: 's1', srcTime: 2 }, duration: 4 });
+    const { grid } = await renderView(m, '/proj', { domain: 'timeline', from: 0, to: 10, cols: 5, rows: 1 });
+    expect(grid[1]).toContain('[overlay ov1]');
+    expect(grid[1]).toContain('[sprite sp1]');
   });
 });
 

@@ -58,6 +58,18 @@ export interface Manifest {
    * Revision-tracked like every other manifest field.
    */
   colorAdjust?: Record<string, { exposure?: number; wb?: number; sat?: number }>;
+  /**
+   * Reference to an external, cross-project "kit" directory (W8): a shared
+   * production-settings folder (caption/title styles, character sprites,
+   * profile/pacing guidance for the director) that multiple projects can
+   * point at. Never copied into the project — kit.json under `path` is read
+   * fresh on every use, so editing the kit affects every project linked to
+   * it. Optional/absent means no kit is linked; every kit-aware feature
+   * (captions --style <kitStyleId>, sprites, `vedit kit`/`resume` profile
+   * highlights) degrades to its pre-W8 behavior. Set via `vedit kit-link
+   * <dir>`, cleared via `vedit kit-unlink`. See src/core/kit.ts.
+   */
+  kit?: { path: string };
 }
 
 export interface Source {
@@ -131,6 +143,40 @@ export interface Timeline {
    * project.json files. See OverlayClip for the anchor contract.
    */
   overlays?: OverlayClip[];
+  /**
+   * Character/prop sprite overlays (W8), anchored to an A-roll moment via
+   * the SAME (sourceId, srcTime) contract as OverlayClip below — `anchor`
+   * is the single source of truth for placement, the timeline position is
+   * always derived via sourceTimeToTimeline, never stored. Unlike the
+   * B-roll V2 track, sprites are a much lighter compositing layer (a still
+   * PNG, not a video) and MAY overlap each other (more than one character
+   * on screen at once) — there is no exclusivity/overlap check. Optional
+   * for backward compatibility with older project.json files.
+   */
+  sprites?: SpriteItem[];
+}
+
+/**
+ * One character/prop sprite placed on the timeline (W8 kit). `assetId`
+ * refers to an entry in the linked kit's `assets[]` (Manifest.kit); the
+ * asset's `visible_bounds_normalized`/`ground_anchor_normalized` (see
+ * KitAsset) drive where exactly it lands — see `spriteGeometry` in ops.ts.
+ */
+export interface SpriteItem {
+  id: string;
+  /** KitAsset.id within the linked kit. */
+  assetId: string;
+  /** The A-roll moment this sprite is glued to (see OverlayClip's anchor doc). */
+  anchor: { sourceId: string; srcTime: number };
+  duration: number;
+  /** 0..1 fraction of the output canvas where the asset's ground_anchor_normalized point is placed. */
+  position: { x: number; y: number };
+  /** Displayed height of the asset's VISIBLE (alpha-bounded) region, as a 0..1 fraction of the output height — not the full (possibly padded) image. */
+  scale: number;
+  /** 0..1 opacity. */
+  opacity: number;
+  /** Mirror horizontally. */
+  flip?: boolean;
 }
 
 /**
@@ -313,4 +359,90 @@ export interface Scene {
 export interface SceneFile {
   sourceId: string;
   scenes: Scene[];
+}
+
+// ---- kit (W8: cross-project production-settings directory) ----
+//
+// vedit-kit/v1's own schema, hand-authored via `vedit kit-init` (see
+// src/core/kit.ts). Every section is optional — "書いた分だけ効く" (only
+// what's written takes effect); a project links to a kit via Manifest.kit
+// and reads kit.json fresh on every use, never copying it in.
+
+export interface KitProfile {
+  tone_tags?: string[];
+  language?: string;
+  duration_seconds?: { min?: number; target?: number; max?: number };
+  pacing?: { average_shot_seconds?: number };
+  /** Vocabulary of construction beats, e.g. ["honest_hook", ..., "quiet_aftertaste"] — director judgment material, never mechanically enforced. */
+  spine?: string[];
+  quiet_pause_policy?: string;
+}
+
+export interface KitPalette {
+  text?: string;
+  outline?: string;
+  box?: string;
+  accent?: string;
+}
+
+/** Shared shape for KitStyle's `caption`/`title` fields. */
+export interface KitTextStyle {
+  /** Font file path, relative to the kit root (e.g. "fonts/MyFont-Bold.ttf"). */
+  font?: string;
+  size_1080p?: number;
+  outline_width?: number;
+  /** 0..1; 1 = fully opaque background box. */
+  background_opacity?: number;
+}
+
+export interface KitStyle {
+  id: string;
+  label?: string;
+  use_for?: string[];
+  palette?: KitPalette;
+  caption?: KitTextStyle;
+  title?: KitTextStyle;
+  motion?: { entry?: string; duration_seconds?: number };
+}
+
+export interface KitAsset {
+  id: string;
+  /** Relative to the kit root. */
+  path: string;
+  type: 'sprite' | 'background' | 'prop';
+  tags?: string[];
+  emotion?: string;
+  intensity?: number;
+  /** Bounding box of the alpha-visible region, normalized 0..1 against the full image; auto-computed by `vedit kit-scan`. */
+  visible_bounds_normalized?: { x0: number; y0: number; x1: number; y1: number };
+  /** Foot/ground point (alpha-weighted centroid of the bottom-most visible row), normalized 0..1 against the full image; auto-computed by `vedit kit-scan`. */
+  ground_anchor_normalized?: { x: number; y: number };
+  /** Pixel dimensions of the source image; filled in by `vedit kit-scan` alongside the alpha geometry above — needed to preserve aspect ratio (see spriteGeometry in ops.ts). Not part of the mini-spec's enumerated fields but required to make visible_bounds/ground_anchor usable without re-probing the file at render time. */
+  width?: number;
+  height?: number;
+  sha256?: string;
+}
+
+export interface KitAudio {
+  music_dir?: string;
+  default_gain?: number;
+  duck_amount?: number;
+  target_lufs?: number;
+  repair_preset?: string;
+}
+
+export interface KitDefaults {
+  captions_style?: string;
+  export_preset?: string;
+  reframe_focus?: string;
+}
+
+export interface KitFile {
+  version: 'vedit-kit/v1';
+  name?: string;
+  profile?: KitProfile;
+  styles?: KitStyle[];
+  assets?: KitAsset[];
+  audio?: KitAudio;
+  defaults?: KitDefaults;
 }

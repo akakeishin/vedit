@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { toOtio } from './otio.js';
-import { addOverlay, removeSourceRange, trimClip } from '../core/ops.js';
+import { addOverlay, addSprite, removeSourceRange, trimClip } from '../core/ops.js';
 import type { Manifest, MusicItem } from '../core/types.js';
 
 const FPS = 30000 / 1001;
@@ -216,5 +216,58 @@ describe('toOtio B-roll V2 track (wave W3)', () => {
     expect(clips).toHaveLength(1);
     expect(clips[0].metadata.vedit.overlayId).toBe('ovOk');
     warn.mockRestore();
+  });
+});
+
+describe('toOtio W8 kit sprites: metadata-only markers on the V1 track (never a real clip/media_reference)', () => {
+  it('emits no sprite markers when there are no sprites', () => {
+    const o: any = toOtio(manifest([{ srcIn: 0, srcOut: 10 }]));
+    const markers = videoTrack(o).markers.filter((mk: any) => mk.name.startsWith('sprite:'));
+    expect(markers).toHaveLength(0);
+  });
+
+  it('a resolved sprite becomes a Marker.2 on the video track carrying assetId/position/scale/opacity metadata — NEVER a Clip.1/media_reference', () => {
+    let m = manifest([{ srcIn: 0, srcOut: 10 }]);
+    m = addSprite(m, 'char1', {
+      id: 'sp1', anchor: { sourceId: 's1', srcTime: 3 }, duration: 2,
+      position: { x: 0.5, y: 0.9 }, scale: 0.3, opacity: 0.8, flip: true,
+    });
+    const o: any = toOtio(m);
+    const track = videoTrack(o);
+    const marker = track.markers.find((mk: any) => mk.name === 'sprite:sp1');
+    expect(marker).toBeDefined();
+    expect(marker.OTIO_SCHEMA).toBe('Marker.2');
+    expect(marker.marked_range.start_time.value).toBe(Math.round(3 * FPS));
+    expect(marker.marked_range.duration.value).toBe(Math.round(2 * FPS));
+    expect(marker.metadata.vedit).toEqual({ assetId: 'char1', position: { x: 0.5, y: 0.9 }, scale: 0.3, opacity: 0.8, flip: true });
+    // No Clip.1/media_reference anywhere carries the sprite's asset — the
+    // kit PNG is never redistributed via the exported OTIO (spec: asset-pack
+    // redistribution terms are respected by never referencing it at all).
+    const allClips = o.tracks.children.flatMap((t: any) => t.children ?? []).filter((c: any) => c.OTIO_SCHEMA === 'Clip.1');
+    // The A-roll clip's own media_reference is expected (that's the real
+    // source video) — what must NEVER appear is a media_reference pointing
+    // at the sprite's kit asset (no such asset name/path anywhere in a Clip).
+    expect(allClips.every((c: any) => !JSON.stringify(c.media_reference).includes('char1'))).toBe(true);
+  });
+
+  it('an orphaned sprite is excluded from markers and warns instead, same as an orphaned overlay', () => {
+    let m = manifest([{ srcIn: 0, srcOut: 10 }]);
+    m = addSprite(m, 'char1', { id: 'spOrphan', anchor: { sourceId: 's1', srcTime: 50 } }); // past the only clip -> unresolvable
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const o: any = toOtio(m);
+    const markers = videoTrack(o).markers.filter((mk: any) => mk.name.startsWith('sprite:'));
+    expect(markers).toHaveLength(0);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('spOrphan'));
+    warn.mockRestore();
+  });
+
+  it('sprite markers coexist with motion markers on the same V1 track', () => {
+    let m: Manifest = { ...manifest([{ srcIn: 0, srcOut: 10 }]) };
+    m = { ...m, timeline: { ...m.timeline, motion: [{ id: 'mo1', spec: 'mo1.json', tlStart: 1, duration: 2 }] } };
+    m = addSprite(m, 'char1', { id: 'sp1', anchor: { sourceId: 's1', srcTime: 3 } });
+    const o: any = toOtio(m);
+    const names = videoTrack(o).markers.map((mk: any) => mk.name);
+    expect(names).toContain('motion:mo1');
+    expect(names).toContain('sprite:sp1');
   });
 });

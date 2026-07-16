@@ -133,6 +133,47 @@ vedit broll-remove <id> --base <rev>
 400)。audioMode は既定 mute(B-roll音声は使わない); mix/replace で
 B-roll側の音を使う場合は `--gain`(既定 -18dB)を調整する。
 
+## キット(プロジェクト横断の制作設定)
+
+シリーズ/チャンネルごとの「設定フォルダ」(プロジェクトの外にある参照。
+コピーしない — 更新は全リンク先プロジェクトに効く)。字幕/タイトルの
+スタイル・立ち絵素材・プロファイル(トーン・尺目標・構成の型)をまとめる。
+
+```bash
+vedit kit-init <dir> --name <シリーズ名>   # 雛形生成(kit.json + GUIDE.md + fonts/ + assets/{characters,backgrounds,props})
+# assets/ 配下に PNG(立ち絵・背景・小物)を置いたら:
+vedit kit-scan <dir>                       # アルファ境界・足元アンカーを自動計算して kit.json に書き戻す(手作業ゼロ)
+vedit kit-link <dir> --base <rev>          # プロジェクトにリンク(kit.json 検証 + defaults.captions_style を初期適用)
+vedit kit                                  # 内容表示(profile 要点・styles・素材数・defaults)
+vedit kit-unlink --base <rev>              # 解除
+```
+
+- `vedit captions --style <kitStyleId> --base <rev>`: キットのスタイルを既存
+  プリセットと同列に指定できる。ASS書き出し・レンダー時の字幕焼き込みにも
+  palette/フォント/サイズが反映される(web プレビューは近似)
+- `vedit kit-assets [--tag quiet] [--emotion happy]`: 素材をタグ・感情で検索
+  (「この場面に合う立ち絵」を選ぶ材料。read-only)
+- `vedit kit` と `vedit resume` に profile の要点(tone_tags・尺目標・
+  pacing・spine)が出る。GUIDE.md は自由記述 — Read して口調やNG事項を把握する
+- `vedit export render` の `--preset`、`vedit reframe` の `--focus` は
+  省略時にキットの `defaults.export_preset` / `defaults.reframe_focus`
+  があればそれを使う(明示フラグは常に優先)
+
+### スプライト(立ち絵オーバーレイ)
+
+```bash
+vedit sprite-add <assetId> --scene s0003 --at-word w0042 [--pos 0.85,0.9] [--scale 0.25] --base <rev>
+vedit sprite-add <assetId> --at-src <aRollSrc> 12.5 [--opacity 0.9] [--flip] --base <rev>
+vedit sprite-update <id> --at-tl 30.2 --base <rev>   # 再アンカー
+vedit sprite-remove <id> --base <rev>
+```
+
+B-roll と同じアンカー規則(発話に張り付き、自動追従。アンカーが消えたら
+orphan — `vedit status`/`resume`/web に警告、`sprite-update` で再アンカー)
+だが、V2 と違い**重複可**(複数キャラを同時表示できる)。`--pos` は
+`ground_anchor_normalized`(素材の足元)を置く出力キャンバス上の位置
+(0..1)、`--scale` は素材の可視領域の高さが出力高さに占める割合。
+
 ## 縦ショート(9:16)
 
 ```bash

@@ -1,8 +1,18 @@
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
-import { cropGeometry, OVERLAY_GAIN_DEFAULT, resolvedActiveOverlays, segments, timelineDuration } from '../core/ops.js';
+import {
+  cropGeometry,
+  OVERLAY_GAIN_DEFAULT,
+  resolvedActiveOverlays,
+  resolvedActiveSprites,
+  segments,
+  spriteGeometry,
+  timelineDuration,
+} from '../core/ops.js';
 import { captionCues } from '../core/captions.js';
-import type { Manifest, Transcript } from '../core/types.js';
+import type { KitFile, KitStyle, Manifest, Transcript } from '../core/types.js';
+import { readKitFile, resolveKitAssets, type ResolvedKitAsset } from '../core/kit.js';
+import { resolveWithinDir } from '../core/project.js';
 import { buildColorChain } from './color.js';
 import { ffmpegHasFilter, run, runCapture } from '../ingest/run.js';
 
@@ -21,25 +31,104 @@ function assTime(t: number): string {
  * always resolves to a real ASS style even before the web side grows more
  * presets; an unrecognized style id falls back to `clean`.
  */
-const ASS_STYLE_PRESETS: Record<string, { primary: string; outline: string; back: string; bold: 0 | -1; borderStyle: 1 | 3; outlineWidth: number; shadow: number }> = {
+interface AssStylePreset {
+  primary: string;
+  outline: string;
+  back: string;
+  bold: 0 | -1;
+  borderStyle: 1 | 3;
+  outlineWidth: number;
+  shadow: number;
+  /** Kit styles only: overrides the module-wide Hiragino Sans / height*0.045 defaults below. */
+  fontname?: string;
+  fontsize?: number;
+}
+
+export const ASS_STYLE_PRESETS: Record<string, AssStylePreset> = {
   clean: { primary: '&H00FFFFFF', outline: '&H00101010', back: '&H80000000', bold: 0, borderStyle: 1, outlineWidth: 3, shadow: 1 },
   bold: { primary: '&H005CE4FF', outline: '&H00000000', back: '&H00000000', bold: -1, borderStyle: 3, outlineWidth: 0, shadow: 0 },
   outline: { primary: '&H00FFFFFF', outline: '&H00000000', back: '&H00000000', bold: 0, borderStyle: 1, outlineWidth: 3, shadow: 1 },
   boxed: { primary: '&H00FFFFFF', outline: '&H00101010', back: '&H00000000', bold: 0, borderStyle: 3, outlineWidth: 0, shadow: 2 },
 };
 
-export function toAss(m: Manifest, transcripts: Transcript[]): string {
+// ---- W8: kit style -> ASS style (palette hex -> BGR, font file -> fontname, size_1080p -> scaled fontsize) ----
+
+/** "#RRGGBB" or "#RGB" -> ASS's BBGGRR hex (no leading &H/alpha — callers prefix those). Garbage input falls back to white. */
+function hexToBgr(hex: string): string {
+  let h = hex.trim().replace(/^#/, '');
+  if (h.length === 3) h = h.split('').map((c) => c + c).join('');
+  if (!/^[0-9a-fA-F]{6}$/.test(h)) return 'FFFFFF';
+  const r = h.slice(0, 2);
+  const g = h.slice(2, 4);
+  const b = h.slice(4, 6);
+  return (b + g + r).toUpperCase();
+}
+function assColor(hex: string | undefined, fallbackBgr: string, alphaHex = '00'): string {
+  return `&H${alphaHex}${hex ? hexToBgr(hex) : fallbackBgr}`;
+}
+/** 0..1 opacity -> ASS alpha hex (00 = opaque, FF = fully transparent — inverted from "opacity"). */
+function opacityToAlphaHex(opacity: number | undefined, fallbackHex: string): string {
+  if (opacity === undefined || !Number.isFinite(opacity)) return fallbackHex;
+  const a = Math.round((1 - Math.max(0, Math.min(1, opacity))) * 255);
+  return a.toString(16).toUpperCase().padStart(2, '0');
+}
+
+/**
+ * Build an ASS style preset from a kit style's palette/caption fields:
+ * text/outline/box hex -> ASS BGR, background_opacity -> the box colour's
+ * alpha channel, outline_width verbatim, font FILE PATH -> ASS Fontname
+ * (its basename without extension — matched against ffmpeg's `ass` filter
+ * `fontsdir=` at render time, see renderFinal), size_1080p scaled to the
+ * actual output height.
+ */
+function kitAssStyle(style: KitStyle, outputHeight: number): AssStylePreset {
+  const palette = style.palette ?? {};
+  const caption = style.caption ?? {};
+  const outlineWidth = caption.outline_width ?? 3;
+  const fontname = caption.font ? path.basename(caption.font, path.extname(caption.font)) : undefined;
+  const fontsize = caption.size_1080p ? Math.round(caption.size_1080p * (outputHeight / 1080)) : undefined;
+  return {
+    primary: assColor(palette.text, 'FFFFFF'),
+    outline: assColor(palette.outline, '101010'),
+    back: assColor(palette.box, '000000', opacityToAlphaHex(caption.background_opacity, '80')),
+    bold: 0,
+    borderStyle: outlineWidth > 0 ? 1 : 3,
+    outlineWidth,
+    shadow: 1,
+    fontname,
+    fontsize,
+  };
+}
+
+/**
+ * `kit`, when given, is an already-loaded kit.json (see readKitFile in
+ * kit.ts) — toAss stays pure/I-O-free by never loading it itself. When
+ * `m.captions.style` matches a kit style id, that style is added to the
+ * emitted styles (the four built-in presets are ALWAYS still emitted too,
+ * unchanged — full regression for every existing caller, which never passes
+ * `kit` at all) and becomes the active style.
+ */
+export function toAss(m: Manifest, transcripts: Transcript[], kit?: KitFile | null): string {
   const cues = captionCues(m, transcripts);
   const { width, height } = m.output ?? { width: m.width, height: m.height };
-  const fontSize = Math.round(height * 0.045);
+  const defaultFontSize = Math.round(height * 0.045);
   const marginV = Math.round(height * 0.06);
-  const styleLines = Object.entries(ASS_STYLE_PRESETS)
-    .map(
-      ([name, s]) =>
-        `Style: ${name},Hiragino Sans,${fontSize},${s.primary},&H000000FF,${s.outline},${s.back},${s.bold},0,0,0,100,100,0,0,${s.borderStyle},${s.outlineWidth},${s.shadow},2,60,60,${marginV},1`,
-    )
+
+  const presets: Record<string, AssStylePreset> = { ...ASS_STYLE_PRESETS };
+  let activeStyle = presets[m.captions.style] ? m.captions.style : 'clean';
+  const kitStyle = kit?.styles?.find((s) => s.id === m.captions.style);
+  if (kitStyle) {
+    presets[kitStyle.id] = kitAssStyle(kitStyle, height);
+    activeStyle = kitStyle.id;
+  }
+
+  const styleLines = Object.entries(presets)
+    .map(([name, s]) => {
+      const fontname = s.fontname ?? 'Hiragino Sans';
+      const fontsize = s.fontsize ?? defaultFontSize;
+      return `Style: ${name},${fontname},${fontsize},${s.primary},&H000000FF,${s.outline},${s.back},${s.bold},0,0,0,100,100,0,0,${s.borderStyle},${s.outlineWidth},${s.shadow},2,60,60,${marginV},1`;
+    })
     .join('\n');
-  const activeStyle = ASS_STYLE_PRESETS[m.captions.style] ? m.captions.style : 'clean';
   const head = `[Script Info]
 ScriptType: v4.00+
 PlayResX: ${width}
@@ -59,7 +148,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 }
 
 export interface FilterGraphBuild {
-  /** Ordered `-i` input paths: video sources first (dedup'd, seg order), then one per music item. */
+  /** Ordered `-i` input paths: video sources first (dedup'd, seg order), then one per music item, then B-roll sources, then W8 sprite PNGs (one per resolved sprite). */
   inputPaths: string[];
   /** filter_complex graph string. */
   graph: string;
@@ -67,6 +156,8 @@ export interface FilterGraphBuild {
   videoLabel: string;
   /** Label to `-map` for the final audio mix. */
   audioLabel: string;
+  /** Indices into `inputPaths` that are still-image sprite inputs needing `-loop 1` (see renderFinal). Present only when the project has resolved sprites AND a `kitAssets` map was supplied. */
+  spriteInputIndices?: number[];
 }
 
 // ---- W1: conversational-audio repair chain ----
@@ -149,7 +240,7 @@ function mixLabels(parts: string[], labels: string[], tag: string): string {
  */
 export function buildFilterGraph(
   m: Manifest,
-  opts: { loudnorm?: { measured?: LoudnormMeasured; printJson?: boolean } } = {},
+  opts: { loudnorm?: { measured?: LoudnormMeasured; printJson?: boolean }; kitAssets?: Map<string, ResolvedKitAsset> } = {},
 ): FilterGraphBuild {
   const segs = segments(m);
   if (segs.length === 0) throw new Error('empty timeline');
@@ -295,7 +386,65 @@ export function buildFilterGraph(
     graph += ';' + ovParts.join(';');
   }
 
-  return { inputPaths, graph, videoLabel, audioLabel };
+  // ---- W8: kit sprite compositing ----
+  // Applied last (after B-roll), same "top of the stack" rationale as W3's
+  // comment above — captions burn on top of sprites too. A sprite whose
+  // asset couldn't be resolved (missing/escaping/unreadable — see
+  // resolveKitAssets in kit.ts) is silently skipped here; the caller
+  // (renderFinal) already turned that into a warning before calling in, so
+  // this stays a pure function of exactly the assets it was HANDED. No
+  // sprites (or no `kitAssets` map at all) never reaches this block's body —
+  // full regression for every pre-W8 project.
+  let spriteInputIndices: number[] | undefined;
+  if (opts.kitAssets) {
+    const activeSprites = resolvedActiveSprites(m).filter((r) => opts.kitAssets!.has(r.sprite.assetId));
+    if (activeSprites.length > 0) {
+      const spriteInputBase = inputPaths.length;
+      spriteInputIndices = [];
+      const spParts: string[] = [];
+      activeSprites.forEach((r, n) => {
+        const asset = opts.kitAssets!.get(r.sprite.assetId)!;
+        inputPaths.push(asset.absPath);
+        const idx = spriteInputBase + n;
+        spriteInputIndices!.push(idx);
+        const geo = spriteGeometry(asset, r.sprite.position, r.sprite.scale, output, { flip: r.sprite.flip });
+        spParts.push(spriteVideoClause(idx, n, geo.width, geo.height, { opacity: r.sprite.opacity, flip: r.sprite.flip }));
+        const composited = `[svc${n}]`;
+        spParts.push(
+          `${videoLabel}[sv${n}]overlay=x=${Math.round(geo.x)}:y=${Math.round(geo.y)}:enable='between(t,${r.tlStart},${r.tlEnd})'${composited}`,
+        );
+        videoLabel = composited;
+      });
+      graph += ';' + spParts.join(';');
+    }
+  }
+
+  return { inputPaths, graph, videoLabel, audioLabel, ...(spriteInputIndices ? { spriteInputIndices } : {}) };
+}
+
+/**
+ * One sprite's video chain: scale the (still-image, `-loop 1`) PNG input to
+ * its computed display size, optionally mirror it, force an alpha channel
+ * (`format=rgba` — PNGs decode with one already, but this guarantees it
+ * survives `scale`), and apply overall opacity via `colorchannelmixer=aa=`
+ * (spec's alternative — a `fade=alpha=1` timed fade — isn't needed since
+ * SpriteItem carries no fade-duration field, only a constant opacity).
+ */
+export function spriteVideoClause(
+  inputIdx: number,
+  n: number,
+  displayWidth: number,
+  displayHeight: number,
+  opts: { opacity?: number; flip?: boolean } = {},
+): string {
+  const w = Math.max(1, Math.round(displayWidth));
+  const h = Math.max(1, Math.round(displayHeight));
+  const opacity = opts.opacity ?? 1;
+  const parts = [`scale=${w}:${h}`];
+  if (opts.flip) parts.push('hflip');
+  parts.push('format=rgba');
+  if (opacity < 0.999) parts.push(`colorchannelmixer=aa=${opacity}`);
+  return `[${inputIdx}:v]${parts.join(',')}[sv${n}]`;
 }
 
 /**
@@ -441,6 +590,24 @@ export function resolveRenderParams(m: Manifest, opts: RenderParamOverrides = {}
 }
 
 /**
+ * Build `-i` args for `inputPaths`, prefixing `-loop 1` before any index
+ * listed in `loopIndices` (W8 sprite PNGs — a still image needs looping to
+ * behave like a continuous stream for the duration `overlay`'s `enable`
+ * window needs it). Absent/empty `loopIndices` produces the exact same
+ * flat `-i p -i p ...` sequence as before W8 — no regression for sprite-less
+ * projects.
+ */
+function ffmpegInputArgs(inputPaths: string[], loopIndices?: number[]): string[] {
+  const loopSet = new Set(loopIndices ?? []);
+  const out: string[] = [];
+  inputPaths.forEach((p, i) => {
+    if (loopSet.has(i)) out.push('-loop', '1');
+    out.push('-i', p);
+  });
+  return out;
+}
+
+/**
  * Run a measurement-only ffmpeg pass (`-f null -`) for a `print_format=json`
  * loudnorm filter and parse the JSON stats block it prints to stderr —
  * pass 1 of 2-pass loudnorm normalization. Only audio needs to be mapped;
@@ -451,9 +618,9 @@ async function measureLoudnorm(
   graph: string,
   audioLabel: string,
   videoLabel: string,
+  spriteInputIndices?: number[],
 ): Promise<LoudnormMeasured> {
-  const inputs: string[] = [];
-  for (const p of inputPaths) inputs.push('-i', p);
+  const inputs = ffmpegInputArgs(inputPaths, spriteInputIndices);
   const { stderr } = await runCapture('ffmpeg', [
     '-y', ...inputs,
     // ffmpeg refuses a graph with an unconnected named output — it does NOT
@@ -517,9 +684,34 @@ export async function renderFinal(
   const wantsLoudnorm = !musicless || params.forceLoudnormI !== null || repairActive;
   const musiclessTarget = params.forceLoudnormI ?? (effectiveM.audioMix?.targetLufs ?? -14);
 
+  // ---- W8: kit (styles/sprites) — best-effort load ----
+  // A missing/corrupt kit.json degrades to "no kit" (warning, not a thrown
+  // error): the kit dir is external/shared and may have moved or been
+  // edited concurrently, and a render shouldn't fail over stale style/
+  // sprite decoration. Every project without `manifest.kit` set never
+  // enters this block at all — full regression.
+  const warnings = [...params.warnings];
+  let kit: import('../core/types.js').KitFile | null = null;
+  if (effectiveM.kit) {
+    try {
+      kit = await readKitFile(effectiveM.kit.path);
+    } catch (e: any) {
+      warnings.push(`kit: ${e?.message ?? e} — rendering without kit styles/sprites`);
+    }
+  }
+  let kitAssets: Map<string, ResolvedKitAsset> | undefined;
+  if (kit && effectiveM.kit) {
+    const spriteAssetIds = (effectiveM.timeline.sprites ?? []).map((s) => s.assetId);
+    if (spriteAssetIds.length > 0) {
+      const { resolved, warnings: assetWarnings } = await resolveKitAssets(effectiveM.kit.path, kit, spriteAssetIds);
+      kitAssets = resolved;
+      warnings.push(...assetWarnings);
+    }
+  }
+
   let measured: LoudnormMeasured | undefined;
   if (wantsLoudnorm && !fast) {
-    const measureBuilt = buildFilterGraph(effectiveM, { loudnorm: { printJson: true } });
+    const measureBuilt = buildFilterGraph(effectiveM, { loudnorm: { printJson: true }, kitAssets });
     let measureGraph = measureBuilt.graph;
     let measureLabel = measureBuilt.audioLabel;
     if (musicless) {
@@ -528,14 +720,15 @@ export async function renderFinal(
       measureGraph += `;${measureLabel}${loudnormClause(musiclessTarget, { printJson: true })}[measure]`;
       measureLabel = '[measure]';
     }
-    measured = await measureLoudnorm(measureBuilt.inputPaths, measureGraph, measureLabel, measureBuilt.videoLabel);
+    measured = await measureLoudnorm(
+      measureBuilt.inputPaths, measureGraph, measureLabel, measureBuilt.videoLabel, measureBuilt.spriteInputIndices,
+    );
   }
 
   const loudnormOpts = fast || !wantsLoudnorm ? {} : { measured };
-  const built = buildFilterGraph(effectiveM, { loudnorm: loudnormOpts });
+  const built = buildFilterGraph(effectiveM, { loudnorm: loudnormOpts, kitAssets });
   let graph = built.graph;
-  const inputs: string[] = [];
-  for (const p of built.inputPaths) inputs.push('-i', p);
+  const inputs = ffmpegInputArgs(built.inputPaths, built.spriteInputIndices);
 
   let assPath: string | null = null;
   if (opts.burnCaptions && effectiveM.captions.enabled && !ffmpegHasFilter('ass')) {
@@ -546,8 +739,23 @@ export async function renderFinal(
   let vLabel = built.videoLabel;
   if (opts.burnCaptions && effectiveM.captions.enabled) {
     assPath = path.join(path.dirname(outPath), '.vedit-captions.ass');
-    await fs.writeFile(assPath, toAss(effectiveM, transcripts));
-    graph += `;${built.videoLabel}ass='${assPath.replace(/'/g, "\\'")}'[vout]`;
+    await fs.writeFile(assPath, toAss(effectiveM, transcripts, kit));
+    // W8: point libass at the kit's font directory (fontsdir=) instead of
+    // `--attach`ing the font, so the ASS Fontname (the font FILE's basename,
+    // see kitAssStyle in toAss) actually resolves. No kit style in use (or
+    // no font on it) -> fontsdirPart stays '' -> byte-for-byte the same ass
+    // filter clause as before W8.
+    let fontsdirPart = '';
+    const activeKitStyle = kit?.styles?.find((s) => s.id === effectiveM.captions.style);
+    if (activeKitStyle?.caption?.font && effectiveM.kit) {
+      try {
+        const fontAbs = await resolveWithinDir(effectiveM.kit.path, activeKitStyle.caption.font);
+        fontsdirPart = `:fontsdir='${path.dirname(fontAbs).replace(/'/g, "\\'")}'`;
+      } catch (e: any) {
+        warnings.push(`kit style ${activeKitStyle.id}: font path invalid (${activeKitStyle.caption.font}) — captions burn without the kit font`);
+      }
+    }
+    graph += `;${built.videoLabel}ass='${assPath.replace(/'/g, "\\'")}'${fontsdirPart}[vout]`;
     vLabel = '[vout]';
   }
 
@@ -578,5 +786,5 @@ export async function renderFinal(
     outPath,
   ]);
   if (assPath) await fs.rm(assPath, { force: true });
-  return { file: outPath, warnings: params.warnings };
+  return { file: outPath, warnings };
 }

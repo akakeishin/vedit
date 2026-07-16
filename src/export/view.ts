@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { cropGeometry, resolvedActiveOverlays, segments } from '../core/ops.js';
+import { cropGeometry, resolvedActiveOverlays, resolvedActiveSprites, segments } from '../core/ops.js';
 import type { Manifest, SceneFile } from '../core/types.js';
 import { buildColorChain } from './color.js';
 import { ffmpegHasFilter, run } from '../ingest/run.js';
@@ -51,7 +51,7 @@ export async function renderView(
   // Build the list of (sourceId, srcTime) sample points. Crop only applies
   // in 'timeline' domain — it's a per-clip concept, and 'source' domain is
   // meant to show the raw, uncut, unframed source for inspection.
-  const points: { sourceId: string; t: number; crop?: { x?: number; y?: number }; overlayId?: string }[] = [];
+  const points: { sourceId: string; t: number; crop?: { x?: number; y?: number }; overlayId?: string; spriteIds?: string[] }[] = [];
   if (domain === 'timeline') {
     const total = segs[segs.length - 1].tlEnd;
     const from = opts.from ?? 0;
@@ -61,15 +61,29 @@ export async function renderView(
     // clip underneath — matching what render.ts's overlay compositing
     // actually produces at that timeline instant.
     const activeOverlays = resolvedActiveOverlays(m);
+    // W8 sprites are a translucent compositing layer on top of the frame,
+    // not a frame-source swap like B-roll — actually drawing the sprite
+    // pixels into the filmstrip is out of scope here (spec leaves this to
+    // implementer judgment); instead every sample point inside a resolved
+    // sprite's [tlStart,tlEnd) gets its id(s) noted in the grid legend below,
+    // same spirit as the `[overlay <id>]` annotation.
+    const activeSprites = resolvedActiveSprites(m);
     for (let i = 0; i < n; i++) {
       const tl = from + ((to - from) * (i + 0.5)) / n;
+      const spriteIds = activeSprites.filter((r) => tl >= r.tlStart && tl < r.tlEnd).map((r) => r.sprite.id);
       const ov = activeOverlays.find((r) => tl >= r.tlStart && tl < r.tlEnd);
       if (ov) {
-        points.push({ sourceId: ov.overlay.sourceId, t: ov.overlay.srcIn + (tl - ov.tlStart), overlayId: ov.overlay.id });
+        points.push({
+          sourceId: ov.overlay.sourceId, t: ov.overlay.srcIn + (tl - ov.tlStart), overlayId: ov.overlay.id,
+          ...(spriteIds.length ? { spriteIds } : {}),
+        });
         continue;
       }
       const seg = segs.find((s) => tl >= s.tlStart && tl < s.tlEnd) ?? segs[segs.length - 1];
-      points.push({ sourceId: seg.sourceId, t: seg.srcStart + (tl - seg.tlStart), crop: seg.crop });
+      points.push({
+        sourceId: seg.sourceId, t: seg.srcStart + (tl - seg.tlStart), crop: seg.crop,
+        ...(spriteIds.length ? { spriteIds } : {}),
+      });
     }
   } else {
     const sourceId = opts.sourceId ?? m.sources[0].id;
@@ -118,7 +132,7 @@ export async function renderView(
   // misattribute a frame to the A-roll clip that's actually cut away there.
   const grid = points.map(
     (pt, i) =>
-      `cell${i + 1}(r${Math.floor(i / cols) + 1}c${(i % cols) + 1})=${pt.t.toFixed(1)}s@${pt.sourceId}${pt.overlayId ? ` [overlay ${pt.overlayId}]` : ''}`,
+      `cell${i + 1}(r${Math.floor(i / cols) + 1}c${(i % cols) + 1})=${pt.t.toFixed(1)}s@${pt.sourceId}${pt.overlayId ? ` [overlay ${pt.overlayId}]` : ''}${pt.spriteIds?.length ? ` [sprite ${pt.spriteIds.join(',')}]` : ''}`,
   );
   return { png: outPath, timecodesBurnedIn: canDrawText, grid };
 }

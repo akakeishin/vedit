@@ -5,7 +5,8 @@ import path from 'node:path';
 import http, { type Server } from 'node:http';
 import { Project } from '../core/project.js';
 import { startDaemon } from './daemon.js';
-import type { Word } from '../core/types.js';
+import { writeKitFile } from '../core/kit.js';
+import type { KitFile, Word } from '../core/types.js';
 
 // music-add shells out to ffprobe via probeAudio(); stub it so the "daemon:
 // music ops" suite below stays fast/deterministic without needing ffmpeg
@@ -1724,5 +1725,343 @@ describe('daemon: color-transform and color-adjust ops', () => {
     expect(status).toBe(200);
     const project = (await getJson(BASE, '/api/project')).body;
     expect(project.manifest.colorAdjust).toEqual({ s1: { exposure: 0.3, wb: -10, sat: 1.1 } });
+  });
+});
+
+// ---- Suite: W8 kit (kit-link / kit-unlink / /api/kit) ----
+describe('daemon: kit-link / kit-unlink / /api/kit', () => {
+  const PORT = 18199;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let dir: string;
+  let kitDir: string;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-kit-'));
+    dir = path.join(root, 'proj');
+    kitDir = path.join(root, 'kit');
+    await fsp.mkdir(kitDir, { recursive: true });
+    const kit: KitFile = {
+      version: 'vedit-kit/v1',
+      profile: { tone_tags: ['calm'] },
+      styles: [{ id: 'kitStyle1', label: 'Kit Style' }],
+      defaults: { captions_style: 'kitStyle1' },
+    };
+    await writeKitFile(kitDir, kit);
+    const project = await Project.create(dir, 'kit');
+    await project.commit(0, 'system', 'setup', {}, 'seed source', (m) => ({
+      ...m,
+      fps: 30,
+      sources: [{ id: 's1', path: '/media/one.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: true }],
+      timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 30 }], motion: [] },
+    }));
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('/api/kit returns {path:null,kit:null} before any kit is linked', async () => {
+    const { status, body } = await getJson(BASE, '/api/kit');
+    expect(status).toBe(200);
+    expect(body).toEqual({ path: null, kit: null });
+  });
+
+  it('kit-link rejects a directory with no kit.json', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'kit-link', path: path.join(kitDir, 'nope'),
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/kit-init/);
+  });
+
+  it('kit-link succeeds: recognizes sections, applies defaults.captions_style, and is reflected in /api/project + /api/state', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'kit-link', path: kitDir,
+    });
+    expect(status).toBe(200);
+    expect(body.path).toBe(kitDir);
+    expect(body.recognizedSections.sort()).toEqual(['defaults', 'profile', 'styles']);
+    expect(body.appliedDefaults).toEqual(['captions_style -> kitStyle1']);
+
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.kit).toEqual({ path: kitDir });
+    expect(project.manifest.captions.style).toBe('kitStyle1'); // applied at link time
+
+    const finalState = (await getJson(BASE, '/api/state')).body;
+    expect(finalState.kit).toEqual({ path: kitDir });
+  });
+
+  it('/api/kit now returns the linked kit content with recognizedSections', async () => {
+    const { status, body } = await getJson(BASE, '/api/kit');
+    expect(status).toBe(200);
+    expect(body.path).toBe(kitDir);
+    expect(body.kit.profile).toEqual({ tone_tags: ['calm'] });
+    expect(body.recognizedSections.sort()).toEqual(['defaults', 'profile', 'styles']);
+  });
+
+  it('kit-unlink clears manifest.kit', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'kit-unlink',
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.kit).toBeUndefined();
+    const kitRes = await getJson(BASE, '/api/kit');
+    expect(kitRes.body).toEqual({ path: null, kit: null });
+  });
+});
+
+// ---- Suite: W8 sprite ops ----
+describe('daemon: W8 sprite ops', () => {
+  const PORT = 18200;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let dir: string;
+  let spriteId: string;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-sprite-'));
+    dir = path.join(root, 'proj');
+    const kitDir = path.join(root, 'kit');
+    await fsp.mkdir(kitDir, { recursive: true });
+    const kit: KitFile = {
+      version: 'vedit-kit/v1',
+      assets: [{ id: 'char1', path: 'assets/characters/char1.png', type: 'sprite' }],
+    };
+    await writeKitFile(kitDir, kit);
+
+    const project = await Project.create(dir, 'sprite');
+    // A-roll (s1) with a cut: tl[0,10)<-src[0,10), tl[10,20)<-src[20,30) —
+    // the gap src[10,20) is used below as the orphan target.
+    await project.commit(0, 'system', 'setup', {}, 'seed sources', (m) => ({
+      ...m,
+      fps: 30,
+      kit: { path: kitDir },
+      sources: [{ id: 's1', path: '/media/aroll.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: true }],
+      timeline: {
+        video: [
+          { id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 10 },
+          { id: 'c2', sourceId: 's1', srcIn: 20, srcOut: 30 },
+        ],
+        motion: [],
+      },
+    }));
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('sprite-add rejects an unknown kit asset id', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'sprite-add', assetId: 'nope', anchor: { sourceId: 's1', srcTime: 2 },
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/unknown kit asset/);
+  });
+
+  it('sprite-add rejects a missing anchor', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'sprite-add', assetId: 'char1',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/anchor/);
+  });
+
+  it('sprite-add with a valid assetId+anchor creates a resolved sprite', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'sprite-add', assetId: 'char1',
+      anchor: { sourceId: 's1', srcTime: 2 }, duration: 3, position: { x: 0.5, y: 0.9 }, scale: 0.3,
+    });
+    expect(status).toBe(200);
+    spriteId = body.id;
+    expect(spriteId).toMatch(/^sp/);
+    expect(body.state.sprites).toBe(1);
+    expect(body.state.orphanedSprites).toBeUndefined();
+
+    const project = (await getJson(BASE, '/api/project')).body;
+    const resolved = project.sprites.find((r: any) => r.sprite.id === spriteId);
+    expect(resolved.tlStart).toBeCloseTo(2);
+    expect(resolved.sprite).toMatchObject({ assetId: 'char1', duration: 3, scale: 0.3 });
+  });
+
+  it('sprite-add with an anchor in the A-roll cut gap creates an ORPHANED sprite, surfaced in state', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'sprite-add', assetId: 'char1',
+      anchor: { sourceId: 's1', srcTime: 15 }, // src[10,20) is the cut gap
+    });
+    expect(status).toBe(200);
+    const orphanId = body.id;
+    expect(body.state.sprites).toBe(2);
+    expect(body.state.orphanedSprites).toHaveLength(1);
+    expect(body.state.orphanedSprites[0].id).toBe(orphanId);
+    expect(body.state.orphanedSprites[0].reason).toMatch(/not on the timeline/);
+
+    // sprite-update re-anchoring it onto a live instant clears the orphan warning.
+    const state2 = (await getJson(BASE, '/api/state')).body;
+    const upd = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state2.revision, op: 'sprite-update', id: orphanId,
+      anchor: { sourceId: 's1', srcTime: 22 },
+    });
+    expect(upd.status).toBe(200);
+    expect(upd.body.state.orphanedSprites).toBeUndefined();
+    const project = (await getJson(BASE, '/api/project')).body;
+    const resolved = project.sprites.find((r: any) => r.sprite.id === orphanId);
+    expect(resolved.tlStart).toBeCloseTo(12); // tl[10,20)<-src[20,30): src22 -> tl12
+
+    // clean up so later tests in this suite see only `spriteId`.
+    const state3 = (await getJson(BASE, '/api/state')).body;
+    await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state3.revision, op: 'sprite-remove', id: orphanId });
+  });
+
+  it('sprite-update rejects an unknown id', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'sprite-update', id: 'nope', opacity: 0.5,
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/unknown sprite/);
+  });
+
+  it('sprite-update patches opacity/scale', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'sprite-update', id: spriteId, opacity: 0.6, scale: 0.5,
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    const resolved = project.sprites.find((r: any) => r.sprite.id === spriteId);
+    expect(resolved.sprite.opacity).toBe(0.6);
+    expect(resolved.sprite.scale).toBe(0.5);
+  });
+
+  it('sprite-remove rejects an unknown id', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'sprite-remove', id: 'nope',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/unknown sprite/);
+  });
+
+  it('sprite-remove with a valid id removes it', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'sprite-remove', id: spriteId,
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.timeline.sprites).toHaveLength(0);
+    const finalState = (await getJson(BASE, '/api/state')).body;
+    expect(finalState.sprites).toBe(0);
+  });
+});
+
+// ---- Suite: sprite-add without any kit linked ----
+describe('daemon: sprite-add without a linked kit', () => {
+  const PORT = 18201;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-nosprite-kit-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'nokit');
+    await project.commit(0, 'system', 'setup', {}, 'seed source', (m) => ({
+      ...m,
+      fps: 30,
+      sources: [{ id: 's1', path: '/media/one.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: true }],
+      timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 30 }], motion: [] },
+    }));
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('sprite-add is rejected with a clear message when no kit is linked', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'sprite-add', assetId: 'char1', anchor: { sourceId: 's1', srcTime: 1 },
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/no kit linked/);
+  });
+});
+
+// ---- Suite: /media/kit path containment (security) ----
+describe('daemon: /media/kit path containment (security)', () => {
+  const PORT = 18202;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let kitDir: string;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-kitmedia-'));
+    const dir = path.join(root, 'proj');
+    kitDir = path.join(root, 'kit');
+    await fsp.mkdir(path.join(kitDir, 'fonts'), { recursive: true });
+    await fsp.writeFile(path.join(kitDir, 'fonts', 'MyFont.ttf'), 'fake-font-bytes');
+    await fsp.mkdir(path.join(kitDir, 'assets', 'characters'), { recursive: true });
+    await fsp.writeFile(path.join(kitDir, 'assets', 'characters', 'char1.png'), 'fake-png-bytes');
+    // A file OUTSIDE the kit directory a traversal attempt might try to read.
+    await fsp.writeFile(path.join(root, 'secret.txt'), 'TOP SECRET CONTENT');
+    await writeKitFile(kitDir, { version: 'vedit-kit/v1' });
+
+    const project = await Project.create(dir, 'kitmedia');
+    await project.commit(0, 'system', 'setup', {}, 'seed', (m) => ({ ...m, kit: { path: kitDir } }));
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('serves a real font file with the correct content-type', async () => {
+    const res = await fetch(`${BASE}/media/kit/fonts/MyFont.ttf`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toBe('font/ttf');
+    expect(await res.text()).toBe('fake-font-bytes');
+  });
+
+  it('serves a real asset PNG under a nested subfolder', async () => {
+    const res = await fetch(`${BASE}/media/kit/assets/characters/char1.png`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toBe('image/png');
+  });
+
+  it('refuses a traversal attempt that would escape the kit directory', async () => {
+    const res = await fetch(`${BASE}/media/kit/${encodeURIComponent('../secret.txt')}`);
+    expect(res.status).not.toBe(200);
+    const text = await res.text();
+    expect(text).not.toContain('TOP SECRET CONTENT');
+  });
+
+  it('404s for a font/asset that does not exist', async () => {
+    const res = await fetch(`${BASE}/media/kit/fonts/nope.ttf`);
+    expect(res.status).toBe(404);
+  });
+
+  it('404s with "no kit linked" when the project has no kit', async () => {
+    const root2 = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-kitmedia-nolink-'));
+    const dir2 = path.join(root2, 'proj');
+    await Project.create(dir2, 'nolink');
+    const port2 = 18203;
+    const started2 = await startDaemon({ port: port2, projectDir: dir2 });
+    try {
+      const res = await fetch(`http://localhost:${port2}/media/kit/fonts/MyFont.ttf`);
+      expect(res.status).toBe(404);
+      const body = await res.json();
+      expect(body.error).toMatch(/no kit linked/);
+    } finally {
+      await new Promise((resolve) => started2.server.close(() => resolve(undefined)));
+    }
   });
 });

@@ -1,4 +1,4 @@
-import { orphanedOverlays, resolvedActiveOverlays, segments } from '../core/ops.js';
+import { orphanedOverlays, orphanedSprites, resolvedActiveOverlays, resolvedActiveSprites, segments } from '../core/ops.js';
 import type { Manifest } from '../core/types.js';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
@@ -79,12 +79,37 @@ export function toOtio(m: Manifest): unknown {
     metadata: { vedit: { spec: mo.spec } },
   }));
 
+  // W8 kit sprites: metadata-only markers, NEVER a real clip/media_reference
+  // — the asset PNG lives in an external (possibly shared/licensed) kit
+  // directory, and the spec requires respecting the underlying asset-pack's
+  // redistribution terms by not embedding/pointing OTIO consumers at it at
+  // all. Render still bakes the sprite into the final video (the user's own
+  // output, not a redistribution of the kit asset itself) — see render.ts.
+  for (const s of orphanedSprites(m)) {
+    console.warn(`[vedit] sprite ${s.id} is orphaned (${s.reason}); excluded from OTIO markers`);
+  }
+  const spriteMarkers = resolvedActiveSprites(m).map((r) => ({
+    OTIO_SCHEMA: 'Marker.2',
+    name: `sprite:${r.sprite.id}`,
+    marked_range: tr(r.tlStart, r.tlEnd, rate),
+    color: 'PINK',
+    metadata: {
+      vedit: {
+        assetId: r.sprite.assetId,
+        position: r.sprite.position,
+        scale: r.sprite.scale,
+        opacity: r.sprite.opacity,
+        ...(r.sprite.flip ? { flip: true } : {}),
+      },
+    },
+  }));
+
   const track = (kind: 'Video' | 'Audio') => ({
     OTIO_SCHEMA: 'Track.1',
     name: kind === 'Video' ? 'V1' : 'A1',
     kind,
     children: clipObjs(kind),
-    markers: kind === 'Video' ? motionMarkers : [],
+    markers: kind === 'Video' ? [...motionMarkers, ...spriteMarkers] : [],
     effects: [],
     metadata: {},
   });

@@ -149,4 +149,49 @@ describe('buildResume', () => {
     expect(r.orphanedOverlays[0].id).toBe('ov1');
     expect(r.nextSteps.some((s) => s.includes('orphan') && s.includes('broll-update'))).toBe(true);
   });
+
+  // ---- W8: kit sprites (orphanedSprites) + kit profile highlights ----
+
+  it('orphanedSprites is empty and no nextSteps hint appears when there are no sprites', () => {
+    const r = buildResume(manifest(), '/d', [], []);
+    expect(r.orphanedSprites).toEqual([]);
+    expect(r.nextSteps.some((s) => s.includes('スプライト'))).toBe(false);
+  });
+
+  it('surfaces orphaned W8 sprites and a re-anchor nextSteps hint', () => {
+    const m = manifest({
+      timeline: {
+        video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 60 }],
+        motion: [],
+        // anchor at src=90 is past the A-roll's only clip (tl[0,60)<-src[0,60)) -> orphan.
+        sprites: [{ id: 'sp1', assetId: 'char1', anchor: { sourceId: 's1', srcTime: 90 }, duration: 2, position: { x: 0.5, y: 0.9 }, scale: 0.3, opacity: 1 }],
+      },
+    });
+    const r = buildResume(m, '/d', [], []);
+    expect(r.orphanedSprites).toHaveLength(1);
+    expect(r.orphanedSprites[0].id).toBe('sp1');
+    expect(r.nextSteps.some((s) => s.includes('スプライト') && s.includes('sprite-update'))).toBe(true);
+  });
+
+  it('kitProfile is null when no kit is passed at all', () => {
+    const r = buildResume(manifest(), '/d', [], []);
+    expect(r.kitProfile).toBeNull();
+  });
+
+  it('kitProfile surfaces the linked kit\'s profile highlights when given an already-loaded kit', () => {
+    const r = buildResume(manifest(), '/d', [], [], {
+      version: 'vedit-kit/v1',
+      profile: { tone_tags: ['calm', 'playful'], spine: ['honest_hook', 'quiet_aftertaste'], pacing: { average_shot_seconds: 4 } },
+    });
+    expect(r.kitProfile).toEqual({
+      tone_tags: ['calm', 'playful'],
+      spine: ['honest_hook', 'quiet_aftertaste'],
+      pacing: { average_shot_seconds: 4 },
+    });
+  });
+
+  it('kitProfile is null when a kit is linked but has no profile section', () => {
+    const r = buildResume(manifest(), '/d', [], [], { version: 'vedit-kit/v1', styles: [{ id: 's1' }] });
+    expect(r.kitProfile).toBeNull();
+  });
 });

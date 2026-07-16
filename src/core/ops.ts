@@ -1,4 +1,4 @@
-import type { Manifest, MusicItem, OverlayClip, SceneFile, Segment, Source, VideoClip, Word } from './types.js';
+import type { Manifest, MusicItem, OverlayClip, SceneFile, Segment, Source, SpriteItem, VideoClip, Word } from './types.js';
 
 /** Snap a time to the timeline frame grid. */
 export function snap(t: number, fps: number): number {
@@ -868,4 +868,228 @@ export function removeOverlay(m: Manifest, id: string): Manifest {
   const next = overlays.filter((o) => o.id !== id);
   if (next.length === overlays.length) throw new Error(`unknown overlay: ${id}`);
   return { ...m, timeline: { ...m.timeline, overlays: next } };
+}
+
+// ---- sprite overlays (W8 kit) ----
+//
+// Character/prop sprites anchored to an A-roll moment via the SAME
+// (sourceId, srcTime) contract as B-roll overlays above —
+// resolveSprites/resolvedActiveSprites/orphanedSprites mirror
+// resolveOverlays/resolvedActiveOverlays/orphanedOverlays exactly. Unlike
+// the B-roll V2 track, sprites are NOT a single exclusive layer: multiple
+// sprites may resolve to overlapping timeline ranges (more than one
+// character on screen at once), so there is no overlap check here.
+// `assetId` is validated by the caller (daemon.ts), not here — this module
+// has no access to the linked kit's asset list, only Manifest.kit.path.
+
+/** Resolve every sprite's current timeline placement; `tlStart` null = orphan (anchor cut away). */
+export function resolveSprites(m: Manifest): { sprite: SpriteItem; tlStart: number | null }[] {
+  return (m.timeline.sprites ?? []).map((sprite) => ({
+    sprite,
+    tlStart: sourceTimeToTimeline(m, sprite.anchor.sourceId, sprite.anchor.srcTime),
+  }));
+}
+
+export interface ResolvedSprite {
+  sprite: SpriteItem;
+  tlStart: number;
+  tlEnd: number;
+}
+
+/** Non-orphan sprites with a resolved [tlStart, tlEnd) placement, sorted by tlStart — what render/view/OTIO/web actually touch. */
+export function resolvedActiveSprites(m: Manifest): ResolvedSprite[] {
+  const out: ResolvedSprite[] = [];
+  for (const r of resolveSprites(m)) {
+    if (r.tlStart === null) continue;
+    out.push({ sprite: r.sprite, tlStart: r.tlStart, tlEnd: r.tlStart + r.sprite.duration });
+  }
+  out.sort((a, b) => a.tlStart - b.tlStart);
+  return out;
+}
+
+/** Sprites whose anchored instant is no longer on the timeline, for status/resume warnings. */
+export function orphanedSprites(m: Manifest): { id: string; reason: string }[] {
+  return resolveSprites(m)
+    .filter((r) => r.tlStart === null)
+    .map((r) => ({
+      id: r.sprite.id,
+      reason: `anchor (${r.sprite.anchor.sourceId}@${r.sprite.anchor.srcTime.toFixed(2)}s) is not on the timeline (cut away)`,
+    }));
+}
+
+function assertUnit(v: number, label: string, name: string): void {
+  if (!Number.isFinite(v) || v < 0 || v > 1) {
+    throw new Error(`${label}: ${name} (${v}) must be a finite number between 0 and 1`);
+  }
+}
+
+/** Add a sprite, anchored to an A-roll moment. Validates finiteness, the anchor source exists, and 0..1 ranges — NOT that assetId exists in a kit (see module doc above). */
+export function addSprite(
+  m: Manifest,
+  assetId: string,
+  opts: {
+    anchor: { sourceId: string; srcTime: number };
+    duration?: number;
+    position?: { x: number; y: number };
+    scale?: number;
+    opacity?: number;
+    flip?: boolean;
+    id?: string;
+  },
+): Manifest {
+  if (typeof assetId !== 'string' || !assetId) throw new Error('sprite-add: assetId is required');
+  if (!opts.anchor || !m.sources.some((s) => s.id === opts.anchor.sourceId)) {
+    throw new Error(`sprite-add: unknown anchor source: ${opts.anchor?.sourceId}`);
+  }
+  if (!Number.isFinite(opts.anchor.srcTime) || opts.anchor.srcTime < 0) {
+    throw new Error(`sprite-add: anchor srcTime (${opts.anchor.srcTime}) must be a finite number >= 0`);
+  }
+  const duration = opts.duration ?? 3;
+  if (!Number.isFinite(duration) || duration <= 0) {
+    throw new Error(`sprite-add: duration (${duration}) must be a finite number > 0`);
+  }
+  const position = opts.position ?? { x: 0.5, y: 0.9 };
+  assertUnit(position.x, 'sprite-add', 'position.x');
+  assertUnit(position.y, 'sprite-add', 'position.y');
+  const scale = opts.scale ?? 0.3;
+  if (!Number.isFinite(scale) || scale <= 0 || scale > 1) {
+    throw new Error(`sprite-add: scale (${scale}) must be a finite number between 0 (exclusive) and 1`);
+  }
+  const opacity = opts.opacity ?? 1;
+  assertUnit(opacity, 'sprite-add', 'opacity');
+  const sprites = m.timeline.sprites ?? [];
+  const id = opts.id ?? freshId('sp');
+  if (sprites.some((s) => s.id === id)) throw new Error(`sprite-add: sprite id already exists: ${id}`);
+  const item: SpriteItem = {
+    id,
+    assetId,
+    anchor: { sourceId: opts.anchor.sourceId, srcTime: opts.anchor.srcTime },
+    duration,
+    position,
+    scale,
+    opacity,
+    ...(opts.flip ? { flip: true } : {}),
+  };
+  return { ...m, timeline: { ...m.timeline, sprites: [...sprites, item] } };
+}
+
+/** Patch an existing sprite's placement/anchor fields (never its assetId — remove+re-add to swap character). */
+export function updateSprite(
+  m: Manifest,
+  id: string,
+  patch: {
+    anchor?: { sourceId: string; srcTime: number };
+    duration?: number;
+    position?: { x: number; y: number };
+    scale?: number;
+    opacity?: number;
+    flip?: boolean;
+  },
+): Manifest {
+  const sprites = m.timeline.sprites ?? [];
+  const idx = sprites.findIndex((s) => s.id === id);
+  if (idx < 0) throw new Error(`unknown sprite: ${id}`);
+  const cur = sprites[idx];
+  const next: SpriteItem = { ...cur };
+  if (patch.anchor !== undefined) {
+    if (!m.sources.some((s) => s.id === patch.anchor!.sourceId)) {
+      throw new Error(`sprite-update: unknown anchor source: ${patch.anchor.sourceId}`);
+    }
+    if (!Number.isFinite(patch.anchor.srcTime) || patch.anchor.srcTime < 0) {
+      throw new Error(`sprite-update: anchor srcTime (${patch.anchor.srcTime}) must be a finite number >= 0`);
+    }
+    next.anchor = { sourceId: patch.anchor.sourceId, srcTime: patch.anchor.srcTime };
+  }
+  if (patch.duration !== undefined) {
+    if (!Number.isFinite(patch.duration) || patch.duration <= 0) {
+      throw new Error(`sprite-update: duration (${patch.duration}) must be a finite number > 0`);
+    }
+    next.duration = patch.duration;
+  }
+  if (patch.position !== undefined) {
+    assertUnit(patch.position.x, 'sprite-update', 'position.x');
+    assertUnit(patch.position.y, 'sprite-update', 'position.y');
+    next.position = { x: patch.position.x, y: patch.position.y };
+  }
+  if (patch.scale !== undefined) {
+    if (!Number.isFinite(patch.scale) || patch.scale <= 0 || patch.scale > 1) {
+      throw new Error(`sprite-update: scale (${patch.scale}) must be a finite number between 0 (exclusive) and 1`);
+    }
+    next.scale = patch.scale;
+  }
+  if (patch.opacity !== undefined) {
+    assertUnit(patch.opacity, 'sprite-update', 'opacity');
+    next.opacity = patch.opacity;
+  }
+  if (patch.flip !== undefined) {
+    if (patch.flip) next.flip = true;
+    else delete next.flip;
+  }
+  const out = [...sprites];
+  out[idx] = next;
+  return { ...m, timeline: { ...m.timeline, sprites: out } };
+}
+
+/** Remove a sprite from the timeline. */
+export function removeSprite(m: Manifest, id: string): Manifest {
+  const sprites = m.timeline.sprites ?? [];
+  const next = sprites.filter((s) => s.id !== id);
+  if (next.length === sprites.length) throw new Error(`unknown sprite: ${id}`);
+  return { ...m, timeline: { ...m.timeline, sprites: next } };
+}
+
+// ---- sprite placement geometry (pure; shared math for render/view/web — see spec §2) ----
+
+export interface SpriteAssetGeometry {
+  width?: number;
+  height?: number;
+  visible_bounds_normalized?: { x0: number; y0: number; x1: number; y1: number };
+  ground_anchor_normalized?: { x: number; y: number };
+}
+
+export interface SpriteGeometryResult {
+  /** Top-left corner + displayed size of the FULL (incl. any transparent padding) sprite image, in output pixels. */
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  /** Where the asset's ground_anchor_normalized point actually lands (== position * outputWH), for convenience. */
+  anchorX: number;
+  anchorY: number;
+}
+
+/**
+ * Map a kit asset + placement (SpriteItem's position/scale/flip) onto output
+ * pixels. `scale` is the displayed height of the asset's VISIBLE region
+ * (visible_bounds_normalized) as a fraction of the output height — not the
+ * full (possibly padded) image — so two assets with different amounts of
+ * transparent padding around the character still read as "the same size" at
+ * the same scale. `position` places the asset's ground_anchor_normalized
+ * point (its "feet") at that 0..1 fraction of the output canvas. Missing
+ * bounds/anchor (asset not yet `vedit kit-scan`ned) fall back to "whole
+ * image is visible" / "anchor at bottom-center" so an unscanned asset still
+ * places reasonably. Missing width/height (same reason) fall back to a
+ * square (1:1) aspect ratio. `flip` mirrors the image horizontally, which
+ * also mirrors where the anchor point falls within it.
+ */
+export function spriteGeometry(
+  asset: SpriteAssetGeometry,
+  position: { x: number; y: number },
+  scale: number,
+  outputWH: { width: number; height: number },
+  opts: { flip?: boolean } = {},
+): SpriteGeometryResult {
+  const bounds = asset.visible_bounds_normalized ?? { x0: 0, y0: 0, x1: 1, y1: 1 };
+  const anchor = asset.ground_anchor_normalized ?? { x: 0.5, y: 1 };
+  const aspect = asset.width && asset.height ? asset.width / asset.height : 1;
+  const visibleHeightFrac = Math.max(1e-6, bounds.y1 - bounds.y0);
+  const displayHeight = Math.max(0, scale) * outputWH.height;
+  const fullHeight = displayHeight / visibleHeightFrac;
+  const fullWidth = fullHeight * aspect;
+  const anchorXFrac = opts.flip ? 1 - anchor.x : anchor.x;
+  const anchorPxX = anchorXFrac * fullWidth;
+  const anchorPxY = anchor.y * fullHeight;
+  const anchorX = position.x * outputWH.width;
+  const anchorY = position.y * outputWH.height;
+  return { x: anchorX - anchorPxX, y: anchorY - anchorPxY, width: fullWidth, height: fullHeight, anchorX, anchorY };
 }

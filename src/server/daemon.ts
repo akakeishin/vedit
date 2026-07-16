@@ -8,6 +8,7 @@ import {
   addClip,
   addMusic,
   addOverlay,
+  addSprite,
   applyReframe,
   buildSelectsTimeline,
   COLOR_WARNING_MESSAGE,
@@ -16,6 +17,7 @@ import {
   moveClip,
   needsColorTransform,
   orphanedOverlays,
+  orphanedSprites,
   padWordRange,
   parseFocus,
   parseReframeSpec,
@@ -23,7 +25,9 @@ import {
   removeMusic,
   removeOverlay,
   removeSourceRange,
+  removeSprite,
   resolveOverlays,
+  resolveSprites,
   segments,
   setAudioMix,
   setAudioRepair,
@@ -36,6 +40,7 @@ import {
   trimClip,
   updateMusic,
   updateOverlay,
+  updateSprite,
   wordRange,
 } from '../core/ops.js';
 import { upsertProject } from '../core/registry.js';
@@ -48,6 +53,7 @@ import { ingestFile, makeProxy, probeAudio } from '../ingest/ingest.js';
 import { run } from '../ingest/run.js';
 import type { CutCandidate, Manifest, MotionItem, SceneFile, Transcript } from '../core/types.js';
 import { freshId } from '../core/ops.js';
+import { applyKitDefaults, readKitFile, recognizedKitSections } from '../core/kit.js';
 
 const WEB_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'web');
 
@@ -163,6 +169,7 @@ async function stateSummary(p: Project) {
   const cands = await p.candidates();
   const pending = cands.filter((c) => c.status === 'proposed').length;
   const orphans = orphanedOverlays(m);
+  const spriteOrphans = orphanedSprites(m);
   return {
     revision: m.revision,
     name: m.name,
@@ -172,6 +179,8 @@ async function stateSummary(p: Project) {
     motion: m.timeline.motion.length,
     music: (m.timeline.music ?? []).length,
     overlays: (m.timeline.overlays ?? []).length,
+    sprites: (m.timeline.sprites ?? []).length,
+    kit: m.kit ? { path: m.kit.path } : undefined,
     sources: m.sources.map((s) => ({
       id: s.id,
       path: s.path,
@@ -184,6 +193,8 @@ async function stateSummary(p: Project) {
     // orphaned B-roll overlays (anchor cut away) — see ops.ts's
     // orphanedOverlays; only present when non-empty, like `warning` below.
     ...(orphans.length ? { orphanedOverlays: orphans } : {}),
+    // orphaned W8 sprites (anchor cut away) — see ops.ts's orphanedSprites.
+    ...(spriteOrphans.length ? { orphanedSprites: spriteOrphans } : {}),
     // Set only when Project.open() had to repair a crash-damaged
     // revisions.jsonl (see Project.reconcile); absent otherwise.
     ...(p.warning ? { warning: p.warning } : {}),
@@ -267,9 +278,23 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
     if (pathname === '/api/state') return json(res, 200, await stateSummary(p));
     if (pathname === '/api/project') {
       const m = await p.manifest();
-      // `overlays` carries every V2 item's resolved tlStart (null = orphan)
-      // so the web UI never has to reimplement sourceTimeToTimeline itself.
-      return json(res, 200, { manifest: m, segments: segments(m), duration: timelineDuration(m), overlays: resolveOverlays(m) });
+      // `overlays`/`sprites` carry every item's resolved tlStart (null =
+      // orphan) so the web UI never has to reimplement sourceTimeToTimeline
+      // itself.
+      return json(res, 200, {
+        manifest: m, segments: segments(m), duration: timelineDuration(m),
+        overlays: resolveOverlays(m), sprites: resolveSprites(m),
+      });
+    }
+    if (pathname === '/api/kit') {
+      const m = await p.manifest();
+      if (!m.kit) return json(res, 200, { path: null, kit: null });
+      try {
+        const kit = await readKitFile(m.kit.path);
+        return json(res, 200, { path: m.kit.path, kit, recognizedSections: recognizedKitSections(kit) });
+      } catch (e: any) {
+        return json(res, 200, { path: m.kit.path, kit: null, error: e?.message ?? String(e) });
+      }
     }
     if (pathname === '/api/revisions') return json(res, 200, await p.revisions());
     if (pathname === '/api/transcript') {
@@ -651,6 +676,51 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         await mutate(p, actor, baseRev, 'broll-remove', b, `broll-remove ${b.id}`, (m) => removeOverlay(m, b.id));
         return json(res, 200, { state: await stateSummary(p) });
       }
+      if (b.op === 'sprite-add') {
+        if (!m0.kit) return json(res, 400, { error: 'sprite-add: no kit linked; run `vedit kit-link <dir>` first' });
+        if (!b.anchor || typeof b.anchor.sourceId !== 'string' || typeof b.anchor.srcTime !== 'number') {
+          return json(res, 400, { error: 'sprite-add: anchor {sourceId, srcTime} is required' });
+        }
+        let kit;
+        try {
+          kit = await readKitFile(m0.kit.path);
+        } catch (e: any) {
+          return json(res, 400, { error: `sprite-add: could not read kit: ${e?.message ?? e}` });
+        }
+        if (!(kit.assets ?? []).some((a) => a.id === b.assetId)) {
+          return json(res, 400, { error: `sprite-add: unknown kit asset: ${b.assetId}` });
+        }
+        const id = freshId('sp');
+        await mutate(
+          p, actor, baseRev, 'sprite-add', b,
+          `sprite-add ${b.assetId} anchor ${b.anchor.sourceId}@${Number(b.anchor.srcTime).toFixed(2)}`,
+          (m) => addSprite(m, b.assetId, {
+            anchor: b.anchor, duration: b.duration, position: b.position, scale: b.scale, opacity: b.opacity, flip: b.flip, id,
+          }),
+        );
+        return json(res, 200, { id, state: await stateSummary(p) });
+      }
+      if (b.op === 'sprite-update') {
+        if (!(m0.timeline.sprites ?? []).some((x) => x.id === b.id)) {
+          return json(res, 400, { error: `unknown sprite: ${b.id}` });
+        }
+        if (b.anchor !== undefined && (typeof b.anchor.sourceId !== 'string' || typeof b.anchor.srcTime !== 'number')) {
+          return json(res, 400, { error: 'sprite-update: anchor must be {sourceId, srcTime}' });
+        }
+        await mutate(p, actor, baseRev, 'sprite-update', b, `sprite-update ${b.id}`, (m) =>
+          updateSprite(m, b.id, {
+            anchor: b.anchor, duration: b.duration, position: b.position, scale: b.scale, opacity: b.opacity, flip: b.flip,
+          }),
+        );
+        return json(res, 200, { state: await stateSummary(p) });
+      }
+      if (b.op === 'sprite-remove') {
+        if (!(m0.timeline.sprites ?? []).some((x) => x.id === b.id)) {
+          return json(res, 400, { error: `unknown sprite: ${b.id}` });
+        }
+        await mutate(p, actor, baseRev, 'sprite-remove', b, `sprite-remove ${b.id}`, (m) => removeSprite(m, b.id));
+        return json(res, 200, { state: await stateSummary(p) });
+      }
       if (b.op === 'audio-mix') {
         await mutate(
           p, actor, baseRev, 'audio-mix', b,
@@ -801,6 +871,32 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
           (m) => ({ ...m, timeline: { ...m.timeline, video: newVideo } }),
         );
         return json(res, 200, { previousClips, newClips: newVideo.length, state: await stateSummary(p) });
+      }
+      if (b.op === 'kit-link') {
+        const dir = typeof b.path === 'string' ? path.resolve(b.path) : undefined;
+        if (!dir) return json(res, 400, { error: 'kit-link: path is required' });
+        let kit;
+        try {
+          kit = await readKitFile(dir);
+        } catch (e: any) {
+          return json(res, 400, { error: `kit-link: ${e?.message ?? e}` });
+        }
+        const sections = recognizedKitSections(kit);
+        let applied: string[] = [];
+        await mutate(p, actor, baseRev, 'kit-link', b, `kit-link ${dir}`, (m) => {
+          const linked: Manifest = { ...m, kit: { path: dir } };
+          const { manifest, applied: a } = applyKitDefaults(linked, kit!);
+          applied = a;
+          return manifest;
+        });
+        return json(res, 200, { path: dir, recognizedSections: sections, appliedDefaults: applied, state: await stateSummary(p) });
+      }
+      if (b.op === 'kit-unlink') {
+        await mutate(p, actor, baseRev, 'kit-unlink', b, 'kit-unlink', (m) => {
+          const { kit: _kit, ...rest } = m;
+          return rest as Manifest;
+        });
+        return json(res, 200, { state: await stateSummary(p) });
       }
       if (b.op === 'restore') {
         // `baseRev` here is the same value every other /api/edit op uses
@@ -1007,7 +1103,45 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
     createReadStream(full).pipe(res);
   }
 
+  /** Guess a browser MIME type for a kit-served font/asset file. */
+  function kitMediaMime(file: string): string {
+    const types: Record<string, string> = {
+      '.ttf': 'font/ttf', '.otf': 'font/otf', '.woff': 'font/woff', '.woff2': 'font/woff2',
+      '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+    };
+    return types[path.extname(file).toLowerCase()] ?? 'application/octet-stream';
+  }
+
+  /**
+   * /media/kit/<relPath> (fonts/*, assets/**\/*.png, ...): the kit root is
+   * OUTSIDE the project directory (that's the whole point — a kit is shared
+   * across projects), so this is a SEPARATE containment root from
+   * resolveWithinDir(p.dir, ...) used everywhere else in serveMedia —
+   * sandboxed to Manifest.kit.path instead. `relPath` may contain slashes
+   * (nested asset subfolders), unlike the fixed 4-segment /media/<kind>/<id>
+   * shape the rest of serveMedia uses, hence the dedicated branch.
+   */
+  async function serveKitMedia(p: Project, relPath: string, req: http.IncomingMessage, res: http.ServerResponse) {
+    const m = await p.manifest();
+    if (!m.kit) return json(res, 404, { error: 'no kit linked' });
+    let full: string;
+    try {
+      full = await resolveWithinDir(m.kit.path, decodeURIComponent(relPath));
+    } catch {
+      return json(res, 404, { error: 'invalid kit media path' });
+    }
+    let stat: ReturnType<typeof statSync>;
+    try {
+      stat = statSync(full);
+    } catch {
+      return json(res, 404, { error: 'kit media not found' });
+    }
+    return serveFileWithRange(req, res, full, stat, kitMediaMime(full));
+  }
+
   async function serveMedia(p: Project, pathname: string, req: http.IncomingMessage, res: http.ServerResponse) {
+    // /media/kit/<relPath>: separate containment root (see serveKitMedia doc).
+    if (pathname.startsWith('/media/kit/')) return serveKitMedia(p, pathname.slice('/media/kit/'.length), req, res);
     // /media/proxy/<sourceId> | /media/peaks/<sourceId> | /media/thumb/<sourceId> | /media/music/<musicId>
     const [, , kind, id] = pathname.split('/');
     const m = await p.manifest();

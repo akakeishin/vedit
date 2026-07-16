@@ -6,6 +6,7 @@ import {
   addClip,
   addMusic,
   addOverlay,
+  addSprite,
   applyReframe,
   buildSelectsTimeline,
   COLOR_WARNING_MESSAGE,
@@ -18,6 +19,7 @@ import {
   moveClip,
   needsColorTransform,
   orphanedOverlays,
+  orphanedSprites,
   OVERLAY_GAIN_DEFAULT,
   padWordRange,
   parseFocus,
@@ -26,8 +28,11 @@ import {
   removeMusic,
   removeOverlay,
   removeSourceRange,
+  removeSprite,
   resolveOverlays,
   resolvedActiveOverlays,
+  resolvedActiveSprites,
+  resolveSprites,
   segments,
   setAudioMix,
   setAudioRepair,
@@ -36,11 +41,13 @@ import {
   setColorTransform,
   setSceneReview,
   sourceTimeToTimeline,
+  spriteGeometry,
   timelineDuration,
   timelineTimeToSource,
   trimClip,
   updateMusic,
   updateOverlay,
+  updateSprite,
   wordRange,
 } from './ops.js';
 import { Project } from './project.js';
@@ -1070,5 +1077,205 @@ describe('resolveOverlays / resolvedActiveOverlays / orphanedOverlays', () => {
 
   it('OVERLAY_GAIN_DEFAULT is -18 (the documented default for mix/replace)', () => {
     expect(OVERLAY_GAIN_DEFAULT).toBe(-18);
+  });
+});
+
+// ---- W8: kit sprites (addSprite / updateSprite / removeSprite, resolve*, orphanedSprites, spriteGeometry) ----
+
+describe('sprites (addSprite / updateSprite / removeSprite)', () => {
+  // Same A-roll-with-a-cut shape as the B-roll suite above: tl[0,10)<-src[0,10), tl[10,20)<-src[20,30).
+  function m(): Manifest {
+    const base = manifest();
+    return {
+      ...base,
+      timeline: {
+        ...base.timeline,
+        video: [
+          { id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 10 },
+          { id: 'c2', sourceId: 's1', srcIn: 20, srcOut: 30 },
+        ],
+      },
+    };
+  }
+
+  it('addSprite fills in sensible defaults (duration/position/scale/opacity) when omitted', () => {
+    const r = addSprite(m(), 'char1', { anchor: { sourceId: 's1', srcTime: 2 } });
+    const sp = r.timeline.sprites![0];
+    expect(sp.assetId).toBe('char1');
+    expect(sp.id).toMatch(/^sp/);
+    expect(sp.duration).toBeGreaterThan(0);
+    expect(sp.position.x).toBeGreaterThanOrEqual(0);
+    expect(sp.position.x).toBeLessThanOrEqual(1);
+    expect(sp.scale).toBeGreaterThan(0);
+    expect(sp.opacity).toBe(1);
+    expect(sp.flip).toBeUndefined();
+  });
+
+  it('addSprite honors explicit fields including flip', () => {
+    const r = addSprite(m(), 'char1', {
+      id: 'sp1', anchor: { sourceId: 's1', srcTime: 2 }, duration: 5,
+      position: { x: 0.2, y: 0.8 }, scale: 0.4, opacity: 0.5, flip: true,
+    });
+    expect(r.timeline.sprites![0]).toMatchObject({
+      id: 'sp1', assetId: 'char1', duration: 5, position: { x: 0.2, y: 0.8 }, scale: 0.4, opacity: 0.5, flip: true,
+    });
+  });
+
+  it('addSprite requires a non-empty assetId and a valid anchor', () => {
+    expect(() => addSprite(m(), '', { anchor: { sourceId: 's1', srcTime: 2 } })).toThrow(/assetId is required/);
+    expect(() => addSprite(m(), 'char1', { anchor: { sourceId: 'nope', srcTime: 2 } })).toThrow(/unknown anchor source/);
+    expect(() => addSprite(m(), 'char1', { anchor: { sourceId: 's1', srcTime: -1 } })).toThrow(/srcTime.*>= 0/);
+  });
+
+  it('addSprite rejects out-of-range duration/position/scale/opacity', () => {
+    const anchor = { sourceId: 's1', srcTime: 2 };
+    expect(() => addSprite(m(), 'c', { anchor, duration: 0 })).toThrow(/duration/);
+    expect(() => addSprite(m(), 'c', { anchor, position: { x: 1.5, y: 0.5 } })).toThrow(/position\.x/);
+    expect(() => addSprite(m(), 'c', { anchor, scale: 0 })).toThrow(/scale/);
+    expect(() => addSprite(m(), 'c', { anchor, scale: 1.5 })).toThrow(/scale/);
+    expect(() => addSprite(m(), 'c', { anchor, opacity: 2 })).toThrow(/opacity/);
+  });
+
+  it('addSprite rejects a duplicate id; two sprites MAY resolve to overlapping ranges (no exclusivity check, unlike B-roll V2)', () => {
+    let r = addSprite(m(), 'c1', { id: 'sp1', anchor: { sourceId: 's1', srcTime: 2 }, duration: 4 });
+    expect(() => addSprite(r, 'c1', { id: 'sp1', anchor: { sourceId: 's1', srcTime: 8 }, duration: 4 })).toThrow(/id already exists/);
+    // Same window as sp1 [2,6) — must NOT throw (sprites can overlap).
+    r = addSprite(r, 'c2', { id: 'sp2', anchor: { sourceId: 's1', srcTime: 3 }, duration: 2 });
+    expect(r.timeline.sprites!.map((s) => s.id)).toEqual(['sp1', 'sp2']);
+  });
+
+  it('updateSprite patches only given fields, never assetId; unknown id / bad anchor throw', () => {
+    let r = addSprite(m(), 'c1', { id: 'sp1', anchor: { sourceId: 's1', srcTime: 2 }, opacity: 1 });
+    r = updateSprite(r, 'sp1', { opacity: 0.6, scale: 0.5 });
+    const sp = r.timeline.sprites![0];
+    expect(sp.assetId).toBe('c1');
+    expect(sp.opacity).toBe(0.6);
+    expect(sp.scale).toBe(0.5);
+    expect(() => updateSprite(r, 'nope', { opacity: 0.5 })).toThrow(/unknown sprite/);
+    expect(() => updateSprite(r, 'sp1', { anchor: { sourceId: 'nope', srcTime: 1 } })).toThrow(/unknown anchor source/);
+    expect(() => updateSprite(r, 'sp1', { scale: 2 })).toThrow(/scale/);
+  });
+
+  it('updateSprite can set and clear flip', () => {
+    let r = addSprite(m(), 'c1', { id: 'sp1', anchor: { sourceId: 's1', srcTime: 2 } });
+    r = updateSprite(r, 'sp1', { flip: true });
+    expect(r.timeline.sprites![0].flip).toBe(true);
+    r = updateSprite(r, 'sp1', { flip: false });
+    expect(r.timeline.sprites![0].flip).toBeUndefined();
+  });
+
+  it('removeSprite drops the item; unknown id throws', () => {
+    let r = addSprite(m(), 'c1', { id: 'sp1', anchor: { sourceId: 's1', srcTime: 2 } });
+    r = addSprite(r, 'c2', { id: 'sp2', anchor: { sourceId: 's1', srcTime: 8 } });
+    r = removeSprite(r, 'sp1');
+    expect(r.timeline.sprites!.map((s) => s.id)).toEqual(['sp2']);
+    expect(() => removeSprite(r, 'sp1')).toThrow(/unknown sprite/);
+  });
+});
+
+describe('resolveSprites / resolvedActiveSprites / orphanedSprites', () => {
+  function m(): Manifest {
+    const base = manifest();
+    return {
+      ...base,
+      timeline: {
+        ...base.timeline,
+        video: [
+          { id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 10 },
+          { id: 'c2', sourceId: 's1', srcIn: 20, srcOut: 30 },
+        ],
+      },
+    };
+  }
+
+  it('an anchor whose instant survives a ripple cut automatically follows the new timeline position', () => {
+    let r = addSprite(m(), 'c1', { id: 'sp1', anchor: { sourceId: 's1', srcTime: 25 } }); // tl[10,20)<-src[20,30): tl=15
+    expect(resolveSprites(r)[0].tlStart).toBeCloseTo(15);
+    r = removeSourceRange(r, 's1', 0, 5); // ripple: everything downstream shifts left by 5s
+    expect(resolveSprites(r)[0].tlStart).toBeCloseTo(10);
+  });
+
+  it('an anchor whose instant gets cut away becomes orphaned (excluded from resolvedActiveSprites)', () => {
+    let r = addSprite(m(), 'c1', { id: 'sp1', anchor: { sourceId: 's1', srcTime: 25 } });
+    expect(resolvedActiveSprites(r)).toHaveLength(1);
+    r = removeSourceRange(r, 's1', 24, 26); // cut away the anchored instant itself
+    expect(resolveSprites(r)[0].tlStart).toBeNull();
+    expect(resolvedActiveSprites(r)).toHaveLength(0);
+    const orphans = orphanedSprites(r);
+    expect(orphans).toHaveLength(1);
+    expect(orphans[0]).toMatchObject({ id: 'sp1' });
+    expect(orphans[0].reason).toMatch(/not on the timeline/);
+  });
+
+  it('resolvedActiveSprites sorts by resolved tlStart', () => {
+    let r = addSprite(m(), 'c1', { id: 'spLater', anchor: { sourceId: 's1', srcTime: 8 }, duration: 2 });
+    r = addSprite(r, 'c2', { id: 'spEarlier', anchor: { sourceId: 's1', srcTime: 2 }, duration: 2 });
+    const active = resolvedActiveSprites(r);
+    expect(active.map((a) => a.sprite.id)).toEqual(['spEarlier', 'spLater']);
+    expect(active[0].tlEnd - active[0].tlStart).toBeCloseTo(2);
+  });
+
+  it('two sprites resolve to overlapping active ranges without error (unlike the B-roll V2 track)', () => {
+    let r = addSprite(m(), 'c1', { id: 'sp1', anchor: { sourceId: 's1', srcTime: 2 }, duration: 6 });
+    r = addSprite(r, 'c2', { id: 'sp2', anchor: { sourceId: 's1', srcTime: 4 }, duration: 6 });
+    const active = resolvedActiveSprites(r);
+    expect(active).toHaveLength(2);
+    expect(active[0].tlEnd).toBeGreaterThan(active[1].tlStart); // overlapping
+  });
+});
+
+describe('spriteGeometry (ground-anchor placement, scale, flip, defaults)', () => {
+  const outputWH = { width: 1000, height: 1000 };
+
+  it('places the asset\'s ground_anchor_normalized point exactly at position * outputWH', () => {
+    const asset = {
+      width: 200, height: 400,
+      visible_bounds_normalized: { x0: 0.25, y0: 0.1, x1: 0.75, y1: 0.9 },
+      ground_anchor_normalized: { x: 0.5, y: 0.9 },
+    };
+    const geo = spriteGeometry(asset, { x: 0.5, y: 0.8 }, 0.2, outputWH);
+    expect(geo.anchorX).toBeCloseTo(500);
+    expect(geo.anchorY).toBeCloseTo(800);
+    // The anchor point, once the image is scaled+positioned, must land exactly on (anchorX, anchorY).
+    const anchorPxX = geo.x + 0.5 * geo.width;
+    const anchorPxY = geo.y + 0.9 * geo.height;
+    expect(anchorPxX).toBeCloseTo(500);
+    expect(anchorPxY).toBeCloseTo(800);
+  });
+
+  it('scale sets the displayed height of the VISIBLE region (not the full padded image) as a fraction of output height', () => {
+    const asset = {
+      width: 200, height: 400,
+      visible_bounds_normalized: { x0: 0, y0: 0.25, x1: 1, y1: 0.75 }, // visible region is 50% of the image's own height
+      ground_anchor_normalized: { x: 0.5, y: 0.75 },
+    };
+    const geo = spriteGeometry(asset, { x: 0.5, y: 0.9 }, 0.3, outputWH); // visible height should be 0.3 * 1000 = 300
+    const visibleHeightPx = geo.height * 0.5; // 50% of the full (scaled) image height is "visible"
+    expect(visibleHeightPx).toBeCloseTo(300);
+    // aspect (200/400 = 0.5) is preserved in the full image dimensions.
+    expect(geo.width / geo.height).toBeCloseTo(200 / 400);
+  });
+
+  it('flip mirrors which side of the image the anchor point sits on', () => {
+    const asset = {
+      width: 100, height: 100,
+      visible_bounds_normalized: { x0: 0, y0: 0, x1: 1, y1: 1 },
+      ground_anchor_normalized: { x: 0.2, y: 1 }, // anchor near the LEFT edge
+    };
+    const normal = spriteGeometry(asset, { x: 0.5, y: 0.5 }, 0.2, outputWH);
+    const flipped = spriteGeometry(asset, { x: 0.5, y: 0.5 }, 0.2, outputWH, { flip: true });
+    // Same displayed size, but the top-left x must differ (anchor offset mirrors).
+    expect(flipped.width).toBeCloseTo(normal.width);
+    expect(flipped.x).not.toBeCloseTo(normal.x);
+    // Flipped: anchor sits at 1 - 0.2 = 0.8 of the width from the left.
+    expect(flipped.anchorX - flipped.x).toBeCloseTo(0.8 * flipped.width);
+    expect(normal.anchorX - normal.x).toBeCloseTo(0.2 * normal.width);
+  });
+
+  it('falls back to "whole image visible" / "bottom-center anchor" / square aspect when the asset is unscanned', () => {
+    const geo = spriteGeometry({}, { x: 0.5, y: 1 }, 0.2, outputWH);
+    expect(geo.width).toBeCloseTo(geo.height); // square fallback aspect
+    expect(geo.anchorX - geo.x).toBeCloseTo(0.5 * geo.width); // anchor.x fallback = 0.5
+    expect(geo.anchorY - geo.y).toBeCloseTo(1.0 * geo.height); // anchor.y fallback = 1 (bottom)
   });
 });

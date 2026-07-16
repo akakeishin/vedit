@@ -62,6 +62,15 @@ main { flex: 1; display: flex; min-height: 0; }
    on top of it, matching render.ts's compositing order. */
 #videoOverlay { position: absolute; inset: 0; z-index: 1; background: #000; pointer-events: none; }
 
+/* W8 kit sprites: absolute-positioned <img>s (see renderSprites in app.js),
+   placed BELOW captions (matches render.ts: sprites composite before the
+   ASS caption burn) but above the video/B-roll layers. Percent-based
+   left/top/width/height so it tracks reframe/letterboxing the same way
+   captionLayer/motionLayer do (all three are children of #videoBox, sized
+   to the OUTPUT aspect). */
+#spriteLayer { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+.spriteImg { position: absolute; }
+
 #captionLayer {
   position: absolute; left: 0; right: 0; bottom: 6%; text-align: center; pointer-events: none;
 }
@@ -71,6 +80,15 @@ main { flex: 1; display: flex; min-height: 0; }
   font-size: clamp(14px, 2.6vw, 26px); text-shadow: 0 1px 3px #000;
 }
 #captionLayer.style-bold .cue { background: #000; color: #ffe45c; }
+/* W8 kit style (captions --style <kitStyleId>): approximation of the ASS
+   palette/font toAss's kitAssStyle burns in — see renderCaption in app.js,
+   which sets these custom properties from the linked kit's style. */
+#captionLayer.style-kit .cue {
+  background: color-mix(in srgb, var(--kit-box, #000) calc(var(--kit-box-opacity, 1) * 100%), transparent);
+  color: var(--kit-text, #fff);
+  -webkit-text-stroke: 1px var(--kit-outline, transparent);
+  font-family: var(--kit-font, inherit);
+}
 
 #motionLayer { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
 .mo-chapter-card {
@@ -175,6 +193,19 @@ main { flex: 1; display: flex; min-height: 0; }
   position: absolute; height: 100%; border-radius: 3px;
   background: rgba(63, 185, 107, 0.8); font-size: 9px; color: #04101f;
   overflow: hidden; white-space: nowrap; padding: 0 3px;
+}
+/* W8 kit sprite row: thin strip just above musicRow, pink so it reads as
+   distinct from B-roll (teal, #overlayRow) and music (green). Orphan chips
+   mirror .ovBlock.orphan. */
+#spriteRow { position: absolute; left: 0; right: 0; bottom: 32px; height: 12px; }
+.spBlock {
+  position: absolute; top: 0; height: 100%; border-radius: 3px;
+  background: rgba(214, 90, 200, 0.85); font-size: 9px; color: #04101f;
+  overflow: hidden; white-space: nowrap; padding: 0 3px; cursor: pointer;
+}
+.spBlock.orphan {
+  width: 12px; background: rgba(214, 87, 60, 0.92); color: #fff;
+  text-align: center; font-weight: 700;
 }
 #playhead {
   position: absolute; top: 0; bottom: 0; width: 1px; background: #ff5252; pointer-events: none;
