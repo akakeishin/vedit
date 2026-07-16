@@ -3,11 +3,21 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
+  addClip,
+  applyReframe,
+  cropGeometry,
+  cropOffset,
+  cropWindow,
   expandWordIds,
   keptWords,
+  moveClip,
   padWordRange,
+  parseFocus,
+  parseReframeSpec,
+  removeClip,
   removeSourceRange,
   segments,
+  setClipCrop,
   sourceTimeToTimeline,
   timelineDuration,
   trimClip,
@@ -268,5 +278,130 @@ describe('timestampsArePacked', () => {
       id: `w${i}`, text: 'x', t0: i * 0.6, t1: i * 0.6 + 0.4, p: 0.9,
     }));
     expect(timestampsArePacked(healthy)).toBe(false);
+  });
+});
+
+describe('addClip / removeClip / moveClip', () => {
+  it('addClip defaults to the full source, appended at the end', () => {
+    const m = addClip(manifest(), 's1', {});
+    expect(m.timeline.video).toHaveLength(2);
+    expect(m.timeline.video[1]).toMatchObject({ sourceId: 's1', srcIn: 0, srcOut: 60 });
+  });
+
+  it('addClip honors in/out/at and rejects an empty range', () => {
+    const m = addClip(manifest(), 's1', { in: 5, out: 15, at: 0 });
+    expect(m.timeline.video).toHaveLength(2);
+    expect(m.timeline.video[0]).toMatchObject({ sourceId: 's1', srcIn: 5, srcOut: 15 });
+    expect(() => addClip(manifest(), 's1', { in: 10, out: 10 })).toThrow(/out .* must be greater than in/);
+  });
+
+  it('addClip rejects an unknown source', () => {
+    expect(() => addClip(manifest(), 'nope', {})).toThrow(/unknown source/);
+  });
+
+  it('removeClip drops the clip but leaves the source pool untouched', () => {
+    const m = removeClip(manifest(), 'c1');
+    expect(m.timeline.video).toHaveLength(0);
+    expect(m.sources).toHaveLength(1);
+  });
+
+  it('removeClip throws on an unknown clip', () => {
+    expect(() => removeClip(manifest(), 'nope')).toThrow(/unknown clip/);
+  });
+
+  it('moveClip reorders relative to another clip, or to the end', () => {
+    let m = addClip(manifest(), 's1', { in: 0, out: 10 }); // c1, c2(new)
+    const newId = m.timeline.video[1].id;
+    m = moveClip(m, newId, 'c1');
+    expect(m.timeline.video.map((c) => c.id)).toEqual([newId, 'c1']);
+    m = moveClip(m, newId, 'end');
+    expect(m.timeline.video.map((c) => c.id)).toEqual(['c1', newId]);
+  });
+
+  it('moveClip throws on an unknown clip or target', () => {
+    expect(() => moveClip(manifest(), 'nope', 'end')).toThrow(/unknown clip/);
+    expect(() => moveClip(manifest(), 'c1', 'nope')).toThrow(/unknown clip/);
+  });
+});
+
+describe('reframe / crop', () => {
+  it('parseReframeSpec maps the common shorthands to conventional pixel sizes', () => {
+    expect(parseReframeSpec('9:16')).toEqual({ width: 1080, height: 1920 });
+    expect(parseReframeSpec('1:1')).toEqual({ width: 1080, height: 1080 });
+    expect(parseReframeSpec('16:9')).toEqual({ width: 1920, height: 1080 });
+  });
+
+  it('parseReframeSpec accepts a literal WxH', () => {
+    expect(parseReframeSpec('1080x1350')).toEqual({ width: 1080, height: 1350 });
+  });
+
+  it('parseReframeSpec rejects garbage', () => {
+    expect(() => parseReframeSpec('vertical')).toThrow(/invalid reframe spec/);
+  });
+
+  it('parseFocus maps mnemonics and clamps numeric input', () => {
+    expect(parseFocus(undefined)).toBe(0.5);
+    expect(parseFocus('left')).toBe(0);
+    expect(parseFocus('center')).toBe(0.5);
+    expect(parseFocus('right')).toBe(1);
+    expect(parseFocus('0.3')).toBeCloseTo(0.3);
+    expect(parseFocus(5)).toBe(1); // clamped
+    expect(() => parseFocus('sideways')).toThrow(/invalid focus/);
+  });
+
+  it('cropWindow crops width for a landscape source going to a portrait output', () => {
+    const win = cropWindow(1920, 1080, 1080, 1920);
+    expect(win.axis).toBe('x');
+    expect(win.height).toBe(1080);
+    expect(win.width).toBeLessThan(1920);
+    expect(win.width).toBeCloseTo(1080 * (1080 / 1920), -1); // rounded to an even pixel count
+  });
+
+  it('cropWindow crops height for a portrait source going to a landscape output', () => {
+    const win = cropWindow(1080, 1920, 1920, 1080);
+    expect(win.axis).toBe('y');
+    expect(win.width).toBe(1080);
+    expect(win.height).toBeLessThan(1920);
+  });
+
+  it('cropWindow needs no crop when aspects already match', () => {
+    const win = cropWindow(1920, 1080, 1920, 1080);
+    expect(win).toEqual({ width: 1920, height: 1080, axis: 'none' });
+  });
+
+  it('cropOffset positions the window within the available slack, clamped to 0..1', () => {
+    expect(cropOffset(1920, 1080, 0)).toBe(0);
+    expect(cropOffset(1920, 1080, 1)).toBe(1920 - 1080);
+    expect(cropOffset(1920, 1080, 0.5)).toBeCloseTo((1920 - 1080) / 2, 0);
+    expect(cropOffset(1920, 1080, -1)).toBe(0); // clamped
+  });
+
+  it('cropGeometry is null when no crop is needed, else combines window + offset', () => {
+    expect(cropGeometry(1920, 1080, 1920, 1080, undefined)).toBeNull();
+    const geo = cropGeometry(1920, 1080, 1080, 1920, { x: 0 });
+    expect(geo).not.toBeNull();
+    expect(geo!.x).toBe(0);
+    expect(geo!.height).toBe(1080);
+  });
+
+  it('applyReframe sets output and stamps the same focus onto every clip', () => {
+    let m = addClip(manifest(), 's1', {}); // two clips now
+    m = applyReframe(m, { width: 1080, height: 1920 }, 0);
+    expect(m.output).toEqual({ width: 1080, height: 1920 });
+    expect(m.timeline.video.every((c) => c.crop?.x === 0 && c.crop?.y === 0)).toBe(true);
+  });
+
+  it('setClipCrop patches one clip without touching others', () => {
+    let m = addClip(manifest(), 's1', {});
+    const [c1, c2] = m.timeline.video;
+    m = setClipCrop(m, c1.id, { x: 0.2 });
+    expect(m.timeline.video[0].crop).toEqual({ x: 0.2 });
+    expect(m.timeline.video[1].crop).toBeUndefined();
+    m = setClipCrop(m, c1.id, { y: 0.8 });
+    expect(m.timeline.video[0].crop).toEqual({ x: 0.2, y: 0.8 }); // merges, doesn't clobber x
+  });
+
+  it('setClipCrop throws on an unknown clip', () => {
+    expect(() => setClipCrop(manifest(), 'nope', { x: 0 })).toThrow(/unknown clip/);
   });
 });

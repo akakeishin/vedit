@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
-import { segments } from '../core/ops.js';
+import { cropGeometry, segments } from '../core/ops.js';
 import { captionCues } from '../core/captions.js';
 import type { Manifest, Transcript } from '../core/types.js';
 import { ffmpegHasFilter, run } from '../ingest/run.js';
@@ -14,14 +14,15 @@ function assTime(t: number): string {
 
 export function toAss(m: Manifest, transcripts: Transcript[]): string {
   const cues = captionCues(m, transcripts);
+  const { width, height } = m.output ?? { width: m.width, height: m.height };
   const head = `[Script Info]
 ScriptType: v4.00+
-PlayResX: ${m.width}
-PlayResY: ${m.height}
+PlayResX: ${width}
+PlayResY: ${height}
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Hiragino Sans,${Math.round(m.height * 0.045)},&H00FFFFFF,&H000000FF,&H00101010,&H80000000,-1,0,0,0,100,100,0,0,1,3,1,2,60,60,${Math.round(m.height * 0.06)},1
+Style: Default,Hiragino Sans,${Math.round(height * 0.045)},&H00FFFFFF,&H000000FF,&H00101010,&H80000000,-1,0,0,0,100,100,0,0,1,3,1,2,60,60,${Math.round(height * 0.06)},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -49,6 +50,7 @@ export async function renderFinal(
   const srcById = new Map(m.sources.map((s) => [s.id, s]));
   const inputs: string[] = [];
   for (const id of srcIds) inputs.push('-i', srcById.get(id)!.path);
+  const output = m.output ?? { width: m.width, height: m.height };
 
   const parts: string[] = [];
   const labels: string[] = [];
@@ -57,8 +59,13 @@ export async function renderFinal(
     const src = srcById.get(seg.sourceId)!;
     const a = seg.srcStart;
     const b = seg.srcStart + (seg.tlEnd - seg.tlStart);
+    // Original sources are rendered at their real resolution, so crop
+    // geometry can be computed in exact pixels (unlike the proxy-based
+    // filmstrip in view.ts, which has to fall back to fractional crop).
+    const geo = cropGeometry(src.width, src.height, output.width, output.height, seg.crop);
+    const cropPart = geo ? `crop=${geo.width}:${geo.height}:${geo.x}:${geo.y},` : '';
     parts.push(
-      `[${idx}:v]trim=start=${a}:end=${b},setpts=PTS-STARTPTS,scale=${m.width}:${m.height}:force_original_aspect_ratio=decrease,pad=${m.width}:${m.height}:(ow-iw)/2:(oh-ih)/2,fps=${m.fps}[v${i}]`,
+      `[${idx}:v]trim=start=${a}:end=${b},setpts=PTS-STARTPTS,${cropPart}scale=${output.width}:${output.height}:force_original_aspect_ratio=decrease,pad=${output.width}:${output.height}:(ow-iw)/2:(oh-ih)/2,fps=${m.fps}[v${i}]`,
     );
     if (src.hasAudio) parts.push(`[${idx}:a]atrim=start=${a}:end=${b},asetpts=PTS-STARTPTS[a${i}]`);
     else parts.push(`anullsrc=r=48000:cl=stereo,atrim=duration=${b - a}[a${i}]`);

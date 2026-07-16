@@ -53,3 +53,19 @@ node dist/cli.js serve --project <dir>   # daemon をフォアグラウンドで
 - whisper のトークン分割により複数トークンのフィラー(「えーと」)が
   filler 検出を逃すことがある(remove-words では普通に消せる)
 - 長尺・複数素材はプロキシ切替時に一瞬止まる可能性(WebCodecs 移行で解消予定)
+
+## 新機能(ワークフロー拡張)
+
+- クリップの取捨選択・並べ替え: `vedit sources` で素材一覧、
+  `vedit ingest --no-add` で素材プールにだけ追加、
+  `vedit clip-add` / `clip-remove` / `clip-move` でタイムライン編集
+- 9:16 などの縦ショート対応: `vedit reframe 9:16 --focus center` で
+  一括リフレーム、`vedit clip-crop` で個別クリップの微調整。
+  プレビュー・フィルムストリップ・最終レンダーすべてに反映(OTIO は
+  メタデータ記録のみ、Resolve 側では再現されない旨を警告)
+- 字幕エクスポート: `vedit export srt` / `vedit export ass` を追加。
+  `vedit export otio` は同名の .srt を自動生成するようになった
+  (OTIO 単体では字幕が消えていた問題への対処)
+- プロジェクト一覧とスタイルプリセット: `vedit projects` で
+  過去に開いたプロジェクトを一覧、`vedit preset-save` /
+  `preset-apply` / `preset-list` で字幕スタイル等を使い回し

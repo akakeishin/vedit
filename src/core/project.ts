@@ -1,6 +1,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import type { CutCandidate, Manifest, RevisionEntry, Transcript } from './types.js';
+import { upsertProject } from './registry.js';
 
 /**
  * Project store on disk. One directory per project:
@@ -39,6 +40,7 @@ export class Project {
       captions: { enabled: true, style: 'clean', maxChars: 24 },
     };
     await p.writeManifest(manifest);
+    await upsertProject(dir, name);
     return p;
   }
 

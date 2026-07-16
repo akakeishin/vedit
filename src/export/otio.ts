@@ -13,6 +13,11 @@ const tr = (start: number, dur: number, rate: number) => ({
   duration: rt(Math.round(dur * rate), rate),
 });
 
+/** Whether this manifest carries reframe state OTIO cannot express natively. */
+export function hasReframe(m: Manifest): boolean {
+  return Boolean(m.output) || m.timeline.video.some((c) => c.crop);
+}
+
 export function toOtio(m: Manifest): unknown {
   const rate = m.fps;
   const srcById = new Map(m.sources.map((s) => [s.id, s]));
@@ -36,7 +41,9 @@ export function toOtio(m: Manifest): unknown {
         media_reference: mediaRef(seg.sourceId),
         effects: [],
         markers: [],
-        metadata: { vedit: { clipId: seg.clipId, sourceId: seg.sourceId } },
+        // OTIO has no standard "reframe" transform, so the crop position is
+        // carried as opaque metadata only — see hasReframe()'s warning.
+        metadata: { vedit: { clipId: seg.clipId, sourceId: seg.sourceId, ...(seg.crop ? { crop: seg.crop } : {}) } },
       }));
 
   const motionMarkers = m.timeline.motion.map((mo) => ({
@@ -69,7 +76,18 @@ export function toOtio(m: Manifest): unknown {
       effects: [],
       metadata: {},
     },
-    metadata: { vedit: { revision: m.revision } },
+    metadata: {
+      vedit: {
+        revision: m.revision,
+        ...(hasReframe(m)
+          ? {
+              output: m.output,
+              reframeNote:
+                'crop/output are recorded under each clip\'s metadata.vedit.crop, but OTIO has no standard transform field — most importers (including Resolve) will not visually apply the reframe on import.',
+            }
+          : {}),
+      },
+    },
   };
 }
 

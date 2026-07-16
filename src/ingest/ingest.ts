@@ -265,7 +265,7 @@ export interface IngestResult {
 export async function ingestFile(
   project: Project,
   file: string,
-  opts: { language?: string; transcribe?: boolean; onProgress?: IngestProgress } = {},
+  opts: { language?: string; transcribe?: boolean; addToTimeline?: boolean; onProgress?: IngestProgress } = {},
 ): Promise<IngestResult> {
   const abs = path.resolve(file);
   await fs.access(abs);
@@ -309,13 +309,14 @@ export async function ingestFile(
     await project.writeTranscript(t);
     source.transcribed = true;
   }
+  const addToTimeline = opts.addToTimeline ?? true;
   const cur = await project.manifest();
   await project.commit(
     cur.revision,
     'system',
     'ingest',
     { file: abs },
-    `ingested ${path.basename(abs)} (${p.duration.toFixed(1)}s)`,
+    `ingested ${path.basename(abs)} (${p.duration.toFixed(1)}s)${addToTimeline ? '' : ', pool only'}`,
     (m) => {
       const first = m.sources.length === 0;
       return {
@@ -324,13 +325,15 @@ export async function ingestFile(
         width: first ? p.width : m.width,
         height: first ? p.height : m.height,
         sources: [...m.sources, source],
-        timeline: {
-          ...m.timeline,
-          video: [
-            ...m.timeline.video,
-            { id: freshId('c'), sourceId: id, srcIn: 0, srcOut: p.duration },
-          ],
-        },
+        timeline: addToTimeline
+          ? {
+              ...m.timeline,
+              video: [
+                ...m.timeline.video,
+                { id: freshId('c'), sourceId: id, srcIn: 0, srcOut: p.duration },
+              ],
+            }
+          : m.timeline,
       };
     },
   );

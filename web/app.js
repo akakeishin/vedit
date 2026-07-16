@@ -84,6 +84,28 @@ function loadSeg(i, { play = false, offset = 0 } = {}) {
     video.src = url;
     video.addEventListener('loadedmetadata', apply, { once: true });
   } else apply();
+  updateFraming();
+}
+
+// manifest.output present -> lock #videoWrap to that aspect (object-fit:
+// cover) and position the crop window per the CURRENT clip's crop.x/y, so
+// the preview matches what export will actually frame. No output -> revert
+// to plain letterboxing.
+function updateFraming() {
+  const wrap = $('videoWrap');
+  const out = S.manifest?.output;
+  if (!out) {
+    wrap.classList.remove('customAspect');
+    video.style.objectPosition = '';
+    return;
+  }
+  wrap.classList.add('customAspect');
+  wrap.style.setProperty('--out-ar', `${out.width}/${out.height}`);
+  const seg = S.segments[S.currentSeg];
+  const clip = seg && S.manifest.timeline.video.find((c) => c.id === seg.clipId);
+  const x = clip?.crop?.x != null ? Math.round(clip.crop.x * 100) : 50;
+  const y = clip?.crop?.y != null ? Math.round(clip.crop.y * 100) : 50;
+  video.style.objectPosition = `${x}% ${y}%`;
 }
 function seekTl(tl, { play } = {}) {
   tl = Math.max(0, Math.min(tl, S.duration - 0.001));
@@ -326,6 +348,13 @@ for (const b of document.querySelectorAll('[data-trim]')) {
     await mutate({ op: 'trim', clipId: S.selectedClip, edge, frames: Number(f) });
   };
 }
+$('clipRemoveBtn').onclick = async () => {
+  if (!S.selectedClip) return;
+  if (!confirm('このクリップをタイムラインから外しますか？(素材は残ります)')) return;
+  const clipId = S.selectedClip;
+  selectClip(null);
+  await mutate({ op: 'clip-remove', clipId });
+};
 
 // ---------- captions & motion overlays ----------
 function renderCaption(tl) {
@@ -686,6 +715,7 @@ async function renderAll() {
   renderCandidates();
   renderHistory();
   renderRange();
+  updateFraming();
 }
 
 window.addEventListener('resize', drawWave);

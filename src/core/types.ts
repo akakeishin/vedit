@@ -13,6 +13,8 @@ export interface Manifest {
   sources: Source[];
   timeline: Timeline;
   captions: CaptionSettings;
+  /** Export/preview canvas size; omitted means "use source width/height" (no reframe). */
+  output?: { width: number; height: number };
 }
 
 export interface Source {
@@ -43,6 +45,14 @@ export interface VideoClip {
   /** Kept range in source time. */
   srcIn: number;
   srcOut: number;
+  /**
+   * Crop window position when manifest.output's aspect differs from the
+   * source's, as a 0..1 fraction of the available slack (0 = window pinned
+   * to the start/left-top, 1 = pinned to the end/right-bottom). Only the
+   * axis actually being cropped (width XOR height, decided by comparing
+   * aspect ratios at render time) is used; the other is ignored.
+   */
+  crop?: { x?: number; y?: number };
 }
 
 export interface MotionItem {
@@ -103,6 +113,7 @@ export interface Segment {
   sourceId: string;
   srcStart: number;
   clipId: string;
+  crop?: { x?: number; y?: number };
 }
 
 // ---- detection ----

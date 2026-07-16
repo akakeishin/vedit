@@ -18,7 +18,7 @@ export function segments(m: Manifest): Segment[] {
   for (const c of m.timeline.video) {
     const d = c.srcOut - c.srcIn;
     if (d <= 0) continue;
-    out.push({ tlStart: t, tlEnd: t + d, sourceId: c.sourceId, srcStart: c.srcIn, clipId: c.id });
+    out.push({ tlStart: t, tlEnd: t + d, sourceId: c.sourceId, srcStart: c.srcIn, clipId: c.id, crop: c.crop });
     t += d;
   }
   return out;
@@ -158,4 +158,148 @@ export function sourceTimeToTimeline(m: Manifest, sourceId: string, t: number): 
     if (t >= s.srcStart && t < s.srcStart + d) return s.tlStart + (t - s.srcStart);
   }
   return null;
+}
+
+// ---- clip selection / reorder (timeline vs. source pool) ----
+
+/** Add a clip to the timeline referencing an already-ingested source. */
+export function addClip(
+  m: Manifest,
+  sourceId: string,
+  opts: { in?: number; out?: number; at?: number; id?: string } = {},
+): Manifest {
+  const src = m.sources.find((s) => s.id === sourceId);
+  if (!src) throw new Error(`unknown source: ${sourceId}`);
+  const srcIn = opts.in ?? 0;
+  const srcOut = opts.out ?? src.duration;
+  if (srcOut <= srcIn) throw new Error(`clip-add: out (${srcOut}) must be greater than in (${srcIn})`);
+  const clip: VideoClip = { id: opts.id ?? freshId('c'), sourceId, srcIn, srcOut };
+  const video = [...m.timeline.video];
+  const at = opts.at === undefined ? video.length : Math.max(0, Math.min(opts.at, video.length));
+  video.splice(at, 0, clip);
+  return { ...m, timeline: { ...m.timeline, video } };
+}
+
+/** Remove a clip from the timeline; its source stays available in the pool. */
+export function removeClip(m: Manifest, clipId: string): Manifest {
+  const video = m.timeline.video.filter((c) => c.id !== clipId);
+  if (video.length === m.timeline.video.length) throw new Error(`unknown clip: ${clipId}`);
+  return { ...m, timeline: { ...m.timeline, video } };
+}
+
+/** Reorder a clip to just before `beforeClipId`, or to the end when 'end'. */
+export function moveClip(m: Manifest, clipId: string, beforeClipId: string | 'end'): Manifest {
+  const clip = m.timeline.video.find((c) => c.id === clipId);
+  if (!clip) throw new Error(`unknown clip: ${clipId}`);
+  const rest = m.timeline.video.filter((c) => c.id !== clipId);
+  let at = rest.length;
+  if (beforeClipId !== 'end') {
+    at = rest.findIndex((c) => c.id === beforeClipId);
+    if (at < 0) throw new Error(`unknown clip: ${beforeClipId}`);
+  }
+  rest.splice(at, 0, clip);
+  return { ...m, timeline: { ...m.timeline, video: rest } };
+}
+
+// ---- 9:16 / arbitrary-aspect reframe ----
+
+/** Parse a reframe target: "9:16"/"1:1"/"16:9" ratios, or literal "WxH" pixels. */
+export function parseReframeSpec(spec: string): { width: number; height: number } {
+  const literal = spec.match(/^(\d+)[xX](\d+)$/);
+  if (literal) return { width: Number(literal[1]), height: Number(literal[2]) };
+  const ratio = spec.match(/^(\d+):(\d+)$/);
+  if (!ratio) throw new Error(`invalid reframe spec: ${spec} (use 9:16, 1:1, 16:9, or WxH)`);
+  const w = Number(ratio[1]);
+  const h = Number(ratio[2]);
+  // Scale so the shorter ratio number lands on 1080px, matching the usual
+  // shorthand for these aspects (9:16 -> 1080x1920, 16:9 -> 1920x1080);
+  // rounded to even pixels since yuv420p requires it.
+  const scale = 1080 / Math.min(w, h);
+  const even = (v: number) => Math.round((v * scale) / 2) * 2;
+  return { width: even(w), height: even(h) };
+}
+
+/** Parse a --focus flag: left/center/right, or an explicit 0..1 fraction. */
+export function parseFocus(focus: string | number | undefined): number {
+  if (focus === undefined) return 0.5;
+  if (focus === 'left') return 0;
+  if (focus === 'center') return 0.5;
+  if (focus === 'right') return 1;
+  const n = Number(focus);
+  if (Number.isNaN(n)) throw new Error(`invalid focus: ${focus} (use left/center/right or 0..1)`);
+  return Math.max(0, Math.min(1, n));
+}
+
+/**
+ * The crop window needed to go from a source's native resolution to an
+ * output aspect ratio: keep full height and narrow the width when the
+ * source is relatively wider than the output, keep full width and shorten
+ * the height when it's relatively taller. Matching aspects need no crop.
+ */
+export function cropWindow(
+  srcW: number,
+  srcH: number,
+  outW: number,
+  outH: number,
+): { width: number; height: number; axis: 'x' | 'y' | 'none' } {
+  const srcAspect = srcW / srcH;
+  const outAspect = outW / outH;
+  if (Math.abs(srcAspect - outAspect) < 1e-6) return { width: srcW, height: srcH, axis: 'none' };
+  if (srcAspect > outAspect) {
+    const width = Math.min(srcW, Math.round((srcH * outAspect) / 2) * 2);
+    return { width, height: srcH, axis: 'x' };
+  }
+  const height = Math.min(srcH, Math.round(srcW / outAspect / 2) * 2);
+  return { width: srcW, height, axis: 'y' };
+}
+
+/**
+ * Convert a clip's 0..1 crop position into a pixel offset: 0 pins the
+ * window to the start (left/top), 1 to the end (right/bottom), clamped to
+ * whatever slack the source has left over after cropWindow.
+ */
+export function cropOffset(sourceDim: number, windowDim: number, pos: number | undefined): number {
+  const slack = Math.max(0, sourceDim - windowDim);
+  const p = Math.max(0, Math.min(1, pos ?? 0.5));
+  return Math.round(slack * p);
+}
+
+/** Full crop geometry for one clip, or null when its source already matches the output aspect. */
+export function cropGeometry(
+  srcW: number,
+  srcH: number,
+  outW: number,
+  outH: number,
+  crop: { x?: number; y?: number } | undefined,
+): { width: number; height: number; x: number; y: number } | null {
+  const win = cropWindow(srcW, srcH, outW, outH);
+  if (win.axis === 'none') return null;
+  const x = win.axis === 'x' ? cropOffset(srcW, win.width, crop?.x) : 0;
+  const y = win.axis === 'y' ? cropOffset(srcH, win.height, crop?.y) : 0;
+  return { width: win.width, height: win.height, x, y };
+}
+
+/** Set output resolution and apply the same focus position to every clip's crop. */
+export function applyReframe(m: Manifest, output: { width: number; height: number }, focus: number): Manifest {
+  return {
+    ...m,
+    output,
+    timeline: { ...m.timeline, video: m.timeline.video.map((c) => ({ ...c, crop: { x: focus, y: focus } })) },
+  };
+}
+
+/** Adjust one clip's crop position without touching the others. */
+export function setClipCrop(m: Manifest, clipId: string, patch: { x?: number; y?: number }): Manifest {
+  if (!m.timeline.video.some((c) => c.id === clipId)) throw new Error(`unknown clip: ${clipId}`);
+  // Drop explicit-undefined keys (e.g. a caller building `{ x: b.x, y: b.y }`
+  // from a partial request body) before merging, so an omitted axis leaves
+  // the existing value alone instead of getting clobbered by `undefined`.
+  const clean = { ...(patch.x !== undefined ? { x: patch.x } : {}), ...(patch.y !== undefined ? { y: patch.y } : {}) };
+  return {
+    ...m,
+    timeline: {
+      ...m.timeline,
+      video: m.timeline.video.map((c) => (c.id === clipId ? { ...c, crop: { ...c.crop, ...clean } } : c)),
+    },
+  };
 }

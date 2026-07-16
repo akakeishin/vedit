@@ -222,3 +222,106 @@ describe('daemon: single-source project', () => {
     expect(body.error).toMatch(/nothing to remove/);
   });
 });
+
+// ---- Suite 3: clip selection/reorder + reframe (P0 workflow ops) ----
+describe('daemon: clip ops and reframe', () => {
+  const PORT = 18181;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-clips-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'clips');
+
+    await project.commit(0, 'system', 'setup', {}, 'seed sources', (m) => ({
+      ...m,
+      fps: 30,
+      width: 1920,
+      height: 1080,
+      sources: [
+        { id: 's1', path: '/media/one.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: true },
+        { id: 's2', path: '/media/two.mp4', duration: 20, fps: 30, width: 1920, height: 1080, hasAudio: true },
+      ],
+      timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 30 }], motion: [] },
+    }));
+
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('clip-add appends a new clip and returns its id', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude',
+      baseRev: state.revision,
+      op: 'clip-add',
+      sourceId: 's2',
+      in: 2,
+      out: 8,
+    });
+    expect(status).toBe(200);
+    expect(body.clipId).toBeTruthy();
+
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.timeline.video).toHaveLength(2);
+    expect(project.manifest.timeline.video[1]).toMatchObject({ id: body.clipId, sourceId: 's2', srcIn: 2, srcOut: 8 });
+  });
+
+  it('clip-add rejects an unknown source', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude',
+      baseRev: state.revision,
+      op: 'clip-add',
+      sourceId: 'nope',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/unknown source/);
+  });
+
+  it('clip-move reorders, then clip-remove drops a clip without touching its source', async () => {
+    let state = (await getJson(BASE, '/api/state')).body;
+    let project = (await getJson(BASE, '/api/project')).body;
+    const [c1, c2] = project.manifest.timeline.video;
+
+    let r = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'clip-move', clipId: c2.id, before: c1.id });
+    expect(r.status).toBe(200);
+    project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.timeline.video.map((c: any) => c.id)).toEqual([c2.id, c1.id]);
+
+    state = (await getJson(BASE, '/api/state')).body;
+    r = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'clip-remove', clipId: c2.id });
+    expect(r.status).toBe(200);
+    project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.timeline.video.map((c: any) => c.id)).toEqual([c1.id]);
+    expect(project.manifest.sources.some((s: any) => s.id === 's2')).toBe(true); // source stays in the pool
+  });
+
+  it('reframe sets output and stamps crop onto every clip; clip-crop adjusts one clip', async () => {
+    let state = (await getJson(BASE, '/api/state')).body;
+    let r = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'reframe', spec: '9:16', focus: 'left' });
+    expect(r.status).toBe(200);
+    expect(r.body.output).toEqual({ width: 1080, height: 1920 });
+
+    let project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.output).toEqual({ width: 1080, height: 1920 });
+    const clipId = project.manifest.timeline.video[0].id;
+    expect(project.manifest.timeline.video[0].crop).toEqual({ x: 0, y: 0 });
+
+    state = (await getJson(BASE, '/api/state')).body;
+    r = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'clip-crop', clipId, x: 0.75 });
+    expect(r.status).toBe(200);
+    project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.timeline.video[0].crop).toEqual({ x: 0.75, y: 0 });
+  });
+
+  it('reframe rejects an invalid spec', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'reframe', spec: 'nonsense' });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/invalid reframe spec/);
+  });
+});

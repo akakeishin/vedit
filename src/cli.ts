@@ -5,9 +5,13 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { startDaemon } from './server/daemon.js';
 import { Project } from './core/project.js';
+import { segments, timelineDuration } from './core/ops.js';
+import { listProjects } from './core/registry.js';
+import { loadPreset, listPresets, savePreset } from './core/presets.js';
 import { renderView } from './export/view.js';
-import { writeOtio } from './export/otio.js';
-import { renderFinal } from './export/render.js';
+import { hasReframe, writeOtio } from './export/otio.js';
+import { renderFinal, toAss } from './export/render.js';
+import { writeSrt } from './export/srt.js';
 import { downloadWhisperModel, findWhisperModel } from './ingest/ingest.js';
 import { ffmpegBin, ffmpegHasFilter, run } from './ingest/run.js';
 import type { Transcript } from './core/types.js';
@@ -113,17 +117,23 @@ const HELP = `vedit — conversational local NLE
 
 usage: vedit <command> [args] [--project <dir>]
 
-project:   create <dir> [--name n] | status | revisions | undo [--rev N] | open
-ingest:    ingest <file...> [--language ja] [--no-transcribe]
-read:      transcript [--full] [--source id] | candidates [--all]
+project:   create <dir> [--name n] | status | revisions | undo [--rev N] | open | projects
+ingest:    ingest <file...> [--language ja] [--no-transcribe] [--no-add]
+read:      transcript [--full] [--source id] | candidates [--all] | sources
 detect:    detect [--min-gap 0.7] [--threshold 0.06] [--no-fillers] [--no-silence]
 cut:       remove-words <w1 w5..w9 ...> [--source id] [--pad 0.08] | remove-range <t0> <t1> [--source id]
            approve <id...|all> | reject <id...> | trim <clipId> <in|out> <±frames>
+clips:     clip-add <sourceId> [--in s] [--out s] [--at index] | clip-remove <clipId>
+           clip-move <clipId> --before <clipId|end>
+reframe:   reframe <9:16|1:1|16:9|WxH> [--focus left|center|right|0..1]
+           clip-crop <clipId> [--x 0..1] [--y 0..1]
 captions:  captions [--enabled true|false] [--style clean|bold] [--max-chars 24]
 motion:    motion-add --type chapter-card --text "..." --at 12 --duration 4 [--subtitle ...]
            motion-update <id> [--text ...] [--at ...] [--duration ...] | motion-remove <id>
 inspect:   view [--from a] [--to b] [--domain timeline|source] [--source id] (prints PNG path)
-export:    export otio <out.otio> | export render <out.mp4> [--burn-captions] | export fcp7xml <out.xml>
+export:    export otio <out.otio> | export render <out.mp4> [--burn-captions]
+           export fcp7xml <out.xml> | export srt <out.srt> | export ass <out.ass>
+presets:   preset-save <name> [--data '{"k":"v"}'] | preset-apply <name> | preset-list
 misc:      doctor [--download-model [name]] | serve [--port]
 
 Mutating commands REQUIRE --base <rev> (or --latest to explicitly use the
@@ -164,6 +174,23 @@ async function main() {
       return out({ ...state, previewUrl: BASE, hint: 'pass --base ' + state.revision + ' to mutating commands' });
     }
 
+    case 'projects': {
+      // Global registry, not tied to any single project — reads the
+      // project.json files directly instead of going through the daemon.
+      const entries = await listProjects();
+      const rows = [];
+      for (const e of entries) {
+        try {
+          const p = await Project.open(e.dir);
+          const m = await p.manifest();
+          rows.push({ name: m.name, dir: e.dir, lastOpened: e.lastOpened, duration: timelineDuration(m) });
+        } catch {
+          rows.push({ name: e.name, dir: e.dir, lastOpened: e.lastOpened, duration: null });
+        }
+      }
+      return out(rows);
+    }
+
     case 'ingest': {
       const dir = projectDir();
       await ensureDaemon(dir);
@@ -176,6 +203,7 @@ async function main() {
             file: path.resolve(f),
             language: flags.language,
             transcribe: flags['no-transcribe'] ? false : undefined,
+            addToTimeline: flags['no-add'] ? false : undefined,
           }),
         });
         out(res);
@@ -215,6 +243,25 @@ async function main() {
       return out(await api(`/api/candidates${flags.all ? '?all=1' : ''}`));
     }
 
+    case 'sources': {
+      // Read-only project inventory; reads project.json directly like
+      // `view`/`export` rather than going through the daemon.
+      const dir = projectDir();
+      const p = await Project.open(dir);
+      const m = await p.manifest();
+      const used = new Map<string, number>();
+      for (const s of segments(m)) used.set(s.sourceId, (used.get(s.sourceId) ?? 0) + (s.tlEnd - s.tlStart));
+      return out(
+        m.sources.map((s) => ({
+          id: s.id,
+          file: path.basename(s.path),
+          duration: s.duration,
+          transcribed: !!s.transcribed,
+          usedSeconds: used.get(s.id) ?? 0,
+        })),
+      );
+    }
+
     case 'approve':
     case 'reject': {
       const dir = projectDir();
@@ -240,6 +287,37 @@ async function main() {
     case 'trim':
       if (pos.length < 3) fail('usage: vedit trim <clipId> <in|out> <±frames>');
       return edit({ op: 'trim', clipId: pos[0], edge: pos[1], frames: Number(pos[2]) });
+
+    case 'clip-add':
+      if (pos.length === 0) fail('usage: vedit clip-add <sourceId> [--in s] [--out s] [--at index]');
+      return edit({
+        op: 'clip-add',
+        sourceId: pos[0],
+        in: flags.in !== undefined ? Number(flags.in) : undefined,
+        out: flags.out !== undefined ? Number(flags.out) : undefined,
+        at: flags.at !== undefined ? Number(flags.at) : undefined,
+      });
+
+    case 'clip-remove':
+      if (pos.length === 0) fail('usage: vedit clip-remove <clipId>');
+      return edit({ op: 'clip-remove', clipId: pos[0] });
+
+    case 'clip-move':
+      if (pos.length === 0 || flags.before === undefined) fail('usage: vedit clip-move <clipId> --before <clipId|end>');
+      return edit({ op: 'clip-move', clipId: pos[0], before: flags.before });
+
+    case 'reframe':
+      if (pos.length === 0) fail('usage: vedit reframe <9:16|1:1|16:9|WxH> [--focus left|center|right|0..1]');
+      return edit({ op: 'reframe', spec: pos[0], focus: flags.focus });
+
+    case 'clip-crop':
+      if (pos.length === 0) fail('usage: vedit clip-crop <clipId> [--x 0..1] [--y 0..1]');
+      return edit({
+        op: 'clip-crop',
+        clipId: pos[0],
+        x: flags.x !== undefined ? Number(flags.x) : undefined,
+        y: flags.y !== undefined ? Number(flags.y) : undefined,
+      });
 
     case 'captions': {
       const patch: Record<string, unknown> = {};
@@ -279,6 +357,26 @@ async function main() {
     case 'motion-remove':
       return edit({ op: 'motion-remove', id: pos[0] ?? fail('usage: vedit motion-remove <id>') });
 
+    case 'preset-save': {
+      const name = pos[0] ?? fail('usage: vedit preset-save <name> [--data \'{"k":"v"}\']');
+      const dir = projectDir();
+      const p = await Project.open(dir);
+      const m = await p.manifest();
+      const extra = flags.data ? JSON.parse(String(flags.data)) : undefined;
+      return out({ ok: true, preset: await savePreset(name, m.captions, extra) });
+    }
+
+    case 'preset-apply': {
+      // Reuses the existing `captions` edit op — presets currently only
+      // carry caption settings, so no new daemon op is needed.
+      const name = pos[0] ?? fail('usage: vedit preset-apply <name>');
+      const preset = await loadPreset(name);
+      return edit({ op: 'captions', patch: preset.captions });
+    }
+
+    case 'preset-list':
+      return out(await listPresets());
+
     case 'undo': {
       const dir = projectDir();
       await ensureDaemon(dir);
@@ -314,16 +412,31 @@ async function main() {
       const p = await Project.open(dir);
       const m = await p.manifest();
       const kind = pos[0];
-      const dest = pos[1] ?? fail('usage: vedit export <otio|render|fcp7xml> <outfile>');
+      const dest = pos[1] ?? fail('usage: vedit export <otio|render|fcp7xml|srt|ass> <outfile>');
+      const transcriptsOf = async (): Promise<Transcript[]> => {
+        const t: Transcript[] = [];
+        for (const s of m.sources) if (s.transcribed) t.push(await p.transcript(s.id));
+        return t;
+      };
       if (kind === 'otio') {
         await writeOtio(m, path.resolve(dest));
-        return out({ ok: true, file: dest, hint: 'DaVinci Resolve: File > Import > Timeline (18.5+, free version OK)' });
+        // OTIO has no cue-list concept, so captions would silently vanish on
+        // import; write a sidecar .srt next to it so Resolve/Premiere still
+        // get the subtitles.
+        const parsed = path.parse(path.resolve(dest));
+        const srtPath = path.join(parsed.dir, parsed.name + '.srt');
+        await writeSrt(m, await transcriptsOf(), srtPath);
+        if (hasReframe(m)) console.error('Resolve 側でリフレームは再現されません(メタデータとして記録)');
+        return out({
+          ok: true,
+          file: dest,
+          srt: srtPath,
+          hint: 'DaVinci Resolve: File > Import > Timeline (18.5+, free version OK). 字幕は File > Import > Subtitle で .srt を読み込んでください',
+        });
       }
       if (kind === 'render') {
-        const transcripts: Transcript[] = [];
-        for (const s of m.sources) if (s.transcribed) transcripts.push(await p.transcript(s.id));
         console.error('rendering from original sources (this encodes the full timeline)...');
-        await renderFinal(m, transcripts, path.resolve(dest), { burnCaptions: Boolean(flags['burn-captions']) });
+        await renderFinal(m, await transcriptsOf(), path.resolve(dest), { burnCaptions: Boolean(flags['burn-captions']) });
         return out({ ok: true, file: dest });
       }
       if (kind === 'fcp7xml') {
@@ -335,7 +448,16 @@ async function main() {
           fail(`fcp7xml conversion failed (needs uv + python): ${e.message}\nThe .otio file was written to ${otioTmp}; Resolve can import it directly.`);
         }
         await fs.rm(otioTmp, { force: true });
+        if (hasReframe(m)) console.error('Resolve 側でリフレームは再現されません(メタデータとして記録)');
         return out({ ok: true, file: dest, hint: 'Premiere: File > Import (FCP7 XML)' });
+      }
+      if (kind === 'srt') {
+        await writeSrt(m, await transcriptsOf(), path.resolve(dest));
+        return out({ ok: true, file: dest });
+      }
+      if (kind === 'ass') {
+        await fs.writeFile(path.resolve(dest), toAss(m, await transcriptsOf()));
+        return out({ ok: true, file: dest });
       }
       fail(`unknown export kind: ${kind}`);
       return;

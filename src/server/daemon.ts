@@ -5,15 +5,23 @@ import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
 import { Project } from '../core/project.js';
 import {
+  addClip,
+  applyReframe,
   expandWordIds,
+  moveClip,
   padWordRange,
+  parseFocus,
+  parseReframeSpec,
+  removeClip,
   removeSourceRange,
   segments,
+  setClipCrop,
   sourceRangeToTimeline,
   timelineDuration,
   trimClip,
   wordRange,
 } from '../core/ops.js';
+import { upsertProject } from '../core/registry.js';
 import { captionCues } from '../core/captions.js';
 import { detectFillers, detectSilences, detectSilencesFromPeaks } from '../core/detect.js';
 import type { Peaks } from '../core/detect.js';
@@ -140,6 +148,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       const dir = path.resolve(b.dir);
       try {
         ctx.project = await Project.open(dir);
+        await upsertProject(dir, (await ctx.project.manifest()).name); // Project.create() upserts on its own path
       } catch {
         ctx.project = await Project.create(dir, b.name ?? path.basename(dir));
       }
@@ -234,6 +243,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       const { source: src, timings } = await ingestFile(p, b.file, {
         language: b.language,
         transcribe: b.transcribe,
+        addToTimeline: b.addToTimeline,
         onProgress: (step) => broadcast(ctx, { type: 'ingest-progress', step }),
       });
       broadcast(ctx, { type: 'update', revision: (await p.manifest()).revision, op: 'ingest', summary: `ingested ${b.file}` });
@@ -341,6 +351,37 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
           ...m,
           timeline: { ...m.timeline, motion: m.timeline.motion.filter((x) => x.id !== b.id) },
         }));
+        return json(res, 200, { state: await stateSummary(p) });
+      }
+      if (b.op === 'clip-add') {
+        const clipId = freshId('c');
+        await mutate(actor, baseRev, 'clip-add', b, `clip-add ${b.sourceId} [${b.in ?? 0}-${b.out ?? '*'}]`, (m) =>
+          addClip(m, b.sourceId, { in: b.in, out: b.out, at: b.at, id: clipId }),
+        );
+        return json(res, 200, { clipId, state: await stateSummary(p) });
+      }
+      if (b.op === 'clip-remove') {
+        await mutate(actor, baseRev, 'clip-remove', b, `clip-remove ${b.clipId}`, (m) => removeClip(m, b.clipId));
+        return json(res, 200, { state: await stateSummary(p) });
+      }
+      if (b.op === 'clip-move') {
+        await mutate(actor, baseRev, 'clip-move', b, `clip-move ${b.clipId} before ${b.before}`, (m) =>
+          moveClip(m, b.clipId, b.before),
+        );
+        return json(res, 200, { state: await stateSummary(p) });
+      }
+      if (b.op === 'reframe') {
+        const output = parseReframeSpec(b.spec);
+        const focus = parseFocus(b.focus);
+        await mutate(actor, baseRev, 'reframe', b, `reframe ${output.width}x${output.height} focus=${b.focus ?? 'center'}`, (m) =>
+          applyReframe(m, output, focus),
+        );
+        return json(res, 200, { output, state: await stateSummary(p) });
+      }
+      if (b.op === 'clip-crop') {
+        await mutate(actor, baseRev, 'clip-crop', b, `clip-crop ${b.clipId} x=${b.x ?? '-'} y=${b.y ?? '-'}`, (m) =>
+          setClipCrop(m, b.clipId, { x: b.x, y: b.y }),
+        );
         return json(res, 200, { state: await stateSummary(p) });
       }
       if (b.op === 'restore') {
