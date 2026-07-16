@@ -1,4 +1,4 @@
-import { segments } from '../core/ops.js';
+import { orphanedOverlays, resolvedActiveOverlays, segments } from '../core/ops.js';
 import type { Manifest } from '../core/types.js';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
@@ -144,6 +144,56 @@ export function toOtio(m: Manifest): unknown {
   };
   const mTrack = musicTrack();
 
+  // B-roll V2 track (W3): resolved (non-orphan) overlays only, each a
+  // Clip.1 gapped to its resolved tlStart — same Gap/Clip shape as the A2
+  // music track above. Orphans (anchor cut away) are never written to the
+  // file; they're surfaced as a console warning instead, mirroring how
+  // reframe state that OTIO can't express is warned about via hasReframe().
+  const overlayTrack = () => {
+    const active = resolvedActiveOverlays(m);
+    for (const o of orphanedOverlays(m)) {
+      console.warn(`[vedit] overlay ${o.id} is orphaned (${o.reason}); excluded from OTIO V2 track`);
+    }
+    if (active.length === 0) return null;
+    const children: unknown[] = [];
+    let cursor = 0;
+    for (const r of active) {
+      const ov = r.overlay;
+      if (r.tlStart > cursor + 1e-9) {
+        children.push({
+          OTIO_SCHEMA: 'Gap.1',
+          name: 'gap',
+          source_range: tr(0, r.tlStart - cursor, rate),
+          effects: [],
+          markers: [],
+          metadata: {},
+        });
+      }
+      const ovSrc = srcById.get(ov.sourceId)!;
+      const ovRate = ovSrc.fps || rate;
+      children.push({
+        OTIO_SCHEMA: 'Clip.1',
+        name: `B${children.length + 1}`,
+        source_range: tr(ov.srcIn, ov.srcOut, ovRate),
+        media_reference: mediaRef(ov.sourceId),
+        effects: [],
+        markers: [],
+        metadata: { vedit: { overlayId: ov.id, audioMode: ov.audioMode, ...(ov.gainDb !== undefined ? { gainDb: ov.gainDb } : {}) } },
+      });
+      cursor = Math.max(cursor, r.tlEnd);
+    }
+    return {
+      OTIO_SCHEMA: 'Track.1',
+      name: 'V2',
+      kind: 'Video',
+      children,
+      markers: [],
+      effects: [],
+      metadata: {},
+    };
+  };
+  const oTrack = overlayTrack();
+
   return {
     OTIO_SCHEMA: 'Timeline.1',
     name: m.name,
@@ -151,7 +201,7 @@ export function toOtio(m: Manifest): unknown {
     tracks: {
       OTIO_SCHEMA: 'Stack.1',
       name: 'tracks',
-      children: [track('Video'), track('Audio'), ...(mTrack ? [mTrack] : [])],
+      children: [track('Video'), track('Audio'), ...(mTrack ? [mTrack] : []), ...(oTrack ? [oTrack] : [])],
       markers: [],
       effects: [],
       metadata: {},

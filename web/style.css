@@ -55,6 +55,12 @@ main { flex: 1; display: flex; min-height: 0; }
    plain letterboxing (videoBox fills videoWrap). */
 #videoWrap.customAspect #videoBox { width: auto; height: 100%; max-width: 100%; aspect-ratio: var(--out-ar, 16/9); margin: 0 auto; }
 #videoWrap.customAspect #videoBox video { object-fit: cover; }
+/* B-roll V2 preview (W3): a second <video> stacked over #video, shown only
+   while the playhead is inside an active overlay's resolved [tlStart,tlEnd)
+   (see syncOverlayVideo in app.js) — a full-frame replace, not a PiP. Placed
+   before captionLayer/motionLayer in the DOM so captions/motion still draw
+   on top of it, matching render.ts's compositing order. */
+#videoOverlay { position: absolute; inset: 0; z-index: 1; background: #000; pointer-events: none; }
 
 #captionLayer {
   position: absolute; left: 0; right: 0; bottom: 6%; text-align: center; pointer-events: none;
@@ -129,8 +135,23 @@ main { flex: 1; display: flex; min-height: 0; }
   flex: none;
 }
 #wave { position: absolute; inset: 0; width: 100%; height: 100%; }
-#clips { position: absolute; left: 0; right: 0; top: 0; height: 62%; }
-#sceneMarks { position: absolute; left: 0; right: 0; top: 0; height: 62%; pointer-events: none; }
+/* B-roll V2 row (W3): thin strip ABOVE the clip row per spec, teal so it
+   reads as a distinct layer from the A-roll clips/scene marks below it. */
+#overlayRow { position: absolute; left: 0; right: 0; top: 0; height: 12%; }
+.ovBlock {
+  position: absolute; top: 0; height: 100%; border-radius: 3px;
+  background: rgba(45, 197, 191, 0.85); font-size: 9px; color: #04101f;
+  overflow: hidden; white-space: nowrap; padding: 0 3px; cursor: pointer;
+}
+/* Orphaned overlay (anchor cut away): fixed-width warning chips stacked at
+   the row's left edge, since there's no resolved timeline position to place
+   them at — click shows the reason as a toast. */
+.ovBlock.orphan {
+  width: 12px; background: rgba(214, 87, 60, 0.92); color: #fff;
+  text-align: center; font-weight: 700;
+}
+#clips { position: absolute; left: 0; right: 0; top: 12%; height: 50%; }
+#sceneMarks { position: absolute; left: 0; right: 0; top: 12%; height: 50%; pointer-events: none; }
 .sceneMark {
   position: absolute; top: 0; width: 1px; height: 100%;
   background: rgba(255, 255, 255, 0.4); pointer-events: auto; cursor: pointer;

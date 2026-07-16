@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { COLOR_WARNING_MESSAGE, needsColorTransform, timelineDuration } from './ops.js';
+import { COLOR_WARNING_MESSAGE, needsColorTransform, orphanedOverlays, timelineDuration } from './ops.js';
 import type { CutCandidate, Manifest, RevisionEntry } from './types.js';
 
 /** A revision log entry as returned by `Project.revisions()` (no snapshot/motionSpecs). */
@@ -28,6 +28,8 @@ export interface ResumeSummary {
   userEditsSinceClaude: ResumeRevisionSummary[];
   pendingCandidates: { total: number; byKind: Record<string, number> };
   sources: { id: string; file: string; transcribed: boolean; colorWarning?: string }[];
+  /** B-roll (V2) overlays whose anchor was cut away — see ops.ts's orphanedOverlays. */
+  orphanedOverlays: { id: string; reason: string }[];
   /** Up to 3 mechanically-derivable next actions. */
   nextSteps: string[];
 }
@@ -77,10 +79,13 @@ export function buildResume(
     ...(needsColorTransform(s.color) ? { colorWarning: COLOR_WARNING_MESSAGE } : {}),
   }));
 
+  const orphans = orphanedOverlays(m);
+
   const nextSteps: string[] = [];
   if (pending.length > 0) nextSteps.push(`保留中の候補 ${pending.length} 件を確認する (vedit candidates)`);
   if (!m.captions.enabled) nextSteps.push('字幕が無効です — 必要なら vedit captions --enabled true');
   if (sources.some((s) => s.colorWarning)) nextSteps.push('Log/HLG素材があります — プレビュー・レンダーの色が浅く見える点に注意');
+  if (orphans.length > 0) nextSteps.push(`B-roll オーバーレイ ${orphans.length} 件が orphan です — 再アンカーしてください (vedit broll-update)`);
   if (nextSteps.length < 3 && m.timeline.video.length === 0) nextSteps.push('素材を ingest してタイムラインを作成する');
 
   return {
@@ -89,6 +94,7 @@ export function buildResume(
     userEditsSinceClaude,
     pendingCandidates: { total: pending.length, byKind },
     sources,
+    orphanedOverlays: orphans,
     nextSteps: nextSteps.slice(0, 3),
   };
 }

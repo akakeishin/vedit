@@ -7,6 +7,7 @@ import { Project, resolveWithinDir } from '../core/project.js';
 import {
   addClip,
   addMusic,
+  addOverlay,
   applyReframe,
   buildSelectsTimeline,
   COLOR_WARNING_MESSAGE,
@@ -14,12 +15,15 @@ import {
   expandWordIds,
   moveClip,
   needsColorTransform,
+  orphanedOverlays,
   padWordRange,
   parseFocus,
   parseReframeSpec,
   removeClip,
   removeMusic,
+  removeOverlay,
   removeSourceRange,
+  resolveOverlays,
   segments,
   setAudioMix,
   setAudioRepair,
@@ -29,6 +33,7 @@ import {
   timelineDuration,
   trimClip,
   updateMusic,
+  updateOverlay,
   wordRange,
 } from '../core/ops.js';
 import { upsertProject } from '../core/registry.js';
@@ -155,6 +160,7 @@ async function stateSummary(p: Project) {
   const m = await p.manifest();
   const cands = await p.candidates();
   const pending = cands.filter((c) => c.status === 'proposed').length;
+  const orphans = orphanedOverlays(m);
   return {
     revision: m.revision,
     name: m.name,
@@ -163,6 +169,7 @@ async function stateSummary(p: Project) {
     clips: m.timeline.video.length,
     motion: m.timeline.motion.length,
     music: (m.timeline.music ?? []).length,
+    overlays: (m.timeline.overlays ?? []).length,
     sources: m.sources.map((s) => ({
       id: s.id,
       path: s.path,
@@ -172,6 +179,9 @@ async function stateSummary(p: Project) {
     })),
     pendingCandidates: pending,
     captions: m.captions,
+    // orphaned B-roll overlays (anchor cut away) — see ops.ts's
+    // orphanedOverlays; only present when non-empty, like `warning` below.
+    ...(orphans.length ? { orphanedOverlays: orphans } : {}),
     // Set only when Project.open() had to repair a crash-damaged
     // revisions.jsonl (see Project.reconcile); absent otherwise.
     ...(p.warning ? { warning: p.warning } : {}),
@@ -255,7 +265,9 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
     if (pathname === '/api/state') return json(res, 200, await stateSummary(p));
     if (pathname === '/api/project') {
       const m = await p.manifest();
-      return json(res, 200, { manifest: m, segments: segments(m), duration: timelineDuration(m) });
+      // `overlays` carries every V2 item's resolved tlStart (null = orphan)
+      // so the web UI never has to reimplement sourceTimeToTimeline itself.
+      return json(res, 200, { manifest: m, segments: segments(m), duration: timelineDuration(m), overlays: resolveOverlays(m) });
     }
     if (pathname === '/api/revisions') return json(res, 200, await p.revisions());
     if (pathname === '/api/transcript') {
@@ -599,6 +611,37 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
           return json(res, 400, { error: `unknown music item: ${b.id}` });
         }
         await mutate(p, actor, baseRev, 'music-remove', b, `music-remove ${b.id}`, (m) => removeMusic(m, b.id));
+        return json(res, 200, { state: await stateSummary(p) });
+      }
+      if (b.op === 'broll-add') {
+        if (!b.anchor || typeof b.anchor.sourceId !== 'string' || typeof b.anchor.srcTime !== 'number') {
+          return json(res, 400, { error: 'broll-add: anchor {sourceId, srcTime} is required' });
+        }
+        const id = freshId('ov');
+        await mutate(
+          p, actor, baseRev, 'broll-add', b,
+          `broll-add ${b.sourceId} [${b.in}-${b.out}] anchor ${b.anchor.sourceId}@${Number(b.anchor.srcTime).toFixed(2)}`,
+          (m) => addOverlay(m, b.sourceId, { srcIn: b.in, srcOut: b.out, anchor: b.anchor, audioMode: b.audioMode, gainDb: b.gainDb, id }),
+        );
+        return json(res, 200, { id, state: await stateSummary(p) });
+      }
+      if (b.op === 'broll-update') {
+        if (!(m0.timeline.overlays ?? []).some((x) => x.id === b.id)) {
+          return json(res, 400, { error: `unknown overlay: ${b.id}` });
+        }
+        if (b.anchor !== undefined && (typeof b.anchor.sourceId !== 'string' || typeof b.anchor.srcTime !== 'number')) {
+          return json(res, 400, { error: 'broll-update: anchor must be {sourceId, srcTime}' });
+        }
+        await mutate(p, actor, baseRev, 'broll-update', b, `broll-update ${b.id}`, (m) =>
+          updateOverlay(m, b.id, { srcIn: b.in, srcOut: b.out, anchor: b.anchor, audioMode: b.audioMode, gainDb: b.gainDb }),
+        );
+        return json(res, 200, { state: await stateSummary(p) });
+      }
+      if (b.op === 'broll-remove') {
+        if (!(m0.timeline.overlays ?? []).some((x) => x.id === b.id)) {
+          return json(res, 400, { error: `unknown overlay: ${b.id}` });
+        }
+        await mutate(p, actor, baseRev, 'broll-remove', b, `broll-remove ${b.id}`, (m) => removeOverlay(m, b.id));
         return json(res, 200, { state: await stateSummary(p) });
       }
       if (b.op === 'audio-mix') {

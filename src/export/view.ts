@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { cropGeometry, segments } from '../core/ops.js';
+import { cropGeometry, resolvedActiveOverlays, segments } from '../core/ops.js';
 import type { Manifest, SceneFile } from '../core/types.js';
 import { ffmpegHasFilter, run } from '../ingest/run.js';
 
@@ -50,13 +50,23 @@ export async function renderView(
   // Build the list of (sourceId, srcTime) sample points. Crop only applies
   // in 'timeline' domain — it's a per-clip concept, and 'source' domain is
   // meant to show the raw, uncut, unframed source for inspection.
-  const points: { sourceId: string; t: number; crop?: { x?: number; y?: number } }[] = [];
+  const points: { sourceId: string; t: number; crop?: { x?: number; y?: number }; overlayId?: string }[] = [];
   if (domain === 'timeline') {
     const total = segs[segs.length - 1].tlEnd;
     const from = opts.from ?? 0;
     const to = Math.min(opts.to ?? total, total);
+    // A sample point that falls inside a resolved (non-orphan) B-roll
+    // overlay's [tlStart,tlEnd) draws the B-roll frame instead of the A-roll
+    // clip underneath — matching what render.ts's overlay compositing
+    // actually produces at that timeline instant.
+    const activeOverlays = resolvedActiveOverlays(m);
     for (let i = 0; i < n; i++) {
       const tl = from + ((to - from) * (i + 0.5)) / n;
+      const ov = activeOverlays.find((r) => tl >= r.tlStart && tl < r.tlEnd);
+      if (ov) {
+        points.push({ sourceId: ov.overlay.sourceId, t: ov.overlay.srcIn + (tl - ov.tlStart), overlayId: ov.overlay.id });
+        continue;
+      }
       const seg = segs.find((s) => tl >= s.tlStart && tl < s.tlEnd) ?? segs[segs.length - 1];
       points.push({ sourceId: seg.sourceId, t: seg.srcStart + (tl - seg.tlStart), crop: seg.crop });
     }
@@ -92,8 +102,13 @@ export async function renderView(
   await run('ffmpeg', ['-y', '-v', 'error', ...inputs, '-filter_complex', tile, '-map', '[strip]', outPath]);
   await run('rm', tmpFrames);
   // Grid legend (left-to-right, top-to-bottom): source times of each cell,
-  // essential when timecodes could not be burned in.
-  const grid = points.map((pt, i) => `cell${i + 1}(r${Math.floor(i / cols) + 1}c${(i % cols) + 1})=${pt.t.toFixed(1)}s@${pt.sourceId}`);
+  // essential when timecodes could not be burned in. Cells drawn from a
+  // B-roll overlay are flagged explicitly so the legend doesn't silently
+  // misattribute a frame to the A-roll clip that's actually cut away there.
+  const grid = points.map(
+    (pt, i) =>
+      `cell${i + 1}(r${Math.floor(i / cols) + 1}c${(i % cols) + 1})=${pt.t.toFixed(1)}s@${pt.sourceId}${pt.overlayId ? ` [overlay ${pt.overlayId}]` : ''}`,
+  );
   return { png: outPath, timecodesBurnedIn: canDrawText, grid };
 }
 

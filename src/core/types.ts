@@ -81,6 +81,37 @@ export interface Timeline {
   motion: MotionItem[];
   /** Background-music items; optional for backward compatibility with older project.json files. */
   music?: MusicItem[];
+  /**
+   * B-roll overlay track (W3), a single non-overlapping layer laid on top of
+   * the A-roll video. Optional for backward compatibility with older
+   * project.json files. See OverlayClip for the anchor contract.
+   */
+  overlays?: OverlayClip[];
+}
+
+/**
+ * A B-roll clip anchored to a moment in an A-roll source rather than to an
+ * absolute timeline position. `anchor` (sourceId + srcTime) is the single
+ * source of truth for placement: the timeline position is always derived via
+ * `sourceTimeToTimeline(anchor)`, never stored, so ripple edits to the A-roll
+ * (cut/reorder) that leave the anchored instant intact automatically carry
+ * the overlay along with it. If the anchored instant itself gets cut away,
+ * the overlay becomes "orphaned" — kept in the manifest but excluded from
+ * render/preview/OTIO until the user re-anchors it (see resolveOverlays).
+ */
+export interface OverlayClip {
+  id: string;
+  /** B-roll source material. */
+  sourceId: string;
+  /** Kept range in the B-roll source's own time; duration = srcOut - srcIn. */
+  srcIn: number;
+  srcOut: number;
+  /** The A-roll moment this overlay is glued to. */
+  anchor: { sourceId: string; srcTime: number };
+  /** How the B-roll's own audio interacts with the A-roll's; default 'mute'. */
+  audioMode: 'mute' | 'mix' | 'replace';
+  /** Gain applied to the B-roll audio when audioMode is 'mix'/'replace'; default -18 (see render.ts's OVERLAY_GAIN_DEFAULT). */
+  gainDb?: number;
 }
 
 export interface VideoClip {

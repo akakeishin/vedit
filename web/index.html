@@ -21,6 +21,7 @@
     <div id="videoWrap">
       <div id="videoBox">
         <video id="video" playsinline aria-label="プレビュー動画"></video>
+        <video id="videoOverlay" hidden muted playsinline aria-hidden="true"></video>
         <div id="captionLayer"></div>
         <div id="motionLayer"></div>
         <div id="ingestOverlay" hidden><div class="spin"></div><span id="ingestStep" aria-live="polite"></span></div>
@@ -39,6 +40,7 @@
     </div>
     <div id="timeline">
       <canvas id="wave"></canvas>
+      <div id="overlayRow"></div>
       <div id="clips"></div>
       <div id="sceneMarks"></div>
       <div id="musicRow"></div>

@@ -5,6 +5,7 @@ import path from 'node:path';
 import {
   addClip,
   addMusic,
+  addOverlay,
   applyReframe,
   buildSelectsTimeline,
   COLOR_WARNING_MESSAGE,
@@ -16,12 +17,17 @@ import {
   keptWords,
   moveClip,
   needsColorTransform,
+  orphanedOverlays,
+  OVERLAY_GAIN_DEFAULT,
   padWordRange,
   parseFocus,
   parseReframeSpec,
   removeClip,
   removeMusic,
+  removeOverlay,
   removeSourceRange,
+  resolveOverlays,
+  resolvedActiveOverlays,
   segments,
   setAudioMix,
   setAudioRepair,
@@ -29,8 +35,10 @@ import {
   setSceneReview,
   sourceTimeToTimeline,
   timelineDuration,
+  timelineTimeToSource,
   trimClip,
   updateMusic,
+  updateOverlay,
   wordRange,
 } from './ops.js';
 import { Project } from './project.js';
@@ -772,5 +780,220 @@ describe('buildSelectsTimeline', () => {
     const before = JSON.stringify(m.timeline.video);
     buildSelectsTimeline(m, sceneFiles());
     expect(JSON.stringify(m.timeline.video)).toBe(before);
+  });
+});
+
+// ---- W3: B-roll V2 overlay track ----
+
+describe('timelineTimeToSource', () => {
+  // A-roll (s1) with a cut in the middle: tl[0,10) <- src[0,10), tl[10,20) <- src[20,30).
+  function m(): Manifest {
+    const base = manifest();
+    return {
+      ...base,
+      timeline: {
+        ...base.timeline,
+        video: [
+          { id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 10 },
+          { id: 'c2', sourceId: 's1', srcIn: 20, srcOut: 30 },
+        ],
+      },
+    };
+  }
+
+  it('is the exact inverse of sourceTimeToTimeline across a cut', () => {
+    const r = timelineTimeToSource(m(), 15);
+    expect(r).toEqual({ sourceId: 's1', srcTime: 25 });
+    expect(sourceTimeToTimeline(m(), r.sourceId, r.srcTime)).toBeCloseTo(15);
+  });
+
+  it('returns null past the end of the timeline', () => {
+    expect(timelineTimeToSource(m(), 20)).toBeNull();
+    expect(timelineTimeToSource(m(), -1)).toBeNull();
+  });
+});
+
+describe('B-roll V2 overlays (addOverlay / updateOverlay / removeOverlay)', () => {
+  // s1 = A-roll with a cut: tl[0,10) <- src[0,10), tl[10,20) <- src[20,30).
+  // s2 = B-roll source, off-timeline (pure overlay material).
+  function m(): Manifest {
+    const base = manifest();
+    return {
+      ...base,
+      sources: [
+        ...base.sources,
+        { id: 's2', path: '/broll.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: true },
+      ],
+      timeline: {
+        ...base.timeline,
+        video: [
+          { id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 10 },
+          { id: 'c2', sourceId: 's1', srcIn: 20, srcOut: 30 },
+        ],
+      },
+    };
+  }
+
+  it('addOverlay defaults audioMode to mute and stores no gainDb when omitted', () => {
+    const r = addOverlay(m(), 's2', { srcIn: 0, srcOut: 4, anchor: { sourceId: 's1', srcTime: 2 } });
+    expect(r.timeline.overlays).toHaveLength(1);
+    const ov = r.timeline.overlays[0];
+    expect(ov).toMatchObject({ sourceId: 's2', srcIn: 0, srcOut: 4, audioMode: 'mute', anchor: { sourceId: 's1', srcTime: 2 } });
+    expect(ov.gainDb).toBeUndefined();
+    expect(ov.id).toMatch(/^ov/);
+  });
+
+  it('addOverlay honors explicit audioMode/gainDb/id', () => {
+    const r = addOverlay(m(), 's2', {
+      id: 'ovX', srcIn: 1, srcOut: 5, anchor: { sourceId: 's1', srcTime: 3 }, audioMode: 'mix', gainDb: -6,
+    });
+    expect(r.timeline.overlays![0]).toEqual({
+      id: 'ovX', sourceId: 's2', srcIn: 1, srcOut: 5, anchor: { sourceId: 's1', srcTime: 3 }, audioMode: 'mix', gainDb: -6,
+    });
+  });
+
+  it('addOverlay rejects an unknown B-roll source or anchor source', () => {
+    expect(() => addOverlay(m(), 'nope', { srcIn: 0, srcOut: 4, anchor: { sourceId: 's1', srcTime: 2 } })).toThrow(/unknown B-roll source/);
+    expect(() => addOverlay(m(), 's2', { srcIn: 0, srcOut: 4, anchor: { sourceId: 'nope', srcTime: 2 } })).toThrow(/unknown anchor source/);
+  });
+
+  it('addOverlay rejects invalid ranges and an out-of-source-duration out', () => {
+    expect(() => addOverlay(m(), 's2', { srcIn: 5, srcOut: 5, anchor: { sourceId: 's1', srcTime: 2 } })).toThrow(/out.*greater than in/);
+    expect(() => addOverlay(m(), 's2', { srcIn: -1, srcOut: 4, anchor: { sourceId: 's1', srcTime: 2 } })).toThrow(/in.*>= 0/);
+    expect(() => addOverlay(m(), 's2', { srcIn: 0, srcOut: 999, anchor: { sourceId: 's1', srcTime: 2 } })).toThrow(/exceeds source duration/);
+  });
+
+  it('addOverlay rejects an invalid audioMode and an out-of-range gainDb', () => {
+    expect(() => addOverlay(m(), 's2', { srcIn: 0, srcOut: 4, anchor: { sourceId: 's1', srcTime: 2 }, audioMode: 'loud' as any })).toThrow(/audioMode/);
+    expect(() => addOverlay(m(), 's2', { srcIn: 0, srcOut: 4, anchor: { sourceId: 's1', srcTime: 2 }, gainDb: 50 })).toThrow(/gain/);
+  });
+
+  it('addOverlay rejects a duplicate id', () => {
+    const r = addOverlay(m(), 's2', { id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 1 } });
+    expect(() => addOverlay(r, 's2', { id: 'ov1', srcIn: 4, srcOut: 6, anchor: { sourceId: 's1', srcTime: 15 } })).toThrow(/id already exists/);
+  });
+
+  it('addOverlay rejects a resolved-region overlap with an existing overlay (V2 allows no overlap)', () => {
+    // First overlay: anchored at src=2 (tl=2), duration 4 -> resolved tl[2,6).
+    let r = addOverlay(m(), 's2', { id: 'ov1', srcIn: 0, srcOut: 4, anchor: { sourceId: 's1', srcTime: 2 } });
+    // Second overlay anchored at src=4 (tl=4), duration 4 -> resolved tl[4,8) — overlaps [2,6).
+    expect(() =>
+      addOverlay(r, 's2', { id: 'ov2', srcIn: 0, srcOut: 4, anchor: { sourceId: 's1', srcTime: 4 } }),
+    ).toThrow(/overlaps existing overlay ov1/);
+    // A non-overlapping placement (resolved tl[6,8)) succeeds.
+    r = addOverlay(r, 's2', { id: 'ov2', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 6 } });
+    expect(r.timeline.overlays).toHaveLength(2);
+  });
+
+  it('addOverlay allows an overlay whose anchor is currently orphaned (nothing to collide with)', () => {
+    // src=15 falls in the A-roll's cut gap (10..20) -> unresolvable.
+    const r = addOverlay(m(), 's2', { srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 15 } });
+    expect(r.timeline.overlays).toHaveLength(1);
+    expect(resolveOverlays(r)[0].tlStart).toBeNull();
+  });
+
+  it('updateOverlay patches only the given fields, leaving sourceId/id untouched', () => {
+    let r = addOverlay(m(), 's2', { id: 'ov1', srcIn: 0, srcOut: 4, anchor: { sourceId: 's1', srcTime: 2 }, audioMode: 'mute' });
+    r = updateOverlay(r, 'ov1', { audioMode: 'mix', gainDb: -10 });
+    const ov = r.timeline.overlays![0];
+    expect(ov).toMatchObject({ id: 'ov1', sourceId: 's2', srcIn: 0, srcOut: 4, audioMode: 'mix', gainDb: -10 });
+    expect(ov.anchor).toEqual({ sourceId: 's1', srcTime: 2 });
+  });
+
+  it('updateOverlay re-anchors (patch.anchor) — this is how a user fixes an orphan', () => {
+    // Anchored in the cut gap -> orphan.
+    let r = addOverlay(m(), 's2', { id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 15 } });
+    expect(resolveOverlays(r)[0].tlStart).toBeNull();
+    r = updateOverlay(r, 'ov1', { anchor: { sourceId: 's1', srcTime: 22 } });
+    expect(resolveOverlays(r)[0].tlStart).toBeCloseTo(12); // tl[10,20) <- src[20,30): src22 -> tl12
+  });
+
+  it('updateOverlay rejects an unknown id and invalid values', () => {
+    const r = addOverlay(m(), 's2', { id: 'ov1', srcIn: 0, srcOut: 4, anchor: { sourceId: 's1', srcTime: 2 } });
+    expect(() => updateOverlay(r, 'nope', { audioMode: 'mix' })).toThrow(/unknown overlay/);
+    expect(() => updateOverlay(r, 'ov1', { audioMode: 'loud' as any })).toThrow(/audioMode/);
+    expect(() => updateOverlay(r, 'ov1', { gainDb: 50 })).toThrow(/gain/);
+    expect(() => updateOverlay(r, 'ov1', { srcOut: 0 })).toThrow(/out.*greater than in/);
+    expect(() => updateOverlay(r, 'ov1', { anchor: { sourceId: 'nope', srcTime: 1 } })).toThrow(/unknown anchor source/);
+  });
+
+  it('updateOverlay rejects a re-anchor that collides with another overlay\'s resolved region', () => {
+    let r = addOverlay(m(), 's2', { id: 'ov1', srcIn: 0, srcOut: 4, anchor: { sourceId: 's1', srcTime: 2 } }); // tl[2,6)
+    r = addOverlay(r, 's2', { id: 'ov2', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 8 } }); // tl[8,10)
+    expect(() => updateOverlay(r, 'ov2', { anchor: { sourceId: 's1', srcTime: 4 } })).toThrow(/overlaps existing overlay ov1/);
+  });
+
+  it('updateOverlay allows patching other fields on an orphaned overlay without requiring the anchor to resolve', () => {
+    let r = addOverlay(m(), 's2', { id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 15 } }); // orphan
+    r = updateOverlay(r, 'ov1', { audioMode: 'replace', gainDb: -3 });
+    const ov = r.timeline.overlays![0];
+    expect(ov.audioMode).toBe('replace');
+    expect(ov.gainDb).toBe(-3);
+    expect(resolveOverlays(r)[0].tlStart).toBeNull(); // still orphaned — anchor untouched
+  });
+
+  it('removeOverlay drops the item; unknown id throws', () => {
+    let r = addOverlay(m(), 's2', { id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 2 } });
+    r = addOverlay(r, 's2', { id: 'ov2', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 8 } });
+    r = removeOverlay(r, 'ov1');
+    expect(r.timeline.overlays!.map((o) => o.id)).toEqual(['ov2']);
+    expect(() => removeOverlay(r, 'ov1')).toThrow(/unknown overlay/);
+  });
+});
+
+describe('resolveOverlays / resolvedActiveOverlays / orphanedOverlays', () => {
+  function m(): Manifest {
+    const base = manifest();
+    return {
+      ...base,
+      sources: [
+        ...base.sources,
+        { id: 's2', path: '/broll.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: true },
+      ],
+      timeline: {
+        ...base.timeline,
+        video: [
+          { id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 10 },
+          { id: 'c2', sourceId: 's1', srcIn: 20, srcOut: 30 },
+        ],
+      },
+    };
+  }
+
+  it('an anchor whose instant survives a ripple cut automatically follows the new timeline position', () => {
+    // Anchor at src=25 (inside the surviving second clip) -> tl[10,20)<-src[20,30): tl=15.
+    let r = addOverlay(m(), 's2', { id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 25 } });
+    expect(resolveOverlays(r)[0].tlStart).toBeCloseTo(15);
+    // Ripple-cut more of the FIRST clip (src[0,5) removed) — everything downstream shifts left by 5s.
+    r = removeSourceRange(r, 's1', 0, 5);
+    // The anchored instant (src=25) still exists and is still kept, so the
+    // overlay follows the ripple: new tl = 15 - 5 = 10.
+    expect(resolveOverlays(r)[0].tlStart).toBeCloseTo(10);
+  });
+
+  it('an anchor whose instant gets cut away becomes orphaned (excluded from resolvedActiveOverlays)', () => {
+    let r = addOverlay(m(), 's2', { id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 25 } });
+    expect(resolvedActiveOverlays(r)).toHaveLength(1);
+    // Cut away the anchored instant itself.
+    r = removeSourceRange(r, 's1', 24, 26);
+    const resolved = resolveOverlays(r);
+    expect(resolved[0].tlStart).toBeNull();
+    expect(resolvedActiveOverlays(r)).toHaveLength(0);
+    const orphans = orphanedOverlays(r);
+    expect(orphans).toHaveLength(1);
+    expect(orphans[0]).toMatchObject({ id: 'ov1' });
+    expect(orphans[0].reason).toMatch(/not on the timeline/);
+  });
+
+  it('resolvedActiveOverlays sorts by resolved tlStart', () => {
+    let r = addOverlay(m(), 's2', { id: 'ovLater', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 25 } }); // tl 15
+    r = addOverlay(r, 's2', { id: 'ovEarlier', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 2 } }); // tl 2
+    const active = resolvedActiveOverlays(r);
+    expect(active.map((a) => a.overlay.id)).toEqual(['ovEarlier', 'ovLater']);
+    expect(active[0].tlEnd - active[0].tlStart).toBeCloseTo(2);
+  });
+
+  it('OVERLAY_GAIN_DEFAULT is -18 (the documented default for mix/replace)', () => {
+    expect(OVERLAY_GAIN_DEFAULT).toBe(-18);
   });
 });

@@ -124,4 +124,29 @@ describe('buildResume', () => {
     const r = buildResume(m, '/d', [], []);
     expect(r.nextSteps.some((s) => s.includes('ingest'))).toBe(true);
   });
+
+  it('orphanedOverlays is empty and no nextSteps hint appears when there are no B-roll overlays', () => {
+    const r = buildResume(manifest(), '/d', [], []);
+    expect(r.orphanedOverlays).toEqual([]);
+    expect(r.nextSteps.some((s) => s.includes('orphan'))).toBe(false);
+  });
+
+  it('surfaces orphaned B-roll overlays (W3) and a re-anchor nextSteps hint', () => {
+    const m = manifest({
+      sources: [
+        ...manifest().sources,
+        { id: 's2', path: '/media/broll.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: true },
+      ],
+      timeline: {
+        video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 60 }],
+        motion: [],
+        // anchor at src=90 is past the A-roll's only clip (tl[0,60)<-src[0,60)) -> orphan.
+        overlays: [{ id: 'ov1', sourceId: 's2', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 90 }, audioMode: 'mute' }],
+      },
+    });
+    const r = buildResume(m, '/d', [], []);
+    expect(r.orphanedOverlays).toHaveLength(1);
+    expect(r.orphanedOverlays[0].id).toBe('ov1');
+    expect(r.nextSteps.some((s) => s.includes('orphan') && s.includes('broll-update'))).toBe(true);
+  });
 });

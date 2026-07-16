@@ -5,7 +5,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { startDaemon } from './server/daemon.js';
 import { Project } from './core/project.js';
-import { buildSelectsTimeline, segments, timelineDuration } from './core/ops.js';
+import { buildSelectsTimeline, segments, timelineDuration, timelineTimeToSource } from './core/ops.js';
 import { listProjects } from './core/registry.js';
 import { loadPreset, listPresets, savePreset } from './core/presets.js';
 import { renderView, renderSceneSheet } from './export/view.js';
@@ -171,6 +171,60 @@ async function resolveScene(dir: string, sceneId: string, explicitSource?: strin
   return hits[0];
 }
 
+/**
+ * Resolve a B-roll overlay's anchor sugar — at most one of --at-word /
+ * --at-src / --at-tl — to {sourceId, srcTime}. Returns undefined when none
+ * were given (broll-update: "don't change the anchor"); broll-add's caller
+ * additionally requires the result to be present.
+ *
+ * --at-src's syntax is `--at-src <aRollSrc> <秒>`: the tiny flag parser at
+ * the top of this file only ever consumes ONE token as a flag's value, so
+ * `<aRollSrc>` lands in flags['at-src'] and the trailing `<秒>` token falls
+ * through to the positional list — it's pos[1] here since pos[0] is always
+ * the command's own id/sourceId positional for broll-add/broll-update.
+ */
+async function resolveAnchorFlags(dir: string): Promise<{ sourceId: string; srcTime: number } | undefined> {
+  const given = ['at-word', 'at-src', 'at-tl'].filter((k) => flags[k] !== undefined);
+  if (given.length === 0) return undefined;
+  if (given.length > 1) fail(`specify only one of --at-word / --at-src / --at-tl (got ${given.map((k) => `--${k}`).join(', ')})`);
+
+  if (flags['at-word'] !== undefined) {
+    const wordId = String(flags['at-word']);
+    const p = await Project.open(dir);
+    const m = await p.manifest();
+    let sourceId = flags.source as string | undefined;
+    if (!sourceId) {
+      const hits: string[] = [];
+      for (const s of m.sources) {
+        if (!s.transcribed) continue;
+        try {
+          const t = await p.transcript(s.id);
+          if (t.words.some((w) => w.id === wordId)) hits.push(s.id);
+        } catch { /* transcript file missing; skip */ }
+      }
+      if (hits.length === 0) fail(`word id ${wordId} not found in any transcribed source; specify --source`);
+      if (hits.length > 1) fail(`word id ${wordId} is ambiguous across sources (${hits.join(', ')}); specify --source`);
+      sourceId = hits[0];
+    }
+    const t = await p.transcript(sourceId);
+    const w = t.words.find((x) => x.id === wordId);
+    if (!w) fail(`unknown word id: ${wordId} (source ${sourceId})`);
+    return { sourceId, srcTime: w.t0 };
+  }
+
+  if (flags['at-src'] !== undefined) {
+    return { sourceId: String(flags['at-src']), srcTime: numArg('--at-src seconds', pos[1]) };
+  }
+
+  // --at-tl: reverse-resolve a CURRENT timeline second to (sourceId, srcTime).
+  const tl = numFlag('at-tl', flags['at-tl'])!;
+  const p = await Project.open(dir);
+  const m = await p.manifest();
+  const r = timelineTimeToSource(m, tl);
+  if (!r) fail(`--at-tl ${tl}: not a valid timeline position (0..${timelineDuration(m).toFixed(2)})`);
+  return r;
+}
+
 const HELP = `vedit — conversational local NLE
 
 usage: vedit <command> [args] [--project <dir>]
@@ -200,6 +254,10 @@ music:     music-add <file> [--at 0] [--duration N] [--src-in 0] [--gain -12] [-
            music-update <id> [同フラグ] | music-remove <id>
            audio-mix [--target-lufs -14] [--duck-amount -10] [--crossfade-ms 12]
            audio-repair --preset outdoor|indoor|wireless|off [--deess]   # 会話音声リペア(既定 off)
+broll:     broll-add <brollSourceId> [--in s --out s | --scene sX]
+             (--at-word wXXXX [--source aRollSrc] | --at-src aRollSrc t | --at-tl t)
+             [--audio mute|mix|replace] [--gain -18] --base <rev>        # B-roll V2 トラック(重複不可・話者音声に張り付く)
+           broll-update <id> [同フラグ] --base <rev> | broll-remove <id> --base <rev>
 inspect:   view [--from a] [--to b] [--domain timeline|source] [--source id] [--scene id] (prints PNG path)
 export:    export otio <out.otio> | export render <out.mp4> [--burn-captions] [--preset youtube|shorts|x]
            export render ... [--no-repair] [--fast-loudnorm]   # 乾音A/B比較 / 1-passループドネスに落とす
@@ -640,6 +698,66 @@ async function main() {
       }
       return edit({ op: 'audio-repair', preset, deess: flags.deess ? true : undefined });
     }
+
+    case 'broll-add': {
+      const USAGE =
+        'usage: vedit broll-add <brollSourceId> [--in s --out s | --scene sX] ' +
+        '(--at-word wXXXX [--source aRollSrc] | --at-src aRollSrc t | --at-tl t) ' +
+        '[--audio mute|mix|replace] [--gain -18] --base <rev>';
+      if (pos.length === 0) fail(USAGE);
+      const brollSourceId = pos[0];
+      if (flags.scene && (flags.in !== undefined || flags.out !== undefined)) fail('--scene cannot be combined with --in/--out');
+      const dir = projectDir();
+      let inVal = numFlag('in', flags.in);
+      let outVal = numFlag('out', flags.out);
+      if (flags.scene) {
+        const r = await resolveScene(dir, String(flags.scene), brollSourceId);
+        inVal = r.t0;
+        outVal = r.t1;
+      }
+      if (inVal === undefined || outVal === undefined) fail(`broll-add requires --in/--out or --scene\n${USAGE}`);
+      const anchor = await resolveAnchorFlags(dir);
+      if (!anchor) fail(`broll-add requires an anchor: --at-word / --at-src / --at-tl\n${USAGE}`);
+      return edit({
+        op: 'broll-add',
+        sourceId: brollSourceId,
+        in: inVal,
+        out: outVal,
+        anchor,
+        audioMode: flags.audio,
+        gainDb: numFlag('gain', flags.gain),
+      });
+    }
+
+    case 'broll-update': {
+      const id = pos[0] ?? fail('usage: vedit broll-update <id> [--in s --out s | --scene sX] [--at-word .. | --at-src .. | --at-tl ..] [--audio mute|mix|replace] [--gain -18] --base <rev>');
+      if (flags.scene && (flags.in !== undefined || flags.out !== undefined)) fail('--scene cannot be combined with --in/--out');
+      const dir = projectDir();
+      let inVal = numFlag('in', flags.in);
+      let outVal = numFlag('out', flags.out);
+      if (flags.scene) {
+        const p = await Project.open(dir);
+        const m = await p.manifest();
+        const ov = (m.timeline.overlays ?? []).find((o) => o.id === id);
+        if (!ov) fail(`unknown overlay: ${id}`);
+        const r = await resolveScene(dir, String(flags.scene), ov.sourceId);
+        inVal = r.t0;
+        outVal = r.t1;
+      }
+      const anchor = await resolveAnchorFlags(dir);
+      return edit({
+        op: 'broll-update',
+        id,
+        in: inVal,
+        out: outVal,
+        anchor,
+        audioMode: flags.audio,
+        gainDb: numFlag('gain', flags.gain),
+      });
+    }
+
+    case 'broll-remove':
+      return edit({ op: 'broll-remove', id: pos[0] ?? fail('usage: vedit broll-remove <id>') });
 
     case 'preset-save': {
       const name = pos[0] ?? fail('usage: vedit preset-save <name> [--data \'{"k":"v"}\']');

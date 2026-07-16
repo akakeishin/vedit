@@ -1,4 +1,4 @@
-import type { Manifest, MusicItem, SceneFile, Segment, Source, VideoClip, Word } from './types.js';
+import type { Manifest, MusicItem, OverlayClip, SceneFile, Segment, Source, VideoClip, Word } from './types.js';
 
 /** Snap a time to the timeline frame grid. */
 export function snap(t: number, fps: number): number {
@@ -169,6 +169,14 @@ export function sourceTimeToTimeline(m: Manifest, sourceId: string, t: number): 
     if (s.sourceId !== sourceId) continue;
     const d = s.tlEnd - s.tlStart;
     if (t >= s.srcStart && t < s.srcStart + d) return s.tlStart + (t - s.srcStart);
+  }
+  return null;
+}
+
+/** Map a timeline time to (sourceId, source time), or null if out of range — the inverse of sourceTimeToTimeline. */
+export function timelineTimeToSource(m: Manifest, tl: number): { sourceId: string; srcTime: number } | null {
+  for (const s of segments(m)) {
+    if (tl >= s.tlStart && tl < s.tlEnd) return { sourceId: s.sourceId, srcTime: s.srcStart + (tl - s.tlStart) };
   }
   return null;
 }
@@ -604,4 +612,204 @@ export function buildSelectsTimeline(m: Manifest, sceneFiles: SceneFile[]): Vide
     }
   }
   return out;
+}
+
+// ---- B-roll V2 overlay track (W3) ----
+//
+// Anchor rule (see OverlayClip in types.ts): an overlay stores WHERE it's
+// glued to the A-roll (anchor.sourceId + anchor.srcTime), never a timeline
+// position. Every consumer (render/preview/OTIO/web) re-derives tlStart via
+// sourceTimeToTimeline on demand through resolveOverlays/resolvedActiveOverlays
+// below — there is no cached/absolute tlStart anywhere in the manifest, so a
+// ripple edit to the A-roll can never leave a stale overlay position behind.
+
+const OVERLAY_AUDIO_MODES = new Set(['mute', 'mix', 'replace']);
+
+/** Default gainDb applied when an overlay's audioMode is 'mix'/'replace' and gainDb is omitted; render.ts's OVERLAY_GAIN_DEFAULT mirrors this. */
+export const OVERLAY_GAIN_DEFAULT = -18;
+
+/**
+ * Resolve every overlay's current timeline placement. `tlStart` is null when
+ * the anchored instant has been cut away from the A-roll (an "orphan") —
+ * callers that need to render/preview/export must filter those out (see
+ * resolvedActiveOverlays), while callers surfacing status/warnings want the
+ * full list including orphans (see orphanedOverlays).
+ */
+export function resolveOverlays(m: Manifest): { overlay: OverlayClip; tlStart: number | null }[] {
+  return (m.timeline.overlays ?? []).map((overlay) => ({
+    overlay,
+    tlStart: sourceTimeToTimeline(m, overlay.anchor.sourceId, overlay.anchor.srcTime),
+  }));
+}
+
+export interface ResolvedOverlay {
+  overlay: OverlayClip;
+  tlStart: number;
+  tlEnd: number;
+}
+
+/**
+ * Non-orphan overlays with a resolved [tlStart, tlEnd) timeline placement,
+ * sorted by tlStart — the only overlays render/view/OTIO ever touch. Orphans
+ * (anchor cut away) are silently excluded here; see orphanedOverlays for the
+ * warning-surface list.
+ */
+export function resolvedActiveOverlays(m: Manifest): ResolvedOverlay[] {
+  const out: ResolvedOverlay[] = [];
+  for (const r of resolveOverlays(m)) {
+    if (r.tlStart === null) continue;
+    out.push({ overlay: r.overlay, tlStart: r.tlStart, tlEnd: r.tlStart + (r.overlay.srcOut - r.overlay.srcIn) });
+  }
+  out.sort((a, b) => a.tlStart - b.tlStart);
+  return out;
+}
+
+/** Overlays whose anchored instant is no longer on the timeline, for status/resume warnings. */
+export function orphanedOverlays(m: Manifest): { id: string; reason: string }[] {
+  return resolveOverlays(m)
+    .filter((r) => r.tlStart === null)
+    .map((r) => ({
+      id: r.overlay.id,
+      reason: `anchor (${r.overlay.anchor.sourceId}@${r.overlay.anchor.srcTime.toFixed(2)}s) is not on the timeline (cut away)`,
+    }));
+}
+
+/** [tlStart, tlEnd) for one overlay if it currently resolves, else null (orphan — nothing to collide with). */
+function resolvedOverlayRange(m: Manifest, o: OverlayClip): { tlStart: number; tlEnd: number } | null {
+  const tlStart = sourceTimeToTimeline(m, o.anchor.sourceId, o.anchor.srcTime);
+  if (tlStart === null) return null;
+  return { tlStart, tlEnd: tlStart + (o.srcOut - o.srcIn) };
+}
+
+/**
+ * V2 is a single non-overlapping layer: reject an add/update whose RESOLVED
+ * region collides with another overlay's resolved region. An orphan
+ * candidate (unresolvable) has nothing to collide with and is always
+ * allowed through — it just won't render/preview/export until re-anchored.
+ */
+function assertNoOverlayOverlap(m: Manifest, candidate: OverlayClip, excludeId?: string): void {
+  const range = resolvedOverlayRange(m, candidate);
+  if (!range) return;
+  for (const o of m.timeline.overlays ?? []) {
+    if (o.id === excludeId) continue;
+    const other = resolvedOverlayRange(m, o);
+    if (!other) continue;
+    if (range.tlStart < other.tlEnd && other.tlStart < range.tlEnd) {
+      throw new Error(
+        `broll: overlaps existing overlay ${o.id} (${other.tlStart.toFixed(2)}-${other.tlEnd.toFixed(2)}s); the B-roll V2 track allows no overlap`,
+      );
+    }
+  }
+}
+
+/** Add a B-roll overlay clip, anchored to an A-roll moment (see OverlayClip). Validates finiteness, srcIn<srcOut, both sources exist, and no overlap with an existing overlay's resolved region. */
+export function addOverlay(
+  m: Manifest,
+  sourceId: string,
+  opts: {
+    srcIn: number;
+    srcOut: number;
+    anchor: { sourceId: string; srcTime: number };
+    audioMode?: 'mute' | 'mix' | 'replace';
+    gainDb?: number;
+    id?: string;
+  },
+): Manifest {
+  const src = m.sources.find((s) => s.id === sourceId);
+  if (!src) throw new Error(`broll-add: unknown B-roll source: ${sourceId}`);
+  if (!opts.anchor || !m.sources.some((s) => s.id === opts.anchor.sourceId)) {
+    throw new Error(`broll-add: unknown anchor source: ${opts.anchor?.sourceId}`);
+  }
+  const { srcIn, srcOut } = opts;
+  if (!Number.isFinite(srcIn) || !Number.isFinite(srcOut)) {
+    throw new Error(`broll-add: in/out must be finite numbers (got in=${srcIn}, out=${srcOut})`);
+  }
+  if (srcIn < 0) throw new Error(`broll-add: in (${srcIn}) must be >= 0`);
+  if (srcOut <= srcIn) throw new Error(`broll-add: out (${srcOut}) must be greater than in (${srcIn})`);
+  if (srcOut > src.duration) throw new Error(`broll-add: out (${srcOut}) exceeds source duration (${src.duration})`);
+  if (!Number.isFinite(opts.anchor.srcTime) || opts.anchor.srcTime < 0) {
+    throw new Error(`broll-add: anchor srcTime (${opts.anchor.srcTime}) must be a finite number >= 0`);
+  }
+  const audioMode = opts.audioMode ?? 'mute';
+  if (!OVERLAY_AUDIO_MODES.has(audioMode)) {
+    throw new Error(`broll-add: audioMode (${JSON.stringify(audioMode)}) must be "mute", "mix", or "replace"`);
+  }
+  if (opts.gainDb !== undefined) assertGain(opts.gainDb, 'broll-add');
+  const overlays = m.timeline.overlays ?? [];
+  const id = opts.id ?? freshId('ov');
+  if (overlays.some((o) => o.id === id)) throw new Error(`broll-add: overlay id already exists: ${id}`);
+  const item: OverlayClip = {
+    id,
+    sourceId,
+    srcIn,
+    srcOut,
+    anchor: { sourceId: opts.anchor.sourceId, srcTime: opts.anchor.srcTime },
+    audioMode: audioMode as 'mute' | 'mix' | 'replace',
+    ...(opts.gainDb !== undefined ? { gainDb: opts.gainDb } : {}),
+  };
+  assertNoOverlayOverlap(m, item);
+  return { ...m, timeline: { ...m.timeline, overlays: [...overlays, item] } };
+}
+
+/** Patch an existing overlay's range/anchor/audio fields (never its B-roll sourceId). Re-anchoring (patch.anchor) is how a user fixes an orphaned overlay. */
+export function updateOverlay(
+  m: Manifest,
+  id: string,
+  patch: {
+    srcIn?: number;
+    srcOut?: number;
+    anchor?: { sourceId: string; srcTime: number };
+    audioMode?: 'mute' | 'mix' | 'replace';
+    gainDb?: number;
+  },
+): Manifest {
+  const overlays = m.timeline.overlays ?? [];
+  const idx = overlays.findIndex((o) => o.id === id);
+  if (idx < 0) throw new Error(`unknown overlay: ${id}`);
+  const cur = overlays[idx];
+  const src = m.sources.find((s) => s.id === cur.sourceId)!;
+  const next: OverlayClip = { ...cur };
+  if (patch.anchor !== undefined) {
+    if (!m.sources.some((s) => s.id === patch.anchor!.sourceId)) {
+      throw new Error(`broll-update: unknown anchor source: ${patch.anchor.sourceId}`);
+    }
+    if (!Number.isFinite(patch.anchor.srcTime) || patch.anchor.srcTime < 0) {
+      throw new Error(`broll-update: anchor srcTime (${patch.anchor.srcTime}) must be a finite number >= 0`);
+    }
+    next.anchor = { sourceId: patch.anchor.sourceId, srcTime: patch.anchor.srcTime };
+  }
+  if (patch.srcIn !== undefined || patch.srcOut !== undefined) {
+    const srcIn = patch.srcIn ?? cur.srcIn;
+    const srcOut = patch.srcOut ?? cur.srcOut;
+    if (!Number.isFinite(srcIn) || !Number.isFinite(srcOut)) {
+      throw new Error(`broll-update: in/out must be finite numbers (got in=${srcIn}, out=${srcOut})`);
+    }
+    if (srcIn < 0) throw new Error(`broll-update: in (${srcIn}) must be >= 0`);
+    if (srcOut <= srcIn) throw new Error(`broll-update: out (${srcOut}) must be greater than in (${srcIn})`);
+    if (srcOut > src.duration) throw new Error(`broll-update: out (${srcOut}) exceeds source duration (${src.duration})`);
+    next.srcIn = srcIn;
+    next.srcOut = srcOut;
+  }
+  if (patch.audioMode !== undefined) {
+    if (!OVERLAY_AUDIO_MODES.has(patch.audioMode)) {
+      throw new Error(`broll-update: audioMode (${JSON.stringify(patch.audioMode)}) must be "mute", "mix", or "replace"`);
+    }
+    next.audioMode = patch.audioMode;
+  }
+  if (patch.gainDb !== undefined) {
+    assertGain(patch.gainDb, 'broll-update');
+    next.gainDb = patch.gainDb;
+  }
+  assertNoOverlayOverlap(m, next, id);
+  const out = [...overlays];
+  out[idx] = next;
+  return { ...m, timeline: { ...m.timeline, overlays: out } };
+}
+
+/** Remove an overlay from the V2 track. */
+export function removeOverlay(m: Manifest, id: string): Manifest {
+  const overlays = m.timeline.overlays ?? [];
+  const next = overlays.filter((o) => o.id !== id);
+  if (next.length === overlays.length) throw new Error(`unknown overlay: ${id}`);
+  return { ...m, timeline: { ...m.timeline, overlays: next } };
 }

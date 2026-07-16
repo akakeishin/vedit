@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
-import { cropGeometry, segments, timelineDuration } from '../core/ops.js';
+import { cropGeometry, OVERLAY_GAIN_DEFAULT, resolvedActiveOverlays, segments, timelineDuration } from '../core/ops.js';
 import { captionCues } from '../core/captions.js';
 import type { Manifest, Transcript } from '../core/types.js';
 import { ffmpegHasFilter, run, runCapture } from '../ingest/run.js';
@@ -244,7 +244,84 @@ export function buildFilterGraph(
     audioLabel = '[final]';
   }
 
-  return { inputPaths, graph, videoLabel: '[vc]', audioLabel };
+  // ---- W3: B-roll V2 overlay compositing ----
+  // Applied LAST, on top of the (possibly music-mixed) [vc]/audioLabel, so
+  // caption burn and preset postFilter (both applied by the caller after
+  // buildFilterGraph returns) land on top of the composited B-roll frame —
+  // matching the render/preview parity the spec requires. An overlay-less
+  // project never reaches this block's body: `graph`/videoLabel/audioLabel
+  // stay byte-for-byte what they were before W3 existed (full regression).
+  let videoLabel = '[vc]';
+  const activeOverlays = resolvedActiveOverlays(m);
+  if (activeOverlays.length > 0) {
+    const overlaySrcIds = [...new Set(activeOverlays.map((r) => r.overlay.sourceId))];
+    const overlayInputBase = inputPaths.length; // video sources + music, already pushed above
+    for (const id of overlaySrcIds) inputPaths.push(srcById.get(id)!.path);
+
+    const ovParts: string[] = [];
+    const audioMixLabels: string[] = [];
+    activeOverlays.forEach((r, n) => {
+      const ov = r.overlay;
+      const ovSrc = srcById.get(ov.sourceId)!;
+      const idx = overlayInputBase + overlaySrcIds.indexOf(ov.sourceId);
+      ovParts.push(overlayVideoClause(idx, n, ov.srcIn, ov.srcOut, r.tlStart, ovSrc.width, ovSrc.height, output.width, output.height, m.fps));
+      const composited = `[ovc${n}]`;
+      ovParts.push(`${videoLabel}[ov${n}]overlay=enable='between(t,${r.tlStart},${r.tlEnd})'${composited}`);
+      videoLabel = composited;
+
+      if (ov.audioMode === 'replace') {
+        const silenced = `[arepl${n}]`;
+        ovParts.push(`${audioLabel}volume=0:enable='between(t,${r.tlStart},${r.tlEnd})'${silenced}`);
+        audioLabel = silenced;
+      }
+      if (ov.audioMode !== 'mute' && ovSrc.hasAudio) {
+        const gain = ov.gainDb ?? OVERLAY_GAIN_DEFAULT;
+        ovParts.push(overlayAudioClause(idx, n, ov.srcIn, ov.srcOut, r.tlStart, gain));
+        audioMixLabels.push(`[ova${n}]`);
+      }
+    });
+    if (audioMixLabels.length > 0) {
+      const allLabels = [audioLabel, ...audioMixLabels];
+      ovParts.push(`${allLabels.join('')}amix=inputs=${allLabels.length}:duration=first:dropout_transition=0:normalize=0[ovAudioMix]`);
+      audioLabel = '[ovAudioMix]';
+    }
+    graph += ';' + ovParts.join(';');
+  }
+
+  return { inputPaths, graph, videoLabel, audioLabel };
+}
+
+/**
+ * One overlay's video chain: trim its B-roll source to [srcIn,srcOut), shift
+ * its PTS to start at the resolved tlStart (so ffmpeg's `overlay` filter —
+ * which samples the overlay input by ITS OWN timestamp — presents the right
+ * frame once `between(t,tlStart,tlEnd)` goes true), then scale/pad/crop to
+ * the output canvas exactly like a main clip. Overlays have no per-clip crop
+ * field (unlike VideoClip) — `cropGeometry(...,undefined)` auto-centers.
+ */
+export function overlayVideoClause(
+  inputIdx: number,
+  n: number,
+  srcIn: number,
+  srcOut: number,
+  tlStart: number,
+  srcW: number,
+  srcH: number,
+  outW: number,
+  outH: number,
+  fps: number,
+): string {
+  const geo = cropGeometry(srcW, srcH, outW, outH, undefined);
+  const cropPart = geo ? `crop=${geo.width}:${geo.height}:${geo.x}:${geo.y},` : '';
+  return (
+    `[${inputIdx}:v]trim=start=${srcIn}:end=${srcOut},setpts=PTS-STARTPTS+${tlStart}/TB,` +
+    `${cropPart}scale=${outW}:${outH}:force_original_aspect_ratio=decrease,pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2,fps=${fps}[ov${n}]`
+  );
+}
+
+/** One overlay's audio chain for audioMode mix/replace: trim, delay to tlStart, apply gain. */
+export function overlayAudioClause(inputIdx: number, n: number, srcIn: number, srcOut: number, tlStart: number, gainDb: number): string {
+  return `[${inputIdx}:a]atrim=start=${srcIn}:end=${srcOut},asetpts=PTS-STARTPTS,adelay=${Math.round(tlStart * 1000)}:all=1,volume=${gainDb}dB[ova${n}]`;
 }
 
 // ---- Wave M: publish presets ----

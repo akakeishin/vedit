@@ -19,7 +19,8 @@ vi.mock('../ingest/run.js', () => ({
   ffmpegHasFilter: () => true,
 }));
 
-import { buildFilterGraph, buildRepairChain, loudnormClause, planExportPreset, renderFinal, resolveRenderParams, toAss } from './render.js';
+import { addOverlay } from '../core/ops.js';
+import { buildFilterGraph, buildRepairChain, loudnormClause, overlayAudioClause, overlayVideoClause, planExportPreset, renderFinal, resolveRenderParams, toAss } from './render.js';
 
 function manifest(style: string): Manifest {
   return {
@@ -211,6 +212,134 @@ describe('buildFilterGraph: with music, duck=true', () => {
     const m = baseManifest({ music: [music({ id: 'mu1', path: '/bgm.mp3', duck: true })], audioMix: { duckAmount: -20 } });
     const built = buildFilterGraph(m);
     expect(built.graph).toContain('sidechaincompress=threshold=0.02:ratio=8:attack=20:release=400:makeup=1');
+  });
+});
+
+// ---- buildFilterGraph: W3 B-roll V2 overlay compositing ----
+//
+// baseManifest()'s A-roll timeline is seg1 tl[0,5)<-src[0,5) and
+// seg2 tl[5,15)<-src[10,20) (a 5s cut sits between them, src[5,10)) — used
+// below both as an anchor-resolution target and as the orphan gap.
+
+function overlayManifest(overlays: { anchorSrcTime: number; srcIn?: number; srcOut?: number; audioMode?: 'mute' | 'mix' | 'replace'; gainDb?: number; id?: string; hasAudio?: boolean }[]): Manifest {
+  let m = baseManifest();
+  m = {
+    ...m,
+    sources: [...m.sources, { id: 's2', path: '/broll.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: overlays[0]?.hasAudio ?? true }],
+  };
+  for (const o of overlays) {
+    m = addOverlay(m, 's2', {
+      id: o.id,
+      srcIn: o.srcIn ?? 0,
+      srcOut: o.srcOut ?? 2,
+      anchor: { sourceId: 's1', srcTime: o.anchorSrcTime },
+      audioMode: o.audioMode,
+      gainDb: o.gainDb,
+    });
+  }
+  return m;
+}
+
+describe('buildFilterGraph: B-roll V2 overlays (W3)', () => {
+  it('an overlay-less project reaches byte-for-byte the same graph as before W3 (regression)', () => {
+    const built = buildFilterGraph(baseManifest());
+    expect(built.videoLabel).toBe('[vc]');
+    expect(built.audioLabel).toBe('[ac]');
+    expect(built.graph).not.toMatch(/overlay=enable|\bova\d|\bovc\d/);
+    expect(built.inputPaths).toEqual(['/x.mp4']);
+  });
+
+  it('an orphaned overlay (anchor cut away) is excluded entirely — same regression guarantee as no overlays', () => {
+    // src=7 falls in the A-roll's cut gap (src[5,10)) -> unresolvable.
+    const m = overlayManifest([{ anchorSrcTime: 7 }]);
+    const built = buildFilterGraph(m);
+    expect(built.videoLabel).toBe('[vc]');
+    expect(built.audioLabel).toBe('[ac]');
+    expect(built.inputPaths).toEqual(['/x.mp4']); // /broll.mp4 never added as an input
+  });
+
+  it('audioMode mute: composites video only, audioLabel/inputs for audio stay untouched', () => {
+    // anchor src=2 -> tl=2 (inside seg1); dur = srcOut-srcIn = 2 -> resolved tl[2,4).
+    const m = overlayManifest([{ anchorSrcTime: 2, id: 'ov1', audioMode: 'mute' }]);
+    const built = buildFilterGraph(m);
+    expect(built.inputPaths).toEqual(['/x.mp4', '/broll.mp4']);
+    expect(built.graph).toContain('[1:v]trim=start=0:end=2,setpts=PTS-STARTPTS+2/TB');
+    expect(built.graph).toContain("[vc][ov0]overlay=enable='between(t,2,4)'[ovc0]");
+    expect(built.videoLabel).toBe('[ovc0]');
+    expect(built.audioLabel).toBe('[ac]'); // untouched: mute never reads B-roll audio
+    expect(built.graph).not.toMatch(/\bova0\b|amix/);
+  });
+
+  it('audioMode mix: B-roll audio is trimmed/delayed/gained and amixed with the A-roll audio (duration=first)', () => {
+    const m = overlayManifest([{ anchorSrcTime: 2, id: 'ov1', audioMode: 'mix', gainDb: -9 }]);
+    const built = buildFilterGraph(m);
+    expect(built.graph).toContain('[1:a]atrim=start=0:end=2,asetpts=PTS-STARTPTS,adelay=2000:all=1,volume=-9dB[ova0]');
+    expect(built.graph).toContain('[ac][ova0]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[ovAudioMix]');
+    expect(built.audioLabel).toBe('[ovAudioMix]');
+    expect(built.graph).not.toContain('volume=0:enable'); // mix never silences the A-roll
+  });
+
+  it('audioMode mix defaults gainDb to OVERLAY_GAIN_DEFAULT (-18) when omitted', () => {
+    const m = overlayManifest([{ anchorSrcTime: 2, id: 'ov1', audioMode: 'mix' }]);
+    const built = buildFilterGraph(m);
+    expect(built.graph).toContain('volume=-18dB[ova0]');
+  });
+
+  it('audioMode replace: silences the A-roll audio over [tlStart,tlEnd) then mixes in the B-roll audio', () => {
+    const m = overlayManifest([{ anchorSrcTime: 2, id: 'ov1', audioMode: 'replace', gainDb: -12 }]);
+    const built = buildFilterGraph(m);
+    expect(built.graph).toContain("[ac]volume=0:enable='between(t,2,4)'[arepl0]");
+    expect(built.graph).toContain('[1:a]atrim=start=0:end=2,asetpts=PTS-STARTPTS,adelay=2000:all=1,volume=-12dB[ova0]');
+    expect(built.graph).toContain('[arepl0][ova0]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[ovAudioMix]');
+    expect(built.audioLabel).toBe('[ovAudioMix]');
+  });
+
+  it('audioMode mix/replace with a B-roll source that has no audio never adds an amix (video overlay still applies)', () => {
+    const m = overlayManifest([{ anchorSrcTime: 2, id: 'ov1', audioMode: 'mix', hasAudio: false }]);
+    const built = buildFilterGraph(m);
+    expect(built.videoLabel).toBe('[ovc0]');
+    expect(built.audioLabel).toBe('[ac]');
+    expect(built.graph).not.toMatch(/amix|ova0/);
+  });
+
+  it('multiple non-overlapping overlays chain the video composite and dedupe a repeated B-roll source input', () => {
+    const m = overlayManifest([
+      { anchorSrcTime: 1, id: 'ov1', audioMode: 'mute' }, // tl[1,3)
+      { anchorSrcTime: 3, id: 'ov2', audioMode: 'mute', srcIn: 5, srcOut: 6 }, // tl[3,4)
+    ]);
+    const built = buildFilterGraph(m);
+    expect(built.inputPaths).toEqual(['/x.mp4', '/broll.mp4']); // one dedup'd overlay input despite 2 overlays
+    expect(built.graph).toContain("[vc][ov0]overlay=enable='between(t,1,3)'[ovc0]");
+    expect(built.graph).toContain("[ovc0][ov1]overlay=enable='between(t,3,4)'[ovc1]");
+    expect(built.videoLabel).toBe('[ovc1]');
+  });
+
+  it('overlay compositing happens on top of a music-mixed graph (audioLabel chains from [final], not [ac])', () => {
+    let m = overlayManifest([{ anchorSrcTime: 2, id: 'ov1', audioMode: 'mix', gainDb: -6 }]);
+    m = { ...m, timeline: { ...m.timeline, music: [music({ id: 'mu1', path: '/bgm.mp3', duck: false })] } };
+    const built = buildFilterGraph(m);
+    expect(built.graph).toContain('[final][ova0]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[ovAudioMix]');
+    expect(built.audioLabel).toBe('[ovAudioMix]');
+    // overlay's B-roll input comes after BOTH the video source and the music source.
+    expect(built.inputPaths).toEqual(['/x.mp4', '/bgm.mp3', '/broll.mp4']);
+    expect(built.graph).toContain('[2:a]atrim'); // broll is ffmpeg input index 2
+  });
+});
+
+describe('overlayVideoClause / overlayAudioClause (pure helpers)', () => {
+  it('overlayVideoClause centers via cropGeometry when source/output aspect mismatch, and no crop clause when they match', () => {
+    const matching = overlayVideoClause(1, 0, 0, 2, 5, 1920, 1080, 1920, 1080, 30);
+    expect(matching).not.toContain('crop=');
+    expect(matching).toBe(
+      '[1:v]trim=start=0:end=2,setpts=PTS-STARTPTS+5/TB,scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,fps=30[ov0]',
+    );
+    const mismatched = overlayVideoClause(1, 0, 0, 2, 5, 1920, 1080, 1080, 1920, 30);
+    expect(mismatched).toContain('crop=');
+  });
+
+  it('overlayAudioClause rounds tlStart to milliseconds for adelay', () => {
+    const clause = overlayAudioClause(2, 0, 0, 2, 1.2345, -18);
+    expect(clause).toBe('[2:a]atrim=start=0:end=2,asetpts=PTS-STARTPTS,adelay=1235:all=1,volume=-18dB[ova0]');
   });
 });
 

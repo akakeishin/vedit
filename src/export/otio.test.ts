@@ -1,6 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { toOtio } from './otio.js';
-import { removeSourceRange, trimClip } from '../core/ops.js';
+import { addOverlay, removeSourceRange, trimClip } from '../core/ops.js';
 import type { Manifest, MusicItem } from '../core/types.js';
 
 const FPS = 30000 / 1001;
@@ -154,5 +154,67 @@ describe('toOtio background music (wave I: A2 track)', () => {
     const a2 = o.tracks.children.find((t: any) => t.name === 'A2');
     expect(a2.children).toHaveLength(1);
     expect(a2.children[0].OTIO_SCHEMA).toBe('Clip.1');
+  });
+});
+
+describe('toOtio B-roll V2 track (wave W3)', () => {
+  function withOverlaySources(): Manifest {
+    return manifest([{ srcIn: 0, srcOut: 10, sourceId: 's1' }], [{ id: 's1' }, { id: 's2', duration: 30 }]);
+  }
+
+  it('emits no V2 track when there are no overlays', () => {
+    const o: any = toOtio(manifest([{ srcIn: 0, srcOut: 10 }]));
+    expect(o.tracks.children.find((t: any) => t.name === 'V2')).toBeUndefined();
+  });
+
+  it('emits a V2 track with a leading Gap + one Clip.1 per resolved overlay, carrying audioMode/gainDb metadata', () => {
+    const m = addOverlay(withOverlaySources(), 's2', {
+      id: 'ov1', srcIn: 1, srcOut: 4, anchor: { sourceId: 's1', srcTime: 3 }, audioMode: 'mix', gainDb: -9,
+    });
+    const o: any = toOtio(m);
+    const v2 = o.tracks.children.find((t: any) => t.name === 'V2');
+    expect(v2).toBeDefined();
+    expect(v2.kind).toBe('Video');
+    // anchor src=3 resolves to tlStart=3 on the single tl[0,10)<-src[0,10) clip -> Gap(0..3) then Clip.
+    expect(v2.children).toHaveLength(2);
+    expect(v2.children[0].OTIO_SCHEMA).toBe('Gap.1');
+    expect(v2.children[0].source_range.duration.value).toBe(Math.round(3 * FPS));
+    const clip = v2.children[1];
+    expect(clip.OTIO_SCHEMA).toBe('Clip.1');
+    expect(clip.source_range.start_time.value).toBe(Math.round(1 * FPS)); // srcIn-anchored, B-roll's own timebase
+    expect(clip.media_reference.target_url).toMatch(/^file:\/\//);
+    expect(clip.metadata.vedit.overlayId).toBe('ov1');
+    expect(clip.metadata.vedit.audioMode).toBe('mix');
+    expect(clip.metadata.vedit.gainDb).toBe(-9);
+  });
+
+  it('emits no leading Gap when the resolved overlay starts at tlStart 0', () => {
+    const m = addOverlay(withOverlaySources(), 's2', { id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 0 } });
+    const o: any = toOtio(m);
+    const v2 = o.tracks.children.find((t: any) => t.name === 'V2');
+    expect(v2.children).toHaveLength(1);
+    expect(v2.children[0].OTIO_SCHEMA).toBe('Clip.1');
+  });
+
+  it('excludes an orphaned overlay from V2 (never thrown/written) and warns instead', () => {
+    // src=50 is past the A-roll's only clip (tl[0,10)<-src[0,10)) -> unresolvable.
+    const m = addOverlay(withOverlaySources(), 's2', { id: 'ovOrphan', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 50 } });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const o: any = toOtio(m);
+    expect(o.tracks.children.find((t: any) => t.name === 'V2')).toBeUndefined();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('ovOrphan'));
+    warn.mockRestore();
+  });
+
+  it('a mix of one resolved and one orphaned overlay writes only the resolved one', () => {
+    let m = addOverlay(withOverlaySources(), 's2', { id: 'ovOk', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 1 } });
+    m = addOverlay(m, 's2', { id: 'ovOrphan', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 50 } });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const o: any = toOtio(m);
+    const v2 = o.tracks.children.find((t: any) => t.name === 'V2');
+    const clips = v2.children.filter((c: any) => c.OTIO_SCHEMA === 'Clip.1');
+    expect(clips).toHaveLength(1);
+    expect(clips[0].metadata.vedit.overlayId).toBe('ovOk');
+    warn.mockRestore();
   });
 });

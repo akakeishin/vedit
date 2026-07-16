@@ -1431,3 +1431,166 @@ describe('daemon: audio-repair op and color warning', () => {
     expect(s2.colorWarning).toBeUndefined();
   });
 });
+
+// ---- Suite: B-roll V2 overlay ops (W3) ----
+describe('daemon: broll (B-roll V2 overlay) ops', () => {
+  const PORT = 18197;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let overlayId: string;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-broll-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'broll');
+    // A-roll (s1) with a cut: tl[0,10)<-src[0,10), tl[10,20)<-src[20,30) —
+    // the gap src[10,20) is used below as the orphan target. s2 is B-roll.
+    await project.commit(0, 'system', 'setup', {}, 'seed sources', (m) => ({
+      ...m,
+      fps: 30,
+      sources: [
+        { id: 's1', path: '/media/aroll.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: true },
+        { id: 's2', path: '/media/broll.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: true },
+      ],
+      timeline: {
+        video: [
+          { id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 10 },
+          { id: 'c2', sourceId: 's1', srcIn: 20, srcOut: 30 },
+        ],
+        motion: [],
+      },
+    }));
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('broll-add rejects a missing anchor', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'broll-add', sourceId: 's2', in: 0, out: 2,
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/anchor/);
+  });
+
+  it('broll-add rejects an unknown B-roll source', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'broll-add', sourceId: 'nope', in: 0, out: 2,
+      anchor: { sourceId: 's1', srcTime: 2 },
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/unknown B-roll source/);
+  });
+
+  it('broll-add with a valid anchor creates a resolved overlay', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'broll-add', sourceId: 's2', in: 0, out: 4,
+      anchor: { sourceId: 's1', srcTime: 2 }, audioMode: 'mix', gainDb: -9,
+    });
+    expect(status).toBe(200);
+    overlayId = body.id;
+    expect(overlayId).toMatch(/^ov/);
+    expect(body.state.overlays).toBe(1);
+    expect(body.state.orphanedOverlays).toBeUndefined(); // resolved -> no orphan warning
+
+    const project = (await getJson(BASE, '/api/project')).body;
+    const resolved = project.overlays.find((r: any) => r.overlay.id === overlayId);
+    expect(resolved.tlStart).toBeCloseTo(2); // 1:1 mapping on the first (uncut) clip
+    expect(resolved.overlay).toMatchObject({ sourceId: 's2', srcIn: 0, srcOut: 4, audioMode: 'mix', gainDb: -9 });
+  });
+
+  it('broll-add rejects a resolved-region overlap with the existing overlay', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'broll-add', sourceId: 's2', in: 0, out: 4,
+      anchor: { sourceId: 's1', srcTime: 3 }, // resolved tl[3,7) overlaps the existing [2,6)
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/overlaps existing overlay/);
+  });
+
+  it('broll-add with an anchor in the A-roll cut gap creates an ORPHANED overlay, surfaced in state', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'broll-add', sourceId: 's2', in: 0, out: 2,
+      anchor: { sourceId: 's1', srcTime: 15 }, // src[10,20) is the cut gap
+    });
+    expect(status).toBe(200);
+    const orphanId = body.id;
+    expect(body.state.overlays).toBe(2);
+    expect(body.state.orphanedOverlays).toHaveLength(1);
+    expect(body.state.orphanedOverlays[0].id).toBe(orphanId);
+    expect(body.state.orphanedOverlays[0].reason).toMatch(/not on the timeline/);
+
+    // broll-update re-anchoring it onto a live instant clears the orphan warning.
+    const state2 = (await getJson(BASE, '/api/state')).body;
+    const upd = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state2.revision, op: 'broll-update', id: orphanId,
+      anchor: { sourceId: 's1', srcTime: 22 },
+    });
+    expect(upd.status).toBe(200);
+    expect(upd.body.state.orphanedOverlays).toBeUndefined();
+    const project = (await getJson(BASE, '/api/project')).body;
+    const resolved = project.overlays.find((r: any) => r.overlay.id === orphanId);
+    expect(resolved.tlStart).toBeCloseTo(12); // tl[10,20)<-src[20,30): src22 -> tl12
+
+    // clean up so later tests in this suite see only `overlayId`.
+    const state3 = (await getJson(BASE, '/api/state')).body;
+    await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state3.revision, op: 'broll-remove', id: orphanId });
+  });
+
+  it('broll-update rejects an unknown id', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'broll-update', id: 'nope', audioMode: 'mute',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/unknown overlay/);
+  });
+
+  it('broll-update rejects a malformed anchor', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'broll-update', id: overlayId, anchor: { sourceId: 's1' },
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/anchor/);
+  });
+
+  it('broll-update with a valid id patches audioMode/gainDb', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'broll-update', id: overlayId, audioMode: 'replace', gainDb: -20,
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    const resolved = project.overlays.find((r: any) => r.overlay.id === overlayId);
+    expect(resolved.overlay.audioMode).toBe('replace');
+    expect(resolved.overlay.gainDb).toBe(-20);
+  });
+
+  it('broll-remove rejects an unknown id', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'broll-remove', id: 'nope',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/unknown overlay/);
+  });
+
+  it('broll-remove with a valid id removes it', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'broll-remove', id: overlayId,
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.timeline.overlays).toHaveLength(0);
+    const finalState = (await getJson(BASE, '/api/state')).body;
+    expect(finalState.overlays).toBe(0);
+  });
+});

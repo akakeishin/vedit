@@ -1,0 +1,93 @@
+import { describe, expect, it, vi } from 'vitest';
+import type { Manifest } from '../core/types.js';
+
+// renderView shells out to ffmpeg via run()/ffmpegHasFilter; stub both so the
+// "B-roll V2 sample point" suite below only asserts on which media path each
+// per-frame ffmpeg call used (and the grid legend text), without needing
+// ffmpeg installed or touching the real filesystem (same approach as
+// render.test.ts's mocks).
+const { runMock } = vi.hoisted(() => ({
+  runMock: vi.fn(async () => ''),
+}));
+vi.mock('../ingest/run.js', () => ({
+  run: (...args: unknown[]) => runMock(...args),
+  ffmpegHasFilter: () => false,
+}));
+
+import { addOverlay } from '../core/ops.js';
+import { renderView } from './view.js';
+
+function manifest(): Manifest {
+  return {
+    version: 1,
+    name: 't',
+    revision: 0,
+    fps: 30,
+    width: 1920,
+    height: 1080,
+    sources: [
+      { id: 's1', path: '/aroll.mp4', duration: 10, fps: 30, width: 1920, height: 1080, hasAudio: true },
+      { id: 's2', path: '/broll.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: true },
+    ],
+    // A single, uncut A-roll clip: tl[0,10) <- src[0,10) (1:1 mapping), so
+    // sample-point math below stays simple.
+    timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 10 }], motion: [] },
+    captions: { enabled: true, style: 'clean', maxChars: 24 },
+  };
+}
+
+/** ffmpeg calls that extract one frame (as opposed to the final xstack tile-compose call). */
+function frameCalls() {
+  return runMock.mock.calls.filter((c) => c[0] === 'ffmpeg' && (c[1] as string[]).includes('-frames:v'));
+}
+
+describe('renderView: B-roll V2 overlay sample points (W3)', () => {
+  it('draws the B-roll frame (not the A-roll) for sample points inside a resolved overlay window', async () => {
+    runMock.mockClear();
+    // anchor src=2 -> tlStart=2 (1:1 mapping); dur=4 -> resolved tl[2,6).
+    const m = addOverlay(manifest(), 's2', { id: 'ov1', srcIn: 0, srcOut: 4, anchor: { sourceId: 's1', srcTime: 2 } });
+    const { grid } = await renderView(m, '/proj', { domain: 'timeline', from: 0, to: 10, cols: 5, rows: 1 });
+    // 5 sample centers at tl = 1,3,5,7,9 — only 3 and 5 fall inside [2,6).
+    expect(grid[0]).toContain('@s1');
+    expect(grid[0]).not.toContain('overlay');
+    expect(grid[1]).toContain('@s2');
+    expect(grid[1]).toContain('[overlay ov1]');
+    expect(grid[2]).toContain('@s2');
+    expect(grid[2]).toContain('[overlay ov1]');
+    expect(grid[3]).toContain('@s1');
+    expect(grid[4]).toContain('@s1');
+
+    // The underlying ffmpeg frame-extraction calls actually read from the
+    // B-roll source's media for the overlay-covered cells — the grid legend
+    // isn't lying about what render.ts would also composite at that instant.
+    const calls = frameCalls();
+    expect(calls).toHaveLength(5);
+    expect(calls[0][1]).toContain('/aroll.mp4');
+    expect(calls[1][1]).toContain('/broll.mp4');
+    expect(calls[2][1]).toContain('/broll.mp4');
+    expect(calls[3][1]).toContain('/aroll.mp4');
+    expect(calls[4][1]).toContain('/aroll.mp4');
+  });
+
+  it('an orphaned overlay never affects sample points (falls back to the A-roll everywhere)', async () => {
+    runMock.mockClear();
+    // src=50 is past the A-roll's only clip (tl[0,10)<-src[0,10)) -> unresolvable.
+    const m = addOverlay(manifest(), 's2', { id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 50 } });
+    const { grid } = await renderView(m, '/proj', { domain: 'timeline', from: 0, to: 10, cols: 5, rows: 1 });
+    expect(grid.every((g) => g.includes('@s1') && !g.includes('overlay'))).toBe(true);
+    expect(frameCalls().every((c) => (c[1] as string[]).some((a) => a === '/aroll.mp4'))).toBe(true);
+  });
+
+  it('an overlay-less project never tags any grid cell with [overlay ...] (regression)', async () => {
+    runMock.mockClear();
+    const { grid } = await renderView(manifest(), '/proj', { domain: 'timeline', from: 0, to: 10, cols: 5, rows: 1 });
+    expect(grid.every((g) => !g.includes('overlay'))).toBe(true);
+  });
+
+  it('domain "source" ignores overlays entirely (raw, uncut source inspection)', async () => {
+    runMock.mockClear();
+    const m = addOverlay(manifest(), 's2', { id: 'ov1', srcIn: 0, srcOut: 4, anchor: { sourceId: 's1', srcTime: 2 } });
+    const { grid } = await renderView(m, '/proj', { domain: 'source', sourceId: 's1', from: 0, to: 10, cols: 5, rows: 1 });
+    expect(grid.every((g) => g.includes('@s1') && !g.includes('overlay'))).toBe(true);
+  });
+});

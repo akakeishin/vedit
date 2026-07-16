@@ -4,12 +4,14 @@
 
 const $ = (id) => document.getElementById(id);
 const video = $('video');
+const videoOverlay = $('videoOverlay');
 const basename = (p) => String(p ?? '').split('/').pop();
 
 const S = {
   manifest: null,
   segments: [],
   duration: 0,
+  overlays: [], // B-roll V2 (W3): [{overlay, tlStart}] from /api/project; tlStart null = orphan
   transcripts: new Map(), // sourceId -> words[]
   cues: [],
   candidates: [],
@@ -67,6 +69,7 @@ async function reload() {
     S.manifest = pr.manifest;
     S.segments = pr.segments;
     S.duration = pr.duration;
+    S.overlays = pr.overlays ?? [];
     S.cues = await api('/api/captions');
     S.candidates = await api('/api/candidates');
     S.candidatesAll = await api('/api/candidates?all=1');
@@ -189,6 +192,7 @@ function tick() {
     // the source-relative timecode.
     $('tc').textContent = `${fmtF(video.currentTime)} / ${fmtF(video.duration || 0)}`;
     syncMusicPlayback(null); // source-preview mode plays a raw source proxy, not the timeline mix
+    syncOverlayVideo(null); // source preview owns the stage; hide the B-roll overlay video too
     requestAnimationFrame(tick);
     return;
   }
@@ -206,6 +210,7 @@ function tick() {
     renderMotion(tl);
     highlightWord(tl);
     syncMusicPlayback(tl);
+    syncOverlayVideo(tl);
     if (S.previewStopAt != null && S.playing && tl >= S.previewStopAt) {
       S.previewStopAt = null;
       stopPlayback();
@@ -440,7 +445,46 @@ function renderTimeline() {
     d.textContent = basename(mu.path);
     murow.appendChild(d);
   }
+  renderOverlayRow();
   drawWave();
+}
+
+// B-roll V2 row (W3): one teal block per resolved overlay, positioned like
+// musicRow/motionRow's blocks. Orphaned overlays (no resolved tlStart —
+// their anchor was cut away) can't be time-positioned, so they render as
+// fixed warning chips stacked at the row's left edge instead; clicking one
+// explains why via a toast (the reason mirrors ops.ts's orphanedOverlays).
+function renderOverlayRow() {
+  const row = $('overlayRow');
+  row.innerHTML = '';
+  if (!S.duration) return;
+  let orphanIdx = 0;
+  for (const r of S.overlays) {
+    const ov = r.overlay;
+    const d = document.createElement('div');
+    if (r.tlStart == null) {
+      d.className = 'ovBlock orphan';
+      d.style.left = `${orphanIdx * 14}px`;
+      d.textContent = '!';
+      d.title = `orphan: ${ov.id} — クリックで理由を表示`;
+      d.onclick = (e) => {
+        e.stopPropagation();
+        toast(
+          `B-roll ${ov.id} は orphan です — アンカー(${ov.anchor.sourceId}@${ov.anchor.srcTime.toFixed(2)}s)がカットで失われました。再アンカーしてください(vedit broll-update)`,
+          { type: 'error' },
+        );
+      };
+      orphanIdx++;
+    } else {
+      const dur = ov.srcOut - ov.srcIn;
+      d.className = 'ovBlock';
+      d.style.left = `${(r.tlStart / S.duration) * 100}%`;
+      d.style.width = `${(dur / S.duration) * 100}%`;
+      d.title = `${ov.id} (${dur.toFixed(1)}s, ${ov.audioMode})`;
+      d.textContent = ov.id;
+    }
+    row.appendChild(d);
+  }
 }
 
 // Thin tick marks at scene boundaries (source-of-truth: scenes-<sourceId>.json).
@@ -555,6 +599,51 @@ function syncMusicPlayback(tl) {
   }
 }
 
+// ---------- B-roll V2 overlay preview (W3) ----------
+// #videoOverlay is a second <video> stacked over #video (see style.css),
+// shown only while the playhead sits inside a resolved (non-orphan) overlay's
+// [tlStart, tlEnd). It plays the B-roll source's own proxy independently of
+// #video, mirroring how enterSourcePreview drives an unrelated proxy — but
+// as its OWN element, so it never fights source-preview mode for #video.
+function activeOverlayAt(tl) {
+  if (tl == null) return null;
+  for (const r of S.overlays) {
+    if (r.tlStart == null) continue; // orphan: excluded from preview, same as render/OTIO
+    const dur = r.overlay.srcOut - r.overlay.srcIn;
+    if (tl >= r.tlStart && tl < r.tlStart + dur) return r;
+  }
+  return null;
+}
+function syncOverlayVideo(tl) {
+  const r = activeOverlayAt(tl);
+  if (!r) {
+    if (!videoOverlay.hidden) { videoOverlay.hidden = true; videoOverlay.pause(); }
+    return;
+  }
+  const ov = r.overlay;
+  const target = ov.srcIn + (tl - r.tlStart);
+  const url = proxyUrl(ov.sourceId);
+  if (!videoOverlay.src.endsWith(url)) {
+    videoOverlay.src = url;
+    videoOverlay.addEventListener('loadedmetadata', () => { videoOverlay.currentTime = target; }, { once: true });
+  } else if (Math.abs(videoOverlay.currentTime - target) > 0.3) {
+    videoOverlay.currentTime = target;
+  }
+  videoOverlay.hidden = false;
+  if (S.playing && videoOverlay.paused) videoOverlay.play().catch(() => {});
+  if (!S.playing && !videoOverlay.paused) videoOverlay.pause();
+  // audioMode=mute: main video's audio continues untouched, second video
+  // stays muted. mix/replace: approximated by unmuting the second video at
+  // the overlay's gain — precisely ducking/replacing the MAIN track's audio
+  // in the browser isn't attempted (spec: "近似でよい").
+  if (ov.audioMode === 'mute') {
+    videoOverlay.muted = true;
+  } else {
+    videoOverlay.muted = false;
+    videoOverlay.volume = Math.max(0, Math.min(1, dbToLinear(ov.gainDb ?? -18)));
+  }
+}
+
 // ---------- source preview mode (media pool "行クリック") ----------
 function renderPreviewBanner() {
   const active = !!S.sourcePreview;
@@ -587,6 +676,8 @@ function enterSourcePreview(sourceId, { at = 0 } = {}) {
   const mo = $('motionLayer'); mo.innerHTML = ''; mo.dataset.cur = '';
   video.style.objectPosition = '50% 50%';
   video.pause();
+  if (!videoOverlay.hidden) { videoOverlay.hidden = true; videoOverlay.pause(); } // B-roll V2 preview doesn't apply to raw source preview
+
   const url = proxyUrl(sourceId);
   const apply = () => { video.currentTime = at; video.play().catch(() => {}); };
   if (!video.src.endsWith(url)) { video.src = url; video.addEventListener('loadedmetadata', apply, { once: true }); }
