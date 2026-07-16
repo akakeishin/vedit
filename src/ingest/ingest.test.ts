@@ -9,10 +9,14 @@ import type { Word } from '../core/types.js';
 // assert on the constructed argv (and, for probe/transcribe, fake ffprobe's
 // JSON / whisper-cli's output file), without needing ffmpeg/ffprobe/whisper
 // installed.
-const { runMock } = vi.hoisted(() => ({ runMock: vi.fn().mockResolvedValue('') }));
+const { runMock, hasFilterMock } = vi.hoisted(() => ({
+  runMock: vi.fn().mockResolvedValue(''),
+  hasFilterMock: vi.fn(() => true),
+}));
 vi.mock('./run.js', () => ({
   run: (...args: unknown[]) => runMock(...args),
   runBinary: vi.fn(),
+  ffmpegHasFilter: (...args: unknown[]) => hasFilterMock(...args),
 }));
 
 import { ingestFile, makeProxy, probe, sanitizeWords, transcribe } from './ingest.js';
@@ -116,6 +120,36 @@ describe('makeProxy', () => {
     await makeProxy('/in.mp4', '/out.mp4', { duration: 10, fps: 120, width: 1920, height: 1080, hasAudio: true });
     const [, args] = runMock.mock.calls[0] as [string, string[]];
     expect(args[args.indexOf('-r') + 1]).toBe('30');
+  });
+
+  it('bakes in colorTransform (W5) as a prefix to -vf when given', async () => {
+    runMock.mockClear();
+    await makeProxy(
+      '/in.mp4', '/out.mp4',
+      { duration: 10, fps: 30, width: 1920, height: 1080, hasAudio: true },
+      { type: 'hlg' },
+    );
+    const [, args] = runMock.mock.calls[0] as [string, string[]];
+    const vf = args[args.indexOf('-vf') + 1];
+    expect(vf).toBe('zscale=t=linear:npl=1000,tonemap=hable,zscale=p=bt709:t=bt709:m=bt709:r=tv,format=yuv420p,scale=-2:720');
+  });
+
+  it('omitting colorTransform (the normal ingest path) leaves -vf byte-identical to before this parameter existed', async () => {
+    runMock.mockClear();
+    await makeProxy('/in.mp4', '/out.mp4', { duration: 10, fps: 30, width: 1920, height: 1080, hasAudio: true });
+    const [, args] = runMock.mock.calls[0] as [string, string[]];
+    expect(args[args.indexOf('-vf') + 1]).toBe('scale=-2:720');
+  });
+
+  it('an explicit colorTransform type "none" also leaves -vf unchanged', async () => {
+    runMock.mockClear();
+    await makeProxy(
+      '/in.mp4', '/out.mp4',
+      { duration: 10, fps: 30, width: 1920, height: 1080, hasAudio: true },
+      { type: 'none' },
+    );
+    const [, args] = runMock.mock.calls[0] as [string, string[]];
+    expect(args[args.indexOf('-vf') + 1]).toBe('scale=-2:720');
   });
 });
 

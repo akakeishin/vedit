@@ -14,6 +14,7 @@ import { renderFinal, toAss } from './export/render.js';
 import { publishPack } from './export/publish.js';
 import { writeSrt } from './export/srt.js';
 import { downloadWhisperModel, findWhisperModel, sha256File } from './ingest/ingest.js';
+import { proposeColorMatch } from './export/color.js';
 import {
   buildPlan,
   copyAndVerify,
@@ -295,6 +296,9 @@ music:     music-add <file> [--at 0] [--duration N] [--src-in 0] [--gain -12] [-
            music-update <id> [同フラグ] | music-remove <id>
            audio-mix [--target-lufs -14] [--duck-amount -10] [--crossfade-ms 12]
            audio-repair --preset outdoor|indoor|wireless|off [--deess]   # 会話音声リペア(既定 off)
+color:     color --source <id> --type hlg|pq|lut|none [--lut path] --base <rev>   # 入力色変換(Rec.709へ、プロキシ自動再生成)
+           color-adjust --source <id> [--exposure -2..2] [--wb -100..100] [--sat 0..2] --base <rev>
+           color-match <基準sourceId> <対象sourceId...>   # 代表フレームの signalstats から調整候補を提案(read-only)
 broll:     broll-add <brollSourceId> [--in s --out s | --scene sX]
              (--at-word wXXXX [--source aRollSrc] | --at-src aRollSrc t | --at-tl t)
              [--audio mute|mix|replace] [--gain -18] --base <rev>        # B-roll V2 トラック(重複不可・話者音声に張り付く)
@@ -887,6 +891,48 @@ async function main() {
         fail('usage: vedit audio-repair --preset outdoor|indoor|wireless|off [--deess] --base <rev>');
       }
       return edit({ op: 'audio-repair', preset, deess: flags.deess ? true : undefined });
+    }
+
+    case 'color': {
+      const USAGE = 'usage: vedit color --source <id> --type hlg|pq|lut|none [--lut path] --base <rev>';
+      const sourceId = flags.source as string | undefined;
+      const type = flags.type as string | undefined;
+      if (!sourceId || !type) fail(USAGE);
+      if (!['hlg', 'pq', 'lut', 'none'].includes(type)) fail(USAGE);
+      if (type === 'lut' && !flags.lut) fail(`--lut <path> is required when --type lut\n${USAGE}`);
+      console.error('色変換を設定し、プロキシを再生成しています(時間がかかることがあります)...');
+      return edit({
+        op: 'color-transform',
+        sourceId,
+        type,
+        lut: flags.lut ? path.resolve(String(flags.lut)) : undefined,
+      });
+    }
+
+    case 'color-adjust': {
+      const sourceId = flags.source as string | undefined;
+      if (!sourceId) fail('usage: vedit color-adjust --source <id> [--exposure -2..2] [--wb -100..100] [--sat 0..2] --base <rev>');
+      return edit({
+        op: 'color-adjust',
+        sourceId,
+        exposure: numFlag('exposure', flags.exposure),
+        wb: numFlag('wb', flags.wb),
+        sat: numFlag('sat', flags.sat),
+      });
+    }
+
+    case 'color-match': {
+      if (pos.length < 2) fail('usage: vedit color-match <基準sourceId> <対象sourceId...>');
+      const dir = projectDir();
+      const p = await Project.open(dir);
+      const m = await p.manifest();
+      const [baseId, ...targetIds] = pos;
+      const result = await proposeColorMatch(m, dir, baseId, targetIds);
+      return out({
+        ...result,
+        applied: false,
+        hint: '提案値は未適用です。承認後 `vedit color-adjust --source <id> --exposure .. --wb .. --sat ..` で反映してください',
+      });
     }
 
     case 'broll-add': {

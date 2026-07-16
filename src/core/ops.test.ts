@@ -32,6 +32,8 @@ import {
   setAudioMix,
   setAudioRepair,
   setClipCrop,
+  setColorAdjust,
+  setColorTransform,
   setSceneReview,
   sourceTimeToTimeline,
   timelineDuration,
@@ -634,6 +636,79 @@ describe('needsColorTransform', () => {
 
   it('exposes a stable warning message constant', () => {
     expect(COLOR_WARNING_MESSAGE).toMatch(/Log\/HLG/);
+  });
+});
+
+// ---- W5: input color transform (setColorTransform) ----
+
+describe('setColorTransform', () => {
+  it('rejects an unknown source', () => {
+    expect(() => setColorTransform(manifest(), 'nope', { type: 'hlg' })).toThrow(/unknown source/);
+  });
+
+  it('rejects an unrecognized type', () => {
+    expect(() => setColorTransform(manifest(), 's1', { type: 'dlog' })).toThrow(/hlg\/pq\/lut\/none/);
+  });
+
+  it('sets hlg/pq/none without a lut path', () => {
+    const m = setColorTransform(manifest(), 's1', { type: 'hlg' });
+    expect(m.sources[0].colorTransform).toEqual({ type: 'hlg' });
+    const m2 = setColorTransform(manifest(), 's1', { type: 'none' });
+    expect(m2.sources[0].colorTransform).toEqual({ type: 'none' });
+  });
+
+  it('rejects type "lut" without a lut path', () => {
+    expect(() => setColorTransform(manifest(), 's1', { type: 'lut' })).toThrow(/--lut/);
+  });
+
+  it('sets type "lut" with a lut path, leaving other sources untouched', () => {
+    const m = setColorTransform(manifest(), 's1', { type: 'lut', lut: '/luts/dlog.cube' });
+    expect(m.sources[0].colorTransform).toEqual({ type: 'lut', lut: '/luts/dlog.cube' });
+  });
+
+  it('overwrites a previously-set transform rather than merging', () => {
+    let m = setColorTransform(manifest(), 's1', { type: 'lut', lut: '/luts/a.cube' });
+    m = setColorTransform(m, 's1', { type: 'hlg' });
+    expect(m.sources[0].colorTransform).toEqual({ type: 'hlg' });
+  });
+});
+
+// ---- W5: per-source color adjust (setColorAdjust) ----
+
+describe('setColorAdjust', () => {
+  it('rejects an unknown source', () => {
+    expect(() => setColorAdjust(manifest(), 'nope', { exposure: 0.5 })).toThrow(/unknown source/);
+  });
+
+  it('rejects out-of-range exposure/wb/sat', () => {
+    expect(() => setColorAdjust(manifest(), 's1', { exposure: 3 })).toThrow(/exposure/);
+    expect(() => setColorAdjust(manifest(), 's1', { exposure: -3 })).toThrow(/exposure/);
+    expect(() => setColorAdjust(manifest(), 's1', { wb: 150 })).toThrow(/wb/);
+    expect(() => setColorAdjust(manifest(), 's1', { sat: -0.1 })).toThrow(/sat/);
+    expect(() => setColorAdjust(manifest(), 's1', { sat: 2.5 })).toThrow(/sat/);
+  });
+
+  it('accepts boundary values', () => {
+    const m = setColorAdjust(manifest(), 's1', { exposure: -2, wb: -100, sat: 0 });
+    expect(m.colorAdjust).toEqual({ s1: { exposure: -2, wb: -100, sat: 0 } });
+    const m2 = setColorAdjust(manifest(), 's1', { exposure: 2, wb: 100, sat: 2 });
+    expect(m2.colorAdjust).toEqual({ s1: { exposure: 2, wb: 100, sat: 2 } });
+  });
+
+  it('merges a partial patch onto an existing entry without clobbering unset fields', () => {
+    let m = setColorAdjust(manifest(), 's1', { exposure: 0.3 });
+    m = setColorAdjust(m, 's1', { wb: -10 });
+    expect(m.colorAdjust).toEqual({ s1: { exposure: 0.3, wb: -10 } });
+  });
+
+  it('prunes the per-source entry down to only the fields that were actually set (no undefined keys)', () => {
+    const m = setColorAdjust(manifest(), 's1', { sat: 1.1 });
+    expect(Object.keys(m.colorAdjust!.s1)).toEqual(['sat']);
+  });
+
+  it('an empty patch prunes the per-source entry down to nothing (same pattern as setSceneReview\'s culling map)', () => {
+    const m = setColorAdjust(manifest(), 's1', {});
+    expect(m.colorAdjust).toEqual({});
   });
 });
 

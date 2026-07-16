@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import path from 'node:path';
 import type { Manifest } from '../core/types.js';
 
 // renderView shells out to ffmpeg via run()/ffmpegHasFilter; stub both so the
@@ -6,12 +7,13 @@ import type { Manifest } from '../core/types.js';
 // per-frame ffmpeg call used (and the grid legend text), without needing
 // ffmpeg installed or touching the real filesystem (same approach as
 // render.test.ts's mocks).
-const { runMock } = vi.hoisted(() => ({
+const { runMock, hasFilterMock } = vi.hoisted(() => ({
   runMock: vi.fn(async () => ''),
+  hasFilterMock: vi.fn(() => false), // no drawtext, matching this suite's prior fixed behavior
 }));
 vi.mock('../ingest/run.js', () => ({
   run: (...args: unknown[]) => runMock(...args),
-  ffmpegHasFilter: () => false,
+  ffmpegHasFilter: (...args: unknown[]) => hasFilterMock(...args),
 }));
 
 import { addOverlay } from '../core/ops.js';
@@ -89,5 +91,44 @@ describe('renderView: B-roll V2 overlay sample points (W3)', () => {
     const m = addOverlay(manifest(), 's2', { id: 'ov1', srcIn: 0, srcOut: 4, anchor: { sourceId: 's1', srcTime: 2 } });
     const { grid } = await renderView(m, '/proj', { domain: 'source', sourceId: 's1', from: 0, to: 10, cols: 5, rows: 1 });
     expect(grid.every((g) => g.includes('@s1') && !g.includes('overlay'))).toBe(true);
+  });
+});
+
+describe('renderView: W5 color transform + adjust (proxy vs no-proxy)', () => {
+  it('applies the full colorTransform chain when the source has no proxy yet (falls back to the original file)', async () => {
+    runMock.mockClear();
+    hasFilterMock.mockImplementation(() => true); // pretend zscale/tonemap are available
+    const m = manifest();
+    m.sources[0].colorTransform = { type: 'hlg' };
+    await renderView(m, '/proj', { domain: 'source', sourceId: 's1', from: 0, to: 1, cols: 1, rows: 1 });
+    const calls = frameCalls();
+    expect(calls).toHaveLength(1);
+    const vf = calls[0][1][calls[0][1].indexOf('-vf') + 1] as string;
+    expect(vf).toContain('tonemap=hable');
+    hasFilterMock.mockImplementation(() => false);
+  });
+
+  it('does NOT re-apply colorTransform once a proxy exists (already baked in) but still applies colorAdjust on top', async () => {
+    runMock.mockClear();
+    const m = manifest();
+    m.sources[0] = { ...m.sources[0], proxy: 'cache/proxy-s1.mp4', colorTransform: { type: 'hlg' } };
+    m.colorAdjust = { s1: { sat: 1.3 } };
+    await renderView(m, '/proj', { domain: 'source', sourceId: 's1', from: 0, to: 1, cols: 1, rows: 1 });
+    const calls = frameCalls();
+    const [cmd, args] = calls[0] as [string, string[]];
+    const vf = args[args.indexOf('-vf') + 1] as string;
+    expect(vf).not.toMatch(/zscale|tonemap/);
+    expect(vf).toContain('eq=brightness=0:saturation=1.3');
+    expect(args).toContain(path.join('/proj', 'cache/proxy-s1.mp4'));
+    expect(cmd).toBe('ffmpeg');
+  });
+
+  it('no colorTransform/colorAdjust anywhere leaves every -vf identical to before this feature existed (regression)', async () => {
+    runMock.mockClear();
+    await renderView(manifest(), '/proj', { domain: 'timeline', from: 0, to: 10, cols: 2, rows: 1 });
+    for (const [, args] of frameCalls() as [string, string[]][]) {
+      const vf = args[args.indexOf('-vf') + 1] as string;
+      expect(vf).not.toMatch(/zscale|tonemap|lut3d|eq=brightness|colortemperature|colorbalance/);
+    }
   });
 });

@@ -28,6 +28,8 @@ import {
   setAudioMix,
   setAudioRepair,
   setClipCrop,
+  setColorAdjust,
+  setColorTransform,
   setSceneReview,
   sourceRangeToTimeline,
   timelineDuration,
@@ -42,7 +44,7 @@ import { detectFillers, detectSilences, detectSilencesFromPeaks } from '../core/
 import type { Peaks } from '../core/detect.js';
 import { packTranscript } from '../core/pack.js';
 import { detectScenesForSource, packScenes } from '../core/scenes.js';
-import { ingestFile, probeAudio } from '../ingest/ingest.js';
+import { ingestFile, makeProxy, probeAudio } from '../ingest/ingest.js';
 import { run } from '../ingest/run.js';
 import type { CutCandidate, Manifest, MotionItem, SceneFile, Transcript } from '../core/types.js';
 import { freshId } from '../core/ops.js';
@@ -662,6 +664,67 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
           p, actor, baseRev, 'audio-repair', b,
           `audio-repair preset=${b.preset}${b.deess ? ' deess' : ''}`,
           (m) => setAudioRepair(m, { preset: b.preset, deess: b.deess }),
+        );
+        return json(res, 200, { state: await stateSummary(p) });
+      }
+      if (b.op === 'color-transform') {
+        const sourceId = b.sourceId as string | undefined;
+        if (!sourceId) return json(res, 400, { error: 'color-transform: sourceId is required' });
+        if (!m0.sources.some((s) => s.id === sourceId)) {
+          return json(res, 400, { error: `unknown source: ${sourceId}` });
+        }
+        const type = b.type as string | undefined;
+        if (!type) return json(res, 400, { error: 'color-transform: type is required (hlg/pq/lut/none)' });
+        let lutAbs: string | undefined;
+        if (type === 'lut') {
+          if (typeof b.lut !== 'string' || !b.lut) {
+            return json(res, 400, { error: 'color-transform: --lut <path> is required when type is "lut"' });
+          }
+          // LUTs are user-owned assets, deliberately not sandboxed to the
+          // project directory (unlike proxy/peaks) — only existence is
+          // checked, mirroring music-add's probeAudio validation.
+          lutAbs = path.resolve(b.lut);
+          try {
+            await fs.access(lutAbs);
+          } catch {
+            return json(res, 400, { error: `color-transform: lut file not found: ${lutAbs}` });
+          }
+        }
+        const updated = await mutate(
+          p, actor, baseRev, 'color-transform', b,
+          `color-transform ${sourceId} -> ${type}${lutAbs ? ` (${path.basename(lutAbs)})` : ''}`,
+          (m) => setColorTransform(m, sourceId, { type, lut: lutAbs }),
+        );
+        // Proxy regen happens AFTER the commit is durable — same ordering
+        // rationale as the motion sidecar writes in commit() (see its doc
+        // comment): if makeProxy throws here, the manifest already
+        // correctly reflects the new colorTransform even though the proxy
+        // on disk is stale until `vedit color` is retried, rather than a
+        // commit silently failing to apply a setting the user just made.
+        const updatedSrc = updated.sources.find((s) => s.id === sourceId)!;
+        let proxyRegenerated = false;
+        if (updatedSrc.proxy) {
+          broadcast(ctx, { type: 'color-transform-progress', sourceId, step: 'regenerating proxy' });
+          await makeProxy(
+            updatedSrc.path,
+            path.join(p.dir, updatedSrc.proxy),
+            { duration: updatedSrc.duration, fps: updatedSrc.fps, width: updatedSrc.width, height: updatedSrc.height, hasAudio: updatedSrc.hasAudio },
+            updatedSrc.colorTransform,
+          );
+          proxyRegenerated = true;
+        }
+        return json(res, 200, { proxyRegenerated, state: await stateSummary(p) });
+      }
+      if (b.op === 'color-adjust') {
+        const sourceId = b.sourceId as string | undefined;
+        if (!sourceId) return json(res, 400, { error: 'color-adjust: sourceId is required' });
+        if (!m0.sources.some((s) => s.id === sourceId)) {
+          return json(res, 400, { error: `unknown source: ${sourceId}` });
+        }
+        await mutate(
+          p, actor, baseRev, 'color-adjust', b,
+          `color-adjust ${sourceId} exposure=${b.exposure ?? '-'} wb=${b.wb ?? '-'} sat=${b.sat ?? '-'}`,
+          (m) => setColorAdjust(m, sourceId, { exposure: b.exposure, wb: b.wb, sat: b.sat }),
         );
         return json(res, 200, { state: await stateSummary(p) });
       }

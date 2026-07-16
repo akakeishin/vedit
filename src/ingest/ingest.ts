@@ -5,6 +5,7 @@ import path from 'node:path';
 import { freshId } from '../core/ops.js';
 import type { Project } from '../core/project.js';
 import type { Manifest, Source, Transcript, Word } from '../core/types.js';
+import { buildColorChain } from '../export/color.js';
 import { run, runBinary } from './run.js';
 
 export interface ProbeResult {
@@ -163,14 +164,24 @@ export function sha256File(file: string): Promise<string> {
  * Keeps the source fps as-is (e.g. 29.97) rather than rounding it — rounding
  * to 30 drifts the proxy out of sync with the original over a long timeline.
  * Only very high frame rates (>60) get capped, to keep the proxy light.
+ *
+ * `colorTransform` (W5), when given, is baked into the proxy so the preview
+ * shows the corrected look without re-decoding the original on every seek —
+ * see buildColorChain in src/export/color.ts. Omitted (the normal ingest
+ * path, since colorTransform is only ever set AFTER ingest via `vedit
+ * color`) means no color filter at all, byte-for-byte the same `-vf` as
+ * before this parameter existed. `vedit color` regenerates the proxy by
+ * calling this again with the newly-set colorTransform.
  */
-export async function makeProxy(file: string, outPath: string, p: ProbeResult): Promise<void> {
+export async function makeProxy(file: string, outPath: string, p: ProbeResult, colorTransform?: Source['colorTransform']): Promise<void> {
   const targetH = Math.min(720, p.height);
   const fps = p.fps > 60 ? 30 : p.fps || 30;
   const gop = Math.max(1, Math.round(fps));
+  const colorPart = buildColorChain(colorTransform);
+  const vf = colorPart ? `${colorPart},scale=-2:${targetH}` : `scale=-2:${targetH}`;
   await run('ffmpeg', [
     '-y', '-i', file,
-    '-vf', `scale=-2:${targetH}`,
+    '-vf', vf,
     '-r', String(fps),
     '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
     '-g', String(gop), // ~1s keyframe interval → snappy seeks

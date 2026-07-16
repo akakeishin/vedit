@@ -3,6 +3,7 @@ import { promises as fs } from 'node:fs';
 import { cropGeometry, OVERLAY_GAIN_DEFAULT, resolvedActiveOverlays, segments, timelineDuration } from '../core/ops.js';
 import { captionCues } from '../core/captions.js';
 import type { Manifest, Transcript } from '../core/types.js';
+import { buildColorChain } from './color.js';
 import { ffmpegHasFilter, run, runCapture } from '../ingest/run.js';
 
 function assTime(t: number): string {
@@ -175,8 +176,14 @@ export function buildFilterGraph(
     // filmstrip in view.ts, which has to fall back to fractional crop).
     const geo = cropGeometry(src.width, src.height, output.width, output.height, seg.crop);
     const cropPart = geo ? `crop=${geo.width}:${geo.height}:${geo.x}:${geo.y},` : '';
+    // W5: input color transform (HLG/PQ/LUT) + exposure/WB/saturation,
+    // applied to the full decoded frame before crop/scale so downstream
+    // filters operate on the corrected picture. A source with neither set
+    // produces '' here -> byte-for-byte the same chain as before W5.
+    const colorChain = buildColorChain(src.colorTransform, m.colorAdjust?.[seg.sourceId]);
+    const colorPart = colorChain ? `${colorChain},` : '';
     parts.push(
-      `[${idx}:v]trim=start=${a}:end=${b},setpts=PTS-STARTPTS,${cropPart}scale=${output.width}:${output.height}:force_original_aspect_ratio=decrease,pad=${output.width}:${output.height}:(ow-iw)/2:(oh-ih)/2,fps=${m.fps}[v${i}]`,
+      `[${idx}:v]trim=start=${a}:end=${b},setpts=PTS-STARTPTS,${colorPart}${cropPart}scale=${output.width}:${output.height}:force_original_aspect_ratio=decrease,pad=${output.width}:${output.height}:(ow-iw)/2:(oh-ih)/2,fps=${m.fps}[v${i}]`,
     );
     if (src.hasAudio) {
       // A razor join between segments clicks; acrossfade would fix that but

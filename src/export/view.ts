@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { cropGeometry, resolvedActiveOverlays, segments } from '../core/ops.js';
 import type { Manifest, SceneFile } from '../core/types.js';
+import { buildColorChain } from './color.js';
 import { ffmpegHasFilter, run } from '../ingest/run.js';
 
 /**
@@ -85,15 +86,25 @@ export async function renderView(
   for (let i = 0; i < points.length; i++) {
     const pt = points[i];
     const src = srcById.get(pt.sourceId)!;
-    const media = src.proxy ? path.join(projectDir, src.proxy) : src.path;
+    const usingProxy = Boolean(src.proxy);
+    const media = usingProxy ? path.join(projectDir, src.proxy!) : src.path;
     const f = path.join(projectDir, 'cache', `.vf${i}.png`);
     const mm = Math.floor(pt.t / 60);
     const ss = (pt.t % 60).toFixed(1).padStart(4, '0');
     const geo = m.output ? cropGeometry(src.width, src.height, m.output.width, m.output.height, pt.crop) : null;
     const cropPart = cropFilterExpr(geo, src.width, src.height);
+    // W5: the proxy already has colorTransform baked in (see makeProxy),
+    // so applying it again here would double-transform — only colorAdjust
+    // (never baked into the proxy) is layered on for that case. A source
+    // with no proxy yet (rare; ingestFile always generates one) falls back
+    // to the original file and needs the full chain, matching what
+    // render.ts would actually produce.
+    const colorChainSrc = usingProxy ? undefined : src.colorTransform;
+    const colorChain = buildColorChain(colorChainSrc, m.colorAdjust?.[pt.sourceId]);
+    const colorPart = colorChain ? `${colorChain},` : '';
     const vf = canDrawText
-      ? `${cropPart}scale=320:-2,drawtext=text='${mm}\\:${ss}':x=6:y=h-th-6:fontsize=22:fontcolor=white:box=1:boxcolor=black@0.6`
-      : `${cropPart}scale=320:-2`;
+      ? `${colorPart}${cropPart}scale=320:-2,drawtext=text='${mm}\\:${ss}':x=6:y=h-th-6:fontsize=22:fontcolor=white:box=1:boxcolor=black@0.6`
+      : `${colorPart}${cropPart}scale=320:-2`;
     await run('ffmpeg', ['-y', '-v', 'error', '-ss', String(pt.t), '-i', media, '-frames:v', '1', '-vf', vf, f]);
     tmpFrames.push(f);
   }

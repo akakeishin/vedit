@@ -14,17 +14,21 @@ import type { Word } from '../core/types.js';
 // `import { probeAudio } from '../ingest/ingest.js'` picks up this stub too.
 // Every other suite in this file is unaffected since none of them touch
 // music-add.
-const { probeAudioMock } = vi.hoisted(() => ({
+// color-transform shells out to makeProxy() (real proxy regen would need
+// real ffmpeg + real media files neither of which exist in these tests) —
+// stub it too, same rationale as probeAudio below.
+const { probeAudioMock, makeProxyMock } = vi.hoisted(() => ({
   probeAudioMock: vi.fn(async (file: string) => {
     if (file.includes('missing')) throw new Error('ffprobe failed: no such file');
     if (file.includes('novoice')) return { duration: 30, hasAudio: false };
     if (file.includes('short')) return { duration: 3, hasAudio: true };
     return { duration: 300, hasAudio: true };
   }),
+  makeProxyMock: vi.fn(async () => undefined),
 }));
 vi.mock('../ingest/ingest.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../ingest/ingest.js')>();
-  return { ...actual, probeAudio: probeAudioMock };
+  return { ...actual, probeAudio: probeAudioMock, makeProxy: makeProxyMock };
 });
 
 function wordsFor(prefix: string, count: number, spacing = 1, dur = 0.8): Word[] {
@@ -1592,5 +1596,133 @@ describe('daemon: broll (B-roll V2 overlay) ops', () => {
     expect(project.manifest.timeline.overlays).toHaveLength(0);
     const finalState = (await getJson(BASE, '/api/state')).body;
     expect(finalState.overlays).toBe(0);
+  });
+});
+
+// ---- Suite: color-transform / color-adjust ops (W5) ----
+describe('daemon: color-transform and color-adjust ops', () => {
+  const PORT = 18198;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let dir: string;
+  let lutPath: string;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-color-'));
+    dir = path.join(root, 'proj');
+    lutPath = path.join(root, 'test.cube');
+    await fsp.writeFile(lutPath, 'LUT_3D_SIZE 2\n');
+    const project = await Project.create(dir, 'color');
+    await project.commit(0, 'system', 'setup', {}, 'seed sources', (m) => ({
+      ...m,
+      fps: 30,
+      sources: [
+        { id: 's1', path: '/media/hlg.mp4', duration: 20, fps: 30, width: 1920, height: 1080, hasAudio: true, proxy: 'cache/proxy-s1.mp4' },
+        { id: 's2', path: '/media/noproxy.mp4', duration: 20, fps: 30, width: 1920, height: 1080, hasAudio: true },
+      ],
+      timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 20 }], motion: [] },
+    }));
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('color-transform rejects an unknown source', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'color-transform', sourceId: 'nope', type: 'hlg',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/unknown source/);
+  });
+
+  it('color-transform rejects an unrecognized type without touching the manifest', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'color-transform', sourceId: 's1', type: 'dlog',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/hlg\/pq\/lut\/none/);
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.sources.find((s: any) => s.id === 's1').colorTransform).toBeUndefined();
+  });
+
+  it('color-transform rejects type "lut" without --lut', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'color-transform', sourceId: 's1', type: 'lut',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/--lut/);
+  });
+
+  it('color-transform rejects a lut path that does not exist on disk', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'color-transform', sourceId: 's1', type: 'lut', lut: '/nope/x.cube',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/lut file not found/);
+  });
+
+  it('color-transform accepts type "hlg", patches colorTransform, and regenerates the proxy (source has one)', async () => {
+    makeProxyMock.mockClear();
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'color-transform', sourceId: 's1', type: 'hlg',
+    });
+    expect(status).toBe(200);
+    expect(body.proxyRegenerated).toBe(true);
+    expect(makeProxyMock).toHaveBeenCalledTimes(1);
+    const [file, outPath, , colorTransform] = makeProxyMock.mock.calls[0];
+    expect(file).toBe('/media/hlg.mp4');
+    expect(outPath).toBe(path.join(dir, 'cache/proxy-s1.mp4'));
+    expect(colorTransform).toEqual({ type: 'hlg' });
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.sources.find((s: any) => s.id === 's1').colorTransform).toEqual({ type: 'hlg' });
+  });
+
+  it('color-transform accepts type "lut" with an existing path and skips proxy regen for a source with none', async () => {
+    makeProxyMock.mockClear();
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'color-transform', sourceId: 's2', type: 'lut', lut: lutPath,
+    });
+    expect(status).toBe(200);
+    expect(body.proxyRegenerated).toBe(false);
+    expect(makeProxyMock).not.toHaveBeenCalled();
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.sources.find((s: any) => s.id === 's2').colorTransform).toEqual({ type: 'lut', lut: lutPath });
+  });
+
+  it('color-adjust rejects an unknown source', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'color-adjust', sourceId: 'nope', exposure: 0.3,
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/unknown source/);
+  });
+
+  it('color-adjust rejects an out-of-range value without touching the manifest', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'color-adjust', sourceId: 's1', exposure: 5,
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/exposure/);
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.colorAdjust).toBeUndefined();
+  });
+
+  it('color-adjust patches manifest.colorAdjust for the given source', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'color-adjust', sourceId: 's1', exposure: 0.3, wb: -10, sat: 1.1,
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.colorAdjust).toEqual({ s1: { exposure: 0.3, wb: -10, sat: 1.1 } });
   });
 });

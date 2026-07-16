@@ -512,6 +512,62 @@ export function needsColorTransform(color: Source['color']): boolean {
   return false;
 }
 
+// ---- input color transform (W5: HLG/PQ/LUT -> Rec.709 SDR) ----
+
+const COLOR_TRANSFORM_TYPES = new Set(['hlg', 'pq', 'lut', 'none']);
+
+/**
+ * Patch a source's input color transform (`Source.colorTransform`).
+ * Validates the source exists, the type is one of hlg/pq/lut/none, and a
+ * 'lut' type carries a non-empty path — but does NOT check the path exists
+ * on disk, since ops.ts is pure/I/O-free; that check (and resolving a
+ * relative path to absolute) is the daemon's job, same division of labor as
+ * music-add's probeAudio check happening in daemon.ts before this is called.
+ */
+export function setColorTransform(m: Manifest, sourceId: string, patch: { type: string; lut?: string }): Manifest {
+  if (!m.sources.some((s) => s.id === sourceId)) throw new Error(`unknown source: ${sourceId}`);
+  if (!COLOR_TRANSFORM_TYPES.has(patch.type)) {
+    throw new Error(`color: type (${JSON.stringify(patch.type)}) must be one of hlg/pq/lut/none`);
+  }
+  if (patch.type === 'lut' && !patch.lut) {
+    throw new Error('color: --lut <path> is required when type is "lut"');
+  }
+  const colorTransform: NonNullable<Source['colorTransform']> = { type: patch.type as 'hlg' | 'pq' | 'lut' | 'none' };
+  if (patch.type === 'lut') colorTransform.lut = patch.lut;
+  return { ...m, sources: m.sources.map((s) => (s.id === sourceId ? { ...s, colorTransform } : s)) };
+}
+
+// ---- per-source color adjust (W5: exposure/WB/saturation; render+preview only) ----
+
+function assertColorRange(v: number, name: string, min: number, max: number): void {
+  if (!Number.isFinite(v) || v < min || v > max) {
+    throw new Error(`color-adjust: ${name} (${v}) must be a finite number between ${min} and ${max}`);
+  }
+}
+
+/**
+ * Patch (merge) a source's `manifest.colorAdjust[sourceId]` entry. Fields
+ * omitted from `patch` leave the existing value alone (same merge contract
+ * as updateMusic), and a resulting per-source entry with no defined fields
+ * at all is pruned back out of the map — same pattern as setSceneReview's
+ * culling map (the top-level `colorAdjust` object itself is left as `{}`
+ * rather than deleted, also matching that precedent).
+ */
+export function setColorAdjust(m: Manifest, sourceId: string, patch: { exposure?: number; wb?: number; sat?: number }): Manifest {
+  if (!m.sources.some((s) => s.id === sourceId)) throw new Error(`unknown source: ${sourceId}`);
+  if (patch.exposure !== undefined) assertColorRange(patch.exposure, 'exposure', -2, 2);
+  if (patch.wb !== undefined) assertColorRange(patch.wb, 'wb', -100, 100);
+  if (patch.sat !== undefined) assertColorRange(patch.sat, 'sat', 0, 2);
+  const colorAdjust = { ...(m.colorAdjust ?? {}) };
+  const cur = { ...(colorAdjust[sourceId] ?? {}) };
+  if (patch.exposure !== undefined) cur.exposure = patch.exposure;
+  if (patch.wb !== undefined) cur.wb = patch.wb;
+  if (patch.sat !== undefined) cur.sat = patch.sat;
+  if (Object.keys(cur).length === 0) delete colorAdjust[sourceId];
+  else colorAdjust[sourceId] = cur;
+  return { ...m, colorAdjust };
+}
+
 /** Adjust one clip's crop position without touching the others. */
 export function setClipCrop(m: Manifest, clipId: string, patch: { x?: number; y?: number }): Manifest {
   if (!m.timeline.video.some((c) => c.id === clipId)) throw new Error(`unknown clip: ${clipId}`);

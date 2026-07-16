@@ -498,6 +498,48 @@ describe('buildFilterGraph: audioRepair splices into the per-segment audio chain
   });
 });
 
+describe('buildFilterGraph: W5 color transform + adjust splices into the per-segment video chain', () => {
+  it('no colorTransform / no colorAdjust leaves the video chain byte-identical to before this feature existed', () => {
+    const built = buildFilterGraph(baseManifest());
+    expect(built.graph).not.toMatch(/zscale|tonemap|lut3d|eq=brightness|colortemperature|colorbalance/);
+    expect(built.graph).toContain('[0:v]trim=start=0:end=5,setpts=PTS-STARTPTS,scale=1920:1080');
+  });
+
+  it('splices the HLG transform in after setpts and before crop/scale, once per segment', () => {
+    const m = baseManifest();
+    m.sources[0].colorTransform = { type: 'hlg' };
+    const built = buildFilterGraph(m);
+    const chainCount = (built.graph.match(/tonemap=hable/g) ?? []).length;
+    expect(chainCount).toBe(2); // one per segment (baseManifest has 2 segments)
+    expect(built.graph).toContain(
+      '[0:v]trim=start=0:end=5,setpts=PTS-STARTPTS,zscale=t=linear:npl=1000,tonemap=hable,zscale=p=bt709:t=bt709:m=bt709:r=tv,format=yuv420p,scale=1920:1080',
+    );
+  });
+
+  it('splices colorAdjust (keyed by sourceId) in for every segment referencing that source', () => {
+    const m = baseManifest();
+    m.colorAdjust = { s1: { exposure: 0.4, sat: 1.2 } };
+    const built = buildFilterGraph(m);
+    const chainCount = (built.graph.match(/eq=brightness=0\.1:saturation=1\.2/g) ?? []).length;
+    expect(chainCount).toBe(2);
+  });
+
+  it('combines colorTransform and colorAdjust in one chain, transform first', () => {
+    const m = baseManifest();
+    m.sources[0].colorTransform = { type: 'lut', lut: '/luts/x.cube' };
+    m.colorAdjust = { s1: { wb: 0 } };
+    const built = buildFilterGraph(m);
+    expect(built.graph).toContain("lut3d='/luts/x.cube',colortemperature=temperature=6500,");
+  });
+
+  it("an explicit colorTransform type 'none' produces no color clause", () => {
+    const m = baseManifest();
+    m.sources[0].colorTransform = { type: 'none' };
+    const built = buildFilterGraph(m);
+    expect(built.graph).not.toMatch(/zscale|tonemap|lut3d/);
+  });
+});
+
 // ---- W1: loudnormClause (2-pass loudnorm) ----
 
 describe('loudnormClause', () => {

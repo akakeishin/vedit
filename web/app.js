@@ -842,11 +842,18 @@ function mediaRow(src) {
   nameRow.innerHTML = `<span class="srcName">${esc(name)}</span><span class="srcDur">${fmt(src.duration)}</span>`;
   const badges = document.createElement('div');
   badges.className = 'srcBadges';
+  // W5: a source with an applied colorTransform (type !== 'none') shows
+  // "変換済み" instead of the "要色変換" warning — the warning's purpose
+  // (flag material that will preview/render flat) no longer applies once
+  // `vedit color` has actually set a transform.
+  const colorConverted = src.colorTransform && src.colorTransform.type && src.colorTransform.type !== 'none';
   badges.innerHTML = [
     src.transcribed ? '<span class="badge ok">文字起こし済み</span>' : '',
     !src.hasAudio ? '<span class="badge warn">音声なし</span>' : '',
     !src.proxy ? '<span class="badge warn">プロキシ未生成</span>' : '',
-    needsColorTransform(src.color) ? '<span class="badge warn">要色変換</span>' : '',
+    colorConverted
+      ? '<span class="badge ok">変換済み</span>'
+      : needsColorTransform(src.color) ? '<span class="badge warn">要色変換</span>' : '',
   ].join('');
   if (S.scenes.has(src.id)) {
     const c = cullingCounts(src.id);
@@ -1698,3 +1705,47 @@ requestAnimationFrame(tick);
 reload().then(() => {
   if (S.segments.length) loadSeg(0, { play: false });
 }).catch((e) => toast(e.message, { type: 'error' }));
+
+// ---------- resizable sidebar (pane divider) ----------
+(() => {
+  const divider = $('paneDivider');
+  if (!divider) return;
+  const KEY = 'vedit.asideW';
+  const DEFAULT_W = 340;
+  const clampW = (w) => Math.max(240, Math.min(window.innerWidth * 0.7, w));
+  const apply = (w) => {
+    document.documentElement.style.setProperty('--aside-w', `${clampW(w)}px`);
+    drawWave(); // timeline canvas depends on stage width
+  };
+  const saved = Number(localStorage.getItem(KEY));
+  if (saved) apply(saved);
+  const current = () => document.querySelector('aside').getBoundingClientRect().width;
+
+  divider.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    divider.classList.add('dragging');
+    divider.setPointerCapture(e.pointerId);
+    const startX = e.clientX;
+    const startW = current();
+    const move = (ev) => apply(startW + (startX - ev.clientX)); // divider left = aside grows
+    const up = () => {
+      divider.classList.remove('dragging');
+      localStorage.setItem(KEY, String(Math.round(current())));
+      divider.removeEventListener('pointermove', move);
+      divider.removeEventListener('pointerup', up);
+    };
+    divider.addEventListener('pointermove', move);
+    divider.addEventListener('pointerup', up);
+  });
+  divider.addEventListener('dblclick', () => {
+    apply(DEFAULT_W);
+    localStorage.removeItem(KEY);
+  });
+  divider.addEventListener('keydown', (e) => {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    e.preventDefault();
+    apply(current() + (e.key === 'ArrowLeft' ? 16 : -16));
+    localStorage.setItem(KEY, String(Math.round(current())));
+  });
+  window.addEventListener('resize', () => apply(current()));
+})();

@@ -207,6 +207,34 @@ vedit publish-pack outdir --thumbs 6   # chapters.txt + thumbnails/ + materials.
 公開素材一式を生成(タイトル・説明文は起草しない — 起草手順は
 editorial-playbook.md の「公開パックの起草手順」参照)。
 
+## 色管理(Log/HLG素材)
+
+ingest 時に「要色変換」警告(`vedit status`/`vedit sources` の
+`colorWarning`、web パネルの赤バッジ)が出たら、そのソースは
+Log/HLG/PQ 素材でプレビュー・レンダーの色が浅く見える。対処:
+
+```bash
+vedit color --source <id> --type hlg --base <rev>          # HLG(transfer=arib-std-b67)
+vedit color --source <id> --type pq  --base <rev>          # PQ(transfer=smpte2084)
+vedit color --source <id> --type lut --lut <DJIの公式LUT>.cube --base <rev>   # D-Log 等
+```
+
+`vedit color` はプロキシを自動で再生成する(プレビューが正しい見た目に
+なるまで少し時間がかかる)。D-Log のような Log プロファイルはコンテナの
+transfer メタデータに出ないことが多く自動判定できない —
+警告が出たら撮影者/ディレクターにカメラ機種と Log プロファイルを確認し、
+メーカー公式 LUT の所在を聞いてから `--type lut --lut <path>` で指定する。
+
+複数ショット間で肌色や明るさがズレる場合は、まず提案(read-only)を見てから:
+
+```bash
+vedit color-match <基準sourceId> <対象sourceId...>          # signalstats差分から exposure/wb/sat を提案
+vedit color-adjust --source <id> --exposure 0.3 --wb -10 --sat 1.1 --base <rev>   # 承認した値を適用
+```
+
+`color-match` は何も書き込まない。提案を確認してから `color-adjust`
+で反映すること — 自動適用はしない。
+
 ## トラブル時
 
 - `vedit doctor`: 依存確認(drawtext/ass 無しの ffmpeg は ffmpeg-full を案内)

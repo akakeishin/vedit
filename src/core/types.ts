@@ -45,6 +45,19 @@ export interface Manifest {
    * for culling (see scenes.ts) so never appear as a key here.
    */
   culling?: Record<string, Record<string, 'keep' | 'reject'>>;
+  /**
+   * Per-source exposure/white-balance/saturation correction (W5), keyed by
+   * sourceId. Applied at render/preview time only — never baked into the
+   * proxy (unlike `Source.colorTransform`, see makeProxy in
+   * src/ingest/ingest.ts) — so it stays cheap to tweak without a re-encode.
+   * Optional for backward compatibility with existing project.json files; a
+   * source with no entry here gets no adjustment at all (see
+   * buildColorChain in src/export/color.ts, which returns '' for it — full
+   * regression). Set via `vedit color-adjust`; `vedit color-match` proposes
+   * values here but never writes them (the user applies them explicitly).
+   * Revision-tracked like every other manifest field.
+   */
+  colorAdjust?: Record<string, { exposure?: number; wb?: number; sat?: number }>;
 }
 
 export interface Source {
@@ -82,6 +95,28 @@ export interface Source {
    * absence is not evidence of anything, just unverified.
    */
   sha256?: string;
+  /**
+   * Input color transform (W5) applied to bring Log/HLG/PQ material into
+   * Rec.709 SDR before preview/render. Optional/absent (or an explicit
+   * `{ type: 'none' }`) means no transform at all — `buildColorChain`
+   * (src/export/color.ts) returns '' for it, so an untouched source's
+   * filtergraph/proxy is byte-for-byte identical to before this feature
+   * existed. Set via `vedit color --source <id> --type hlg|pq|lut|none`,
+   * which also regenerates the source's proxy (see makeProxy in
+   * src/ingest/ingest.ts) so the preview reflects the transform.
+   */
+  colorTransform?: {
+    type: 'hlg' | 'pq' | 'lut' | 'none';
+    /**
+     * Absolute filesystem path to a user-supplied .cube LUT, required when
+     * type is 'lut'. The CLI resolves a relative --lut argument against
+     * the current working directory before it reaches here (same
+     * resolve-then-store convention as MusicItem.path) — paths outside the
+     * project directory are explicitly allowed since LUTs are typically
+     * user-owned assets shared across projects, not project-local files.
+     */
+    lut?: string;
+  };
 }
 
 export interface Timeline {
