@@ -33,12 +33,19 @@ vedit doctor --download-model ggml-large-v3-turbo
 
 ```bash
 vedit create <dir> --name <名前>
-vedit ingest <files...> --language ja     # 4K素材で約26秒/分。複数本は ingest エージェントに委譲
+vedit ingest <file> --language ja         # 単発素材はこちら。4K素材で約26秒/分
+vedit ingest-batch <dir> --plan           # 複数本(撮影カード等)は事前確認してから ingest エージェントに委譲
 vedit open                                # プレビューURLを必ずユーザーに伝える
 vedit status                              # revision / duration / sources(全コマンドの起点)
 vedit transcript                          # packed transcript(編集判断の主材料)
 vedit detect                              # 無音(波形+単語ギャップ)・フィラー候補
 ```
+
+`ingest-batch` は撮影カード/フォルダの一括取り込み用: SHA-256 で重複を検出して
+スキップ、`--copy <destDir>` でプロジェクト外の素材保管先へコピー後に検証
+(既定は `--link` = 元パス参照)、処理は `<project>/ingest-journal.json` に
+記録され中断後の再実行で完了済みをスキップして再開する。`--plan` は
+読み取り専用の下見(ファイル数・合計尺・コーデック/VFR/音声/色警告)。
 
 プロジェクト指定は `--project <dir>` または env `VEDIT_PROJECT`。
 

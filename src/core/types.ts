@@ -73,6 +73,15 @@ export interface Source {
     space?: string;
     bitDepth?: number;
   };
+  /**
+   * SHA-256 of the original file's bytes (hex), computed by `vedit
+   * ingest-batch`'s verification pass (see src/ingest/batch.ts) and used
+   * for duplicate detection across batches/re-ingests. Optional/absent for
+   * sources ingested via plain `vedit ingest`, ingested with
+   * `ingest-batch --no-verify`, or ingested before this field existed —
+   * absence is not evidence of anything, just unverified.
+   */
+  sha256?: string;
 }
 
 export interface Timeline {

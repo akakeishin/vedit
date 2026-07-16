@@ -1,17 +1,29 @@
-import { promises as fs } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { createReadStream, promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { freshId } from '../core/ops.js';
 import type { Project } from '../core/project.js';
-import type { Source, Transcript, Word } from '../core/types.js';
+import type { Manifest, Source, Transcript, Word } from '../core/types.js';
 import { run, runBinary } from './run.js';
 
 export interface ProbeResult {
   duration: number;
   fps: number;
+  /**
+   * Nominal (r_frame_rate) rate, kept separate from `fps` (which prefers
+   * the computed avg_frame_rate — see parseFrameRate above `probe`) so a
+   * caller that wants to flag variable-frame-rate material can compare the
+   * two; absent when ffprobe reports neither a usable avg nor r rate.
+   */
+  rFps?: number;
   width: number;
   height: number;
   hasAudio: boolean;
+  /** ffprobe's codec_name for the video stream (e.g. "h264", "hevc"), when reported. */
+  codec?: string;
+  /** format.tags.creation_time verbatim (ISO-ish string), when the container carries one. */
+  creationTime?: string;
   /** Color metadata from the video stream, when ffprobe reports any of it. */
   color?: Source['color'];
 }
@@ -45,7 +57,11 @@ export async function probe(file: string): Promise<ProbeResult> {
   const a = (j.streams as any[]).find((s) => s.codec_type === 'audio');
   if (!v) throw new Error(`no video stream in ${file}`);
 
-  const fps = parseFrameRate(v.avg_frame_rate) ?? parseFrameRate(v.r_frame_rate) ?? 30;
+  const rFps = parseFrameRate(v.r_frame_rate) ?? undefined;
+  const fps = parseFrameRate(v.avg_frame_rate) ?? rFps ?? 30;
+  const codec = typeof v.codec_name === 'string' && v.codec_name ? v.codec_name : undefined;
+  const creationTimeRaw = j.format?.tags?.creation_time;
+  const creationTime = typeof creationTimeRaw === 'string' && creationTimeRaw ? creationTimeRaw : undefined;
 
   // ffprobe emits the sentinel "N/A" for format.duration when the container
   // doesn't carry an overall duration (common for some raw/streamed
@@ -84,9 +100,12 @@ export async function probe(file: string): Promise<ProbeResult> {
   return {
     duration,
     fps,
+    rFps,
     width: v.width,
     height: v.height,
     hasAudio: Boolean(a),
+    codec,
+    creationTime,
     color,
   };
 }
@@ -121,6 +140,22 @@ export async function probeAudio(file: string): Promise<AudioProbeResult> {
     throw new Error(`ffprobe returned no usable duration for ${file}`);
   }
   return { duration, hasAudio: Boolean(a) };
+}
+
+/**
+ * Streaming SHA-256 of a file's raw bytes (hex digest). Used by
+ * `vedit ingest-batch` (src/ingest/batch.ts) for duplicate detection and
+ * post-copy verification — never loads the whole file into memory, so it's
+ * safe on multi-GB camera-card footage.
+ */
+export function sha256File(file: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = createHash('sha256');
+    const stream = createReadStream(file);
+    stream.on('error', reject);
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
+  });
 }
 
 /**
@@ -386,7 +421,21 @@ export interface IngestResult {
 export async function ingestFile(
   project: Project,
   file: string,
-  opts: { language?: string; transcribe?: boolean; addToTimeline?: boolean; onProgress?: IngestProgress } = {},
+  opts: {
+    language?: string;
+    transcribe?: boolean;
+    addToTimeline?: boolean;
+    onProgress?: IngestProgress;
+    /**
+     * Pre-computed SHA-256 of `file`'s bytes (hex), recorded on the
+     * resulting Source verbatim. `ingestFile` never hashes the file itself
+     * — that's `ingest-batch`'s job (src/ingest/batch.ts), since hashing a
+     * multi-GB file is slow and single-file `vedit ingest` has no need for
+     * it. Omitted entirely leaves `source.sha256` unset, same as before
+     * this option existed.
+     */
+    sha256?: string;
+  } = {},
 ): Promise<IngestResult> {
   const abs = path.resolve(file);
   await fs.access(abs);
@@ -424,6 +473,7 @@ export async function ingestFile(
     peaks: p.hasAudio ? peaksRel : undefined,
     transcribed: false,
     color: p.color,
+    sha256: opts.sha256,
   };
   if (p.hasAudio && opts.transcribe !== false) {
     notify('transcribing (whisper)');
@@ -432,32 +482,45 @@ export async function ingestFile(
     source.transcribed = true;
   }
   const addToTimeline = opts.addToTimeline ?? true;
-  const cur = await project.manifest();
-  await project.commit(
-    cur.revision,
-    'system',
-    'ingest',
-    { file: abs },
-    `ingested ${path.basename(abs)} (${p.duration.toFixed(1)}s)${addToTimeline ? '' : ', pool only'}`,
-    (m) => {
-      const first = m.sources.length === 0;
-      return {
-        ...m,
-        fps: first ? Math.min(60, p.fps) : m.fps,
-        width: first ? p.width : m.width,
-        height: first ? p.height : m.height,
-        sources: [...m.sources, source],
-        timeline: addToTimeline
-          ? {
-              ...m.timeline,
-              video: [
-                ...m.timeline.video,
-                { id: freshId('c'), sourceId: id, srcIn: 0, srcOut: p.duration },
-              ],
-            }
-          : m.timeline,
-      };
-    },
-  );
+  const summary = `ingested ${path.basename(abs)} (${p.duration.toFixed(1)}s)${addToTimeline ? '' : ', pool only'}`;
+  const buildNext = (m: Manifest): Manifest => {
+    const first = m.sources.length === 0;
+    return {
+      ...m,
+      fps: first ? Math.min(60, p.fps) : m.fps,
+      width: first ? p.width : m.width,
+      height: first ? p.height : m.height,
+      sources: [...m.sources, source],
+      timeline: addToTimeline
+        ? {
+            ...m.timeline,
+            video: [
+              ...m.timeline.video,
+              { id: freshId('c'), sourceId: id, srcIn: 0, srcOut: p.duration },
+            ],
+          }
+        : m.timeline,
+    };
+  };
+  // `ingest-batch` runs up to two ingests concurrently (bounded parallelism
+  // for the slow proxy/transcribe work — see batch.ts) but Project.commit
+  // is optimistic-concurrency-checked: reading `cur.revision` here and then
+  // committing against it is a read-then-write pair, so a second concurrent
+  // ingestFile call can land its commit in between and make this one's
+  // baseRev stale. That's not a real conflict (each ingest only appends its
+  // own source/clip, independent of what the other wrote) — just re-read
+  // the manifest and retry. Bounded so a genuinely stuck/looping caller
+  // still fails loudly instead of spinning forever.
+  const MAX_STALE_RETRIES = 20;
+  for (let attempt = 0; ; attempt++) {
+    const cur = await project.manifest();
+    try {
+      await project.commit(cur.revision, 'system', 'ingest', { file: abs }, summary, buildNext);
+      break;
+    } catch (e: any) {
+      if (e?.code === 'STALE_REVISION' && attempt < MAX_STALE_RETRIES) continue;
+      throw e;
+    }
+  }
   return { source, timings };
 }

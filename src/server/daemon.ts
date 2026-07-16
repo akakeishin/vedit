@@ -404,6 +404,11 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         language: b.language,
         transcribe: b.transcribe,
         addToTimeline: b.addToTimeline,
+        // Set only by `ingest-batch` (see src/ingest/batch.ts), which
+        // computes the hash itself during its verification pass; a plain
+        // `vedit ingest` never sends this, so `source.sha256` stays unset
+        // exactly as before this option existed.
+        sha256: b.sha256,
         onProgress: (step) => broadcast(ctx, { type: 'ingest-progress', step }),
       });
       broadcast(ctx, { type: 'update', revision: (await p.manifest()).revision, op: 'ingest', summary: `ingested ${b.file}` });

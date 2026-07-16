@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
-import { promises as fs } from 'node:fs';
+import { mkdtempSync, promises as fs } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { Project } from '../core/project.js';
 import type { Word } from '../core/types.js';
 
 // makeProxy/probe/transcribe shell out via run(); stub it so these tests only
@@ -12,7 +15,7 @@ vi.mock('./run.js', () => ({
   runBinary: vi.fn(),
 }));
 
-import { makeProxy, probe, sanitizeWords, transcribe } from './ingest.js';
+import { ingestFile, makeProxy, probe, sanitizeWords, transcribe } from './ingest.js';
 
 describe('sanitizeWords', () => {
   it('leaves well-formed words untouched', () => {
@@ -247,5 +250,49 @@ describe('transcribe', () => {
     expect(meta.at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     expect(t.words).toHaveLength(1);
     expect(t.words[0].text).toBe('hello');
+  });
+});
+
+describe('ingestFile concurrency', () => {
+  // ingest-batch (src/ingest/batch.ts) runs up to 2 ingests concurrently for
+  // the slow proxy/transcribe work, but Project.commit() rejects a stale
+  // baseRev. ingestFile reads the manifest and commits against it as its
+  // very last step — a straightforward read-then-write race when a second
+  // concurrent ingestFile lands its own commit in between. This is a
+  // regression test for the retry-on-STALE_REVISION loop that closes that
+  // race: both ingests must land as two distinct sources, not one succeeding
+  // and the other throwing.
+  it('retries on stale-revision conflicts so two concurrent ingests both land', async () => {
+    runMock.mockReset();
+    runMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'ffprobe') {
+        return JSON.stringify({
+          format: { duration: '5' },
+          streams: [{ codec_type: 'video', avg_frame_rate: '30/1', width: 640, height: 360, duration: '5' }],
+          // no audio stream: skips peaks + transcribe entirely, keeping this
+          // test focused on the commit race rather than needing to also fake
+          // whisper-cli output.
+        });
+      }
+      return ''; // ffmpeg (makeProxy) — no real encode needed, argv isn't asserted here
+    });
+
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-ingest-race-'));
+    const project = await Project.create(path.join(root, 'proj'), 'race');
+    const fileA = path.join(root, 'a.mp4');
+    const fileB = path.join(root, 'b.mp4');
+    await fs.writeFile(fileA, 'a');
+    await fs.writeFile(fileB, 'b');
+
+    const [ra, rb] = await Promise.all([
+      ingestFile(project, fileA, { transcribe: false }),
+      ingestFile(project, fileB, { transcribe: false }),
+    ]);
+
+    expect(ra.source.id).not.toBe(rb.source.id);
+    const m = await project.manifest();
+    expect(m.sources.map((s) => s.id).sort()).toEqual([ra.source.id, rb.source.id].sort());
+    expect(m.timeline.video).toHaveLength(2);
+    expect(m.revision).toBe(2); // two accepted commits, no lost update
   });
 });

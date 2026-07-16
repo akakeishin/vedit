@@ -13,7 +13,20 @@ import { hasReframe, writeOtio } from './export/otio.js';
 import { renderFinal, toAss } from './export/render.js';
 import { publishPack } from './export/publish.js';
 import { writeSrt } from './export/srt.js';
-import { downloadWhisperModel, findWhisperModel } from './ingest/ingest.js';
+import { downloadWhisperModel, findWhisperModel, sha256File } from './ingest/ingest.js';
+import {
+  buildPlan,
+  copyAndVerify,
+  copyPlain,
+  createJournal,
+  detectDuplicates,
+  type DuplicateResult,
+  journalPath,
+  listVideoFiles,
+  readJournal,
+  runPool,
+  sortByCreationTime,
+} from './ingest/batch.js';
 import { ffmpegBin, ffmpegHasFilter, run } from './ingest/run.js';
 import { buildResume } from './core/resume.js';
 import type { Transcript } from './core/types.js';
@@ -29,6 +42,7 @@ const BOOLEAN_FLAGS = new Set([
   'no-transcribe', 'no-add', 'no-fillers', 'no-silence',
   'latest', 'full', 'all', 'burn-captions', 'no-duck',
   'no-repair', 'fast-loudnorm', 'deess', 'confirm',
+  'plan', 'link', 'no-verify',
 ]);
 const argv = process.argv.slice(2);
 const cmd = argv[0];
@@ -100,6 +114,31 @@ async function api(pathname: string, init?: RequestInit): Promise<any> {
     fail(msg);
   }
   return body;
+}
+
+/**
+ * Like `api()`, but never exits the process on a backend error — resolves
+ * to a discriminated result instead. `api()`'s exit-on-error is right for
+ * every other command (one shot, fail fast), but `ingest-batch` processes
+ * many files in one invocation and is designed to survive a single file's
+ * ingest failure (record it in the journal, keep going, let the user retry
+ * just that file later) — see the 'ingest-batch' case below.
+ */
+async function apiTry(pathname: string, init?: RequestInit): Promise<{ ok: true; body: any } | { ok: false; error: string }> {
+  try {
+    const res = await fetch(BASE + pathname, init);
+    const text = await res.text();
+    let body: any;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      body = text;
+    }
+    if (!res.ok) return { ok: false, error: body?.error ?? text };
+    return { ok: true, body };
+  } catch (e: any) {
+    return { ok: false, error: e?.message ?? String(e) };
+  }
 }
 
 async function daemonUp(): Promise<boolean> {
@@ -231,6 +270,8 @@ usage: vedit <command> [args] [--project <dir>]
 
 project:   create <dir> [--name n] | status | resume | revisions | undo [--rev N] | open | projects
 ingest:    ingest <file...> [--language ja] [--no-transcribe] [--no-add]
+           ingest-batch <dir|files...> [--plan] [--copy destDir | --link] [--no-verify]
+             [--language ja] [--no-transcribe] [--no-add]   # 撮影カード一括取込、検証付き・再開可能
 read:      transcript [--full] [--source id] | candidates [--all] | sources
 detect:    detect [--min-gap 0.7] [--threshold 0.06] [--no-fillers] [--no-silence]
 cut:       remove-words <w1 w5..w9 ...> [--source id] [--pad 0.08] | remove-range <t0> <t1> [--source id]
@@ -353,6 +394,155 @@ async function main() {
         out(res);
       }
       return;
+    }
+
+    case 'ingest-batch': {
+      const USAGE = 'usage: vedit ingest-batch <dir|files...> [--plan] [--copy destDir | --link] [--no-verify] [--language ja] [--no-transcribe] [--no-add]';
+      if (pos.length === 0) fail(USAGE);
+      if (flags.copy && flags.link) fail('--copy and --link are mutually exclusive');
+      const dir = projectDir();
+
+      const files = await listVideoFiles(pos);
+      if (files.length === 0) fail('no video files found (recognized extensions: .mp4/.mov/.m4v)');
+      console.error(`scanning ${files.length} file(s)...`);
+      const plan = await buildPlan(files);
+      const sorted = await sortByCreationTime(plan.entries);
+
+      if (flags.plan) {
+        return out({
+          fileCount: plan.fileCount,
+          totalSize: plan.totalSize,
+          totalDuration: Number(plan.totalDuration.toFixed(1)),
+          files: sorted.map((e) => ({
+            file: e.file,
+            size: e.size,
+            duration: Number(e.duration.toFixed(1)),
+            codec: e.codec,
+            hasAudio: e.hasAudio,
+            warnings: e.warnings.map((w) => w.message),
+          })),
+          applied: false,
+          hint: '読み取り専用プラン(重複検出・取り込みは未実行)。実行するには --plan を外して再実行してください',
+        });
+      }
+
+      const copyDest = flags.copy ? path.resolve(String(flags.copy)) : undefined;
+      const verify = !flags['no-verify'];
+
+      // Existing-source dedup: read the manifest directly (like `vedit
+      // sources`) rather than through the daemon — this is a read-only
+      // lookup that doesn't need the daemon up yet.
+      const p = await Project.open(dir);
+      const m0 = await p.manifest();
+      const existingBySha = new Map<string, string>();
+      for (const s of m0.sources) if (s.sha256) existingBySha.set(s.sha256, s.id);
+
+      // Journal resume: skip files already fully ingested by a prior
+      // (possibly interrupted) run of this same command.
+      const priorJournal = await readJournal(dir);
+      const alreadyIngested = new Set(priorJournal.filter((e) => e.status === 'ingested').map((e) => e.file));
+      const journal = createJournal(dir, priorJournal);
+      const toProcess = sorted.filter((e) => !alreadyIngested.has(e.file));
+      const resumeSkipped = sorted.length - toProcess.length;
+      if (resumeSkipped > 0) console.error(`skipping ${resumeSkipped} already-ingested file(s) (journal resume: ${journalPath(dir)})`);
+
+      // Hashing (unless --no-verify): sequential with N/M progress, since a
+      // multi-GB file can take real wall-clock time to hash and interleaving
+      // hash progress with 2-wide ingest progress would be unreadable.
+      const fileHashes = new Map<string, string>();
+      if (verify) {
+        for (let i = 0; i < toProcess.length; i++) {
+          const f = toProcess[i].file;
+          console.error(`hashing ${i + 1}/${toProcess.length}: ${path.basename(f)}`);
+          const hash = await sha256File(f);
+          fileHashes.set(f, hash);
+          await journal.record({ file: f, sha256: hash, status: 'planned', at: new Date().toISOString() });
+        }
+      } else {
+        for (const e of toProcess) {
+          await journal.record({ file: e.file, status: 'planned', at: new Date().toISOString() });
+        }
+      }
+
+      // Duplicate detection (batch-internal + against existing sources) —
+      // only meaningful when hashes were actually computed.
+      let targets = toProcess;
+      const skippedDuplicates: DuplicateResult[] = [];
+      if (verify) {
+        const { unique, duplicates } = detectDuplicates(
+          toProcess.map((e) => ({ file: e.file, hash: fileHashes.get(e.file)! })),
+          existingBySha,
+        );
+        skippedDuplicates.push(...duplicates);
+        const uniqueFiles = new Set(unique.map((u) => u.file));
+        targets = toProcess.filter((e) => uniqueFiles.has(e.file));
+        for (const d of duplicates) {
+          console.error(`skip duplicate (${d.kind === 'existing' ? 'already in project: ' + d.duplicateOf : 'same as ' + path.basename(d.duplicateOf)}): ${path.basename(d.file)}`);
+        }
+      }
+
+      if (targets.length === 0) {
+        return out({
+          ingested: 0,
+          failed: [],
+          skippedDuplicates: skippedDuplicates.map((d) => ({ file: d.file, kind: d.kind, duplicateOf: d.duplicateOf })),
+          skippedAlreadyIngested: resumeSkipped,
+          journal: journalPath(dir),
+          hint: '取り込み対象なし(全件が重複または取り込み済み)',
+        });
+      }
+
+      await ensureDaemon(dir);
+
+      const results: { file: string; ok: boolean; error?: string }[] = [];
+      // Bounded to 2 concurrent files: proxy generation + transcription are
+      // the expensive part of each /api/ingest call (see runPool in
+      // batch.ts). Copy-then-verify happens inside the same worker so it's
+      // bounded by the same concurrency limit.
+      await runPool(targets, 2, async (entry) => {
+        const hash = fileHashes.get(entry.file);
+        let ingestPath = entry.file;
+        if (copyDest) {
+          try {
+            ingestPath = hash ? await copyAndVerify(entry.file, copyDest, hash) : await copyPlain(entry.file, copyDest);
+          } catch (e: any) {
+            await journal.record({ file: entry.file, sha256: hash, status: 'failed', error: e?.message ?? String(e), at: new Date().toISOString() });
+            // Copy verification failure means the copy (or the read of the
+            // original) is corrupt — a data-integrity problem, not a
+            // per-file quirk — so abort the whole batch rather than risk
+            // silently ingesting bad footage from the rest of the run.
+            fail(`copy verification failed for ${entry.file}, aborting batch: ${e?.message ?? e}`);
+          }
+          await journal.record({ file: entry.file, sha256: hash, status: 'copied', destPath: ingestPath, at: new Date().toISOString() });
+        }
+        console.error(`ingesting ${path.basename(entry.file)}...`);
+        const res = await apiTry('/api/ingest', {
+          method: 'POST',
+          body: JSON.stringify({
+            file: ingestPath,
+            sha256: hash,
+            language: flags.language,
+            transcribe: flags['no-transcribe'] ? false : undefined,
+            addToTimeline: flags['no-add'] ? false : undefined,
+          }),
+        });
+        if (res.ok) {
+          await journal.record({ file: entry.file, sha256: hash, status: 'ingested', destPath: copyDest ? ingestPath : undefined, at: new Date().toISOString() });
+          results.push({ file: entry.file, ok: true });
+        } else {
+          await journal.record({ file: entry.file, sha256: hash, status: 'failed', error: res.error, at: new Date().toISOString() });
+          results.push({ file: entry.file, ok: false, error: res.error });
+        }
+      });
+
+      return out({
+        ingested: results.filter((r) => r.ok).length,
+        failed: results.filter((r) => !r.ok).map((r) => ({ file: r.file, error: r.error })),
+        skippedDuplicates: skippedDuplicates.map((d) => ({ file: d.file, kind: d.kind, duplicateOf: d.duplicateOf })),
+        skippedAlreadyIngested: resumeSkipped,
+        journal: journalPath(dir),
+        hint: results.some((r) => !r.ok) ? '失敗したファイルは同じコマンドを再実行すれば再試行される(ジャーナルで完了済みはスキップ)' : undefined,
+      });
     }
 
     case 'transcript': {
