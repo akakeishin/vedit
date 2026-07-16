@@ -4,6 +4,7 @@
 
 const $ = (id) => document.getElementById(id);
 const video = $('video');
+const basename = (p) => String(p ?? '').split('/').pop();
 
 const S = {
   manifest: null,
@@ -18,13 +19,21 @@ const S = {
   scenes: new Map(), // sourceId -> Scene[]
   currentSeg: -1,
   playing: false,
+  // Transcript selection: composite "sourceId:wordId" keys throughout, since
+  // word ids restart at w0000 per source and are NOT globally unique.
   selWords: new Set(),
-  selAnchor: null,
+  selAnchor: null, // "sourceId:wordId"
+  selSourceId: null, // source locked for the CURRENT selection; used for delete so
+  // we never have to re-derive it from a possibly-stale DOM query.
+  focusKey: null, // "sourceId:wordId" — roving-tabindex focus stop in #words
+  activeWordKey: null, // "sourceId:wordId" currently playback-highlighted
   selectedClip: null,
   detectMinGap: 0.7,
   rateIdx: 0, // index into PLAY_RATES, cycled by repeated L presses
   rangeIn: null, // timeline seconds
   rangeOut: null, // timeline seconds
+  previewStopAt: null, // timeline seconds; candidate "前後を再生" auto-stop point
+  loadState: 'loading', // 'loading' | 'ok' | 'no-project' | 'error'
 };
 const PLAY_RATES = [1, 1.5, 2];
 
@@ -38,32 +47,69 @@ async function api(path, init) {
 }
 
 async function reload() {
-  const pr = await api('/api/project');
-  S.manifest = pr.manifest;
-  S.segments = pr.segments;
-  S.duration = pr.duration;
-  S.cues = await api('/api/captions');
-  S.candidates = await api('/api/candidates');
-  S.candidatesAll = await api('/api/candidates?all=1');
-  S.revisions = await api('/api/revisions');
-  for (const src of S.manifest.sources) {
-    if (src.transcribed && !S.transcripts.has(src.id)) {
-      const t = await api(`/api/transcript?full=1&source=${src.id}`);
-      S.transcripts.set(src.id, t.words);
-    }
-    if (src.peaks && !S.peaks.has(src.id)) {
-      S.peaks.set(src.id, await api(`/media/peaks/${src.id}`));
-    }
-    try {
-      const f = await api(`/api/scenes?source=${src.id}&full=1`);
-      if (f.scenes && f.scenes.length) S.scenes.set(src.id, f.scenes);
-      else S.scenes.delete(src.id);
-    } catch {
-      S.scenes.delete(src.id); // no scenes detected yet for this source
-    }
+  let pr;
+  try {
+    pr = await api('/api/project');
+  } catch (e) {
+    S.loadState = e.status === 400 && /no project open/.test(e.message ?? '') ? 'no-project' : 'error';
+    renderStageState();
+    throw e;
   }
-  renderAll();
+  try {
+    S.manifest = pr.manifest;
+    S.segments = pr.segments;
+    S.duration = pr.duration;
+    S.cues = await api('/api/captions');
+    S.candidates = await api('/api/candidates');
+    S.candidatesAll = await api('/api/candidates?all=1');
+    S.revisions = await api('/api/revisions');
+    for (const src of S.manifest.sources) {
+      if (src.transcribed && !S.transcripts.has(src.id)) {
+        const t = await api(`/api/transcript?full=1&source=${src.id}`);
+        S.transcripts.set(src.id, t.words);
+      }
+      if (src.peaks && !S.peaks.has(src.id)) {
+        S.peaks.set(src.id, await api(`/media/peaks/${src.id}`));
+      }
+      try {
+        const f = await api(`/api/scenes?source=${src.id}&full=1`);
+        if (f.scenes && f.scenes.length) S.scenes.set(src.id, f.scenes);
+        else S.scenes.delete(src.id);
+      } catch {
+        S.scenes.delete(src.id); // no scenes detected yet for this source
+      }
+    }
+    S.loadState = 'ok';
+    renderAll();
+  } catch (e) {
+    S.loadState = 'error';
+    renderStageState();
+    throw e;
+  }
 }
+
+// ---------- stage empty/failure states (persistent, not just a toast) ----------
+function renderStageState() {
+  const el = $('stageEmpty');
+  const msg = $('stageEmptyMsg');
+  const retry = $('stageEmptyRetry');
+  if (S.loadState === 'error') {
+    el.hidden = false;
+    msg.textContent = '読み込みに失敗しました';
+    retry.hidden = false;
+  } else if (S.loadState === 'no-project') {
+    el.hidden = false;
+    msg.textContent = 'プロジェクト未選択';
+    retry.hidden = true;
+  } else if (S.manifest && (S.manifest.sources?.length ?? 0) === 0) {
+    el.hidden = false;
+    msg.textContent = '素材がありません — `vedit ingest <file>` で取り込み';
+    retry.hidden = true;
+  } else {
+    el.hidden = true;
+  }
+}
+$('stageEmptyRetry').onclick = () => { reload().catch(() => {}); };
 
 // ---------- playback: timeline time <-> proxy time ----------
 function segAt(tl) {
@@ -95,7 +141,7 @@ function loadSeg(i, { play = false, offset = 0 } = {}) {
   updateFraming();
 }
 
-// manifest.output present -> lock #videoWrap to that aspect (object-fit:
+// manifest.output present -> lock #videoBox to that aspect (object-fit:
 // cover) and position the crop window per the CURRENT clip's crop.x/y, so
 // the preview matches what export will actually frame. No output -> revert
 // to plain letterboxing.
@@ -119,6 +165,7 @@ function seekTl(tl, { play } = {}) {
   tl = Math.max(0, Math.min(tl, S.duration - 0.001));
   let i = segAt(tl);
   if (i < 0) i = S.segments.length - 1;
+  if (i < 0) return; // no segments at all
   loadSeg(i, { play: play ?? S.playing, offset: tl - S.segments[i].tlStart });
 }
 
@@ -129,7 +176,7 @@ function tick() {
     const s = S.segments[i];
     if (!video.paused && video.currentTime >= s.srcStart + (s.tlEnd - s.tlStart) - 0.02) {
       if (i + 1 < S.segments.length) loadSeg(i + 1, { play: true });
-      else { video.pause(); S.playing = false; $('playBtn').textContent = '▶'; }
+      else { video.pause(); S.playing = false; setPlayBtnState(false); }
     }
     const tl = tlNow();
     $('playhead').style.left = `${(tl / S.duration) * 100}%`;
@@ -137,6 +184,10 @@ function tick() {
     renderCaption(tl);
     renderMotion(tl);
     highlightWord(tl);
+    if (S.previewStopAt != null && S.playing && tl >= S.previewStopAt) {
+      S.previewStopAt = null;
+      stopPlayback();
+    }
   }
   requestAnimationFrame(tick);
 }
@@ -157,10 +208,16 @@ function setPlaybackRate(rate) {
   if (rate === 1) { lbl.hidden = true; }
   else { lbl.hidden = false; lbl.textContent = `${rate}x`; }
 }
+function setPlayBtnState(playing) {
+  const btn = $('playBtn');
+  btn.textContent = playing ? '⏸' : '▶';
+  btn.setAttribute('aria-pressed', String(playing));
+  btn.setAttribute('aria-label', playing ? '一時停止' : '再生');
+}
 function stopPlayback() {
   video.pause();
   S.playing = false;
-  $('playBtn').textContent = '▶';
+  setPlayBtnState(false);
   S.rateIdx = 0;
   setPlaybackRate(1);
 }
@@ -168,15 +225,25 @@ function startPlayback() {
   if (S.currentSeg < 0) seekTl(0, { play: true });
   else video.play().catch(() => {});
   S.playing = true;
-  $('playBtn').textContent = '⏸';
+  setPlayBtnState(true);
 }
 
 $('playBtn').onclick = () => {
   if (S.playing) stopPlayback();
   else startPlayback();
 };
+
+// Global 1-key shortcuts are disabled while focus is inside a button/select/
+// [role=tab]/dialog — those elements have their own key handling (native
+// Space/Enter activation, tab arrow-navigation, dialog Esc-to-close), and
+// letting the document-level handler also fire would double-trigger or
+// hijack keys the control itself needs (see item 15 in the UX/a11y pass).
+function globalShortcutsBlocked(target) {
+  return !!target?.closest?.('button, select, [role="tab"], dialog');
+}
 document.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.isContentEditable) return;
+  if (globalShortcutsBlocked(e.target)) return;
   if (e.code === 'Space') { e.preventDefault(); $('playBtn').click(); return; }
   if (e.code === 'ArrowLeft') { seekTl(tlNow() - (e.shiftKey ? 1 / S.manifest.fps : 1)); return; }
   if (e.code === 'ArrowRight') { seekTl(tlNow() + (e.shiftKey ? 1 / S.manifest.fps : 1)); return; }
@@ -194,7 +261,7 @@ document.addEventListener('keydown', (e) => {
     setPlaybackRate(1);
     seekTl(tlNow() - 2, { play: true });
     S.playing = true;
-    $('playBtn').textContent = '⏸';
+    setPlayBtnState(true);
     return;
   }
   if (e.key === ',') { e.preventDefault(); seekTl(tlNow() - 1 / S.manifest.fps); return; }
@@ -266,7 +333,7 @@ $('rangeDeleteBtn').onclick = async () => {
   if (overlapping.length === 0) return;
   const sourceId = overlapping[0].sourceId;
   if (overlapping.some((s) => s.sourceId !== sourceId)) {
-    toast('複数クリップにまたがる範囲は未対応です');
+    toast('複数クリップにまたがる範囲は未対応です', { type: 'error' });
     return;
   }
   const first = overlapping[0];
@@ -277,15 +344,30 @@ $('rangeDeleteBtn').onclick = async () => {
   await mutate({ op: 'remove-range', sourceId, t0, t1 });
 };
 
-// ---------- shortcuts overlay ----------
-function toggleShortcuts() {
-  const el = $('shortcutsOverlay');
-  el.hidden = !el.hidden;
+// ---------- shortcuts dialog ----------
+let shortcutsInvoker = null;
+function openShortcuts() {
+  const dlg = $('shortcutsDialog');
+  if (dlg.open) return;
+  shortcutsInvoker = document.activeElement;
+  dlg.showModal();
 }
-$('shortcutsBtn').onclick = toggleShortcuts;
-$('shortcutsCloseBtn').onclick = toggleShortcuts;
-$('shortcutsOverlay').addEventListener('click', (e) => {
-  if (e.target.id === 'shortcutsOverlay') toggleShortcuts();
+function closeShortcuts() {
+  const dlg = $('shortcutsDialog');
+  if (dlg.open) dlg.close();
+}
+function toggleShortcuts() {
+  if ($('shortcutsDialog').open) closeShortcuts();
+  else openShortcuts();
+}
+$('shortcutsBtn').onclick = openShortcuts;
+$('shortcutsCloseBtn').onclick = closeShortcuts;
+$('shortcutsDialog').addEventListener('click', (e) => {
+  if (e.target === $('shortcutsDialog')) closeShortcuts();
+});
+$('shortcutsDialog').addEventListener('close', () => {
+  shortcutsInvoker?.focus?.();
+  shortcutsInvoker = null;
 });
 
 function renderTimeline() {
@@ -349,7 +431,7 @@ function drawWave() {
   const g = c.getContext('2d');
   g.scale(devicePixelRatio, devicePixelRatio);
   g.clearRect(0, 0, r.width, r.height);
-  g.fillStyle = '#39424f';
+  g.fillStyle = '#637287';
   const mid = r.height * 0.62;
   for (const s of S.segments) {
     const pk = S.peaks.get(s.sourceId);
@@ -452,14 +534,14 @@ function keptSet(sourceId) {
   return kept;
 }
 
-// wordId -> rejected candidate (for the non-destructive "ignored" overlay,
-// Descript-style: a rejected cut candidate stays visible, struck through faintly,
+// "sourceId:wordId" -> rejected candidate (for the non-destructive "ignored"
+// overlay: a rejected cut candidate stays visible, struck through faintly,
 // rather than disappearing without a trace).
 function rejectedWordMap() {
   const m = new Map();
   for (const c of S.candidatesAll) {
     if (c.status !== 'rejected') continue;
-    for (const id of c.wordIds ?? []) m.set(id, c);
+    for (const id of c.wordIds ?? []) m.set(`${c.sourceId}:${id}`, c);
   }
   return m;
 }
@@ -468,26 +550,45 @@ function renderTranscript() {
   const el = $('words');
   el.innerHTML = '';
   const ignored = rejectedWordMap();
+  // If the roving-tabindex stop points at a word that no longer exists
+  // (e.g. it was just deleted), fall back to the first available word so the
+  // listbox always has exactly one tabbable stop.
+  if (S.focusKey) {
+    const [fSrc, fId] = S.focusKey.split(':');
+    if (!(S.transcripts.get(fSrc) ?? []).some((w) => w.id === fId)) S.focusKey = null;
+  }
   for (const src of S.manifest.sources) {
     const words = S.transcripts.get(src.id);
     if (!words) continue;
+    const heading = document.createElement('div');
+    heading.className = 'srcHeading';
+    heading.setAttribute('role', 'presentation');
+    heading.textContent = `📄 ${basename(src.path)} (${src.id})`;
+    el.appendChild(heading);
     const kept = keptSet(src.id);
     let prev = null;
     for (const w of words) {
       if (prev && w.t0 - prev.t1 >= 0.7) {
         const g = document.createElement('span');
         g.className = 'gap';
+        g.setAttribute('role', 'presentation');
         g.textContent = `〔${(w.t0 - prev.t1).toFixed(1)}s〕`;
         el.appendChild(g);
       }
+      const key = `${src.id}:${w.id}`;
+      const cand = ignored.get(key);
+      const selected = S.selWords.has(key);
       const s = document.createElement('span');
-      const cand = ignored.get(w.id);
-      s.className = 'w' + (kept.has(w.id) ? '' : ' cut') + (S.selWords.has(w.id) ? ' sel' : '') + (cand ? ' ignored' : '');
+      s.className = 'w' + (kept.has(w.id) ? '' : ' cut') + (selected ? ' sel' : '') + (cand ? ' ignored' : '');
       s.textContent = w.text;
       s.dataset.id = w.id;
       s.dataset.src = src.id;
+      s.setAttribute('role', 'option');
+      s.setAttribute('aria-selected', String(selected));
+      if (!S.focusKey) S.focusKey = key; // default roving-tabindex stop: first word
+      s.tabIndex = key === S.focusKey ? 0 : -1;
       s.title = cand
-        ? `却下済み: ${cand.label}(クリックで復元=再提案)`
+        ? `却下済み: ${cand.label}(再検出で再提案されます)`
         : `${w.id} ${w.t0.toFixed(2)}–${w.t1.toFixed(2)}s`;
       el.appendChild(s);
       prev = w;
@@ -495,60 +596,202 @@ function renderTranscript() {
   }
 }
 
-// selection: pointerdown starts, drag extends, click seeks
+function wordTl(srcId, w) {
+  const seg = S.segments.find((s) => s.sourceId === srcId && (w.t0 + w.t1) / 2 >= s.srcStart && (w.t0 + w.t1) / 2 < s.srcStart + (s.tlEnd - s.tlStart));
+  if (!seg) return null;
+  return seg.tlStart + (w.t0 + w.t1) / 2 - seg.srcStart;
+}
+function seekToWord(srcId, w) {
+  const tl = wordTl(srcId, w);
+  if (tl != null) seekTl(tl, { play: false });
+}
+function focusWordEl(srcId, id) {
+  document.querySelector(`.w[data-src="${CSS.escape(srcId)}"][data-id="${CSS.escape(id)}"]`)?.focus();
+}
+
+// selection: pointerdown starts, drag extends, click seeks. Shift+click
+// (without a drag) extends the range from the last anchor — the non-drag
+// "click start, shift+click end" alternative. Selection is always
+// single-source: extending into a different source is blocked with a toast.
 let dragging = false;
 $('words').addEventListener('pointerdown', (e) => {
   const t = e.target.closest('.w');
   if (!t) return;
+  const srcId = t.dataset.src;
+  const key = `${srcId}:${t.dataset.id}`;
+  if (e.shiftKey && S.selAnchor) {
+    const anchorSrc = S.selAnchor.split(':')[0];
+    if (anchorSrc !== srcId) { toast('ソースをまたぐ選択はできません', { type: 'error' }); return; }
+    const words = S.transcripts.get(srcId) ?? [];
+    const ids = words.map((w) => `${srcId}:${w.id}`);
+    const a = ids.indexOf(S.selAnchor);
+    const b = ids.indexOf(key);
+    if (a >= 0 && b >= 0) {
+      S.selWords = new Set(ids.slice(Math.min(a, b), Math.max(a, b) + 1));
+      S.selSourceId = srcId;
+    }
+    S.focusKey = key;
+    renderTranscript();
+    updateSelBtn();
+    // renderTranscript() rebuilds #words' DOM, so the element the mouse
+    // actually clicked no longer exists — the browser's native "click
+    // focuses this element" doesn't carry over. Re-focus the replacement so
+    // a keyboard user can immediately continue with arrow keys.
+    focusWordEl(srcId, t.dataset.id);
+    return;
+  }
   dragging = true;
-  S.selAnchor = t.dataset.id;
-  S.selWords = new Set([t.dataset.id]);
+  S.selAnchor = key;
+  S.selSourceId = srcId;
+  S.focusKey = key;
+  S.selWords = new Set([key]);
   renderTranscript();
   updateSelBtn();
+  focusWordEl(srcId, t.dataset.id);
 });
 $('words').addEventListener('pointerover', (e) => {
   if (!dragging) return;
   const t = e.target.closest('.w');
   if (!t) return;
   const srcId = t.dataset.src;
+  if (srcId !== S.selSourceId) { toast('ソースをまたぐ選択はできません', { type: 'error' }); return; }
   const words = S.transcripts.get(srcId) ?? [];
-  const ids = words.map((w) => w.id);
+  const ids = words.map((w) => `${srcId}:${w.id}`);
   const a = ids.indexOf(S.selAnchor);
-  const b = ids.indexOf(t.dataset.id);
+  const b = ids.indexOf(`${srcId}:${t.dataset.id}`);
   if (a < 0 || b < 0) return;
   S.selWords = new Set(ids.slice(Math.min(a, b), Math.max(a, b) + 1));
+  S.focusKey = `${srcId}:${t.dataset.id}`;
   renderTranscript();
   updateSelBtn();
+  focusWordEl(srcId, t.dataset.id);
 });
 window.addEventListener('pointerup', (e) => {
   if (!dragging) return;
   dragging = false;
   if (S.selWords.size === 1) {
     // treat as click: seek to word if it's on the timeline
-    const id = [...S.selWords][0];
-    const t = e.target.closest?.('.w');
-    const srcId = t?.dataset.src ?? S.manifest.sources[0].id;
+    const key = [...S.selWords][0];
+    const [srcId, id] = key.split(':');
     const w = (S.transcripts.get(srcId) ?? []).find((x) => x.id === id);
-    if (w) {
-      const seg = S.segments.find((s) => s.sourceId === srcId && (w.t0 + w.t1) / 2 >= s.srcStart && (w.t0 + w.t1) / 2 < s.srcStart + (s.tlEnd - s.tlStart));
-      if (seg) seekTl(seg.tlStart + (w.t0 + w.t1) / 2 - seg.srcStart, { play: false });
-    }
+    if (w) seekToWord(srcId, w);
     S.selWords.clear();
+    S.selSourceId = null;
     renderTranscript();
+    focusWordEl(srcId, id);
   }
   updateSelBtn();
 });
-function updateSelBtn() {
-  $('removeSelBtn').disabled = S.selWords.size < 1;
-  $('removeSelBtn').textContent = S.selWords.size > 0 ? `選択を削除 (${S.selWords.size}語)` : '選択を削除';
-}
-$('removeSelBtn').onclick = async () => {
-  if (S.selWords.size === 0) return;
-  const srcId = document.querySelector(`.w[data-id="${[...S.selWords][0]}"]`)?.dataset.src;
-  await mutate({ op: 'remove-words', ids: [...S.selWords], sourceId: srcId });
-  S.selWords.clear();
+
+// ---------- transcript keyboard nav (WAI-ARIA listbox pattern) ----------
+function toggleWordSelection(srcId, id) {
+  if (S.selSourceId && S.selSourceId !== srcId && S.selWords.size) {
+    toast('ソースをまたぐ選択はできません', { type: 'error' });
+    return;
+  }
+  const key = `${srcId}:${id}`;
+  if (S.selWords.has(key)) {
+    S.selWords.delete(key);
+    if (S.selWords.size === 0) S.selSourceId = null;
+  } else {
+    S.selWords.add(key);
+    S.selSourceId = srcId;
+    S.selAnchor = key;
+  }
+  S.focusKey = key;
+  renderTranscript();
   updateSelBtn();
-};
+  focusWordEl(srcId, id); // renderTranscript() rebuilt the DOM; reclaim focus so Space/arrows keep working
+}
+// All words across all sources, in the same order they render in — used so
+// plain (non-extending) arrow-key focus movement can cross a source
+// boundary freely; only EXTENDING a selection (shift+arrow) is blocked at
+// the boundary (mirrors the mouse-drag behavior in the pointerover handler).
+function flattenedWords() {
+  const out = [];
+  for (const src of S.manifest.sources) {
+    const words = S.transcripts.get(src.id);
+    if (!words) continue;
+    for (const w of words) out.push({ srcId: src.id, id: w.id, t0: w.t0, t1: w.t1 });
+  }
+  return out;
+}
+function moveWordFocus(flat, newIdx, extend) {
+  if (newIdx < 0 || newIdx >= flat.length) return;
+  const entry = flat[newIdx];
+  const newKey = `${entry.srcId}:${entry.id}`;
+  if (extend) {
+    if (!S.selAnchor) S.selAnchor = S.focusKey ?? newKey;
+    const anchorSrc = S.selAnchor.split(':')[0];
+    if (anchorSrc !== entry.srcId) { toast('ソースをまたぐ選択はできません', { type: 'error' }); return; }
+    const anchorIdx = flat.findIndex((w) => `${w.srcId}:${w.id}` === S.selAnchor);
+    if (anchorIdx >= 0) {
+      const lo = Math.min(anchorIdx, newIdx), hi = Math.max(anchorIdx, newIdx);
+      S.selWords = new Set(flat.slice(lo, hi + 1).map((w) => `${w.srcId}:${w.id}`));
+      S.selSourceId = entry.srcId;
+    }
+  }
+  S.focusKey = newKey;
+  renderTranscript();
+  updateSelBtn();
+  focusWordEl(entry.srcId, entry.id);
+}
+async function deleteSelectedWords() {
+  if (S.selWords.size === 0) return;
+  const srcId = S.selSourceId;
+  const ids = [...S.selWords].map((k) => k.split(':')[1]);
+  const { ok } = await mutate(
+    { op: 'remove-words', ids, sourceId: srcId },
+    { conflictMessage: '削除は適用されませんでした。最新状態を確認してもう一度実行してください' },
+  );
+  if (ok) {
+    S.selWords.clear();
+    S.selSourceId = null;
+    updateSelBtn();
+  }
+  // on failure S.selWords/S.selSourceId are left intact so the user's
+  // selection survives the re-render and they can just retry.
+  // Either way, mutate()'s reload() rebuilt #words' DOM; reclaim focus onto
+  // the current roving-tabindex stop so keyboard navigation can continue.
+  if (S.focusKey) {
+    const [fSrc, fId] = S.focusKey.split(':');
+    focusWordEl(fSrc, fId);
+  } else {
+    $('transcriptPanel').focus();
+  }
+}
+$('words').addEventListener('keydown', (e) => {
+  const t = e.target.closest('.w');
+  if (!t) return;
+  const srcId = t.dataset.src;
+  const flat = flattenedWords();
+  const idx = flat.findIndex((w) => w.srcId === srcId && w.id === t.dataset.id);
+  if (idx < 0) return;
+  if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
+    e.preventDefault(); e.stopPropagation();
+    moveWordFocus(flat, idx + 1, e.shiftKey);
+  } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+    e.preventDefault(); e.stopPropagation();
+    moveWordFocus(flat, idx - 1, e.shiftKey);
+  } else if (e.code === 'Space') {
+    e.preventDefault(); e.stopPropagation();
+    toggleWordSelection(srcId, t.dataset.id);
+  } else if (e.key === 'Enter') {
+    e.preventDefault(); e.stopPropagation();
+    seekToWord(srcId, flat[idx]);
+  } else if (e.key === 'Delete' || e.key === 'Backspace') {
+    e.preventDefault(); e.stopPropagation();
+    deleteSelectedWords();
+  }
+});
+
+function updateSelBtn() {
+  const n = S.selWords.size;
+  $('removeSelBtn').disabled = n < 1;
+  $('removeSelBtn').textContent = n > 0 ? `選択を削除 (${n}語)` : '選択を削除';
+  $('selStatus').textContent = n > 0 ? `${n}語選択中` : '選択解除';
+}
+$('removeSelBtn').onclick = deleteSelectedWords;
 
 function highlightWord(tl) {
   const i = S.currentSeg;
@@ -557,36 +800,77 @@ function highlightWord(tl) {
   const srcT = s.srcStart + (tl - s.tlStart);
   const words = S.transcripts.get(s.sourceId) ?? [];
   const w = words.find((x) => srcT >= x.t0 && srcT < x.t1);
-  const cur = document.querySelector('.w.active');
-  if (cur && cur.dataset.id !== w?.id) cur.classList.remove('active');
-  if (w) document.querySelector(`.w[data-id="${w.id}"]`)?.classList.add('active');
+  const key = w ? `${s.sourceId}:${w.id}` : null;
+  if (S.activeWordKey === key) return;
+  if (S.activeWordKey) {
+    const [ps, pid] = S.activeWordKey.split(':');
+    document.querySelector(`.w[data-src="${CSS.escape(ps)}"][data-id="${CSS.escape(pid)}"]`)?.classList.remove('active');
+  }
+  S.activeWordKey = key;
+  if (key) document.querySelector(`.w[data-src="${CSS.escape(s.sourceId)}"][data-id="${CSS.escape(w.id)}"]`)?.classList.add('active');
 }
 
 // ---------- candidates ----------
 const KIND_LABEL = { silence: '無音', filler: 'フィラー', retake: '言い直し', 'low-energy': '低テンション' };
 const KIND_ORDER = ['silence', 'filler', 'retake', 'low-energy'];
 
+// Map a candidate's (padded) source-time point to a timeline seconds value,
+// clamped to the segment that currently contains its source range — used by
+// both the row's seek-on-click and the "前後を再生" preview.
+function candidateTl(t, c) {
+  const seg = S.segments.find((s) => s.sourceId === c.sourceId && t >= s.srcStart - 2 && t <= s.srcStart + (s.tlEnd - s.tlStart) + 2);
+  if (!seg) return null;
+  const clamped = Math.max(seg.srcStart, Math.min(t, seg.srcStart + (seg.tlEnd - seg.tlStart)));
+  return seg.tlStart + (clamped - seg.srcStart);
+}
+
 function candRow(c) {
   const d = document.createElement('div');
   d.className = 'cand';
+  d.tabIndex = 0;
   const dur = Math.max(0, c.t1 - c.t0);
-  d.innerHTML = `<span class="kind ${c.kind}">${c.kind}</span><span class="lbl">${esc(c.label)}</span><span class="dur">-${dur.toFixed(1)}s</span>`;
-  d.onclick = () => {
-    // seek near the candidate (it may already be cut away)
-    const seg = S.segments.find((s) => s.sourceId === c.sourceId && c.t0 >= s.srcStart - 2 && c.t0 <= s.srcStart + (s.tlEnd - s.tlStart) + 2);
-    if (seg) seekTl(seg.tlStart + Math.max(0, Math.min(c.t0 - seg.srcStart, seg.tlEnd - seg.tlStart - 0.1)), { play: false });
+  const src = S.manifest.sources.find((s) => s.id === c.sourceId);
+  const srcName = src ? basename(src.path) : c.sourceId;
+  const timeRange = `${fmt(c.t0)}–${fmt(c.t1)}`;
+  d.innerHTML = `<span class="kind ${c.kind}">${esc(KIND_LABEL[c.kind] ?? c.kind)}</span><span class="lbl">${esc(c.label)}</span><span class="srcTag">${esc(srcName)} ${timeRange}</span><span class="dur">-${dur.toFixed(1)}s</span>`;
+  d.setAttribute('aria-label', `${KIND_LABEL[c.kind] ?? c.kind}: ${c.label}(${srcName} ${timeRange}, -${dur.toFixed(1)}秒)`);
+  const seekHere = () => {
+    const tl = candidateTl(c.t0, c);
+    if (tl != null) seekTl(Math.max(0, Math.min(tl, S.duration - 0.1)), { play: false });
+  };
+  d.onclick = seekHere;
+  d.onkeydown = (e) => {
+    if (e.key === 'Enter' || e.code === 'Space') { e.preventDefault(); seekHere(); }
+  };
+  const preview = document.createElement('button');
+  preview.className = 'btn-preview';
+  preview.textContent = '前後を再生';
+  preview.title = '候補の1秒前から再生し、終端+1秒で自動停止';
+  preview.setAttribute('aria-label', `${c.label} の前後を再生`);
+  preview.onclick = (e) => {
+    e.stopPropagation();
+    const startTl = candidateTl(c.t0 - 1, c);
+    const endTl = candidateTl(c.t1 + 1, c);
+    if (startTl == null) return;
+    S.previewStopAt = endTl;
+    seekTl(startTl, { play: true });
+    S.playing = true;
+    setPlayBtnState(true);
   };
   const ok = document.createElement('button');
   ok.className = 'btn-approve';
-  ok.textContent = '✓';
-  ok.title = '承認(カット適用)';
+  ok.textContent = 'カット適用';
+  ok.setAttribute('aria-label', `${c.label} をカット適用`);
   ok.onclick = async (e) => { e.stopPropagation(); await decide([c.id], 'approve'); };
   const ng = document.createElement('button');
   ng.className = 'btn-reject';
-  ng.textContent = '✕';
-  ng.title = '却下';
+  ng.textContent = '残す';
+  ng.setAttribute('aria-label', `${c.label} を残す(却下)`);
   ng.onclick = async (e) => { e.stopPropagation(); await decide([c.id], 'reject'); };
-  d.append(ok, ng);
+  const actions = document.createElement('div');
+  actions.className = 'candActions';
+  actions.append(preview, ok, ng);
+  d.append(actions);
   return d;
 }
 
@@ -627,7 +911,13 @@ function renderCandidates() {
     el.appendChild(group);
   }
 }
-$('approveAllBtn').onclick = () => decide('all', 'approve');
+$('approveAllBtn').onclick = () => {
+  const n = S.candidates.length;
+  if (n === 0) return;
+  const totalDur = S.candidates.reduce((sum, c) => sum + Math.max(0, c.t1 - c.t0), 0);
+  if (!confirm(`${n}件・合計−${totalDur.toFixed(1)}s を適用します`)) return;
+  decide('all', 'approve');
+};
 
 // ---------- detection threshold ----------
 $('minGapRange').oninput = (e) => {
@@ -639,23 +929,50 @@ $('redetectBtn').onclick = async () => {
     await api('/api/detect', { method: 'POST', body: JSON.stringify({ minGap: S.detectMinGap }) });
     toast(`しきい値 ${S.detectMinGap.toFixed(1)}s で再検出しました`);
   } catch (e) {
-    toast(e.message);
+    toast(e.message, { type: 'error' });
   }
-  await reload();
+  await reload().catch(() => {});
 };
+
+// Moves focus to the "next" candidate row after a decide()/reload() re-render
+// (the decided rows disappear from the list), or to the panel itself if none
+// remain — so keyboard/screen-reader users never lose their place.
+function focusAfterCandidateDecision(anchorIdx) {
+  const rows = [...document.querySelectorAll('#candList .cand')];
+  if (rows.length === 0) { $('candPanel').focus(); return; }
+  const idx = Math.max(0, Math.min(anchorIdx, rows.length - 1));
+  rows[idx].focus();
+}
 async function decide(ids, decision) {
+  const idList = ids === 'all' ? S.candidates.map((c) => c.id) : ids;
+  const lastId = idList[idList.length - 1];
+  const anchorIdx = Math.max(0, S.candidates.findIndex((c) => c.id === lastId));
   try {
     await api('/api/candidates/decide', {
       method: 'POST',
       body: JSON.stringify({ ids, decision, actor: 'ui', baseRev: S.manifest.revision }),
     });
   } catch (e) {
-    toast(e.status === 409 ? '他の編集と競合しました。最新状態を再読込します' : e.message);
+    toast(e.status === 409 ? '他の編集と競合しました。最新状態を再読込します' : e.message, { type: 'error' });
   }
-  await reload();
+  await reload().catch(() => {});
+  focusAfterCandidateDecision(anchorIdx);
 }
 
 // ---------- history / undo ----------
+function focusAfterHistoryAction() {
+  const rows = [...document.querySelectorAll('#histList .restoreBtn')];
+  if (rows.length === 0) { $('histPanel').focus(); return; }
+  rows[0].focus();
+}
+async function restoreToRevision(rev) {
+  const { ok } = await mutate({ op: 'restore', rev });
+  if (ok) toast(`r${rev} に戻しました。ほかの版を確認するには「履歴」タブを開いてください`);
+  // renderHistory() always rebuilds #histList's DOM on reload, so the
+  // clicked button is stale either way — always re-focus something so focus
+  // never silently drops to <body>, on both success and (post-reload) failure.
+  focusAfterHistoryAction();
+}
 function renderHistory() {
   const el = $('histList');
   el.innerHTML = '';
@@ -671,76 +988,162 @@ function renderHistory() {
       btn.textContent = 'ここに戻す';
       btn.onclick = async () => {
         if (!confirm(`r${r.rev} 「${r.summary}」に戻しますか？`)) return;
-        await mutate({ op: 'restore', rev: r.rev });
+        await restoreToRevision(r.rev);
       };
       d.appendChild(btn);
     }
     el.appendChild(d);
   }
 }
+function updateUndoBtn() {
+  const btn = $('undoBtn');
+  const rev = S.manifest?.revision ?? 0;
+  if (rev <= 1) {
+    btn.textContent = '⟲ 戻せません';
+    btn.disabled = true;
+    btn.setAttribute('aria-label', '戻せるリビジョンがありません');
+  } else {
+    btn.textContent = `⟲ r${rev - 1}へ戻す`;
+    btn.disabled = false;
+    btn.setAttribute('aria-label', `r${rev - 1}へ戻す`);
+  }
+}
 $('undoBtn').onclick = async () => {
-  const last = S.revisions.at(-1);
-  if (!last || last.rev <= 1) return toast('戻せるリビジョンがありません');
-  await mutate({ op: 'restore', rev: last.rev - 1 });
+  const rev = S.manifest?.revision ?? 0;
+  if (rev <= 1) { toast('戻せるリビジョンがありません', { type: 'error' }); return; }
+  await restoreToRevision(rev - 1);
 };
 
 // ---------- shared mutation path ----------
-async function mutate(body) {
+// Returns {ok, conflict} instead of throwing so callers can decide what to
+// preserve (e.g. keep the transcript selection alive) when a 409 happens.
+async function mutate(body, opts = {}) {
   try {
     await api('/api/edit', {
       method: 'POST',
       body: JSON.stringify({ baseRev: S.manifest.revision, actor: 'ui', ...body }),
     });
+    await reload();
+    return { ok: true, conflict: false };
   } catch (e) {
-    toast(e.status === 409 ? '他の編集と競合しました。再読込しました' : e.message);
+    const conflict = e.status === 409;
+    const msg = conflict ? (opts.conflictMessage ?? '他の編集と競合しました。最新状態を再読み込みしました') : e.message;
+    toast(msg, { type: 'error' });
+    await reload().catch(() => {});
+    return { ok: false, conflict };
   }
-  await reload();
 }
 
 let toastTimer;
-function toast(msg) {
+function toast(msg, opts = {}) {
   const t = $('toast');
-  t.textContent = msg;
+  const isError = opts.type === 'error';
+  t.innerHTML = '';
+  const span = document.createElement('span');
+  span.textContent = msg;
+  t.appendChild(span);
+  if (isError) {
+    const closeBtn = document.createElement('button');
+    closeBtn.className = 'toastClose';
+    closeBtn.textContent = '×';
+    closeBtn.setAttribute('aria-label', '閉じる');
+    closeBtn.onclick = () => { t.hidden = true; };
+    t.appendChild(closeBtn);
+  }
+  t.setAttribute('role', isError ? 'alert' : 'status');
   t.hidden = false;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => (t.hidden = true), 3500);
+  if (!isError) {
+    toastTimer = setTimeout(() => (t.hidden = true), 3500);
+  }
 }
 
-// ---------- tabs ----------
-for (const tab of document.querySelectorAll('.tab')) {
-  tab.onclick = () => {
-    document.querySelectorAll('.tab').forEach((t) => t.classList.remove('active'));
-    document.querySelectorAll('.panel').forEach((p) => p.classList.remove('active'));
-    tab.classList.add('active');
-    $(tab.dataset.panel).classList.add('active');
-  };
+// ---------- tabs (WAI-ARIA Tabs pattern: automatic activation) ----------
+const tabList = document.querySelector('.tabs');
+const tabs = [...document.querySelectorAll('.tab')];
+function activateTab(tab, { focus = true } = {}) {
+  for (const tEl of tabs) {
+    const selected = tEl === tab;
+    tEl.classList.toggle('active', selected);
+    tEl.setAttribute('aria-selected', String(selected));
+    tEl.tabIndex = selected ? 0 : -1;
+  }
+  document.querySelectorAll('.panel').forEach((p) => p.classList.remove('active'));
+  $(tab.dataset.panel).classList.add('active');
+  if (focus) tab.focus();
 }
+for (const tab of tabs) {
+  tab.onclick = () => activateTab(tab, { focus: false });
+}
+// Left/right (and Home/End) move + activate a tab, scoped to the tablist so
+// they never fall through to the global seek shortcuts.
+tabList.addEventListener('keydown', (e) => {
+  const idx = tabs.indexOf(document.activeElement);
+  if (idx < 0) return;
+  if (e.key === 'ArrowRight') { e.preventDefault(); activateTab(tabs[(idx + 1) % tabs.length]); }
+  else if (e.key === 'ArrowLeft') { e.preventDefault(); activateTab(tabs[(idx - 1 + tabs.length) % tabs.length]); }
+  else if (e.key === 'Home') { e.preventDefault(); activateTab(tabs[0]); }
+  else if (e.key === 'End') { e.preventDefault(); activateTab(tabs[tabs.length - 1]); }
+});
 
 // ---------- websocket live updates ----------
 function connectWs() {
   const ws = new WebSocket(`ws://${location.host}/ws`);
-  ws.onopen = () => $('conn').classList.add('up');
-  ws.onclose = () => { $('conn').classList.remove('up'); setTimeout(connectWs, 1500); };
+  ws.onopen = () => {
+    const el = $('conn');
+    el.classList.add('up');
+    el.textContent = '● 接続済み';
+    el.title = '接続済み';
+  };
+  ws.onclose = () => {
+    const el = $('conn');
+    el.classList.remove('up');
+    el.textContent = '● 再接続中';
+    el.title = '再接続中';
+    setTimeout(connectWs, 1500);
+  };
   ws.onmessage = async (ev) => {
     const msg = JSON.parse(ev.data);
-    if (msg.type === 'ingest-start') { $('ingestOverlay').hidden = false; $('ingestStep').textContent = '取り込み中...'; }
+    if (msg.type === 'ingest-start') {
+      $('ingestOverlay').hidden = false;
+      $('ingestStep').textContent = '取り込み中...';
+      $('stage').setAttribute('aria-busy', 'true');
+    }
     if (msg.type === 'ingest-progress') $('ingestStep').textContent = msg.step;
     if (msg.type === 'update' || msg.type === 'candidates' || msg.type === 'project') {
       $('ingestOverlay').hidden = true;
+      $('stage').removeAttribute('aria-busy');
       const tl = tlNow();
-      await reload();
-      if (msg.type === 'update') seekTl(Math.min(tl, S.duration - 0.01), { play: false });
+      try {
+        await reload();
+        if (msg.type === 'update') seekTl(Math.min(tl, S.duration - 0.01), { play: false });
+      } catch (e) {
+        toast(e.message, { type: 'error' });
+      }
       if (msg.summary) toast(`r${msg.revision ?? ''}: ${msg.summary}`);
     }
   };
 }
 
 // ---------- render root ----------
+function gcd(a, b) { return b ? gcd(b, a % b) : a; }
+function aspectLabel(w, h) {
+  const g = gcd(Math.round(w), Math.round(h)) || 1;
+  return `${Math.round(w / g)}:${Math.round(h / g)}`;
+}
+function renderStat() {
+  const m = S.manifest;
+  const out = m.output;
+  $('stat').textContent = out
+    ? `${fmt(S.duration)} / 出力 ${out.width}×${out.height} (${aspectLabel(out.width, out.height)}) · 素材 ${m.width}×${m.height} ${Math.round(m.fps)}fps`
+    : `${fmt(S.duration)} / ${m.width}×${m.height} ${Math.round(m.fps)}fps`;
+}
 async function renderAll() {
   const m = S.manifest;
   $('projName').textContent = m.name;
-  $('stat').textContent = `${fmt(S.duration)} / ${m.width}×${m.height} ${Math.round(m.fps)}fps`;
+  renderStat();
   $('revLabel').textContent = `rev ${m.revision}`;
+  updateUndoBtn();
   await loadMotionSpecs();
   renderTimeline();
   renderTranscript();
@@ -748,11 +1151,17 @@ async function renderAll() {
   renderHistory();
   renderRange();
   updateFraming();
+  renderStageState();
 }
 
 window.addEventListener('resize', drawWave);
+// Connect the socket and start the frame loop unconditionally — tick() is a
+// no-op until a segment is loaded — so that if the initial /api/project call
+// fails (e.g. "no project open"), the UI still hears about a project being
+// opened later (via `vedit open`) instead of being stuck until a manual
+// browser refresh.
+connectWs();
+requestAnimationFrame(tick);
 reload().then(() => {
   if (S.segments.length) loadSeg(0, { play: false });
-  requestAnimationFrame(tick);
-  connectWs();
-}).catch((e) => toast(e.message));
+}).catch((e) => toast(e.message, { type: 'error' }));

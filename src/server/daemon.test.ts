@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, promises as fsp } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { Server } from 'node:http';
@@ -221,6 +221,74 @@ describe('daemon: single-source project', () => {
     expect(status).toBe(400);
     expect(body.error).toMatch(/nothing to remove/);
   });
+
+  it('remove-range that does not intersect any clip on the timeline is rejected without committing a revision', async () => {
+    const revsBefore = (await getJson(BASE, '/api/revisions')).body;
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude',
+      baseRev: state.revision,
+      op: 'remove-range',
+      t0: 500,
+      t1: 501,
+      sourceId: 's1',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/does not intersect/);
+    const revsAfter = (await getJson(BASE, '/api/revisions')).body;
+    expect(revsAfter.length).toBe(revsBefore.length);
+  });
+});
+
+// ---- Suite 2b: remove-words whose source range is no longer on the
+// timeline (isolated project so it isn't coupled to Suite 2's mutations) ----
+describe('daemon: remove-words with a source range already cut', () => {
+  const PORT = 18185;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-nointersect-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'nointersect');
+
+    const words = wordsFor('w', 5); // w0003 spans ~3.5..4.3
+    await project.writeTranscript({ sourceId: 's1', language: 'en', words });
+    const dur = 25;
+    await project.commit(0, 'system', 'setup', {}, 'seed source', (m) => ({
+      ...m,
+      fps: 30,
+      sources: [{ id: 's1', path: '/media/one.mp4', duration: dur, fps: 30, width: 1920, height: 1080, hasAudio: true, transcribed: true }],
+      timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: dur }], motion: [] },
+    }));
+
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('is rejected once the word\'s source range has already been cut, instead of committing a no-op revision', async () => {
+    // Cut a range that fully covers w0003 (3.5..4.3) outright.
+    let state = (await getJson(BASE, '/api/state')).body;
+    let r = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'remove-range', t0: 3.0, t1: 5.0, sourceId: 's1',
+    });
+    expect(r.status).toBe(200);
+
+    // The word id still resolves (word data is independent of the
+    // timeline), but its source range is gone — must be a 400, not a
+    // silent no-op commit.
+    const revsBefore = (await getJson(BASE, '/api/revisions')).body;
+    state = (await getJson(BASE, '/api/state')).body;
+    r = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'remove-words', ids: ['w0003'], sourceId: 's1', pad: 0,
+    });
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/does not intersect/);
+    const revsAfter = (await getJson(BASE, '/api/revisions')).body;
+    expect(revsAfter.length).toBe(revsBefore.length);
+  });
 });
 
 // ---- Suite 3: clip selection/reorder + reframe (P0 workflow ops) ----
@@ -282,6 +350,18 @@ describe('daemon: clip ops and reframe', () => {
     expect(body.error).toMatch(/unknown source/);
   });
 
+  it('clip-add rejects an out beyond the source duration and a non-integer at', async () => {
+    let state = (await getJson(BASE, '/api/state')).body;
+    let r = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'clip-add', sourceId: 's2', in: 0, out: 9999 });
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/exceeds source duration/);
+
+    state = (await getJson(BASE, '/api/state')).body;
+    r = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'clip-add', sourceId: 's2', at: 0.5 });
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/at \(0\.5\)/);
+  });
+
   it('clip-move reorders, then clip-remove drops a clip without touching its source', async () => {
     let state = (await getJson(BASE, '/api/state')).body;
     let project = (await getJson(BASE, '/api/project')).body;
@@ -298,6 +378,18 @@ describe('daemon: clip ops and reframe', () => {
     project = (await getJson(BASE, '/api/project')).body;
     expect(project.manifest.timeline.video.map((c: any) => c.id)).toEqual([c1.id]);
     expect(project.manifest.sources.some((s: any) => s.id === 's2')).toBe(true); // source stays in the pool
+  });
+
+  it('clip-move and clip-remove reject an unknown clip id (400, not a silent no-op)', async () => {
+    let state = (await getJson(BASE, '/api/state')).body;
+    let r = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'clip-move', clipId: 'nope', before: 'end' });
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/unknown clip/);
+
+    state = (await getJson(BASE, '/api/state')).body;
+    r = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'clip-remove', clipId: 'nope' });
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/unknown clip/);
   });
 
   it('reframe sets output and stamps crop onto every clip; clip-crop adjusts one clip', async () => {
@@ -324,6 +416,65 @@ describe('daemon: clip ops and reframe', () => {
     expect(status).toBe(400);
     expect(body.error).toMatch(/invalid reframe spec/);
   });
+
+  it('reframe rejects a degenerate 0x0 spec', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'reframe', spec: '0x0' });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/invalid reframe spec/);
+  });
+
+  it('clip-crop rejects an out-of-range x', async () => {
+    let state = (await getJson(BASE, '/api/state')).body;
+    const project = (await getJson(BASE, '/api/project')).body;
+    const clipId = project.manifest.timeline.video[0].id;
+    const { status, body } = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'clip-crop', clipId, x: 1.5 });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/x \(1\.5\)/);
+  });
+});
+
+// ---- Suite 3b: trim validation ----
+describe('daemon: trim validation', () => {
+  const PORT = 18191;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-trim-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'trim');
+    await project.commit(0, 'system', 'setup', {}, 'seed source', (m) => ({
+      ...m,
+      fps: 30,
+      sources: [{ id: 's1', path: '/media/one.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: true }],
+      timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 30 }], motion: [] },
+    }));
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('rejects an edge that is not exactly "in" or "out"', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'trim', clipId: 'c1', edge: 'left', frames: 1 });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/invalid edge/);
+  });
+
+  it('rejects non-integer frames', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'trim', clipId: 'c1', edge: 'in', frames: 1.5 });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/invalid frames/);
+  });
+
+  it('accepts a valid integer frame trim', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'trim', clipId: 'c1', edge: 'in', frames: 5 });
+    expect(status).toBe(200);
+  });
 });
 
 // ---- Suite 4: scene index routes (list/note; detect shells out to ffmpeg and
@@ -342,7 +493,11 @@ describe('daemon: scene index routes', () => {
     await project.commit(0, 'system', 'setup', {}, 'seed source', (m) => ({
       ...m,
       fps: 30,
-      sources: [{ id: 's1', path: '/media/one.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: false }],
+      sources: [
+        { id: 's1', path: '/media/one.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: false },
+        // No scenes file for this one — distinct from a wholly unknown sourceId.
+        { id: 's2', path: '/media/two.mp4', duration: 15, fps: 30, width: 1920, height: 1080, hasAudio: false },
+      ],
       timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 30 }], motion: [] },
     }));
 
@@ -376,10 +531,22 @@ describe('daemon: scene index routes', () => {
     expect(body.scenes).toHaveLength(2);
   });
 
-  it('GET /api/scenes for a source with no scenes file yet returns an empty packed list', async () => {
-    const { status, text } = await getText(BASE, '/api/scenes?source=nope');
+  it('GET /api/scenes for a known source with no scenes file yet returns an empty packed list', async () => {
+    const { status, text } = await getText(BASE, '/api/scenes?source=s2');
     expect(status).toBe(200);
     expect(text).toMatch(/no scenes detected/);
+  });
+
+  it('GET /api/scenes rejects a sourceId that is not in the manifest (404, not a silent empty list)', async () => {
+    const { status, body } = await getJson(BASE, '/api/scenes?source=nope');
+    expect(status).toBe(404);
+    expect(body.error).toMatch(/unknown source/);
+  });
+
+  it('GET /api/scenes rejects a path-traversal sourceId (400/404, not a file read outside the project)', async () => {
+    const { status, body } = await getJson(BASE, '/api/scenes?source=' + encodeURIComponent('../../../../etc/passwd'));
+    expect([400, 404]).toContain(status);
+    expect(body.error).toBeTruthy();
   });
 
   it('POST /api/scenes/note records text + "by" provenance and an ISO timestamp', async () => {
@@ -417,5 +584,281 @@ describe('daemon: scene index routes', () => {
     });
     expect(status).toBe(400);
     expect(body.error).toMatch(/unknown scene/);
+  });
+});
+
+// ---- Suite 5: path containment (security) — /api/transcript, /media escape ----
+describe('daemon: path containment (security)', () => {
+  const PORT = 18186;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let root: string;
+  let dir: string;
+
+  beforeAll(async () => {
+    root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-security-'));
+    dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'security');
+    await project.writeTranscript({ sourceId: 's1', language: 'en', words: wordsFor('w', 3) });
+
+    // A file OUTSIDE the project directory that a path-traversal attack
+    // against /media might try to read via a manifest-supplied proxy path.
+    await fsp.writeFile(path.join(root, 'secret.mp4'), 'TOP SECRET CONTENT');
+
+    await project.commit(0, 'system', 'setup', {}, 'seed source', (m) => ({
+      ...m,
+      fps: 30,
+      sources: [
+        {
+          id: 's1',
+          path: '/media/one.mp4',
+          duration: 10,
+          fps: 30,
+          width: 1920,
+          height: 1080,
+          hasAudio: true,
+          transcribed: true,
+          // Simulates a corrupted/tampered manifest: escapes the project dir.
+          proxy: '../secret.mp4',
+        },
+      ],
+      timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 10 }], motion: [] },
+    }));
+
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('GET /media/proxy/<id> refuses to serve a manifest proxy path that escapes the project directory', async () => {
+    const res = await fetch(`${BASE}/media/proxy/s1`);
+    expect(res.status).not.toBe(200);
+    const text = await res.text();
+    expect(text).not.toContain('TOP SECRET CONTENT');
+  });
+
+  it('GET /api/transcript?source=<traversal> is rejected (source must exist in the manifest)', async () => {
+    const { status, body } = await getJson(BASE, '/api/transcript?full=1&source=' + encodeURIComponent('x/../../../../etc/passwd'));
+    expect(status).toBe(404);
+    expect(body.error).toMatch(/unknown source/);
+  });
+
+  it('GET /api/transcript?source=s1&full=1 still works for a real source', async () => {
+    const { status, body } = await getJson(BASE, '/api/transcript?source=s1&full=1');
+    expect(status).toBe(200);
+    expect(body.sourceId).toBe('s1');
+  });
+
+  it('GET /api/scenes?source=<traversal> is rejected the same way', async () => {
+    const { status, body } = await getJson(BASE, '/api/scenes?source=' + encodeURIComponent('x/../../../../etc/passwd'));
+    expect(status).toBe(404);
+    expect(body.error).toMatch(/unknown source/);
+  });
+});
+
+// ---- Suite 6: motion-update / motion-remove validation + traversal ----
+describe('daemon: motion ops', () => {
+  const PORT = 18187;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let motionId: string;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-motion-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'motion');
+    await project.commit(0, 'system', 'setup', {}, 'seed source', (m) => ({
+      ...m,
+      fps: 30,
+      sources: [{ id: 's1', path: '/media/one.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: true }],
+      timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 30 }], motion: [] },
+    }));
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('motion-add creates a spec and a timeline item', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'motion-add',
+      spec: { type: 'chapter-card', params: { text: 'Intro' } }, tlStart: 0, duration: 2,
+    });
+    expect(status).toBe(200);
+    motionId = body.id;
+    expect(motionId).toBeTruthy();
+  });
+
+  it('motion-update rejects an id that is not on the timeline', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'motion-update', id: 'nope', tlStart: 1,
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/unknown motion item/);
+  });
+
+  it('motion-update rejects a path-traversal id (never touches project.json)', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'motion-update', id: '../../project', spec: { type: 'chapter-card' },
+    });
+    expect(status).toBe(400);
+    expect(body.error).toBeTruthy();
+    // project.json is still intact and parseable — the attack never landed.
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.name).toBe('motion');
+  });
+
+  it('GET /api/motion/<id> rejects an id with unsafe characters', async () => {
+    const res = await fetch(`${BASE}/api/motion/..%2f..%2fproject`);
+    expect(res.status).toBe(404);
+  });
+
+  it('motion-update with a valid id updates the spec and timeline placement', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'motion-update', id: motionId, tlStart: 5,
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.timeline.motion[0].tlStart).toBe(5);
+  });
+
+  it('motion-remove rejects an unknown id', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'motion-remove', id: 'nope',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/unknown motion item/);
+  });
+
+  it('motion-remove with a valid id removes it', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'motion-remove', id: motionId,
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.timeline.motion).toHaveLength(0);
+  });
+});
+
+// ---- Suite 7: /api/open safety (corrupted project.json must not be clobbered) ----
+describe('daemon: /api/open safety', () => {
+  const PORT = 18188;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+
+  beforeAll(async () => {
+    const started = await startDaemon({ port: PORT }); // no projectDir: nothing open yet
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('rejects opening a corrupted project.json instead of silently recreating it', async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-corrupt-'));
+    const dir = path.join(root, 'proj');
+    await fsp.mkdir(dir, { recursive: true });
+    await fsp.writeFile(path.join(dir, 'project.json'), '{ this is not valid json');
+
+    const { status, body } = await postJson(BASE, '/api/open', { dir });
+    expect(status).not.toBe(200);
+    expect(body.error).toBeTruthy();
+
+    const raw = await fsp.readFile(path.join(dir, 'project.json'), 'utf8');
+    expect(raw).toBe('{ this is not valid json'); // untouched — Project.create never ran
+  });
+
+  it('opening a genuinely missing project creates a fresh one', async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-fresh-'));
+    const dir = path.join(root, 'proj');
+    const { status, body } = await postJson(BASE, '/api/open', { dir, name: 'fresh' });
+    expect(status).toBe(200);
+    expect(body.state.name).toBe('fresh');
+  });
+});
+
+// ---- Suite 8: HTTP robustness — body size cap, Range header edge cases ----
+describe('daemon: http robustness', () => {
+  const PORT = 18189;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  const content = '0123456789AB'; // 12 bytes
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-http-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'http');
+    await fsp.mkdir(project.cacheDir, { recursive: true });
+    await fsp.writeFile(path.join(project.cacheDir, 'dummy.bin'), content);
+
+    await project.commit(0, 'system', 'setup', {}, 'seed source', (m) => ({
+      ...m,
+      fps: 30,
+      sources: [{
+        id: 's1', path: '/media/one.mp4', duration: 1, fps: 30, width: 1920, height: 1080, hasAudio: true,
+        proxy: 'cache/dummy.bin',
+      }],
+      timeline: { video: [], motion: [] },
+    }));
+
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('POST /api/edit rejects a body over the 10MB limit with 413', async () => {
+    const huge = 'x'.repeat(10 * 1024 * 1024 + 1);
+    const res = await fetch(`${BASE}/api/edit`, {
+      method: 'POST',
+      body: JSON.stringify({ actor: 'ui', op: 'captions', patch: { note: huge } }),
+    });
+    expect(res.status).toBe(413);
+  });
+
+  it('GET /media with a suffix range (bytes=-N) returns the last N bytes', async () => {
+    const res = await fetch(`${BASE}/media/proxy/s1`, { headers: { range: 'bytes=-4' } });
+    expect(res.status).toBe(206);
+    const text = await res.text();
+    expect(text).toBe('89AB');
+    expect(res.headers.get('content-range')).toBe(`bytes 8-11/${content.length}`);
+  });
+
+  it('GET /media with an open-ended range (bytes=N-) returns from N to the end', async () => {
+    const res = await fetch(`${BASE}/media/proxy/s1`, { headers: { range: 'bytes=10-' } });
+    expect(res.status).toBe(206);
+    const text = await res.text();
+    expect(text).toBe('AB');
+  });
+
+  it('GET /media with an end beyond the file size clamps to the last byte', async () => {
+    const res = await fetch(`${BASE}/media/proxy/s1`, { headers: { range: 'bytes=0-9999' } });
+    expect(res.status).toBe(206);
+    expect(res.headers.get('content-range')).toBe(`bytes 0-11/${content.length}`);
+  });
+
+  it('GET /media with a start beyond the file size returns 416', async () => {
+    const res = await fetch(`${BASE}/media/proxy/s1`, { headers: { range: 'bytes=9999-10000' } });
+    expect(res.status).toBe(416);
+  });
+
+  it('GET /media with an inverted range (start > end) returns 416', async () => {
+    const res = await fetch(`${BASE}/media/proxy/s1`, { headers: { range: 'bytes=10-2' } });
+    expect(res.status).toBe(416);
+  });
+
+  it('GET /media with a malformed or multi-range header ignores it and serves the full body (200)', async () => {
+    const res1 = await fetch(`${BASE}/media/proxy/s1`, { headers: { range: 'bytes=0-3,6-9' } });
+    expect(res1.status).toBe(200);
+    expect(await res1.text()).toBe(content);
+
+    const res2 = await fetch(`${BASE}/media/proxy/s1`, { headers: { range: 'not-a-range' } });
+    expect(res2.status).toBe(200);
   });
 });

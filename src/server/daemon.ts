@@ -3,7 +3,7 @@ import { promises as fs, createReadStream, statSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
-import { Project } from '../core/project.js';
+import { Project, resolveWithinDir } from '../core/project.js';
 import {
   addClip,
   applyReframe,
@@ -56,11 +56,51 @@ function json(res: http.ServerResponse, status: number, body: unknown) {
   res.end(data);
 }
 
+const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10MB
+
+class PayloadTooLargeError extends Error {
+  code = 'PAYLOAD_TOO_LARGE';
+}
+
 async function readBody(req: http.IncomingMessage): Promise<any> {
   const chunks: Buffer[] = [];
-  for await (const c of req) chunks.push(c as Buffer);
+  let total = 0;
+  let tooLarge = false;
+  for await (const c of req) {
+    const buf = c as Buffer;
+    total += buf.length;
+    if (total > MAX_BODY_BYTES) {
+      // Keep draining the stream instead of destroying the socket: an abrupt
+      // reset while the client is still mid-upload surfaces as a raw socket
+      // error on their end rather than our 413 response.
+      tooLarge = true;
+      continue;
+    }
+    chunks.push(buf);
+  }
+  if (tooLarge) throw new PayloadTooLargeError(`request body exceeds ${MAX_BODY_BYTES} byte limit`);
   const raw = Buffer.concat(chunks).toString('utf8');
   return raw ? JSON.parse(raw) : {};
+}
+
+/**
+ * Open an existing project at `dir`, or create a fresh one if none exists
+ * yet. Only a missing project.json (ENOENT) counts as "no project here" —
+ * any other failure (corrupt JSON, permissions, ...) is surfaced as-is so a
+ * damaged project.json is never silently clobbered by Project.create's
+ * blank manifest.
+ */
+async function openOrCreateProject(dir: string, name: string): Promise<{ project: Project; created: boolean }> {
+  try {
+    const project = await Project.open(dir);
+    await project.manifest(); // force a parse now so corruption surfaces before we decide whether to fall back
+    return { project, created: false };
+  } catch (e: any) {
+    if (e?.code === 'ENOENT') {
+      return { project: await Project.create(dir, name), created: true };
+    }
+    throw e;
+  }
 }
 
 function broadcast(ctx: Ctx, msg: unknown) {
@@ -101,11 +141,8 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
   const port = opts.port ?? Number(process.env.VEDIT_PORT ?? 7799);
   const ctx: Ctx = { project: null, clients: new Set() };
   if (opts.projectDir) {
-    try {
-      ctx.project = await Project.open(opts.projectDir);
-    } catch {
-      ctx.project = await Project.create(opts.projectDir, path.basename(opts.projectDir));
-    }
+    const { project } = await openOrCreateProject(opts.projectDir, path.basename(opts.projectDir));
+    ctx.project = project;
   }
 
   const server = http.createServer(async (req, res) => {
@@ -113,7 +150,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
     try {
       await route(ctx, req, res, url);
     } catch (e: any) {
-      const status = e?.code === 'STALE_REVISION' ? 409 : 400;
+      const status = e?.code === 'STALE_REVISION' ? 409 : e?.code === 'PAYLOAD_TOO_LARGE' ? 413 : 400;
       json(res, status, { error: e?.message ?? String(e), code: e?.code });
     }
   });
@@ -147,12 +184,9 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
     if (pathname === '/api/open' && method === 'POST') {
       const b = await readBody(req);
       const dir = path.resolve(b.dir);
-      try {
-        ctx.project = await Project.open(dir);
-        await upsertProject(dir, (await ctx.project.manifest()).name); // Project.create() upserts on its own path
-      } catch {
-        ctx.project = await Project.create(dir, b.name ?? path.basename(dir));
-      }
+      const { project, created } = await openOrCreateProject(dir, b.name ?? path.basename(dir));
+      ctx.project = project;
+      if (!created) await upsertProject(dir, (await project.manifest()).name); // Project.create() upserts on its own path
       broadcast(ctx, { type: 'project', dir });
       return json(res, 200, { ok: true, dir, state: await stateSummary(ctx.project) });
     }
@@ -181,6 +215,11 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       const m = await p.manifest();
       const requestedSource = url.searchParams.get('source');
       const full = Boolean(url.searchParams.get('full'));
+      // Never resolve a transcript path for an id that isn't a real source —
+      // the manifest is the allowlist, not just a character-class check.
+      if (requestedSource && !m.sources.some((s) => s.id === requestedSource)) {
+        return json(res, 404, { error: `unknown source: ${requestedSource}` });
+      }
       const transcribedSrcs = m.sources.filter((s) => s.transcribed);
       if (transcribedSrcs.length === 0) return json(res, 404, { error: 'no transcribed source' });
 
@@ -225,7 +264,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
     if (pathname.startsWith('/api/motion/') && method === 'GET') {
       const id = pathname.split('/')[3];
       try {
-        const spec = JSON.parse(await fs.readFile(path.join(p.motionDir, `${id}.json`), 'utf8'));
+        const spec = JSON.parse(await fs.readFile(p.motionSpecPath(id), 'utf8'));
         return json(res, 200, spec);
       } catch {
         return json(res, 404, { error: `no motion spec: ${id}` });
@@ -240,6 +279,10 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       const m = await p.manifest();
       const requestedSource = url.searchParams.get('source');
       const full = Boolean(url.searchParams.get('full'));
+      // Same allowlist-against-manifest rule as /api/transcript above.
+      if (requestedSource && !m.sources.some((s) => s.id === requestedSource)) {
+        return json(res, 404, { error: `unknown source: ${requestedSource}` });
+      }
 
       if (requestedSource) {
         const f = await p.scenes(requestedSource);
@@ -322,6 +365,12 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         const before = timelineDuration(m0);
         const preview = removeSourceRange(m0, sourceId!, r.t0, r.t1);
         const removedSeconds = before - timelineDuration(preview);
+        if (removedSeconds < 1 / m0.fps) {
+          // The words themselves are real, but that source range no longer has
+          // any clip on the timeline (e.g. already cut) — refuse rather than
+          // commit a revision that changes nothing.
+          return json(res, 400, { error: 'range does not intersect source media' });
+        }
         await mutate(actor, baseRev, 'remove-words', b, `removed ${removed} words (${removedSeconds.toFixed(1)}s): "${text.slice(0, 40)}"`, (m) =>
           removeSourceRange(m, sourceId!, r.t0, r.t1),
         );
@@ -340,6 +389,9 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         const before = timelineDuration(m0);
         const preview = removeSourceRange(m0, sourceId!, b.t0, b.t1);
         const removedSeconds = before - timelineDuration(preview);
+        if (removedSeconds < 1 / m0.fps) {
+          return json(res, 400, { error: 'range does not intersect source media' });
+        }
         await mutate(actor, baseRev, 'remove-range', b, `removed ${removedSeconds.toFixed(1)}s of source ${sourceId}`, (m) =>
           removeSourceRange(m, sourceId!, b.t0, b.t1),
         );
@@ -370,8 +422,14 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         return json(res, 200, { id: specId, state: await stateSummary(p) });
       }
       if (b.op === 'motion-update') {
-        const specPath = path.join(p.motionDir, `${b.id}.json`);
+        // Only an id that's actually on the timeline may be touched — this
+        // is the allowlist; motionSpecPath below is a second, independent
+        // guard that the resolved file stays inside motion/.
+        if (!m0.timeline.motion.some((x) => x.id === b.id)) {
+          return json(res, 400, { error: `unknown motion item: ${b.id}` });
+        }
         if (b.spec) {
+          const specPath = await resolveWithinDir(p.motionDir, `${b.id}.json`);
           const old = JSON.parse(await fs.readFile(specPath, 'utf8'));
           await fs.writeFile(specPath, JSON.stringify({ ...old, ...b.spec, id: b.id }, null, 2));
         }
@@ -389,6 +447,9 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         return json(res, 200, { state: await stateSummary(p) });
       }
       if (b.op === 'motion-remove') {
+        if (!m0.timeline.motion.some((x) => x.id === b.id)) {
+          return json(res, 400, { error: `unknown motion item: ${b.id}` });
+        }
         await mutate(actor, baseRev, 'motion-remove', b, `motion ${b.id} removed`, (m) => ({
           ...m,
           timeline: { ...m.timeline, motion: m.timeline.motion.filter((x) => x.id !== b.id) },
@@ -578,25 +639,70 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
     if (!src) return json(res, 404, { error: 'unknown source' });
     const rel = kind === 'proxy' ? src.proxy : src.peaks;
     if (!rel) return json(res, 404, { error: `no ${kind} for source` });
-    const full = path.join(p.dir, rel);
-    const stat = statSync(full);
+    // The manifest is on-disk data, not trusted input: a tampered/corrupted
+    // project.json could point proxy/peaks outside the project directory.
+    let full: string;
+    try {
+      full = await resolveWithinDir(p.dir, rel);
+    } catch {
+      return json(res, 404, { error: `invalid ${kind} path for source` });
+    }
+    let stat: ReturnType<typeof statSync>;
+    try {
+      stat = statSync(full);
+    } catch {
+      return json(res, 404, { error: `${kind} file not found` });
+    }
     const type = kind === 'proxy' ? 'video/mp4' : 'application/json';
     const range = req.headers.range;
     if (range) {
-      const [a, b] = range.replace('bytes=', '').split('-');
-      const start = Number(a);
-      const end = b ? Number(b) : stat.size - 1;
-      res.writeHead(206, {
-        'content-type': type,
-        'content-range': `bytes ${start}-${end}/${stat.size}`,
-        'accept-ranges': 'bytes',
-        'content-length': end - start + 1,
-      });
-      createReadStream(full, { start, end }).pipe(res);
-    } else {
-      res.writeHead(200, { 'content-type': type, 'content-length': stat.size, 'accept-ranges': 'bytes' });
-      createReadStream(full).pipe(res);
+      const parsed = parseByteRange(range, stat.size);
+      if (parsed === 'unsatisfiable') {
+        res.writeHead(416, { 'content-range': `bytes */${stat.size}` });
+        return res.end();
+      }
+      if (parsed) {
+        const { start, end } = parsed;
+        res.writeHead(206, {
+          'content-type': type,
+          'content-range': `bytes ${start}-${end}/${stat.size}`,
+          'accept-ranges': 'bytes',
+          'content-length': end - start + 1,
+        });
+        createReadStream(full, { start, end }).pipe(res);
+        return;
+      }
+      // Malformed or multi-range header: ignore it and serve the full body.
     }
+    res.writeHead(200, { 'content-type': type, 'content-length': stat.size, 'accept-ranges': 'bytes' });
+    createReadStream(full).pipe(res);
+  }
+
+  /**
+   * Parse a single-range `Range: bytes=...` header per RFC 7233 §2.1:
+   * "N-M", "N-" (open-ended), and "-N" (suffix: last N bytes). Returns
+   * `null` for anything we don't support (malformed, multiple ranges) so
+   * the caller falls back to a normal 200, and `'unsatisfiable'` when the
+   * range is well-formed but out of bounds (416).
+   */
+  function parseByteRange(header: string, size: number): { start: number; end: number } | 'unsatisfiable' | null {
+    const m = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+    if (!m || (m[1] === '' && m[2] === '')) return null;
+    let start: number;
+    let end: number;
+    if (m[1] === '') {
+      const suffixLen = Number(m[2]);
+      if (!Number.isFinite(suffixLen) || suffixLen <= 0) return 'unsatisfiable';
+      start = Math.max(0, size - suffixLen);
+      end = size - 1;
+    } else {
+      start = Number(m[1]);
+      end = m[2] === '' ? size - 1 : Number(m[2]);
+    }
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || start >= size || start > end) {
+      return 'unsatisfiable';
+    }
+    return { start, end: Math.min(end, size - 1) };
   }
 
   await new Promise<void>((resolve) => server.listen(port, '127.0.0.1', resolve));

@@ -1,4 +1,7 @@
 import { describe, expect, it } from 'vitest';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import {
   assignSceneIds,
   buildSceneRanges,
@@ -7,7 +10,9 @@ import {
   mergeShortRanges,
   packScenes,
   parseSceneChangeTimes,
+  sceneThumbPath,
 } from './scenes.js';
+import { Project } from './project.js';
 import type { Peaks } from './detect.js';
 import type { Scene, SceneFile, Word } from './types.js';
 
@@ -204,5 +209,23 @@ describe('packScenes', () => {
     expect(text).toMatch(/s0001 \[0:00\.0–0:04\.2\] 4\.2s silent energy=0\.12 — エスカレーター上りの追い撮り \(by:model\)/);
     expect(text).toMatch(/s0002 \[0:04\.2–0:09\.0\] 4\.8s speech energy=0\.55/);
     expect(text).not.toMatch(/s0002.*—/); // no note appended for s0002
+  });
+});
+
+// ---- sceneThumbPath: containment for the thumbnail write path ----
+
+describe('sceneThumbPath', () => {
+  it('resolves a normal sourceId/sceneId to a path under cache/', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'vedit-'));
+    const project = await Project.create(path.join(dir, 'proj'), 'test');
+    const { rel, abs } = await sceneThumbPath(project, 's1', 's0001');
+    expect(rel).toBe(path.join('cache', 'sc-s1-s0001.jpg'));
+    expect(abs).toBe(path.join(project.dir, 'cache', 'sc-s1-s0001.jpg'));
+  });
+
+  it('rejects a sourceId/sceneId crafted to escape cache/ via traversal', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'vedit-'));
+    const project = await Project.create(path.join(dir, 'proj'), 'test');
+    await expect(sceneThumbPath(project, '../../../../etc', 'passwd')).rejects.toThrow(/escapes directory/);
   });
 });

@@ -40,6 +40,75 @@ export function sanitizeCaptionText(text: string): string {
   return t;
 }
 
+/** Merge two chronologically-adjacent cues into one (used by the CPS floor below). */
+function mergeCues(a: CaptionCue, b: CaptionCue): CaptionCue {
+  const join = isCjk(a.text) || isCjk(b.text) ? '' : ' ';
+  return {
+    tlStart: Math.min(a.tlStart, b.tlStart),
+    tlEnd: Math.max(a.tlEnd, b.tlEnd),
+    text: sanitizeCaptionText(a.text + join + b.text),
+    wordIds: [...a.wordIds, ...b.wordIds],
+  };
+}
+
+const MIN_DISPLAY = 0.6;
+const DEFAULT_MAX_CPS = 8;
+
+/**
+ * Guarantee every cue is on screen long enough to read: at least
+ * `text.length / maxCps` seconds (floor MIN_DISPLAY). A cue that's too short
+ * — typically because de-overlap above just truncated it against a cue that
+ * starts right after it — first tries to (a) borrow the idle gap before the
+ * next cue (or the timeline end); if that's not enough, (b) merges into the
+ * previous cue; if there is no previous cue, (c) merges into the next one
+ * instead. Merging re-checks the combined cue against its own requirement,
+ * so a chain of too-short cues collapses until it reads comfortably (or only
+ * one cue is left, in which case it's kept as-is).
+ */
+function enforceMinDisplay(cues: CaptionCue[], total: number, maxCps: number): void {
+  let i = 0;
+  while (i < cues.length) {
+    const c = cues[i];
+    const need = Math.max(MIN_DISPLAY, c.text.length / maxCps);
+    let dur = c.tlEnd - c.tlStart;
+    if (dur >= need - 1e-9) {
+      i++;
+      continue;
+    }
+
+    // (a) borrow from the idle gap before the next cue (or the timeline end)
+    const nextStart = i + 1 < cues.length ? cues[i + 1].tlStart : total;
+    const gap = Math.max(0, nextStart - c.tlEnd);
+    const borrow = Math.min(gap, need - dur);
+    if (borrow > 0) {
+      c.tlEnd += borrow;
+      dur += borrow;
+    }
+    if (dur >= need - 1e-9) {
+      i++;
+      continue;
+    }
+
+    // (b) merge with the previous cue
+    if (i > 0) {
+      cues[i - 1] = mergeCues(cues[i - 1], c);
+      cues.splice(i, 1);
+      i--; // re-check the merged cue against its own requirement
+      continue;
+    }
+
+    // (c) no previous cue (this is the first one) — merge with the next
+    if (i + 1 < cues.length) {
+      cues[i] = mergeCues(c, cues[i + 1]);
+      cues.splice(i + 1, 1);
+      continue; // re-check the merged cue at the same index
+    }
+
+    // only cue left in the whole list — nothing to merge with, keep as-is
+    i++;
+  }
+}
+
 /**
  * Derive caption cues from the kept words, in timeline time. Lines break on
  * pauses (>0.6s), sentence punctuation, or maxChars. Captions therefore follow
@@ -90,5 +159,12 @@ export function captionCues(m: Manifest, transcripts: Transcript[]): CaptionCue[
   for (let i = 0; i < cues.length - 1; i++) {
     if (cues[i].tlEnd > cues[i + 1].tlStart) cues[i].tlEnd = cues[i + 1].tlStart;
   }
+
+  // De-overlap above can truncate a cue well below a readable duration (a
+  // sentence flushed at 0.6s can get cut down to ~100ms if the next cue
+  // starts right after) — restore a minimum display time by borrowing idle
+  // time or merging with a neighbor.
+  enforceMinDisplay(cues, total, m.captions.maxCps ?? DEFAULT_MAX_CPS);
+
   return cues.filter((c) => c.tlEnd > c.tlStart);
 }

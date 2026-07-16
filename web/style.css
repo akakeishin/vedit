@@ -2,8 +2,15 @@
 /* author display rules (e.g. display:flex) must never resurrect [hidden] elements */
 [hidden] { display: none !important; }
 :root {
-  --bg: #101216; --panel: #16191f; --edge: #262b34; --text: #d7dce3; --dim: #7d8590;
-  --accent: #4b9fff; --cut: #5a3038; --keep: #23384e; --ok: #3fb96b; --bad: #d05656;
+  --bg: #101216; --panel: #16191f; --edge: #262b34; --text: #d7dce3; --dim: #808894;
+  --accent: #4b9fff; --cut: #5a3038; --keep: #23384e; --ok: #3fb96b; --bad: #e06a6a;
+}
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0;
+}
+@media (prefers-reduced-motion: reduce) {
+  .mo-chapter-card, .mo-lower-third, .mo-callout, .mo-cta { animation: none !important; }
 }
 html, body { height: 100%; }
 body {
@@ -18,7 +25,7 @@ header {
 #projName { font-weight: 700; }
 #stat { color: var(--dim); }
 .spacer { flex: 1; }
-.conn { color: var(--bad); font-size: 10px; }
+.conn { color: var(--bad); font-size: 11px; white-space: nowrap; }
 .conn.up { color: var(--ok); }
 button {
   background: #1d2129; color: var(--text); border: 1px solid var(--edge);
@@ -29,17 +36,25 @@ button:disabled { opacity: 0.4; cursor: default; }
 
 main { flex: 1; display: flex; min-height: 0; }
 #stage { flex: 1.6; display: flex; flex-direction: column; padding: 12px; gap: 8px; min-width: 0; }
+/* #videoWrap is ALWAYS the flexible stage area (flex:1 1 0; min-height:0) so
+   it only ever claims the space left over after #transport/#timeline take
+   what they need — it must never grow to consume #stage's full height.
+   #videoBox is the inner box sized to the actual video/output aspect ratio
+   and centered within #videoWrap by the latter's flex align/justify.
+   Captions/motion overlays are positioned against #videoBox (not
+   #videoWrap) so they track the cropped preview exactly. */
 #videoWrap {
-  position: relative; flex: 1; min-height: 0; background: #000;
+  position: relative; flex: 1 1 0; min-height: 0; background: #000;
   border-radius: 8px; overflow: hidden; display: flex; align-items: center; justify-content: center;
 }
-#videoWrap video { max-width: 100%; max-height: 100%; width: 100%; height: 100%; object-fit: contain; }
+#videoBox { position: relative; width: 100%; height: 100%; }
+#videoBox video { width: 100%; height: 100%; object-fit: contain; }
 /* manifest.output present and its aspect differs from the source: lock the
-   wrapper to the OUTPUT aspect (letterboxed within the stage) so captions/
-   motion overlays — positioned absolute/inset:0 against this wrapper —
-   preview at the framing the export will actually produce. */
-#videoWrap.customAspect { flex: none; width: auto; height: 100%; max-width: 100%; aspect-ratio: var(--out-ar, 16/9); margin: 0 auto; }
-#videoWrap.customAspect video { object-fit: cover; }
+   inner box to the OUTPUT aspect (letterboxed within #videoWrap) so the
+   preview matches the framing the export will actually produce. No output ->
+   plain letterboxing (videoBox fills videoWrap). */
+#videoWrap.customAspect #videoBox { width: auto; height: 100%; max-width: 100%; aspect-ratio: var(--out-ar, 16/9); margin: 0 auto; }
+#videoWrap.customAspect #videoBox video { object-fit: cover; }
 
 #captionLayer {
   position: absolute; left: 0; right: 0; bottom: 6%; text-align: center; pointer-events: none;
@@ -91,6 +106,15 @@ main { flex: 1; display: flex; min-height: 0; }
 .spin { width: 16px; height: 16px; border: 2px solid #555; border-top-color: #fff; border-radius: 50%; animation: sp 0.8s linear infinite; }
 @keyframes sp { to { transform: rotate(360deg) } }
 
+/* Persistent stage-center states for empty/failed project loads — not a
+   toast, since the user needs this to stay visible until resolved. */
+#stageEmpty {
+  position: absolute; inset: 0; display: flex; flex-direction: column; gap: 12px;
+  align-items: center; justify-content: center; text-align: center; padding: 24px;
+  background: rgba(10,12,16,0.94); color: var(--dim);
+}
+#stageEmpty p { max-width: 320px; font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
+
 #transport { display: flex; align-items: center; gap: 10px; }
 #tc { font-variant-numeric: tabular-nums; color: var(--dim); }
 #revLabel { color: var(--dim); font-size: 12px; }
@@ -114,15 +138,15 @@ main { flex: 1; display: flex; min-height: 0; }
 .sceneMark:hover { background: var(--accent); width: 2px; }
 .clip {
   position: absolute; top: 8%; height: 84%;
-  background: var(--keep); border: 1px solid #3a5a7e; border-left: 1px solid rgba(255,255,255,0.22);
-  border-radius: 4px; opacity: 0.75;
+  background: var(--keep); border: 1px solid #526c8b; border-left: 1px solid rgba(255,255,255,0.22);
+  border-radius: 4px;
 }
 .clip.alt { background: #1e3348; }
 .clip.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
 #motionRow { position: absolute; left: 0; right: 0; bottom: 2px; height: 14px; }
 .moBlock {
   position: absolute; height: 100%; border-radius: 3px;
-  background: #7a5cd0; opacity: 0.85; font-size: 9px; color: #fff;
+  background: rgba(122, 92, 208, 0.85); font-size: 9px; color: #fff;
   overflow: hidden; white-space: nowrap; padding: 0 3px;
 }
 #playhead {
@@ -151,6 +175,7 @@ aside {
 .tabs { display: flex; border-bottom: 1px solid var(--edge); }
 .tab { flex: 1; border: 0; border-radius: 0; background: none; padding: 8px; color: var(--dim); }
 .tab.active { color: var(--text); box-shadow: inset 0 -2px var(--accent); }
+.tab:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .panel { display: none; flex: 1; min-height: 0; overflow: auto; flex-direction: column; }
 .panel.active { display: flex; }
 .panelbar {
@@ -160,12 +185,18 @@ aside {
 .hintText { color: var(--dim); font-size: 11px; }
 
 #words { padding: 10px 12px; user-select: none; overflow-y: auto; }
+.srcHeading {
+  color: var(--text); font-size: 11px; font-weight: 700; letter-spacing: 0.02em;
+  padding: 10px 0 4px; margin-top: 4px; border-bottom: 1px solid var(--edge);
+}
+.srcHeading:first-child { margin-top: 0; }
 .w { cursor: pointer; border-radius: 3px; padding: 1px 1px; }
 .w:hover { background: #26303e; }
-.w.cut { color: #6a4a50; text-decoration: line-through; }
-.w.ignored { color: #6b7280; text-decoration: none; border-bottom: 1px dotted #6b7280; }
-.w.sel { background: #2c4a6e; }
-.w.active { background: #3d5e86; }
+.w:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.w.cut { color: #9a7b82; text-decoration: line-through; }
+.w.ignored { color: #8b93a0; text-decoration: none; border-bottom: 1px dotted #8b93a0; }
+.w.sel { background: #2c4a6e; outline: 1px solid var(--accent); outline-offset: -1px; }
+.w.active { background: #3d5e86; outline: 1px solid var(--accent); outline-offset: -1px; }
 .gap { color: var(--dim); font-size: 11px; margin: 0 2px; }
 
 .candPanelbar { flex-wrap: wrap; }
@@ -181,16 +212,23 @@ aside {
 }
 .candGroupHeader button { padding: 2px 8px; font-size: 11px; }
 .cand {
-  display: flex; align-items: center; gap: 8px; padding: 6px 8px;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; padding: 6px 8px;
   background: #1a1e26; border: 1px solid var(--edge); border-radius: 6px; cursor: pointer;
 }
+.cand .lbl, .cand .srcTag, .cand .dur { flex: none; }
+.cand .lbl { flex: 1 1 auto; min-width: 60px; }
+.candActions { display: flex; gap: 6px; flex: 1 0 100%; justify-content: flex-end; }
 .cand .kind { font-size: 10px; padding: 1px 6px; border-radius: 999px; background: #33405a; }
 .cand .kind.filler { background: #5a4a33; }
 .cand .kind.retake { background: #4a3a5a; }
 .cand .kind.low-energy { background: #3a4a3a; }
 .cand .lbl { flex: 1; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cand .srcTag { color: var(--dim); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .cand .dur { color: var(--dim); font-size: 11px; font-variant-numeric: tabular-nums; }
-.cand button { padding: 2px 8px; }
+.cand:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.cand button { padding: 2px 8px; white-space: nowrap; }
+.btn-preview { color: var(--text); font-size: 11px; }
+.btn-approve, .btn-reject, .btn-preview { font-size: 11px; }
 .btn-approve { color: var(--ok); border-color: var(--ok); }
 .btn-approve:hover { background: rgba(63, 185, 107, 0.12); }
 .btn-reject { color: var(--bad); border-color: var(--bad); }
@@ -203,18 +241,22 @@ aside {
   position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
   background: #202633; border: 1px solid var(--edge); padding: 8px 16px; border-radius: 8px;
   box-shadow: 0 4px 20px rgba(0,0,0,0.5); z-index: 10;
+  display: flex; align-items: center; gap: 10px; max-width: 60vw;
+}
+#toast[role="alert"] { border-color: var(--bad); }
+.toastClose {
+  padding: 0 6px; border-radius: 4px; line-height: 1; flex: none;
+  background: none; border: 1px solid var(--edge);
 }
 
-#shortcutsOverlay {
-  position: fixed; inset: 0; background: rgba(0,0,0,0.6);
-  display: flex; align-items: center; justify-content: center; z-index: 20;
+dialog#shortcutsDialog {
+  background: var(--panel); color: var(--text); border: 1px solid var(--edge); border-radius: 10px;
+  padding: 20px 24px; min-width: 320px; max-width: 480px; box-shadow: 0 8px 40px rgba(0,0,0,0.6);
 }
-.shortcutsBox {
-  background: var(--panel); border: 1px solid var(--edge); border-radius: 10px;
-  padding: 20px 24px; min-width: 320px; box-shadow: 0 8px 40px rgba(0,0,0,0.6);
-}
-.shortcutsBox h2 { font-size: 15px; margin-bottom: 12px; }
-.shortcutsBox table { border-collapse: collapse; width: 100%; margin-bottom: 14px; }
-.shortcutsBox td { padding: 4px 8px; font-size: 12px; border-bottom: 1px solid var(--edge); }
-.shortcutsBox td:first-child { color: var(--accent); font-variant-numeric: tabular-nums; white-space: nowrap; font-weight: 600; }
-.shortcutsBox td:last-child { color: var(--text); }
+dialog#shortcutsDialog::backdrop { background: rgba(0,0,0,0.6); }
+dialog#shortcutsDialog h2 { font-size: 15px; margin-bottom: 12px; }
+dialog#shortcutsDialog table { border-collapse: collapse; width: 100%; margin-bottom: 14px; }
+dialog#shortcutsDialog td { padding: 4px 8px; font-size: 12px; border-bottom: 1px solid var(--edge); }
+dialog#shortcutsDialog td:first-child { color: var(--accent); font-variant-numeric: tabular-nums; white-space: nowrap; font-weight: 600; }
+dialog#shortcutsDialog td:last-child { color: var(--text); }
+dialog#shortcutsDialog .hintText { display: block; margin-bottom: 14px; }

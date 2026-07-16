@@ -1,15 +1,18 @@
 import { describe, expect, it, vi } from 'vitest';
+import { promises as fs } from 'node:fs';
 import type { Word } from '../core/types.js';
 
-// makeProxy shells out to ffmpeg via run(); stub it so these tests only
-// assert on the constructed argv, without needing ffmpeg installed.
+// makeProxy/probe/transcribe shell out via run(); stub it so these tests only
+// assert on the constructed argv (and, for probe/transcribe, fake ffprobe's
+// JSON / whisper-cli's output file), without needing ffmpeg/ffprobe/whisper
+// installed.
 const { runMock } = vi.hoisted(() => ({ runMock: vi.fn().mockResolvedValue('') }));
 vi.mock('./run.js', () => ({
   run: (...args: unknown[]) => runMock(...args),
   runBinary: vi.fn(),
 }));
 
-import { makeProxy, sanitizeWords } from './ingest.js';
+import { makeProxy, probe, sanitizeWords, transcribe } from './ingest.js';
 
 describe('sanitizeWords', () => {
   it('leaves well-formed words untouched', () => {
@@ -78,6 +81,19 @@ describe('sanitizeWords', () => {
     expect(out.map((w) => w.id)).toEqual(['w1']);
     expect(out[0].text).toBe('「こんにちは');
   });
+
+  it('attaches a closing bracket to the previous word and an opening bracket to the next word, even mid-stream (regression: both used to glue onto the previous word, producing "な」「")', () => {
+    const words: Word[] = [
+      { id: 'w0', text: 'な', t0: 0, t1: 0.2, p: 0.9 },
+      { id: 'w1', text: '」', t0: 0.2, t1: 0.2, p: 0.9 }, // closing: attaches to the previous word
+      { id: 'w2', text: '「', t0: 0.25, t1: 0.25, p: 0.9 }, // opening: attaches to the next word
+      { id: 'w3', text: 'つぎ', t0: 0.3, t1: 0.6, p: 0.9 },
+    ];
+    const out = sanitizeWords(words);
+    expect(out.map((w) => w.id)).toEqual(['w0', 'w3']);
+    expect(out[0].text).toBe('な」');
+    expect(out[1].text).toBe('「つぎ');
+  });
 });
 
 describe('makeProxy', () => {
@@ -97,5 +113,77 @@ describe('makeProxy', () => {
     await makeProxy('/in.mp4', '/out.mp4', { duration: 10, fps: 120, width: 1920, height: 1080, hasAudio: true });
     const [, args] = runMock.mock.calls[0] as [string, string[]];
     expect(args[args.indexOf('-r') + 1]).toBe('30');
+  });
+});
+
+describe('probe', () => {
+  it('falls back from avg_frame_rate "0/0" to r_frame_rate instead of silently guessing 30fps', async () => {
+    runMock.mockReset();
+    runMock.mockResolvedValue(
+      JSON.stringify({
+        format: { duration: '12.5' },
+        streams: [
+          { codec_type: 'video', avg_frame_rate: '0/0', r_frame_rate: '30000/1001', width: 1920, height: 1080, duration: '12.5' },
+          { codec_type: 'audio' },
+        ],
+      }),
+    );
+    const p = await probe('/in.mp4');
+    expect(p.fps).toBeCloseTo(30000 / 1001, 5);
+    expect(p.duration).toBeCloseTo(12.5);
+    expect(p.hasAudio).toBe(true);
+  });
+
+  it('falls back from format.duration "N/A" to the video stream duration instead of producing NaN', async () => {
+    runMock.mockReset();
+    runMock.mockResolvedValue(
+      JSON.stringify({
+        format: { duration: 'N/A' },
+        streams: [{ codec_type: 'video', avg_frame_rate: '30/1', width: 1280, height: 720, duration: '7.25' }],
+      }),
+    );
+    const p = await probe('/in.mp4');
+    expect(p.duration).toBeCloseTo(7.25);
+    expect(p.hasAudio).toBe(false);
+  });
+
+  it('throws an explicit error when neither format nor stream duration is usable', async () => {
+    runMock.mockReset();
+    runMock.mockResolvedValue(
+      JSON.stringify({
+        format: { duration: 'N/A' },
+        streams: [{ codec_type: 'video', avg_frame_rate: '0/0', r_frame_rate: '0/0', width: 100, height: 100 }],
+      }),
+    );
+    await expect(probe('/in.mp4')).rejects.toThrow(/duration/i);
+  });
+});
+
+describe('transcribe', () => {
+  it('passes explicit --beam-size/--best-of/--split-on-word and records provenance meta on the transcript', async () => {
+    runMock.mockReset();
+    runMock.mockImplementation(async (cmd: string, args: string[]) => {
+      if (cmd === 'whisper-cli') {
+        const outBase = args[args.indexOf('-of') + 1];
+        await fs.writeFile(
+          `${outBase}.json`,
+          JSON.stringify({
+            transcription: [{ tokens: [{ text: 'hello', offsets: { from: 0, to: 500 }, p: 0.9 }] }],
+            result: { language: 'en' },
+          }),
+        );
+      }
+      return '';
+    });
+    const t = await transcribe('/in.mp4', 'src1', { model: '/models/ggml-small.bin' });
+    const whisperCall = runMock.mock.calls.find(([cmd]) => cmd === 'whisper-cli') as [string, string[]];
+    const [, args] = whisperCall;
+    expect(args).toEqual(expect.arrayContaining(['--beam-size', '5', '--best-of', '5', '--split-on-word']));
+    const meta = (t as any).meta;
+    expect(meta.model).toBe('ggml-small.bin');
+    expect(meta.args).toEqual(args);
+    expect(meta.at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(t.words).toHaveLength(1);
+    expect(t.words[0].text).toBe('hello');
   });
 });

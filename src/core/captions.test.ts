@@ -68,4 +68,53 @@ describe('captionCues', () => {
     const cues = captionCues(m, [t]);
     expect(cues).toHaveLength(0);
   });
+
+  describe('minimum display duration (CPS floor)', () => {
+    it('regression: a cue truncated below 0.6s by de-overlap gets merged with its neighbor instead of flashing by (real case: "では、また次回!" at 121ms)', () => {
+      const m = manifest([{ srcIn: 0, srcOut: 20 }]);
+      const words: Word[] = [
+        // Short, punctuation-terminated utterance: flushes immediately as its
+        // own cue with the 0.6s floor from captionCues' own flush() logic.
+        { id: 'w0', text: 'では、また次回!', t0: 10, t1: 10.05, p: 0.9 },
+        // The next cue starts soon enough after that de-overlap truncates the
+        // first cue's tail well below 0.6s again.
+        { id: 'w1', text: 'next.', t0: 10.3, t1: 10.6, p: 0.9 },
+      ];
+      const t: Transcript = { sourceId: 's1', language: 'ja', words };
+      const cues = captionCues(m, [t]);
+      // Not enough idle time anywhere to borrow from, so the two cues merge
+      // into one that comfortably clears both the 0.6s floor and its CPS need.
+      expect(cues).toHaveLength(1);
+      expect(cues[0].tlEnd - cues[0].tlStart).toBeGreaterThanOrEqual(0.6);
+      expect(cues[0].text).toContain('では、また次回!');
+      expect(cues[0].text).toContain('next.');
+      expect(cues[0].wordIds).toEqual(['w0', 'w1']);
+    });
+
+    it('extends a too-short cue by borrowing idle time instead of merging, when enough room exists', () => {
+      const m = manifest([{ srcIn: 0, srcOut: 20 }]);
+      const words: Word[] = [
+        { id: 'w0', text: 'ではまた明日もよろしくお願いいたします!', t0: 5, t1: 5.1, p: 0.9 },
+      ];
+      const t: Transcript = { sourceId: 's1', language: 'ja', words };
+      const cues = captionCues(m, [t]);
+      expect(cues).toHaveLength(1);
+      const need = Math.max(0.6, cues[0].text.length / 8);
+      expect(cues[0].tlEnd - cues[0].tlStart).toBeGreaterThanOrEqual(need - 1e-6);
+    });
+
+    it('respects a custom maxCps from CaptionSettings instead of the default 8', () => {
+      const base = manifest([{ srcIn: 0, srcOut: 20 }]);
+      const m: Manifest = { ...base, captions: { ...base.captions, maxCps: 100 } }; // very lenient
+      const words: Word[] = [
+        { id: 'w0', text: 'ではまた明日もよろしくお願いいたします!', t0: 5, t1: 5.1, p: 0.9 },
+      ];
+      const t: Transcript = { sourceId: 's1', language: 'ja', words };
+      const cues = captionCues(m, [t]);
+      expect(cues).toHaveLength(1);
+      // With maxCps=100 the CPS requirement is trivially satisfied by the
+      // existing 0.6s flush floor — no extension needed.
+      expect(cues[0].tlEnd - cues[0].tlStart).toBeCloseTo(0.6, 5);
+    });
+  });
 });

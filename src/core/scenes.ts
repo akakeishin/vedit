@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs';
 import { keptWords } from './ops.js';
 import type { Manifest, Scene, SceneFile, Word } from './types.js';
 import type { Peaks } from './detect.js';
-import type { Project } from './project.js';
+import { resolveWithinDir, type Project } from './project.js';
 import { run, runCapture } from '../ingest/run.js';
 
 /**
@@ -170,6 +170,21 @@ export function computeEnergy(peaks: Peaks, t0: number, t1: number): number {
   return sum / (i1 - i0);
 }
 
+// ---- thumbnail path containment ----
+
+/**
+ * Compute a scene's thumbnail path under cache/, rejecting anything that
+ * would resolve outside the project directory. sourceId/sceneId normally
+ * come from validated manifest/scene data, but this is on the write path
+ * for a file derived from request-adjacent input, so it gets the same
+ * containment check as the read paths in daemon.ts.
+ */
+export async function sceneThumbPath(project: Project, sourceId: string, sceneId: string): Promise<{ rel: string; abs: string }> {
+  const rel = path.join('cache', `sc-${sourceId}-${sceneId}.jpg`);
+  const abs = await resolveWithinDir(project.dir, rel);
+  return { rel, abs };
+}
+
 // ---- orchestration (impure: ffmpeg + project I/O) ----
 
 export interface DetectScenesOpts {
@@ -217,8 +232,7 @@ export async function detectScenesForSource(
 
   const scenes: Scene[] = [];
   for (const r of withIds) {
-    const thumbRel = path.join('cache', `sc-${sourceId}-${r.id}.jpg`);
-    const thumbAbs = path.join(project.dir, thumbRel);
+    const { rel: thumbRel, abs: thumbAbs } = await sceneThumbPath(project, sourceId, r.id);
     const mid = (r.t0 + r.t1) / 2;
     await run('ffmpeg', [
       '-y', '-v', 'error',

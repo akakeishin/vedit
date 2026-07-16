@@ -20,6 +20,13 @@ const PORT = Number(process.env.VEDIT_PORT ?? 7799);
 const BASE = `http://localhost:${PORT}`;
 
 // ---- tiny arg parsing ----
+// Flags that never consume the following token as a value — without this,
+// `--no-transcribe clip.mp4` would eat `clip.mp4` as the flag's value and
+// leave the positional argument list empty.
+const BOOLEAN_FLAGS = new Set([
+  'no-transcribe', 'no-add', 'no-fillers', 'no-silence',
+  'latest', 'full', 'all', 'burn-captions',
+]);
 const argv = process.argv.slice(2);
 const cmd = argv[0];
 const flags: Record<string, string | boolean> = {};
@@ -28,9 +35,14 @@ for (let i = 1; i < argv.length; i++) {
   const a = argv[i];
   if (a.startsWith('--')) {
     const eq = a.indexOf('=');
-    if (eq > 0) flags[a.slice(2, eq)] = a.slice(eq + 1);
-    else if (i + 1 < argv.length && !argv[i + 1].startsWith('--')) flags[a.slice(2)] = argv[++i];
-    else flags[a.slice(2)] = true;
+    if (eq > 0) {
+      flags[a.slice(2, eq)] = a.slice(eq + 1);
+    } else {
+      const name = a.slice(2);
+      if (BOOLEAN_FLAGS.has(name)) flags[name] = true;
+      else if (i + 1 < argv.length && !argv[i + 1].startsWith('--')) flags[name] = argv[++i];
+      else flags[name] = true;
+    }
   } else pos.push(a);
 }
 
@@ -42,6 +54,23 @@ function fail(msg: string): never {
   console.error(JSON.stringify({ error: msg }));
   process.exit(1);
 }
+
+/** Parse a `--flag` value as a finite number, or fail with a clear message before it ever reaches the API. */
+function numFlag(name: string, raw: string | boolean | undefined): number | undefined {
+  if (raw === undefined) return undefined;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) fail(`--${name} must be a finite number (got ${JSON.stringify(raw)})`);
+  return n;
+}
+
+/** Parse a positional argument as a finite number, or fail with a clear message before it ever reaches the API. */
+function numArg(label: string, raw: string | undefined): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) fail(`${label} must be a finite number (got ${JSON.stringify(raw)})`);
+  return n;
+}
+
+const MUTATE_HINT = '確認: vedit view / 取消: vedit undo';
 
 function projectDir(): string {
   const dir = (flags.project as string) ?? process.env.VEDIT_PROJECT ?? process.cwd();
@@ -97,20 +126,25 @@ async function ensureDaemon(dir?: string): Promise<void> {
 }
 
 function baseRevOf(state: any): number {
-  if (flags.base !== undefined) return Number(flags.base);
+  if (flags.base !== undefined) return numFlag('base', flags.base)!;
   if (flags.latest) return Number(state.revision);
   fail('--base <revision> is required (or --latest to explicitly use the current one); run `vedit status` first');
+}
+
+/** Submit an edit against an already-known baseRev, bypassing the --base/--latest requirement (used by `undo`, which always bases itself on the current revision). */
+async function editRaw(baseRev: number, body: Record<string, unknown>) {
+  const res = await api('/api/edit', {
+    method: 'POST',
+    body: JSON.stringify({ baseRev, actor: flags.actor ?? 'claude', ...body }),
+  });
+  out({ ...res, hint: MUTATE_HINT });
 }
 
 async function edit(body: Record<string, unknown>) {
   const dir = projectDir();
   await ensureDaemon(dir);
   const state = await api('/api/state');
-  const res = await api('/api/edit', {
-    method: 'POST',
-    body: JSON.stringify({ baseRev: baseRevOf(state), actor: flags.actor ?? 'claude', ...body }),
-  });
-  out({ ...res, hint: 'preview updated live; use `vedit view` to inspect, `vedit undo` to revert' });
+  await editRaw(baseRevOf(state), body);
 }
 
 /**
@@ -164,7 +198,9 @@ misc:      doctor [--download-model [name]] | serve [--port]
 
 Mutating commands REQUIRE --base <rev> (or --latest to explicitly use the
 current one); if the project changed since that revision the edit is
-REJECTED (409) — re-read state first.`;
+REJECTED (409) — re-read state first. Exception: \`undo\` never needs --base —
+it always bases itself on the current revision, since undoing inherently
+means "from here, go back one step".`;
 
 async function main() {
   switch (cmd) {
@@ -175,7 +211,7 @@ async function main() {
 
     case 'serve': {
       const dir = (flags.project as string) ? path.resolve(flags.project as string) : undefined;
-      const { url } = await startDaemon({ port: Number(flags.port ?? PORT), projectDir: dir });
+      const { url } = await startDaemon({ port: numFlag('port', flags.port) ?? PORT, projectDir: dir });
       console.log(`vedit daemon on ${url}${dir ? ` (project: ${dir})` : ''}`);
       return; // keeps running
     }
@@ -254,8 +290,8 @@ async function main() {
       const res = await api('/api/detect', {
         method: 'POST',
         body: JSON.stringify({
-          minGap: flags['min-gap'] ? Number(flags['min-gap']) : undefined,
-          threshold: flags.threshold ? Number(flags.threshold) : undefined,
+          minGap: numFlag('min-gap', flags['min-gap']),
+          threshold: numFlag('threshold', flags.threshold),
           fillers: flags['no-fillers'] ? false : undefined,
           silence: flags['no-silence'] ? false : undefined,
         }),
@@ -299,12 +335,12 @@ async function main() {
         method: 'POST',
         body: JSON.stringify({ ids, decision: cmd === 'approve' ? 'approve' : 'reject', actor: flags.actor ?? 'claude', baseRev: baseRevOf(state) }),
       });
-      return out(res);
+      return out({ ...res, hint: MUTATE_HINT });
     }
 
     case 'remove-words':
       if (pos.length === 0) fail('usage: vedit remove-words <w12 w40..w52 ...>');
-      return edit({ op: 'remove-words', ids: pos, sourceId: flags.source, pad: flags.pad !== undefined ? Number(flags.pad) : undefined });
+      return edit({ op: 'remove-words', ids: pos, sourceId: flags.source, pad: numFlag('pad', flags.pad) });
 
     case 'remove-range': {
       if (flags.scene) {
@@ -314,19 +350,19 @@ async function main() {
         return edit({ op: 'remove-range', t0: r.t0, t1: r.t1, sourceId: r.sourceId });
       }
       if (pos.length < 2) fail('usage: vedit remove-range <t0> <t1> [--scene id]');
-      return edit({ op: 'remove-range', t0: Number(pos[0]), t1: Number(pos[1]), sourceId: flags.source });
+      return edit({ op: 'remove-range', t0: numArg('t0', pos[0]), t1: numArg('t1', pos[1]), sourceId: flags.source });
     }
 
     case 'trim':
       if (pos.length < 3) fail('usage: vedit trim <clipId> <in|out> <±frames>');
-      return edit({ op: 'trim', clipId: pos[0], edge: pos[1], frames: Number(pos[2]) });
+      return edit({ op: 'trim', clipId: pos[0], edge: pos[1], frames: numArg('±frames', pos[2]) });
 
     case 'clip-add': {
       if (pos.length === 0 && !flags.scene) fail('usage: vedit clip-add <sourceId> [--in s] [--out s] [--at index] [--scene id]');
       if (flags.scene && (flags.in !== undefined || flags.out !== undefined)) fail('--scene cannot be combined with --in/--out');
       let sourceId = pos[0];
-      let inVal = flags.in !== undefined ? Number(flags.in) : undefined;
-      let outVal = flags.out !== undefined ? Number(flags.out) : undefined;
+      let inVal = numFlag('in', flags.in);
+      let outVal = numFlag('out', flags.out);
       if (flags.scene) {
         const dir = projectDir();
         const r = await resolveScene(dir, String(flags.scene), sourceId);
@@ -339,7 +375,7 @@ async function main() {
         sourceId,
         in: inVal,
         out: outVal,
-        at: flags.at !== undefined ? Number(flags.at) : undefined,
+        at: numFlag('at', flags.at),
       });
     }
 
@@ -361,9 +397,9 @@ async function main() {
           method: 'POST',
           body: JSON.stringify({
             sourceId: flags.source,
-            sensitivity: flags.sensitivity !== undefined ? Number(flags.sensitivity) : undefined,
-            maxLen: flags['max-len'] !== undefined ? Number(flags['max-len']) : undefined,
-            minLen: flags['min-len'] !== undefined ? Number(flags['min-len']) : undefined,
+            sensitivity: numFlag('sensitivity', flags.sensitivity),
+            maxLen: numFlag('max-len', flags['max-len']),
+            minLen: numFlag('min-len', flags['min-len']),
           }),
         });
         return out(res);
@@ -376,7 +412,7 @@ async function main() {
         const sourceId = (flags.source as string) ?? m.sources[0]?.id;
         if (!sourceId) fail('no sources in project');
         const file = await p.scenes(sourceId);
-        const v = await renderSceneSheet(file, dir, { cols: flags.cols ? Number(flags.cols) : undefined });
+        const v = await renderSceneSheet(file, dir, { cols: numFlag('cols', flags.cols) });
         return out({ ...v, hint: 'Read the png to inspect scene thumbnails; grid maps cells to scene ids' });
       }
 
@@ -426,15 +462,15 @@ async function main() {
       return edit({
         op: 'clip-crop',
         clipId: pos[0],
-        x: flags.x !== undefined ? Number(flags.x) : undefined,
-        y: flags.y !== undefined ? Number(flags.y) : undefined,
+        x: numFlag('x', flags.x),
+        y: numFlag('y', flags.y),
       });
 
     case 'captions': {
       const patch: Record<string, unknown> = {};
       if (flags.enabled !== undefined) patch.enabled = flags.enabled === 'true' || flags.enabled === true;
       if (flags.style) patch.style = flags.style;
-      if (flags['max-chars']) patch.maxChars = Number(flags['max-chars']);
+      if (flags['max-chars']) patch.maxChars = numFlag('max-chars', flags['max-chars']);
       if (Object.keys(patch).length === 0) {
         const dir = projectDir();
         await ensureDaemon(dir);
@@ -450,8 +486,8 @@ async function main() {
       return edit({
         op: 'motion-add',
         spec: { type, params, html: flags.html },
-        tlStart: Number(flags.at ?? 0),
-        duration: Number(flags.duration ?? 4),
+        tlStart: numFlag('at', flags.at) ?? 0,
+        duration: numFlag('duration', flags.duration) ?? 4,
       });
     }
     case 'motion-update': {
@@ -461,8 +497,8 @@ async function main() {
         op: 'motion-update',
         id: pos[0] ?? fail('usage: vedit motion-update <id> [--text ...]'),
         spec: Object.keys(params).length ? { params } : undefined,
-        tlStart: flags.at !== undefined ? Number(flags.at) : undefined,
-        duration: flags.duration !== undefined ? Number(flags.duration) : undefined,
+        tlStart: numFlag('at', flags.at),
+        duration: numFlag('duration', flags.duration),
       });
     }
     case 'motion-remove':
@@ -489,11 +525,15 @@ async function main() {
       return out(await listPresets());
 
     case 'undo': {
+      // Unlike other mutating commands, undo doesn't need --base/--latest —
+      // it always bases itself on whatever the current revision is, since
+      // "undo" inherently means "from here, go back one step".
       const dir = projectDir();
       await ensureDaemon(dir);
+      const state = await api('/api/state');
       const revs = await api('/api/revisions');
-      const target = flags.rev ? Number(flags.rev) : Math.max(1, (revs.at(-1)?.rev ?? 1) - 1);
-      return edit({ op: 'restore', rev: target });
+      const target = flags.rev !== undefined ? numFlag('rev', flags.rev)! : Math.max(1, (revs.at(-1)?.rev ?? 1) - 1);
+      return editRaw(Number(state.revision), { op: 'restore', rev: target });
     }
 
     case 'revisions': {
@@ -508,8 +548,8 @@ async function main() {
       const p = await Project.open(dir);
       const m = await p.manifest();
       let sourceId = flags.source as string | undefined;
-      let from = flags.from !== undefined ? Number(flags.from) : undefined;
-      let to = flags.to !== undefined ? Number(flags.to) : undefined;
+      let from = numFlag('from', flags.from);
+      let to = numFlag('to', flags.to);
       let domain = (flags.domain as 'timeline' | 'source') ?? 'timeline';
       if (flags.scene) {
         if (flags.from !== undefined || flags.to !== undefined) fail('--scene cannot be combined with --from/--to');
@@ -524,8 +564,8 @@ async function main() {
         sourceId,
         from,
         to,
-        cols: flags.cols ? Number(flags.cols) : undefined,
-        rows: flags.rows ? Number(flags.rows) : undefined,
+        cols: numFlag('cols', flags.cols),
+        rows: numFlag('rows', flags.rows),
       });
       return out({ ...v, hint: 'Read the png to inspect frames; grid maps cells to source times' });
     }

@@ -131,7 +131,10 @@ export function expandWordIds(spec: string[], words: Word[]): string[] {
 
 /** Trim one edge of a clip by a signed number of frames (+ extends, - shortens... in source time). */
 export function trimClip(m: Manifest, clipId: string, edge: 'in' | 'out', frames: number): Manifest {
-  if (!Number.isFinite(frames)) throw new Error(`invalid frames: ${frames}`);
+  if (edge !== 'in' && edge !== 'out') {
+    throw new Error(`invalid edge: ${JSON.stringify(edge)} (must be "in" or "out")`);
+  }
+  if (!Number.isInteger(frames)) throw new Error(`invalid frames: ${JSON.stringify(frames)} (must be a finite integer)`);
   const src = new Map(m.sources.map((s) => [s.id, s]));
   const next = m.timeline.video.map((c) => {
     if (c.id !== clipId) return c;
@@ -182,10 +185,24 @@ export function addClip(
   if (!src) throw new Error(`unknown source: ${sourceId}`);
   const srcIn = opts.in ?? 0;
   const srcOut = opts.out ?? src.duration;
+  if (!Number.isFinite(srcIn) || !Number.isFinite(srcOut)) {
+    throw new Error(`clip-add: in/out must be finite numbers (got in=${srcIn}, out=${srcOut})`);
+  }
+  if (srcIn < 0) throw new Error(`clip-add: in (${srcIn}) must be >= 0`);
   if (srcOut <= srcIn) throw new Error(`clip-add: out (${srcOut}) must be greater than in (${srcIn})`);
-  const clip: VideoClip = { id: opts.id ?? freshId('c'), sourceId, srcIn, srcOut };
+  if (srcOut > src.duration) {
+    throw new Error(`clip-add: out (${srcOut}) exceeds source duration (${src.duration})`);
+  }
+  const id = opts.id ?? freshId('c');
+  if (m.timeline.video.some((c) => c.id === id)) {
+    throw new Error(`clip-add: clip id already exists: ${id}`);
+  }
+  const clip: VideoClip = { id, sourceId, srcIn, srcOut };
   const video = [...m.timeline.video];
-  const at = opts.at === undefined ? video.length : Math.max(0, Math.min(opts.at, video.length));
+  if (opts.at !== undefined && (!Number.isInteger(opts.at) || opts.at < 0 || opts.at > video.length)) {
+    throw new Error(`clip-add: at (${opts.at}) must be an integer between 0 and ${video.length}`);
+  }
+  const at = opts.at === undefined ? video.length : opts.at;
   video.splice(at, 0, clip);
   return { ...m, timeline: { ...m.timeline, video } };
 }
@@ -215,18 +232,26 @@ export function moveClip(m: Manifest, clipId: string, beforeClipId: string | 'en
 
 /** Parse a reframe target: "9:16"/"1:1"/"16:9" ratios, or literal "WxH" pixels. */
 export function parseReframeSpec(spec: string): { width: number; height: number } {
+  // yuv420p requires even dimensions; reject non-positive/non-finite values
+  // outright (a 0 or Infinity ratio part would otherwise divide-by-zero into
+  // NaN/Infinity below) and round odd pixel counts to the nearest even one.
+  const normalizeDim = (v: number): number => {
+    if (!Number.isFinite(v) || v <= 0) {
+      throw new Error(`invalid reframe spec: ${spec} (dimensions must be positive finite numbers)`);
+    }
+    return Math.max(2, Math.round(v / 2) * 2);
+  };
   const literal = spec.match(/^(\d+)[xX](\d+)$/);
-  if (literal) return { width: Number(literal[1]), height: Number(literal[2]) };
+  if (literal) return { width: normalizeDim(Number(literal[1])), height: normalizeDim(Number(literal[2])) };
   const ratio = spec.match(/^(\d+):(\d+)$/);
   if (!ratio) throw new Error(`invalid reframe spec: ${spec} (use 9:16, 1:1, 16:9, or WxH)`);
   const w = Number(ratio[1]);
   const h = Number(ratio[2]);
+  if (w <= 0 || h <= 0) throw new Error(`invalid reframe spec: ${spec} (ratio parts must be positive)`);
   // Scale so the shorter ratio number lands on 1080px, matching the usual
-  // shorthand for these aspects (9:16 -> 1080x1920, 16:9 -> 1920x1080);
-  // rounded to even pixels since yuv420p requires it.
+  // shorthand for these aspects (9:16 -> 1080x1920, 16:9 -> 1920x1080).
   const scale = 1080 / Math.min(w, h);
-  const even = (v: number) => Math.round((v * scale) / 2) * 2;
-  return { width: even(w), height: even(h) };
+  return { width: normalizeDim(w * scale), height: normalizeDim(h * scale) };
 }
 
 /** Parse a --focus flag: left/center/right, or an explicit 0..1 fraction. */
@@ -301,6 +326,11 @@ export function applyReframe(m: Manifest, output: { width: number; height: numbe
 /** Adjust one clip's crop position without touching the others. */
 export function setClipCrop(m: Manifest, clipId: string, patch: { x?: number; y?: number }): Manifest {
   if (!m.timeline.video.some((c) => c.id === clipId)) throw new Error(`unknown clip: ${clipId}`);
+  for (const [axis, v] of [['x', patch.x], ['y', patch.y]] as const) {
+    if (v !== undefined && (!Number.isFinite(v) || v < 0 || v > 1)) {
+      throw new Error(`clip-crop: ${axis} (${v}) must be a finite number between 0 and 1`);
+    }
+  }
   // Drop explicit-undefined keys (e.g. a caller building `{ x: b.x, y: b.y }`
   // from a partial request body) before merging, so an omitted axis leaves
   // the existing value alone instead of getting clobbered by `undefined`.

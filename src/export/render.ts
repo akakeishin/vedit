@@ -12,9 +12,33 @@ function assTime(t: number): string {
   return `${h}:${String(m).padStart(2, '0')}:${s}`;
 }
 
+/**
+ * ASS style presets, one per `captions.style` id. Colours are ASS's
+ * &HAABBGGRR — `bold`'s &H005CE4FF is opaque yellow (RGB FF,E4,5C = #ffe45c),
+ * matching the web preview's `.style-bold` caption color exactly. At least
+ * these four (clean/bold/outline/boxed) are always emitted so `--style`
+ * always resolves to a real ASS style even before the web side grows more
+ * presets; an unrecognized style id falls back to `clean`.
+ */
+const ASS_STYLE_PRESETS: Record<string, { primary: string; outline: string; back: string; bold: 0 | -1; borderStyle: 1 | 3; outlineWidth: number; shadow: number }> = {
+  clean: { primary: '&H00FFFFFF', outline: '&H00101010', back: '&H80000000', bold: 0, borderStyle: 1, outlineWidth: 3, shadow: 1 },
+  bold: { primary: '&H005CE4FF', outline: '&H00000000', back: '&H00000000', bold: -1, borderStyle: 3, outlineWidth: 0, shadow: 0 },
+  outline: { primary: '&H00FFFFFF', outline: '&H00000000', back: '&H00000000', bold: 0, borderStyle: 1, outlineWidth: 3, shadow: 1 },
+  boxed: { primary: '&H00FFFFFF', outline: '&H00101010', back: '&H00000000', bold: 0, borderStyle: 3, outlineWidth: 0, shadow: 2 },
+};
+
 export function toAss(m: Manifest, transcripts: Transcript[]): string {
   const cues = captionCues(m, transcripts);
   const { width, height } = m.output ?? { width: m.width, height: m.height };
+  const fontSize = Math.round(height * 0.045);
+  const marginV = Math.round(height * 0.06);
+  const styleLines = Object.entries(ASS_STYLE_PRESETS)
+    .map(
+      ([name, s]) =>
+        `Style: ${name},Hiragino Sans,${fontSize},${s.primary},&H000000FF,${s.outline},${s.back},${s.bold},0,0,0,100,100,0,0,${s.borderStyle},${s.outlineWidth},${s.shadow},2,60,60,${marginV},1`,
+    )
+    .join('\n');
+  const activeStyle = ASS_STYLE_PRESETS[m.captions.style] ? m.captions.style : 'clean';
   const head = `[Script Info]
 ScriptType: v4.00+
 PlayResX: ${width}
@@ -22,13 +46,13 @@ PlayResY: ${height}
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Hiragino Sans,${Math.round(height * 0.045)},&H00FFFFFF,&H000000FF,&H00101010,&H80000000,-1,0,0,0,100,100,0,0,1,3,1,2,60,60,${Math.round(height * 0.06)},1
+${styleLines}
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 `;
   const lines = cues.map(
-    (c) => `Dialogue: 0,${assTime(c.tlStart)},${assTime(c.tlEnd)},Default,,0,0,0,,${c.text.replace(/\n/g, '\\N')}`,
+    (c) => `Dialogue: 0,${assTime(c.tlStart)},${assTime(c.tlEnd)},${activeStyle},,0,0,0,,${c.text.replace(/\n/g, '\\N')}`,
   );
   return head + lines.join('\n') + '\n';
 }

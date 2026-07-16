@@ -127,6 +127,17 @@ describe('trimClip', () => {
   it('throws on unknown clip', () => {
     expect(() => trimClip(manifest(), 'nope', 'in', 1)).toThrow(/unknown clip/);
   });
+
+  it('rejects an edge that is not exactly "in" or "out"', () => {
+    expect(() => trimClip(manifest(), 'c1', 'left' as any, 1)).toThrow(/invalid edge/);
+    expect(() => trimClip(manifest(), 'c1', 'IN' as any, 1)).toThrow(/invalid edge/);
+  });
+
+  it('rejects non-integer or non-finite frames', () => {
+    expect(() => trimClip(manifest(), 'c1', 'in', 1.5)).toThrow(/invalid frames/);
+    expect(() => trimClip(manifest(), 'c1', 'in', NaN)).toThrow(/invalid frames/);
+    expect(() => trimClip(manifest(), 'c1', 'in', Infinity)).toThrow(/invalid frames/);
+  });
 });
 
 describe('detection', () => {
@@ -235,6 +246,34 @@ describe('Project store', () => {
     const revs = await p.revisions();
     expect(revs.map((r) => r.rev)).toEqual([1, 2, 3]);
   });
+
+  it('rejects sourceId/motion ids containing path separators or traversal segments', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'vedit-'));
+    const p = await Project.create(path.join(dir, 'proj'), 'test');
+
+    // The classic disguised-traversal payload: embedding ".." past a
+    // prefix like "scenes-" or "transcript-" still escapes path.join once
+    // enough ".." segments are present, so the character-class check must
+    // reject "/" outright rather than trying to out-think path.normalize.
+    const attacks = ['../../../../etc/passwd', 'x/../../secret', '..', 'a/b', ''];
+    for (const bad of attacks) {
+      expect(() => p.transcriptPath(bad)).toThrow(/invalid source id/);
+      expect(() => p.scenesPath(bad)).toThrow(/invalid source id/);
+      expect(() => p.motionSpecPath(bad)).toThrow(/invalid motion id/);
+    }
+    // A normal generated id is unaffected.
+    expect(p.transcriptPath('s1')).toContain('transcript-s1.json');
+    expect(p.scenesPath('s1')).toContain('scenes-s1.json');
+    expect(p.motionSpecPath('mo123')).toContain(path.join('motion', 'mo123.json'));
+  });
+
+  it('resolveWithinDir rejects a relative path that escapes the base directory', async () => {
+    const { resolveWithinDir } = await import('./project.js');
+    const dir = mkdtempSync(path.join(tmpdir(), 'vedit-'));
+    await expect(resolveWithinDir(dir, '../secret.mp4')).rejects.toThrow(/escapes directory/);
+    await expect(resolveWithinDir(dir, 'cache/../../secret.mp4')).rejects.toThrow(/escapes directory/);
+    await expect(resolveWithinDir(dir, 'cache/ok.mp4')).resolves.toContain(path.join('cache', 'ok.mp4'));
+  });
 });
 
 describe('adaptiveThreshold', () => {
@@ -322,6 +361,29 @@ describe('addClip / removeClip / moveClip', () => {
     expect(() => moveClip(manifest(), 'nope', 'end')).toThrow(/unknown clip/);
     expect(() => moveClip(manifest(), 'c1', 'nope')).toThrow(/unknown clip/);
   });
+
+  it('addClip rejects non-finite in/out', () => {
+    expect(() => addClip(manifest(), 's1', { in: NaN, out: 10 })).toThrow(/finite/);
+    expect(() => addClip(manifest(), 's1', { in: 0, out: Infinity })).toThrow(/finite/);
+  });
+
+  it('addClip rejects a negative in', () => {
+    expect(() => addClip(manifest(), 's1', { in: -1, out: 10 })).toThrow(/in \(-1\) must be >= 0/);
+  });
+
+  it('addClip rejects an out beyond the source duration', () => {
+    expect(() => addClip(manifest(), 's1', { in: 0, out: 61 })).toThrow(/exceeds source duration/);
+  });
+
+  it('addClip rejects a duplicate clip id', () => {
+    expect(() => addClip(manifest(), 's1', { id: 'c1' })).toThrow(/clip id already exists: c1/);
+  });
+
+  it('addClip rejects a non-integer or out-of-range at', () => {
+    expect(() => addClip(manifest(), 's1', { at: 0.5 })).toThrow(/at \(0\.5\)/);
+    expect(() => addClip(manifest(), 's1', { at: -1 })).toThrow(/at \(-1\)/);
+    expect(() => addClip(manifest(), 's1', { at: 99 })).toThrow(/at \(99\)/);
+  });
 });
 
 describe('reframe / crop', () => {
@@ -337,6 +399,20 @@ describe('reframe / crop', () => {
 
   it('parseReframeSpec rejects garbage', () => {
     expect(() => parseReframeSpec('vertical')).toThrow(/invalid reframe spec/);
+  });
+
+  it('parseReframeSpec rejects a zero literal dimension', () => {
+    expect(() => parseReframeSpec('0x1080')).toThrow(/invalid reframe spec/);
+    expect(() => parseReframeSpec('1080x0')).toThrow(/invalid reframe spec/);
+  });
+
+  it('parseReframeSpec rejects a zero ratio part (would otherwise divide by zero into NaN/Infinity)', () => {
+    expect(() => parseReframeSpec('0:16')).toThrow(/invalid reframe spec/);
+    expect(() => parseReframeSpec('16:0')).toThrow(/invalid reframe spec/);
+  });
+
+  it('parseReframeSpec normalizes odd literal dimensions to the nearest even pixel count', () => {
+    expect(parseReframeSpec('1081x1351')).toEqual({ width: 1082, height: 1352 });
   });
 
   it('parseFocus maps mnemonics and clamps numeric input', () => {
@@ -403,5 +479,12 @@ describe('reframe / crop', () => {
 
   it('setClipCrop throws on an unknown clip', () => {
     expect(() => setClipCrop(manifest(), 'nope', { x: 0 })).toThrow(/unknown clip/);
+  });
+
+  it('setClipCrop rejects an out-of-range or non-finite x/y', () => {
+    expect(() => setClipCrop(manifest(), 'c1', { x: 1.5 })).toThrow(/x \(1\.5\)/);
+    expect(() => setClipCrop(manifest(), 'c1', { x: -0.1 })).toThrow(/x \(-0\.1\)/);
+    expect(() => setClipCrop(manifest(), 'c1', { y: NaN })).toThrow(/y \(NaN\)/);
+    expect(() => setClipCrop(manifest(), 'c1', { y: Infinity })).toThrow(/y \(Infinity\)/);
   });
 });

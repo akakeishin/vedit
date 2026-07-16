@@ -70,6 +70,13 @@ export interface CaptionSettings {
   style: string;
   /** Max characters per caption line before splitting. */
   maxChars: number;
+  /**
+   * Max characters-per-second a cue may be displayed at before its duration
+   * is extended (or it's merged with a neighbor) to stay readable. Optional
+   * for backward compatibility with existing project.json files; defaults
+   * to 8 when absent.
+   */
+  maxCps?: number;
 }
 
 // ---- transcript ----

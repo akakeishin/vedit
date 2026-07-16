@@ -14,6 +14,23 @@ export interface ProbeResult {
   hasAudio: boolean;
 }
 
+/**
+ * Parse an ffprobe "N/D" frame-rate string. ffprobe emits the sentinel
+ * "0/0" for avg_frame_rate when it can't compute an average (e.g. very
+ * short or corrupt-container clips) — `"0/0" || fallback` in a truthiness
+ * check never catches that because "0/0" is a non-empty, truthy string.
+ * Returns null for anything that isn't a real positive rate so the caller
+ * can fall back explicitly.
+ */
+function parseFrameRate(s: unknown): number | null {
+  if (typeof s !== 'string') return null;
+  const [numStr, denStr] = s.split('/');
+  const num = Number(numStr);
+  const den = denStr !== undefined ? Number(denStr) : 1;
+  if (!Number.isFinite(num) || !Number.isFinite(den) || num <= 0 || den <= 0) return null;
+  return num / den;
+}
+
 export async function probe(file: string): Promise<ProbeResult> {
   const out = await run('ffprobe', [
     '-v', 'error',
@@ -25,10 +42,32 @@ export async function probe(file: string): Promise<ProbeResult> {
   const v = (j.streams as any[]).find((s) => s.codec_type === 'video');
   const a = (j.streams as any[]).find((s) => s.codec_type === 'audio');
   if (!v) throw new Error(`no video stream in ${file}`);
-  const [num, den] = String(v.avg_frame_rate || v.r_frame_rate || '30/1').split('/').map(Number);
+
+  const fps = parseFrameRate(v.avg_frame_rate) ?? parseFrameRate(v.r_frame_rate) ?? 30;
+
+  // ffprobe emits the sentinel "N/A" for format.duration when the container
+  // doesn't carry an overall duration (common for some raw/streamed
+  // formats); `Number("N/A")` is NaN, which `??` doesn't catch since the
+  // value is a defined (non-null) string. Fall back to the video stream's
+  // own duration, and fail loudly rather than silently returning 0/NaN if
+  // neither is usable — a bogus duration corrupts every downstream time
+  // computation.
+  const formatDuration = Number(j.format?.duration);
+  const streamDuration = Number(v.duration);
+  const duration = Number.isFinite(formatDuration) && formatDuration > 0
+    ? formatDuration
+    : Number.isFinite(streamDuration) && streamDuration > 0
+      ? streamDuration
+      : NaN;
+  if (!Number.isFinite(duration)) {
+    throw new Error(
+      `ffprobe returned no usable duration for ${file} (format.duration=${JSON.stringify(j.format?.duration)}, stream.duration=${JSON.stringify(v.duration)})`,
+    );
+  }
+
   return {
-    duration: Number(j.format.duration ?? v.duration ?? 0),
-    fps: den ? num / den : 30,
+    duration,
+    fps,
     width: v.width,
     height: v.height,
     hasAudio: Boolean(a),
@@ -139,6 +178,13 @@ export async function transcribe(
     '-ojf', // full JSON with token-level offsets
     '-of', outBase,
     '--threads', String(Math.max(2, os.cpus().length - 2)),
+    // Explicit rather than relying on whatever the installed whisper-cli
+    // build defaults to — beam-size/best-of pin decoding quality, and
+    // split-on-word keeps segment boundaries at word edges (matches how
+    // this pipeline consumes token offsets as word-level timing).
+    '--beam-size', '5',
+    '--best-of', '5',
+    '--split-on-word',
   ];
   if (opts.language) args.push('-l', opts.language);
   else args.push('-l', 'auto');
@@ -174,11 +220,22 @@ export async function transcribe(
     if (cur) push(cur.text, cur.t0, cur.t1, cur.p);
   }
   await fs.rm(tmp, { recursive: true, force: true });
-  return {
+  // `meta` is provenance for debugging/reproducibility (which model, what
+  // decoding args, when) — not part of the Transcript type, so any reader
+  // that only knows about `sourceId`/`language`/`words` ignores it
+  // (JSON.stringify/parse round-trips extra own properties just fine; this
+  // is purely additive and backward compatible).
+  const result: Transcript & { meta: { model: string; args: string[]; at: string } } = {
     sourceId,
     language: j.result?.language ?? opts.language ?? 'auto',
     words: sanitizeWords(words, opts.sourceDuration),
+    meta: {
+      model: path.basename(model),
+      args,
+      at: new Date().toISOString(),
+    },
   };
+  return result;
 }
 
 /**
@@ -198,24 +255,39 @@ export async function transcribe(
 export function sanitizeWords(raw: Word[], sourceDuration?: number): Word[] {
   if (raw.length === 0) return raw;
 
-  // Fold standalone punctuation/symbol tokens into a neighbor: glued onto the
-  // previous word if one exists yet, else prefixed onto the next real word.
+  // Fold standalone punctuation/symbol tokens into a neighbor, in the
+  // direction the mark actually reads: an opening bracket/quote (「『([（【)
+  // belongs with the word that follows it, everything else (closing
+  // brackets, commas, sentence-enders) belongs with the word before it.
+  // Classifying purely by "is there a previous word yet" (as opposed to by
+  // the mark itself) glued a run like closing-then-opening bracket tokens
+  // ("」" then "「") onto the SAME previous word, producing garbage like
+  // "な」「" instead of "な」" + "「next". Classification is keyed off the
+  // token's first character, which matches whisper's actual granularity of
+  // one punctuation mark per token.
+  const OPEN_CHARS = new Set(['(', '（', '「', '『', '[', '【']);
   const PUNCT_ONLY = /^[、。！？!?」「『』()（）\[\]【】…・,.\s]+$/u;
   const folded: Word[] = [];
-  let prefix = '';
+  let openPrefix = ''; // open-class punctuation queued to prefix the next real word
   for (const w of raw) {
     if (PUNCT_ONLY.test(w.text)) {
-      if (folded.length > 0) folded[folded.length - 1] = { ...folded[folded.length - 1], text: folded[folded.length - 1].text + w.text };
-      else prefix += w.text;
+      const isOpen = OPEN_CHARS.has(w.text[0]);
+      if (isOpen || folded.length === 0) {
+        // open-class marks always attach forward; anything else falls back
+        // to forward attachment too when there's no previous word yet.
+        openPrefix += w.text;
+      } else {
+        folded[folded.length - 1] = { ...folded[folded.length - 1], text: folded[folded.length - 1].text + w.text };
+      }
       continue;
     }
-    folded.push(prefix ? { ...w, text: prefix + w.text } : { ...w });
-    prefix = '';
+    folded.push(openPrefix ? { ...w, text: openPrefix + w.text } : { ...w });
+    openPrefix = '';
   }
-  if (prefix) {
+  if (openPrefix) {
     // trailing punctuation with nothing after it to attach to; keep the input.
     if (folded.length === 0) return raw;
-    folded[folded.length - 1] = { ...folded[folded.length - 1], text: folded[folded.length - 1].text + prefix };
+    folded[folded.length - 1] = { ...folded[folded.length - 1], text: folded[folded.length - 1].text + openPrefix };
   }
 
   // Reallocate time for runs of zero-width (t0 >= t1) words.

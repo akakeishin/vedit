@@ -19,9 +19,30 @@ function srtTime(t: number): string {
   return `${pad(h)}:${pad(m)}:${pad(s)},${pad(ms, 3)}`;
 }
 
+/**
+ * Wrap a cue's text into at most two lines when it exceeds `maxChars`,
+ * breaking at the last word boundary at or before the limit. Falls back to a
+ * hard character-count split when there's no word boundary to break on
+ * (e.g. CJK text, which captionCues joins without spaces).
+ */
+export function wrapSrtLine(text: string, maxChars: number): string {
+  if (maxChars <= 0 || text.length <= maxChars) return text;
+  let breakAt = -1;
+  for (let i = Math.min(maxChars, text.length - 1); i > 0; i--) {
+    if (/\s/.test(text[i])) {
+      breakAt = i;
+      break;
+    }
+  }
+  if (breakAt === -1) return text.slice(0, maxChars) + '\n' + text.slice(maxChars);
+  return text.slice(0, breakAt).trimEnd() + '\n' + text.slice(breakAt + 1).trimStart();
+}
+
 export function toSrt(m: Manifest, transcripts: Transcript[]): string {
   const cues = captionCues(m, transcripts);
-  return cues.map((c, i) => `${i + 1}\n${srtTime(c.tlStart)} --> ${srtTime(c.tlEnd)}\n${c.text}\n`).join('\n');
+  return cues
+    .map((c, i) => `${i + 1}\n${srtTime(c.tlStart)} --> ${srtTime(c.tlEnd)}\n${wrapSrtLine(c.text, m.captions.maxChars)}\n`)
+    .join('\n');
 }
 
 export async function writeSrt(m: Manifest, transcripts: Transcript[], outPath: string): Promise<string> {

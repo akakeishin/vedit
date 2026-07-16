@@ -4,6 +4,46 @@ import type { CutCandidate, Manifest, RevisionEntry, Scene, SceneFile, Transcrip
 import { upsertProject } from './registry.js';
 
 /**
+ * Ids used to build filenames (sourceId, motion spec id) must never carry a
+ * path separator or ".." segment — the daemon treats a manifest and its
+ * requests as untrusted even though it only binds to localhost, since a
+ * corrupted/tampered project.json or a crafted request param must not be
+ * able to read or write outside the project directory.
+ */
+const SAFE_ID = /^[A-Za-z0-9_-]+$/;
+
+function assertSafeId(id: unknown, kind: string): asserts id is string {
+  if (typeof id !== 'string' || !SAFE_ID.test(id)) {
+    throw new Error(`invalid ${kind} id: ${JSON.stringify(id)}`);
+  }
+}
+
+/**
+ * Resolve `rel` under `dir` and reject anything that would land outside it:
+ * a string-level check via path.resolve (catches "../.." traversal even
+ * when disguised inside a longer segment, e.g. "scenes-../../x"), then —
+ * when the target already exists — a realpath check on both sides to catch
+ * symlink-based escapes too. Used for manifest-supplied relative paths
+ * (proxy/peaks/thumb) which are on-disk data, not trusted input.
+ */
+export async function resolveWithinDir(dir: string, rel: string): Promise<string> {
+  const base = path.resolve(dir);
+  const full = path.resolve(base, rel);
+  if (full !== base && !full.startsWith(base + path.sep)) {
+    throw new Error(`path escapes directory: ${rel}`);
+  }
+  try {
+    const [realBase, realFull] = await Promise.all([fs.realpath(base), fs.realpath(full)]);
+    if (realFull !== realBase && !realFull.startsWith(realBase + path.sep)) {
+      throw new Error(`path escapes directory (symlink): ${rel}`);
+    }
+  } catch (e: any) {
+    if (e?.code !== 'ENOENT') throw e; // target not created yet: string-level check above already covers traversal
+  }
+  return full;
+}
+
+/**
  * Project store on disk. One directory per project:
  *   project.json / revisions.jsonl / transcript-<sourceId>.json /
  *   candidates.json / scenes-<sourceId>.json / motion/ / cache/
@@ -22,6 +62,12 @@ export class Project {
   }
   get motionDir() {
     return path.join(this.dir, 'motion');
+  }
+
+  /** Path of a motion spec file, rejecting an id that isn't a bare safe token. */
+  motionSpecPath(id: string) {
+    assertSafeId(id, 'motion');
+    return path.join(this.motionDir, `${id}.json`);
   }
 
   static async create(dir: string, name: string): Promise<Project> {
@@ -135,6 +181,7 @@ export class Project {
   // ---- transcript ----
 
   transcriptPath(sourceId: string) {
+    assertSafeId(sourceId, 'source');
     return path.join(this.dir, `transcript-${sourceId}.json`);
   }
 
@@ -167,6 +214,7 @@ export class Project {
   // ---- scene index (detect + annotate) ----
 
   scenesPath(sourceId: string) {
+    assertSafeId(sourceId, 'source');
     return path.join(this.dir, `scenes-${sourceId}.json`);
   }
 

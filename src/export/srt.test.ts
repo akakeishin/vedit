@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { toSrt } from './srt.js';
-import type { Manifest, Transcript } from '../core/types.js';
+import { toSrt, wrapSrtLine } from './srt.js';
+import type { Manifest, Transcript, Word } from '../core/types.js';
 
 function manifest(): Manifest {
   return {
@@ -32,11 +32,15 @@ function transcript(): Transcript {
 
 describe('toSrt', () => {
   it('renders numbered cues with comma-separated SRT timecodes', () => {
+    // Each cue's raw flush duration is 0.65s, but "Hello."/"World." (6 chars)
+    // need 6/8=0.75s to clear captionCues' CPS floor, so 0.1s is borrowed
+    // from the idle gap after each cue, pushing the end time to :02,250 /
+    // :06,250 instead of the un-extended :02,150 / :06,150.
     const srt = toSrt(manifest(), [transcript()]);
     expect(srt).toBe(
-      '1\n00:00:01,500 --> 00:00:02,150\nHello.\n' +
+      '1\n00:00:01,500 --> 00:00:02,250\nHello.\n' +
         '\n' +
-        '2\n00:00:05,500 --> 00:00:06,150\nWorld.\n',
+        '2\n00:00:05,500 --> 00:00:06,250\nWorld.\n',
     );
   });
 
@@ -63,5 +67,41 @@ describe('toSrt', () => {
     };
     const srt = toSrt(m, [t]);
     expect(srt).toContain('00:01:00,000 -->');
+  });
+});
+
+describe('wrapSrtLine', () => {
+  it('leaves text at or under maxChars untouched', () => {
+    expect(wrapSrtLine('short', 24)).toBe('short');
+  });
+
+  it('wraps at the last word boundary at or before maxChars', () => {
+    expect(wrapSrtLine('a b c d e f.', 10)).toBe('a b c d e\nf.');
+  });
+
+  it('hard-breaks at maxChars when there is no word boundary (e.g. CJK text with no spaces)', () => {
+    expect(wrapSrtLine('あいうえおかきく', 6)).toBe('あいうえおか\nきく');
+  });
+
+  it('never produces more than two lines', () => {
+    const wrapped = wrapSrtLine('one two three four five six seven', 8);
+    expect(wrapped.split('\n')).toHaveLength(2);
+  });
+});
+
+describe('toSrt line wrapping', () => {
+  it('wraps a cue whose joined text exceeds maxChars into two SRT lines', () => {
+    const m: Manifest = { ...manifest(), captions: { ...manifest().captions, maxChars: 10 } };
+    const words: Word[] = [
+      { id: 'w0', text: 'a', t0: 1.0, t1: 1.1, p: 0.9 },
+      { id: 'w1', text: 'b', t0: 1.1, t1: 1.2, p: 0.9 },
+      { id: 'w2', text: 'c', t0: 1.2, t1: 1.3, p: 0.9 },
+      { id: 'w3', text: 'd', t0: 1.3, t1: 1.4, p: 0.9 },
+      { id: 'w4', text: 'e', t0: 1.4, t1: 1.5, p: 0.9 },
+      { id: 'w5', text: 'f.', t0: 1.5, t1: 1.6, p: 0.9 },
+    ];
+    const t: Transcript = { sourceId: 's1', language: 'en', words };
+    const srt = toSrt(m, [t]);
+    expect(srt).toContain('a b c d e\nf.');
   });
 });

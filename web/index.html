@@ -11,21 +11,27 @@
   <span id="projName">vedit</span>
   <span id="stat"></span>
   <span class="spacer"></span>
-  <button id="shortcutsBtn" title="ショートカット一覧 (?)">⌨ ?</button>
-  <button id="undoBtn" title="直前のリビジョンに戻す">⟲ undo</button>
-  <span id="conn" class="conn">●</span>
+  <button id="shortcutsBtn" title="ショートカット一覧 (?)" aria-label="ショートカット一覧を開く">⌨ ?</button>
+  <button id="undoBtn" aria-label="直前のリビジョンに戻す">⟲ undo</button>
+  <span id="conn" class="conn" title="接続待ち">● 接続待ち</span>
 </header>
 
 <main>
-  <section id="stage">
+  <section id="stage" aria-label="プレビュー">
     <div id="videoWrap">
-      <video id="video" playsinline></video>
-      <div id="captionLayer"></div>
-      <div id="motionLayer"></div>
-      <div id="ingestOverlay" hidden><div class="spin"></div><span id="ingestStep"></span></div>
+      <div id="videoBox">
+        <video id="video" playsinline aria-label="プレビュー動画"></video>
+        <div id="captionLayer"></div>
+        <div id="motionLayer"></div>
+        <div id="ingestOverlay" hidden><div class="spin"></div><span id="ingestStep" aria-live="polite"></span></div>
+        <div id="stageEmpty" hidden>
+          <p id="stageEmptyMsg"></p>
+          <button id="stageEmptyRetry" hidden>再読み込み</button>
+        </div>
+      </div>
     </div>
     <div id="transport">
-      <button id="playBtn">▶</button>
+      <button id="playBtn" aria-label="再生" aria-pressed="false">▶</button>
       <span id="tc">0:00.0 (f0) / 0:00.0 (f0)</span>
       <span id="rateLabel" hidden></span>
       <span class="spacer"></span>
@@ -48,28 +54,29 @@
     <div id="clipInspector" hidden>
       <span id="clipLabel"></span>
       <span>IN</span>
-      <button data-trim="in:-1">−1f</button><button data-trim="in:1">+1f</button>
+      <button data-trim="in:-1" aria-label="IN点を1フレーム戻す">−1f</button><button data-trim="in:1" aria-label="IN点を1フレーム進める">+1f</button>
       <span>OUT</span>
-      <button data-trim="out:-1">−1f</button><button data-trim="out:1">+1f</button>
+      <button data-trim="out:-1" aria-label="OUT点を1フレーム戻す">−1f</button><button data-trim="out:1" aria-label="OUT点を1フレーム進める">+1f</button>
       <button id="clipRemoveBtn">クリップを外す</button>
-      <button id="clipClose">×</button>
+      <button id="clipClose" aria-label="クリップ詳細を閉じる">×</button>
     </div>
   </section>
 
   <aside>
-    <div class="tabs">
-      <button class="tab active" data-panel="transcriptPanel">Transcript</button>
-      <button class="tab" data-panel="candPanel">提案 <span id="candCount"></span></button>
-      <button class="tab" data-panel="histPanel">履歴</button>
+    <div class="tabs" role="tablist" aria-label="パネル切替">
+      <button class="tab active" id="tab-transcriptPanel" role="tab" aria-selected="true" aria-controls="transcriptPanel" data-panel="transcriptPanel" tabindex="0">Transcript</button>
+      <button class="tab" id="tab-candPanel" role="tab" aria-selected="false" aria-controls="candPanel" data-panel="candPanel" tabindex="-1">提案 <span id="candCount"></span></button>
+      <button class="tab" id="tab-histPanel" role="tab" aria-selected="false" aria-controls="histPanel" data-panel="histPanel" tabindex="-1">履歴</button>
     </div>
-    <div id="transcriptPanel" class="panel active">
+    <div id="transcriptPanel" class="panel active" role="tabpanel" aria-labelledby="tab-transcriptPanel" tabindex="0">
       <div class="panelbar">
         <button id="removeSelBtn" disabled>選択を削除</button>
-        <span class="hintText">ドラッグで単語選択 / クリックでシーク</span>
+        <span class="hintText">ドラッグ or クリック→Shift+クリックで単語選択 / クリックでシーク / 矢印+Space+Delete も使用可</span>
+        <span id="selStatus" role="status" class="sr-only"></span>
       </div>
-      <div id="words"></div>
+      <div id="words" role="listbox" aria-label="トランスクリプト" aria-multiselectable="true"></div>
     </div>
-    <div id="candPanel" class="panel">
+    <div id="candPanel" class="panel" role="tabpanel" aria-labelledby="tab-candPanel" tabindex="0">
       <div class="panelbar candPanelbar">
         <button id="approveAllBtn">すべて承認</button>
         <span class="spacer"></span>
@@ -81,30 +88,29 @@
       </div>
       <div id="candList"></div>
     </div>
-    <div id="histPanel" class="panel">
+    <div id="histPanel" class="panel" role="tabpanel" aria-labelledby="tab-histPanel" tabindex="0">
       <div id="histList"></div>
     </div>
   </aside>
 </main>
 <div id="toast" hidden></div>
-<div id="shortcutsOverlay" hidden>
-  <div class="shortcutsBox">
-    <h2>ショートカット一覧</h2>
-    <table>
-      <tr><td>Space</td><td>再生 / 停止</td></tr>
-      <tr><td>K</td><td>停止</td></tr>
-      <tr><td>L</td><td>再生(連打で 1x→1.5x→2x)</td></tr>
-      <tr><td>J</td><td>2秒巻き戻して再生</td></tr>
-      <tr><td>← / →</td><td>±1秒</td></tr>
-      <tr><td>Shift+← / Shift+→</td><td>±1フレーム</td></tr>
-      <tr><td>, / .</td><td>±1フレーム</td></tr>
-      <tr><td>I / O</td><td>選択レンジのイン/アウト点を設定</td></tr>
-      <tr><td>Esc</td><td>レンジ選択を解除</td></tr>
-      <tr><td>?</td><td>このヘルプの表示/非表示</td></tr>
-    </table>
-    <button id="shortcutsCloseBtn">閉じる</button>
-  </div>
-</div>
+<dialog id="shortcutsDialog" aria-labelledby="shortcutsTitle">
+  <h2 id="shortcutsTitle">ショートカット一覧</h2>
+  <table>
+    <tr><td>Space</td><td>再生 / 停止</td></tr>
+    <tr><td>K</td><td>停止</td></tr>
+    <tr><td>L</td><td>再生(連打で 1x→1.5x→2x)</td></tr>
+    <tr><td>J</td><td>2秒巻き戻して再生</td></tr>
+    <tr><td>← / →</td><td>±1秒</td></tr>
+    <tr><td>Shift+← / Shift+→</td><td>±1フレーム</td></tr>
+    <tr><td>, / .</td><td>±1フレーム</td></tr>
+    <tr><td>I / O</td><td>選択レンジのイン/アウト点を設定</td></tr>
+    <tr><td>Esc</td><td>レンジ選択を解除</td></tr>
+    <tr><td>?</td><td>このヘルプの表示/非表示</td></tr>
+  </table>
+  <p class="hintText">トランスクリプト欄にフォーカス中: ←/→で移動、Spaceで選択トグル、Shift+←/→で範囲拡張、Enterでシーク、Deleteで削除</p>
+  <button id="shortcutsCloseBtn">閉じる</button>
+</dialog>
 <script src="app.js"></script>
 </body>
 </html>
