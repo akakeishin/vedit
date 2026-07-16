@@ -42,12 +42,8 @@ kit.json(vedit-kit/v1)のセクション — **すべて optional、書いた分
   repair_preset } — audio-mix / audio-repair の既定値
 - `defaults`: { captions_style, export_preset, reframe_focus }
 
-## 既存スキーマの取り込み(互換レイヤ、二次)
-
-`vedit kit-import <srcDir> <kitDir>`: 既知スキーマ
-(video-production-profile/v1、*-video-design-presets/v1、
-video-character-asset-pack/v1、GUIDE md)を認識して vedit-kit/v1 に**変換**
-(元ファイルは不変、assets はパス参照のまま)。ぽんしゃす設定はこれで一発移行。
+(取り込みコンバータは作らない — キットは kit-init から新規作成する方針。
+既存のぽんしゃす設定は参考例に留める)
 
 ## 1. デザインプリセット → 字幕/タイトルスタイル
 
