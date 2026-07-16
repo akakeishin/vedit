@@ -5,6 +5,7 @@ import path from 'node:path';
 import {
   expandWordIds,
   keptWords,
+  padWordRange,
   removeSourceRange,
   segments,
   sourceTimeToTimeline,
@@ -13,7 +14,7 @@ import {
   wordRange,
 } from './ops.js';
 import { Project } from './project.js';
-import { detectFillers, detectSilences } from './detect.js';
+import { detectFillers, detectSilences, detectSilencesFromPeaks } from './detect.js';
 import type { Manifest, Transcript, Word } from './types.js';
 
 function manifest(): Manifest {
@@ -131,6 +132,77 @@ describe('detection', () => {
   });
 });
 
+describe('padWordRange', () => {
+  const w = words(); // 10 words, 1s each, 0.8s speech + 0.2s gap, big gap after w5
+
+  it('widens the range by pad on both sides', () => {
+    const ids = ['w2'];
+    const r = wordRange(w, ids); // t0=2.5, t1=3.3
+    const padded = padWordRange(w, ids, r, 0.08);
+    expect(padded.t0).toBeCloseTo(2.42);
+    expect(padded.t1).toBeCloseTo(3.38);
+  });
+
+  it('clamps to the neighboring surviving word instead of biting into it', () => {
+    // words are spaced 0.2s apart, so a 0.08 pad fits; a much larger pad
+    // must not intrude past the previous/next word's boundary.
+    const ids = ['w2'];
+    const r = wordRange(w, ids);
+    const padded = padWordRange(w, ids, r, 5);
+    const prev = w.find((x) => x.id === 'w1')!;
+    const next = w.find((x) => x.id === 'w3')!;
+    expect(padded.t0).toBeCloseTo(prev.t1);
+    expect(padded.t1).toBeCloseTo(next.t0);
+  });
+
+  it('pad is effectively zero when already flush against a neighbor', () => {
+    const flush: Word[] = [
+      { id: 'a', text: 'x', t0: 0, t1: 1, p: 1 },
+      { id: 'b', text: 'y', t0: 1, t1: 2, p: 1 },
+      { id: 'c', text: 'z', t0: 2, t1: 3, p: 1 },
+    ];
+    const padded = padWordRange(flush, ['b'], { t0: 1, t1: 2 }, 0.5);
+    expect(padded.t0).toBeCloseTo(1);
+    expect(padded.t1).toBeCloseTo(2);
+  });
+});
+
+describe('detectSilencesFromPeaks', () => {
+  it('finds a quiet stretch at the given threshold/minGap', () => {
+    // 25 samples/sec: 1s loud, 2s quiet, 1s loud
+    const rate = 25;
+    const peaks: number[] = [
+      ...Array(rate).fill(0.5),
+      ...Array(rate * 2).fill(0.01),
+      ...Array(rate).fill(0.5),
+    ];
+    const cands = detectSilencesFromPeaks({ rate, peaks }, { sourceId: 's1' });
+    expect(cands).toHaveLength(1);
+    expect(cands[0].t0).toBeGreaterThan(1);
+    expect(cands[0].t1).toBeLessThan(3);
+    expect(cands[0].t1 - cands[0].t0).toBeGreaterThan(1.5);
+  });
+
+  it('ignores quiet stretches shorter than minGap', () => {
+    const rate = 25;
+    const peaks: number[] = [...Array(rate).fill(0.5), ...Array(Math.round(rate * 0.3)).fill(0.01), ...Array(rate).fill(0.5)];
+    const cands = detectSilencesFromPeaks({ rate, peaks }, { sourceId: 's1', minGap: 0.7 });
+    expect(cands).toHaveLength(0);
+  });
+
+  it('shrinks a candidate to word boundaries so it never cuts into speech', () => {
+    const rate = 25;
+    // 3s of quiet waveform, but the transcript says there's a word from 1..2s
+    // in the middle of it (e.g. very soft speech).
+    const peaks: number[] = Array(rate * 3).fill(0.01);
+    const words: Word[] = [{ id: 'w0', text: 'hi', t0: 1, t1: 2, p: 0.9 }];
+    const cands = detectSilencesFromPeaks({ rate, peaks }, { sourceId: 's1', words, pad: 0 });
+    for (const c of cands) {
+      expect(c.t1 <= 1 || c.t0 >= 2).toBe(true);
+    }
+  });
+});
+
 describe('Project store', () => {
   it('commit bumps revision, rejects stale base, restore works', async () => {
     const dir = mkdtempSync(path.join(tmpdir(), 'vedit-'));
@@ -152,5 +224,49 @@ describe('Project store', () => {
 
     const revs = await p.revisions();
     expect(revs.map((r) => r.rev)).toEqual([1, 2, 3]);
+  });
+});
+
+describe('adaptiveThreshold', () => {
+  it('sits between the noise floor and speech level of quiet footage', async () => {
+    const { adaptiveThreshold } = await import('./detect.js');
+    // Quiet outdoor clip: floor ~0.03, speech peaks ~0.1 (real DJI distribution)
+    const peaks = [
+      ...Array(300).fill(0.03),
+      ...Array(80).fill(0.05),
+      ...Array(40).fill(0.1),
+    ];
+    const th = adaptiveThreshold(peaks);
+    expect(th).toBeGreaterThan(0.03);
+    expect(th).toBeLessThan(0.1);
+  });
+  it('clamps to a sane range on extreme inputs', async () => {
+    const { adaptiveThreshold } = await import('./detect.js');
+    expect(adaptiveThreshold(Array(100).fill(0.9))).toBeLessThanOrEqual(0.12);
+    expect(adaptiveThreshold(Array(100).fill(0))).toBeGreaterThanOrEqual(0.02);
+  });
+});
+
+describe('timestampsArePacked', () => {
+  it('detects back-to-back fabricated timing and lets waveform win', async () => {
+    const { timestampsArePacked, detectSilencesFromPeaks } = await import('./detect.js');
+    // 10 words packed with zero gaps over 0..5s
+    const packed = Array.from({ length: 10 }, (_, i) => ({
+      id: `w${i}`, text: 'x', t0: i * 0.5, t1: (i + 1) * 0.5, p: 0.9,
+    }));
+    expect(timestampsArePacked(packed)).toBe(true);
+    // waveform says 1..3s is quiet; packed words must not veto it
+    const rate = 25;
+    const peaks = [...Array(rate).fill(0.5), ...Array(rate * 2).fill(0.01), ...Array(rate * 2).fill(0.5)];
+    const cands = detectSilencesFromPeaks({ rate, peaks }, { sourceId: 's1', words: packed });
+    expect(cands.length).toBe(1);
+    expect(cands[0].label).toContain('unreliable');
+  });
+  it('healthy transcripts still clamp', async () => {
+    const { timestampsArePacked } = await import('./detect.js');
+    const healthy = Array.from({ length: 10 }, (_, i) => ({
+      id: `w${i}`, text: 'x', t0: i * 0.6, t1: i * 0.6 + 0.4, p: 0.9,
+    }));
+    expect(timestampsArePacked(healthy)).toBe(false);
   });
 });

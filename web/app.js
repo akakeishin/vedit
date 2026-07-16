@@ -12,6 +12,7 @@ const S = {
   transcripts: new Map(), // sourceId -> words[]
   cues: [],
   candidates: [],
+  candidatesAll: [], // includes approved/rejected, for the "ignored word" overlay
   revisions: [],
   peaks: new Map(), // sourceId -> {rate, peaks}
   currentSeg: -1,
@@ -19,7 +20,12 @@ const S = {
   selWords: new Set(),
   selAnchor: null,
   selectedClip: null,
+  detectMinGap: 0.7,
+  rateIdx: 0, // index into PLAY_RATES, cycled by repeated L presses
+  rangeIn: null, // timeline seconds
+  rangeOut: null, // timeline seconds
 };
+const PLAY_RATES = [1, 1.5, 2];
 
 // ---------- data ----------
 async function api(path, init) {
@@ -37,6 +43,7 @@ async function reload() {
   S.duration = pr.duration;
   S.cues = await api('/api/captions');
   S.candidates = await api('/api/candidates');
+  S.candidatesAll = await api('/api/candidates?all=1');
   S.revisions = await api('/api/revisions');
   for (const src of S.manifest.sources) {
     if (src.transcribed && !S.transcripts.has(src.id)) {
@@ -96,7 +103,7 @@ function tick() {
     }
     const tl = tlNow();
     $('playhead').style.left = `${(tl / S.duration) * 100}%`;
-    $('tc').textContent = `${fmt(tl)} / ${fmt(S.duration)}`;
+    $('tc').textContent = `${fmtF(tl)} / ${fmtF(S.duration)}`;
     renderCaption(tl);
     renderMotion(tl);
     highlightWord(tl);
@@ -107,20 +114,65 @@ function fmt(t) {
   const m = Math.floor(t / 60);
   return `${m}:${(t % 60).toFixed(1).padStart(4, '0')}`;
 }
+// Frame-accurate timecode, e.g. "0:06.9 (f207)".
+function fmtF(t) {
+  const fps = S.manifest?.fps ?? 30;
+  const frame = Math.round(t * fps);
+  return `${fmt(t)} (f${frame})`;
+}
+
+function setPlaybackRate(rate) {
+  video.playbackRate = rate;
+  const lbl = $('rateLabel');
+  if (rate === 1) { lbl.hidden = true; }
+  else { lbl.hidden = false; lbl.textContent = `${rate}x`; }
+}
+function stopPlayback() {
+  video.pause();
+  S.playing = false;
+  $('playBtn').textContent = '▶';
+  S.rateIdx = 0;
+  setPlaybackRate(1);
+}
+function startPlayback() {
+  if (S.currentSeg < 0) seekTl(0, { play: true });
+  else video.play().catch(() => {});
+  S.playing = true;
+  $('playBtn').textContent = '⏸';
+}
 
 $('playBtn').onclick = () => {
-  if (S.playing) { video.pause(); S.playing = false; $('playBtn').textContent = '▶'; }
-  else {
-    if (S.currentSeg < 0) seekTl(0, { play: true });
-    else video.play().catch(() => {});
-    S.playing = true; $('playBtn').textContent = '⏸';
-  }
+  if (S.playing) stopPlayback();
+  else startPlayback();
 };
 document.addEventListener('keydown', (e) => {
-  if (e.target.tagName === 'INPUT') return;
-  if (e.code === 'Space') { e.preventDefault(); $('playBtn').click(); }
-  if (e.code === 'ArrowLeft') seekTl(tlNow() - (e.shiftKey ? 1 / S.manifest.fps : 1));
-  if (e.code === 'ArrowRight') seekTl(tlNow() + (e.shiftKey ? 1 / S.manifest.fps : 1));
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.isContentEditable) return;
+  if (e.code === 'Space') { e.preventDefault(); $('playBtn').click(); return; }
+  if (e.code === 'ArrowLeft') { seekTl(tlNow() - (e.shiftKey ? 1 / S.manifest.fps : 1)); return; }
+  if (e.code === 'ArrowRight') { seekTl(tlNow() + (e.shiftKey ? 1 / S.manifest.fps : 1)); return; }
+  const key = e.key.toLowerCase();
+  if (key === 'k') { e.preventDefault(); stopPlayback(); return; }
+  if (key === 'l') {
+    e.preventDefault();
+    if (!S.playing) { S.rateIdx = 0; setPlaybackRate(PLAY_RATES[0]); startPlayback(); }
+    else { S.rateIdx = (S.rateIdx + 1) % PLAY_RATES.length; setPlaybackRate(PLAY_RATES[S.rateIdx]); }
+    return;
+  }
+  if (key === 'j') {
+    e.preventDefault();
+    S.rateIdx = 0;
+    setPlaybackRate(1);
+    seekTl(tlNow() - 2, { play: true });
+    S.playing = true;
+    $('playBtn').textContent = '⏸';
+    return;
+  }
+  if (e.key === ',') { e.preventDefault(); seekTl(tlNow() - 1 / S.manifest.fps); return; }
+  if (e.key === '.') { e.preventDefault(); seekTl(tlNow() + 1 / S.manifest.fps); return; }
+  if (key === 'i') { e.preventDefault(); setRangePoint('in'); return; }
+  if (key === 'o') { e.preventDefault(); setRangePoint('out'); return; }
+  if (e.key === '?') { e.preventDefault(); toggleShortcuts(); return; }
+  if (e.code === 'Escape') { e.preventDefault(); clearRange(); return; }
 });
 
 // ---------- timeline strip ----------
@@ -135,13 +187,85 @@ tlEl.addEventListener('pointerdown', (e) => {
   window.addEventListener('pointermove', move);
   window.addEventListener('pointerup', up);
 });
+// Alt(Option)+hover scrubs the preview without clicking; plain hover does nothing
+// (avoids accidental seeking while just moving the mouse over the strip).
+tlEl.addEventListener('mousemove', (e) => {
+  if (!e.altKey || !S.duration) return;
+  const r = tlEl.getBoundingClientRect();
+  seekTl(((e.clientX - r.left) / r.width) * S.duration, { play: false });
+});
+
+// ---------- range selection (I/O points) ----------
+function setRangePoint(which) {
+  if (!S.duration) return;
+  const tl = tlNow();
+  if (which === 'in') S.rangeIn = tl; else S.rangeOut = tl;
+  if (S.rangeIn != null && S.rangeOut != null && S.rangeIn > S.rangeOut) {
+    [S.rangeIn, S.rangeOut] = [S.rangeOut, S.rangeIn];
+  }
+  renderRange();
+}
+function clearRange() {
+  S.rangeIn = null;
+  S.rangeOut = null;
+  renderRange();
+}
+function renderRange() {
+  const sel = $('rangeSel');
+  const bar = $('rangeBar');
+  if (S.rangeIn == null && S.rangeOut == null) {
+    sel.hidden = true;
+    bar.hidden = true;
+    return;
+  }
+  const a = S.rangeIn ?? S.rangeOut;
+  const b = S.rangeOut ?? S.rangeIn;
+  sel.hidden = false;
+  sel.style.left = `${(a / S.duration) * 100}%`;
+  sel.style.width = `${Math.max(0, (b - a) / S.duration) * 100}%`;
+  if (S.rangeIn != null && S.rangeOut != null) {
+    bar.hidden = false;
+    $('rangeInfo').textContent = `IN ${fmt(S.rangeIn)} – OUT ${fmt(S.rangeOut)} (${fmt(S.rangeOut - S.rangeIn)})`;
+  } else {
+    bar.hidden = true;
+  }
+}
+$('rangeDeleteBtn').onclick = async () => {
+  if (S.rangeIn == null || S.rangeOut == null) return;
+  const overlapping = S.segments.filter((s) => s.tlEnd > S.rangeIn && s.tlStart < S.rangeOut);
+  if (overlapping.length === 0) return;
+  const sourceId = overlapping[0].sourceId;
+  if (overlapping.some((s) => s.sourceId !== sourceId)) {
+    toast('複数クリップにまたがる範囲は未対応です');
+    return;
+  }
+  const first = overlapping[0];
+  const last = overlapping[overlapping.length - 1];
+  const t0 = first.srcStart + Math.max(0, S.rangeIn - first.tlStart);
+  const t1 = last.srcStart + Math.min(last.tlEnd - last.tlStart, S.rangeOut - last.tlStart);
+  clearRange();
+  await mutate({ op: 'remove-range', sourceId, t0, t1 });
+};
+
+// ---------- shortcuts overlay ----------
+function toggleShortcuts() {
+  const el = $('shortcutsOverlay');
+  el.hidden = !el.hidden;
+}
+$('shortcutsBtn').onclick = toggleShortcuts;
+$('shortcutsCloseBtn').onclick = toggleShortcuts;
+$('shortcutsOverlay').addEventListener('click', (e) => {
+  if (e.target.id === 'shortcutsOverlay') toggleShortcuts();
+});
 
 function renderTimeline() {
   const clips = $('clips');
   clips.innerHTML = '';
-  for (const s of S.segments) {
+  S.segments.forEach((s, idx) => {
     const d = document.createElement('div');
-    d.className = 'clip' + (S.selectedClip === s.clipId ? ' sel' : '');
+    // Alternate shade per clip (even within the same source) so adjacent clip
+    // boundaries stay visible; the boundary itself gets a thin divider line.
+    d.className = 'clip' + (idx % 2 ? ' alt' : '') + (S.selectedClip === s.clipId ? ' sel' : '');
     d.style.left = `${(s.tlStart / S.duration) * 100}%`;
     d.style.width = `${((s.tlEnd - s.tlStart) / S.duration) * 100}%`;
     d.title = `${s.clipId} (${fmt(s.tlEnd - s.tlStart)})`;
@@ -149,7 +273,7 @@ function renderTimeline() {
     // still seeks to the pointer position.
     d.onpointerdown = () => selectClip(s.clipId);
     clips.appendChild(d);
-  }
+  });
   const mrow = $('motionRow');
   mrow.innerHTML = '';
   for (const mo of S.manifest.timeline.motion) {
@@ -267,9 +391,22 @@ function keptSet(sourceId) {
   return kept;
 }
 
+// wordId -> rejected candidate (for the non-destructive "ignored" overlay,
+// Descript-style: a rejected cut candidate stays visible, struck through faintly,
+// rather than disappearing without a trace).
+function rejectedWordMap() {
+  const m = new Map();
+  for (const c of S.candidatesAll) {
+    if (c.status !== 'rejected') continue;
+    for (const id of c.wordIds ?? []) m.set(id, c);
+  }
+  return m;
+}
+
 function renderTranscript() {
   const el = $('words');
   el.innerHTML = '';
+  const ignored = rejectedWordMap();
   for (const src of S.manifest.sources) {
     const words = S.transcripts.get(src.id);
     if (!words) continue;
@@ -283,11 +420,14 @@ function renderTranscript() {
         el.appendChild(g);
       }
       const s = document.createElement('span');
-      s.className = 'w' + (kept.has(w.id) ? '' : ' cut') + (S.selWords.has(w.id) ? ' sel' : '');
+      const cand = ignored.get(w.id);
+      s.className = 'w' + (kept.has(w.id) ? '' : ' cut') + (S.selWords.has(w.id) ? ' sel' : '') + (cand ? ' ignored' : '');
       s.textContent = w.text;
       s.dataset.id = w.id;
       s.dataset.src = src.id;
-      s.title = `${w.id} ${w.t0.toFixed(2)}–${w.t1.toFixed(2)}s`;
+      s.title = cand
+        ? `却下済み: ${cand.label}(クリックで復元=再提案)`
+        : `${w.id} ${w.t0.toFixed(2)}–${w.t1.toFixed(2)}s`;
       el.appendChild(s);
       prev = w;
     }
@@ -362,33 +502,86 @@ function highlightWord(tl) {
 }
 
 // ---------- candidates ----------
+const KIND_LABEL = { silence: '無音', filler: 'フィラー', retake: '言い直し', 'low-energy': '低テンション' };
+const KIND_ORDER = ['silence', 'filler', 'retake', 'low-energy'];
+
+function candRow(c) {
+  const d = document.createElement('div');
+  d.className = 'cand';
+  const dur = Math.max(0, c.t1 - c.t0);
+  d.innerHTML = `<span class="kind ${c.kind}">${c.kind}</span><span class="lbl">${esc(c.label)}</span><span class="dur">-${dur.toFixed(1)}s</span>`;
+  d.onclick = () => {
+    // seek near the candidate (it may already be cut away)
+    const seg = S.segments.find((s) => s.sourceId === c.sourceId && c.t0 >= s.srcStart - 2 && c.t0 <= s.srcStart + (s.tlEnd - s.tlStart) + 2);
+    if (seg) seekTl(seg.tlStart + Math.max(0, Math.min(c.t0 - seg.srcStart, seg.tlEnd - seg.tlStart - 0.1)), { play: false });
+  };
+  const ok = document.createElement('button');
+  ok.className = 'btn-approve';
+  ok.textContent = '✓';
+  ok.title = '承認(カット適用)';
+  ok.onclick = async (e) => { e.stopPropagation(); await decide([c.id], 'approve'); };
+  const ng = document.createElement('button');
+  ng.className = 'btn-reject';
+  ng.textContent = '✕';
+  ng.title = '却下';
+  ng.onclick = async (e) => { e.stopPropagation(); await decide([c.id], 'reject'); };
+  d.append(ok, ng);
+  return d;
+}
+
 function renderCandidates() {
   $('candCount').textContent = S.candidates.length ? `(${S.candidates.length})` : '';
   const el = $('candList');
   el.innerHTML = '';
-  if (S.candidates.length === 0) el.innerHTML = '<div class="hintText" style="padding:8px">提案はありません。Claude に「無音とフィラーを検出して」と頼むか、CLI で `vedit detect`。</div>';
+  if (S.candidates.length === 0) { el.innerHTML = '<div class="hintText" style="padding:8px">提案はありません。Claude に「無音とフィラーを検出して」と頼むか、CLI で `vedit detect`。</div>'; return; }
+
+  const byKind = new Map();
   for (const c of S.candidates) {
-    const d = document.createElement('div');
-    d.className = 'cand';
-    d.innerHTML = `<span class="kind ${c.kind}">${c.kind}</span><span class="lbl">${esc(c.label)}</span>`;
-    d.onclick = () => {
-      // seek near the candidate (it may already be cut away)
-      const seg = S.segments.find((s) => s.sourceId === c.sourceId && c.t0 >= s.srcStart - 2 && c.t0 <= s.srcStart + (s.tlEnd - s.tlStart) + 2);
-      if (seg) seekTl(seg.tlStart + Math.max(0, Math.min(c.t0 - seg.srcStart, seg.tlEnd - seg.tlStart - 0.1)), { play: false });
-    };
-    const ok = document.createElement('button');
-    ok.textContent = '✓';
-    ok.title = '承認(カット適用)';
-    ok.onclick = async (e) => { e.stopPropagation(); await decide([c.id], 'approve'); };
-    const ng = document.createElement('button');
-    ng.textContent = '✕';
-    ng.title = '却下';
-    ng.onclick = async (e) => { e.stopPropagation(); await decide([c.id], 'reject'); };
-    d.append(ok, ng);
-    el.appendChild(d);
+    if (!byKind.has(c.kind)) byKind.set(c.kind, []);
+    byKind.get(c.kind).push(c);
+  }
+  const kinds = [...byKind.keys()].sort((a, b) => {
+    const ia = KIND_ORDER.indexOf(a), ib = KIND_ORDER.indexOf(b);
+    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+  });
+  for (const kind of kinds) {
+    const list = byKind.get(kind);
+    const totalDur = list.reduce((sum, c) => sum + Math.max(0, c.t1 - c.t0), 0);
+    const group = document.createElement('div');
+    group.className = 'candGroup';
+    const header = document.createElement('div');
+    header.className = 'candGroupHeader';
+    header.innerHTML = `<span class="kind ${kind}">${KIND_LABEL[kind] ?? kind}</span><span class="hintText">${list.length}件 / 計-${totalDur.toFixed(1)}s</span><span class="spacer"></span>`;
+    const approveBtn = document.createElement('button');
+    approveBtn.className = 'btn-approve';
+    approveBtn.textContent = 'まとめて承認';
+    approveBtn.onclick = () => decide(list.map((c) => c.id), 'approve');
+    const rejectBtn = document.createElement('button');
+    rejectBtn.className = 'btn-reject';
+    rejectBtn.textContent = 'まとめて却下';
+    rejectBtn.onclick = () => decide(list.map((c) => c.id), 'reject');
+    header.append(approveBtn, rejectBtn);
+    group.appendChild(header);
+    for (const c of list) group.appendChild(candRow(c));
+    el.appendChild(group);
   }
 }
 $('approveAllBtn').onclick = () => decide('all', 'approve');
+
+// ---------- detection threshold ----------
+$('minGapRange').oninput = (e) => {
+  S.detectMinGap = Number(e.target.value);
+  $('minGapVal').textContent = `${S.detectMinGap.toFixed(1)}s`;
+};
+$('redetectBtn').onclick = async () => {
+  try {
+    await api('/api/detect', { method: 'POST', body: JSON.stringify({ minGap: S.detectMinGap }) });
+    toast(`しきい値 ${S.detectMinGap.toFixed(1)}s で再検出しました`);
+  } catch (e) {
+    toast(e.message);
+  }
+  await reload();
+};
 async function decide(ids, decision) {
   try {
     await api('/api/candidates/decide', {
@@ -408,7 +601,19 @@ function renderHistory() {
   for (const r of [...S.revisions].reverse()) {
     const d = document.createElement('div');
     d.className = 'hist';
-    d.innerHTML = `<b>r${r.rev}</b> [${r.actor}] ${esc(r.summary)}`;
+    const info = document.createElement('span');
+    info.innerHTML = `<b>r${r.rev}</b> [${r.actor}] ${esc(r.summary)}`;
+    d.appendChild(info);
+    if (r.rev !== S.manifest.revision) {
+      const btn = document.createElement('button');
+      btn.className = 'restoreBtn';
+      btn.textContent = 'ここに戻す';
+      btn.onclick = async () => {
+        if (!confirm(`r${r.rev} 「${r.summary}」に戻しますか？`)) return;
+        await mutate({ op: 'restore', rev: r.rev });
+      };
+      d.appendChild(btn);
+    }
     el.appendChild(d);
   }
 }
@@ -480,6 +685,7 @@ async function renderAll() {
   renderTranscript();
   renderCandidates();
   renderHistory();
+  renderRange();
 }
 
 window.addEventListener('resize', drawWave);

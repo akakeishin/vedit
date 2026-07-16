@@ -45,10 +45,11 @@ export function packTranscript(
         blockStart = w;
       }
     }
-    const tagId = i % idEvery === 0 || i === words.length - 1 || buf.length === 0;
+    const cand = candByWord.get(w.id);
+    const flagged = w.p < 0.4 || (cand && cand.status === 'proposed');
+    const tagId = i % idEvery === 0 || i === words.length - 1 || buf.length === 0 || flagged;
     let token = tagId ? `${w.text}⟨${w.id}⟩` : w.text;
     if (w.p < 0.4) token += '?';
-    const cand = candByWord.get(w.id);
     if (cand && cand.status === 'proposed') token += `[${cand.kind}]`;
     buf.push(token);
   }
@@ -59,6 +60,7 @@ export function packTranscript(
     `# packed transcript (source ${t.sourceId}, timeline ${ts(dur)} total, ${words.length} words kept)`,
     `# times are SOURCE time; ⟨id⟩ marks word ids; use ranges like ${words[0].id}..${words[Math.min(10, words.length - 1)].id}`,
     `# "?"=low confidence, [silence]/[filler]=pending candidates`,
+    '# need every id? run `vedit transcript --full --source <id>`',
   ];
   return [...header, ...lines].join('\n');
 }

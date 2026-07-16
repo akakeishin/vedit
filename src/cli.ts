@@ -93,7 +93,9 @@ async function ensureDaemon(dir?: string): Promise<void> {
 }
 
 function baseRevOf(state: any): number {
-  return Number(flags.base ?? state.revision);
+  if (flags.base !== undefined) return Number(flags.base);
+  if (flags.latest) return Number(state.revision);
+  fail('--base <revision> is required (or --latest to explicitly use the current one); run `vedit status` first');
 }
 
 async function edit(body: Record<string, unknown>) {
@@ -114,8 +116,8 @@ usage: vedit <command> [args] [--project <dir>]
 project:   create <dir> [--name n] | status | revisions | undo [--rev N] | open
 ingest:    ingest <file...> [--language ja] [--no-transcribe]
 read:      transcript [--full] [--source id] | candidates [--all]
-detect:    detect [--min-gap 0.7] [--no-fillers] [--no-silence]
-cut:       remove-words <w1 w5..w9 ...> | remove-range <t0> <t1> [--source id]
+detect:    detect [--min-gap 0.7] [--threshold 0.06] [--no-fillers] [--no-silence]
+cut:       remove-words <w1 w5..w9 ...> [--source id] [--pad 0.08] | remove-range <t0> <t1> [--source id]
            approve <id...|all> | reject <id...> | trim <clipId> <in|out> <±frames>
 captions:  captions [--enabled true|false] [--style clean|bold] [--max-chars 24]
 motion:    motion-add --type chapter-card --text "..." --at 12 --duration 4 [--subtitle ...]
@@ -124,8 +126,9 @@ inspect:   view [--from a] [--to b] [--domain timeline|source] [--source id] (pr
 export:    export otio <out.otio> | export render <out.mp4> [--burn-captions] | export fcp7xml <out.xml>
 misc:      doctor [--download-model [name]] | serve [--port]
 
-Mutating commands accept --base <rev>; if the project changed since that
-revision the edit is REJECTED (409) — re-read state first.`;
+Mutating commands REQUIRE --base <rev> (or --latest to explicitly use the
+current one); if the project changed since that revision the edit is
+REJECTED (409) — re-read state first.`;
 
 async function main() {
   switch (cmd) {
@@ -198,6 +201,7 @@ async function main() {
         method: 'POST',
         body: JSON.stringify({
           minGap: flags['min-gap'] ? Number(flags['min-gap']) : undefined,
+          threshold: flags.threshold ? Number(flags.threshold) : undefined,
           fillers: flags['no-fillers'] ? false : undefined,
           silence: flags['no-silence'] ? false : undefined,
         }),
@@ -227,7 +231,7 @@ async function main() {
 
     case 'remove-words':
       if (pos.length === 0) fail('usage: vedit remove-words <w12 w40..w52 ...>');
-      return edit({ op: 'remove-words', ids: pos, sourceId: flags.source });
+      return edit({ op: 'remove-words', ids: pos, sourceId: flags.source, pad: flags.pad !== undefined ? Number(flags.pad) : undefined });
 
     case 'remove-range':
       if (pos.length < 2) fail('usage: vedit remove-range <t0> <t1>');

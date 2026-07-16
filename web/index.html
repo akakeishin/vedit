@@ -11,6 +11,7 @@
   <span id="projName">vedit</span>
   <span id="stat"></span>
   <span class="spacer"></span>
+  <button id="shortcutsBtn" title="ショートカット一覧 (?)">⌨ ?</button>
   <button id="undoBtn" title="直前のリビジョンに戻す">⟲ undo</button>
   <span id="conn" class="conn">●</span>
 </header>
@@ -25,7 +26,8 @@
     </div>
     <div id="transport">
       <button id="playBtn">▶</button>
-      <span id="tc">0:00.0 / 0:00.0</span>
+      <span id="tc">0:00.0 (f0) / 0:00.0 (f0)</span>
+      <span id="rateLabel" hidden></span>
       <span class="spacer"></span>
       <span id="revLabel"></span>
     </div>
@@ -33,7 +35,14 @@
       <canvas id="wave"></canvas>
       <div id="clips"></div>
       <div id="motionRow"></div>
+      <div id="rangeSel" hidden></div>
       <div id="playhead"></div>
+    </div>
+    <div id="timelineHint" class="hintText">Alt+ホバーでスクラブ / I・Oで範囲選択 / ?でショートカット一覧</div>
+    <div id="rangeBar" hidden>
+      <span id="rangeInfo"></span>
+      <button id="rangeDeleteBtn">この範囲を削除</button>
+      <span class="hintText">Esc で解除</span>
     </div>
     <div id="clipInspector" hidden>
       <span id="clipLabel"></span>
@@ -59,8 +68,14 @@
       <div id="words"></div>
     </div>
     <div id="candPanel" class="panel">
-      <div class="panelbar">
+      <div class="panelbar candPanelbar">
         <button id="approveAllBtn">すべて承認</button>
+        <span class="spacer"></span>
+        <label class="thresholdCtl">無音のしきい値
+          <input type="range" id="minGapRange" min="0.3" max="2.0" step="0.1" value="0.7">
+          <span id="minGapVal">0.7s</span>
+        </label>
+        <button id="redetectBtn">再検出</button>
       </div>
       <div id="candList"></div>
     </div>
@@ -70,6 +85,24 @@
   </aside>
 </main>
 <div id="toast" hidden></div>
+<div id="shortcutsOverlay" hidden>
+  <div class="shortcutsBox">
+    <h2>ショートカット一覧</h2>
+    <table>
+      <tr><td>Space</td><td>再生 / 停止</td></tr>
+      <tr><td>K</td><td>停止</td></tr>
+      <tr><td>L</td><td>再生(連打で 1x→1.5x→2x)</td></tr>
+      <tr><td>J</td><td>2秒巻き戻して再生</td></tr>
+      <tr><td>← / →</td><td>±1秒</td></tr>
+      <tr><td>Shift+← / Shift+→</td><td>±1フレーム</td></tr>
+      <tr><td>, / .</td><td>±1フレーム</td></tr>
+      <tr><td>I / O</td><td>選択レンジのイン/アウト点を設定</td></tr>
+      <tr><td>Esc</td><td>レンジ選択を解除</td></tr>
+      <tr><td>?</td><td>このヘルプの表示/非表示</td></tr>
+    </table>
+    <button id="shortcutsCloseBtn">閉じる</button>
+  </div>
+</div>
 <script src="app.js"></script>
 </body>
 </html>

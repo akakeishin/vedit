@@ -79,6 +79,31 @@ export function wordRange(words: Word[], ids: string[]): { t0: number; t1: numbe
   return { t0, t1 };
 }
 
+/**
+ * Widen a word-derived removal range by `pad` seconds on each side, without
+ * biting into a surviving (non-removed) neighbor word. Whisper's word
+ * boundaries are often a hair too tight, so a razor cut at t0/t1 can clip the
+ * tail of speech; padding outward — clamped at the nearest kept word —
+ * avoids that while never touching audio the user meant to keep.
+ */
+export function padWordRange(
+  words: Word[],
+  ids: string[],
+  range: { t0: number; t1: number },
+  pad: number,
+): { t0: number; t1: number } {
+  const idSet = new Set(ids);
+  let t0 = range.t0 - pad;
+  let t1 = range.t1 + pad;
+  for (const w of words) {
+    if (idSet.has(w.id)) continue;
+    if (w.t1 <= range.t0 && w.t1 > t0) t0 = w.t1;
+    if (w.t0 >= range.t1 && w.t0 < t1) t1 = w.t0;
+  }
+  t0 = Math.max(0, t0);
+  return { t0, t1: Math.max(t0, t1) };
+}
+
 /** Expand "w12..w34" style ranges into explicit id lists. */
 export function expandWordIds(spec: string[], words: Word[]): string[] {
   const order = new Map(words.map((w, i) => [w.id, i]));

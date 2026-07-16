@@ -86,6 +86,7 @@ export async function renderFinal(
     '-c:v', 'libx264', '-preset', 'medium', '-crf', '18',
     '-pix_fmt', 'yuv420p',
     '-c:a', 'aac', '-b:a', '192k',
+    '-dn', // drop any data streams (e.g. DJI tmcd) that survived the filtergraph
     '-movflags', '+faststart',
     outPath,
   ]);

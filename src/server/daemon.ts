@@ -6,6 +6,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { Project } from '../core/project.js';
 import {
   expandWordIds,
+  padWordRange,
   removeSourceRange,
   segments,
   sourceRangeToTimeline,
@@ -14,7 +15,8 @@ import {
   wordRange,
 } from '../core/ops.js';
 import { captionCues } from '../core/captions.js';
-import { detectFillers, detectSilences } from '../core/detect.js';
+import { detectFillers, detectSilences, detectSilencesFromPeaks } from '../core/detect.js';
+import type { Peaks } from '../core/detect.js';
 import { packTranscript } from '../core/pack.js';
 import { ingestFile } from '../ingest/ingest.js';
 import type { CutCandidate, Manifest, MotionItem, Transcript } from '../core/types.js';
@@ -55,6 +57,17 @@ async function readBody(req: http.IncomingMessage): Promise<any> {
 function broadcast(ctx: Ctx, msg: unknown) {
   const data = JSON.stringify(msg);
   for (const ws of ctx.clients) if (ws.readyState === WebSocket.OPEN) ws.send(data);
+}
+
+/**
+ * Word ids restart at w0000 per source, so a sourceId-less remove-words /
+ * remove-range is ambiguous the moment there's more than one transcribed
+ * source. Returns the list to disambiguate against, or null when it's safe
+ * to default (0 or 1 transcribed sources).
+ */
+function ambiguousSources(m: Manifest): { id: string; path: string }[] | null {
+  const transcribed = m.sources.filter((s) => s.transcribed);
+  return transcribed.length >= 2 ? transcribed.map((s) => ({ id: s.id, path: path.basename(s.path) })) : null;
 }
 
 /** Snapshot the state Claude/UI needs after every mutation. */
@@ -156,13 +169,44 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
     if (pathname === '/api/revisions') return json(res, 200, await p.revisions());
     if (pathname === '/api/transcript') {
       const m = await p.manifest();
-      const sourceId = url.searchParams.get('source') ?? m.sources.find((s) => s.transcribed)?.id;
-      if (!sourceId) return json(res, 404, { error: 'no transcribed source' });
-      const t = await p.transcript(sourceId);
-      if (url.searchParams.get('full')) return json(res, 200, t);
-      const cands = await p.candidates();
+      const requestedSource = url.searchParams.get('source');
+      const full = Boolean(url.searchParams.get('full'));
+      const transcribedSrcs = m.sources.filter((s) => s.transcribed);
+      if (transcribedSrcs.length === 0) return json(res, 404, { error: 'no transcribed source' });
+
+      const renderPacked = async (sourceId: string) => {
+        const t = await p.transcript(sourceId);
+        const cands = await p.candidates();
+        return packTranscript(m, t, cands);
+      };
+
+      if (requestedSource) {
+        if (full) return json(res, 200, await p.transcript(requestedSource));
+        res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+        return res.end(await renderPacked(requestedSource));
+      }
+
+      if (transcribedSrcs.length > 1) {
+        if (full) {
+          return json(res, 400, {
+            error: 'multiple transcribed sources; specify sourceId (--source <id>)',
+            sources: transcribedSrcs.map((s) => ({ id: s.id, path: path.basename(s.path) })),
+          });
+        }
+        const parts: string[] = [];
+        for (const s of transcribedSrcs) {
+          parts.push(`## source ${s.id} (${path.basename(s.path)}) — use --source ${s.id} for edits`);
+          parts.push(await renderPacked(s.id));
+        }
+        res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+        return res.end(parts.join('\n\n'));
+      }
+
+      // exactly one transcribed source
+      const sourceId = transcribedSrcs[0].id;
+      if (full) return json(res, 200, await p.transcript(sourceId));
       res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
-      return res.end(packTranscript(m, t, cands));
+      return res.end(await renderPacked(sourceId));
     }
     if (pathname === '/api/captions') {
       const m = await p.manifest();
@@ -187,40 +231,67 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
     if (pathname === '/api/ingest' && method === 'POST') {
       const b = await readBody(req);
       broadcast(ctx, { type: 'ingest-start', file: b.file });
-      const src = await ingestFile(p, b.file, {
+      const { source: src, timings } = await ingestFile(p, b.file, {
         language: b.language,
         transcribe: b.transcribe,
         onProgress: (step) => broadcast(ctx, { type: 'ingest-progress', step }),
       });
       broadcast(ctx, { type: 'update', revision: (await p.manifest()).revision, op: 'ingest', summary: `ingested ${b.file}` });
-      return json(res, 200, { source: src, state: await stateSummary(p) });
+      return json(res, 200, { source: src, timings, state: await stateSummary(p) });
     }
 
     // ---- edits ----
     if (pathname === '/api/edit' && method === 'POST') {
       const b = await readBody(req);
       const actor = b.actor ?? 'claude';
+      if (actor === 'claude' && typeof b.baseRev !== 'number') {
+        return json(res, 400, { error: 'baseRev is required; run `vedit status` and pass --base <revision>' });
+      }
       const m0 = await p.manifest();
       const baseRev = b.baseRev ?? m0.revision;
 
       if (b.op === 'remove-words') {
-        const sourceId = b.sourceId ?? m0.sources.find((s) => s.transcribed)?.id;
-        const t = await p.transcript(sourceId);
+        let sourceId = b.sourceId as string | undefined;
+        if (!sourceId) {
+          const amb = ambiguousSources(m0);
+          if (amb) return json(res, 400, { error: 'multiple transcribed sources; specify sourceId (--source <id>)', sources: amb });
+          sourceId = m0.sources.find((s) => s.transcribed)?.id;
+        }
+        const t = await p.transcript(sourceId!);
         const ids = expandWordIds(b.ids, t.words);
-        const r = wordRange(t.words, ids);
+        const raw = wordRange(t.words, ids);
+        const pad = typeof b.pad === 'number' ? b.pad : 0.08;
+        const r = padWordRange(t.words, ids, raw, pad);
+        if (r.t1 - r.t0 < 1 / m0.fps) {
+          return json(res, 400, { error: 'nothing to remove (range collapsed to zero frames)' });
+        }
         const removed = ids.length;
         const text = t.words.filter((w) => ids.includes(w.id)).map((w) => w.text).join('');
-        await mutate(actor, baseRev, 'remove-words', b, `removed ${removed} words (${(r.t1 - r.t0).toFixed(1)}s): "${text.slice(0, 40)}"`, (m) =>
-          removeSourceRange(m, sourceId, r.t0, r.t1),
+        const before = timelineDuration(m0);
+        const preview = removeSourceRange(m0, sourceId!, r.t0, r.t1);
+        const removedSeconds = before - timelineDuration(preview);
+        await mutate(actor, baseRev, 'remove-words', b, `removed ${removed} words (${removedSeconds.toFixed(1)}s): "${text.slice(0, 40)}"`, (m) =>
+          removeSourceRange(m, sourceId!, r.t0, r.t1),
         );
-        return json(res, 200, { removedSeconds: r.t1 - r.t0, state: await stateSummary(p) });
+        return json(res, 200, { removedSeconds, state: await stateSummary(p) });
       }
       if (b.op === 'remove-range') {
-        const sourceId = b.sourceId ?? m0.sources[0]?.id;
-        await mutate(actor, baseRev, 'remove-range', b, `removed ${(b.t1 - b.t0).toFixed(1)}s of source ${sourceId}`, (m) =>
-          removeSourceRange(m, sourceId, b.t0, b.t1),
+        let sourceId = b.sourceId as string | undefined;
+        if (!sourceId) {
+          const amb = ambiguousSources(m0);
+          if (amb) return json(res, 400, { error: 'multiple transcribed sources; specify sourceId (--source <id>)', sources: amb });
+          sourceId = m0.sources[0]?.id;
+        }
+        if (Math.abs(b.t1 - b.t0) < 1 / m0.fps) {
+          return json(res, 400, { error: 'nothing to remove (range collapsed to zero frames)' });
+        }
+        const before = timelineDuration(m0);
+        const preview = removeSourceRange(m0, sourceId!, b.t0, b.t1);
+        const removedSeconds = before - timelineDuration(preview);
+        await mutate(actor, baseRev, 'remove-range', b, `removed ${removedSeconds.toFixed(1)}s of source ${sourceId}`, (m) =>
+          removeSourceRange(m, sourceId!, b.t0, b.t1),
         );
-        return json(res, 200, { state: await stateSummary(p) });
+        return json(res, 200, { removedSeconds, state: await stateSummary(p) });
       }
       if (b.op === 'trim') {
         await mutate(actor, baseRev, 'trim', b, `trim ${b.clipId} ${b.edge} ${b.frames}f`, (m) =>
@@ -285,9 +356,37 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       const b = await readBody(req);
       const m = await p.manifest();
       const out: CutCandidate[] = [];
-      for (const t of await allTranscripts(p)) {
+      const transcripts = await allTranscripts(p);
+      const wordsBySource = new Map(transcripts.map((t) => [t.sourceId, t.words]));
+      for (const t of transcripts) {
         if (b.silence !== false) out.push(...detectSilences(t, b.minGap ?? 0.7));
         if (b.fillers !== false) out.push(...detectFillers(t));
+      }
+      // Word-gap detection misses silence when whisper packs words with no
+      // gap; fall back to the waveform for every source that has peaks, and
+      // merge with anything the word-gap pass already found nearby.
+      if (b.silence !== false) {
+        for (const src of m.sources) {
+          if (!src.peaks) continue;
+          let peaks: Peaks;
+          try {
+            peaks = JSON.parse(await fs.readFile(path.join(p.dir, src.peaks), 'utf8'));
+          } catch {
+            continue;
+          }
+          const waveCands = detectSilencesFromPeaks(peaks, {
+            sourceId: src.id,
+            threshold: b.threshold ?? 0.06,
+            minGap: b.minGap ?? 0.7,
+            words: wordsBySource.get(src.id),
+          });
+          for (const c of waveCands) {
+            const dup = out.some(
+              (o) => o.kind === 'silence' && o.sourceId === c.sourceId && Math.abs(o.t0 - c.t0) <= 0.2 && Math.abs(o.t1 - c.t1) <= 0.2,
+            );
+            if (!dup) out.push(c);
+          }
+        }
       }
       // Keep prior decisions: don't resurrect ranges already approved/rejected.
       const prior = await p.candidates();
@@ -306,17 +405,25 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
     }
     if (pathname === '/api/candidates/decide' && method === 'POST') {
       const b = await readBody(req); // { ids: string[] | 'all', decision, actor, baseRev }
+      const actor = b.actor ?? 'ui';
+      if (actor === 'claude' && typeof b.baseRev !== 'number') {
+        return json(res, 400, { error: 'baseRev is required; run `vedit status` and pass --base <revision>' });
+      }
       const all = await p.candidates();
       const target = b.ids === 'all' ? all.filter((c) => c.status === 'proposed') : all.filter((c) => b.ids.includes(c.id));
       if (target.length === 0) return json(res, 400, { error: 'no matching pending candidates' });
-      const actor = b.actor ?? 'ui';
       if (b.decision === 'approve') {
         const m0 = await p.manifest();
-        let baseRev = b.baseRev ?? m0.revision;
-        // Apply all approved cuts in ONE revision so undo is atomic.
-        const totalSec = target.reduce((a, c) => a + (c.t1 - c.t0), 0);
+        const baseRev = b.baseRev ?? m0.revision;
+        // Apply all approved cuts in ONE revision so undo is atomic. Compute
+        // the real (frame-snapped) delta up front so the summary and
+        // response agree with what actually lands on the timeline.
+        const before = timelineDuration(m0);
+        let preview = m0;
+        for (const c of target) preview = removeSourceRange(preview, c.sourceId, c.t0, c.t1);
+        const removedSeconds = before - timelineDuration(preview);
         await mutate(actor, baseRev, 'apply-candidates', { ids: target.map((c) => c.id) },
-          `applied ${target.length} cuts (-${totalSec.toFixed(1)}s)`, (m) => {
+          `applied ${target.length} cuts (-${removedSeconds.toFixed(1)}s)`, (m) => {
             let cur = m;
             for (const c of target) cur = removeSourceRange(cur, c.sourceId, c.t0, c.t1);
             return cur;
