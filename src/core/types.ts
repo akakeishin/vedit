@@ -137,3 +137,26 @@ export interface MotionSpec {
   /** For custom-html: full HTML fragment rendered in the overlay. */
   html?: string;
 }
+
+// ---- scene index ----
+
+export interface Scene {
+  /** Stable within a source; re-detection preserves it for matching ranges (±0.5s). */
+  id: string;
+  /** Source time. */
+  t0: number;
+  t1: number;
+  /** Relative path under cache/, e.g. "cache/sc-<sourceId>-<sceneId>.jpg". */
+  thumb: string;
+  /** Whether any kept transcript word overlaps this range. */
+  hasSpeech: boolean;
+  /** Mean waveform peak over the range (motion proxy); 0 when the source has no peaks. */
+  energy: number;
+  /** Model/human annotation; outsourced from detection so provenance is explicit. */
+  note?: { text: string; by: 'user' | 'model'; at: string };
+}
+
+export interface SceneFile {
+  sourceId: string;
+  scenes: Scene[];
+}

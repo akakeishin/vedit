@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { cropGeometry, segments } from '../core/ops.js';
-import type { Manifest } from '../core/types.js';
+import type { Manifest, SceneFile } from '../core/types.js';
 import { ffmpegHasFilter, run } from '../ingest/run.js';
 
 /**
@@ -94,5 +94,77 @@ export async function renderView(
   // Grid legend (left-to-right, top-to-bottom): source times of each cell,
   // essential when timecodes could not be burned in.
   const grid = points.map((pt, i) => `cell${i + 1}(r${Math.floor(i / cols) + 1}c${(i % cols) + 1})=${pt.t.toFixed(1)}s@${pt.sourceId}`);
+  return { png: outPath, timecodesBurnedIn: canDrawText, grid };
+}
+
+async function probeDims(file: string): Promise<{ width: number; height: number }> {
+  const out = await run('ffprobe', [
+    '-v', 'error', '-select_streams', 'v:0',
+    '-show_entries', 'stream=width,height',
+    '-of', 'csv=s=x:p=0',
+    file,
+  ]);
+  const [w, h] = out.trim().split('x').map(Number);
+  return { width: w || 160, height: h || 90 };
+}
+
+/**
+ * Contact sheet PNG for a source's scene index: one cell per scene thumbnail
+ * (already generated at detect time), tiled into a grid with the scene id +
+ * start timecode burned in. Mirrors renderView's approach (grid legend as a
+ * JSON fallback when drawtext isn't available).
+ */
+export async function renderSceneSheet(
+  file: SceneFile,
+  projectDir: string,
+  opts: { cols?: number } = {},
+): Promise<{ png: string; timecodesBurnedIn: boolean; grid: string[] }> {
+  const scenes = file.scenes;
+  if (scenes.length === 0) {
+    throw new Error(`no scenes detected for source ${file.sourceId}; run \`vedit scenes detect --source ${file.sourceId}\` first`);
+  }
+  const cols = Math.max(1, opts.cols ?? Math.min(6, scenes.length));
+  const rows = Math.ceil(scenes.length / cols);
+  const canDrawText = ffmpegHasFilter('drawtext');
+
+  const cellPaths: string[] = [];
+  const tmpFrames: string[] = [];
+  for (let i = 0; i < scenes.length; i++) {
+    const sc = scenes[i];
+    const thumbAbs = path.join(projectDir, sc.thumb);
+    if (!canDrawText) {
+      cellPaths.push(thumbAbs);
+      continue;
+    }
+    const f = path.join(projectDir, 'cache', `.ss${i}.jpg`);
+    const mm = Math.floor(sc.t0 / 60);
+    const ss = (sc.t0 % 60).toFixed(1).padStart(4, '0');
+    const label = `${sc.id} ${mm}\\:${ss}`;
+    const vf = `drawtext=text='${label}':x=4:y=h-th-4:fontsize=13:fontcolor=white:box=1:boxcolor=black@0.6`;
+    await run('ffmpeg', ['-y', '-v', 'error', '-i', thumbAbs, '-vf', vf, f]);
+    cellPaths.push(f);
+    tmpFrames.push(f);
+  }
+
+  // Pad to a full grid so xstack's fixed cols x rows is satisfied when the
+  // scene count isn't a multiple of cols.
+  const pad = cols * rows - scenes.length;
+  let blankPath: string | null = null;
+  if (pad > 0) {
+    const dims = await probeDims(cellPaths[0]);
+    blankPath = path.join(projectDir, 'cache', '.ssblank.jpg');
+    await run('ffmpeg', ['-y', '-v', 'error', '-f', 'lavfi', '-i', `color=black:s=${dims.width}x${dims.height}:d=1`, '-frames:v', '1', blankPath]);
+    for (let i = 0; i < pad; i++) cellPaths.push(blankPath);
+  }
+
+  const outPath = path.join(projectDir, 'cache', `scenes-sheet-${file.sourceId}-${Date.now()}.png`);
+  const inputs = cellPaths.flatMap((f) => ['-i', f]);
+  const tile = cellPaths.map((_, i) => `[${i}:v]`).join('') + `xstack=grid=${cols}x${rows}[strip]`;
+  await run('ffmpeg', ['-y', '-v', 'error', ...inputs, '-filter_complex', tile, '-map', '[strip]', outPath]);
+
+  const cleanup = [...tmpFrames, ...(blankPath ? [blankPath] : [])];
+  if (cleanup.length) await run('rm', cleanup);
+
+  const grid = scenes.map((sc, i) => `cell${i + 1}(r${Math.floor(i / cols) + 1}c${(i % cols) + 1})=${sc.id}@${sc.t0.toFixed(1)}s`);
   return { png: outPath, timecodesBurnedIn: canDrawText, grid };
 }

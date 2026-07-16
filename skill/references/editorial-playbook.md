@@ -67,3 +67,7 @@
 3. 選ばれた範囲だけの新プロジェクトを作り(元プロジェクトはそのまま)、
    冒頭に最強の一言をフックとして配置、字幕は大きめスタイル
 4. 9:16 リフレーム(実装後: reframe コマンド)+ 縦向き export
+
+しゃべりのないB-roll区間を差し込みたい場合は `vedit scenes detect` +
+`vedit scenes sheet` で視覚版の「packed transcript」を作り、注釈付きの
+シーンを `clip-add --scene s0003` で直接指定する(タイムコード手計算不要)。

@@ -8,7 +8,7 @@ import { Project } from './core/project.js';
 import { segments, timelineDuration } from './core/ops.js';
 import { listProjects } from './core/registry.js';
 import { loadPreset, listPresets, savePreset } from './core/presets.js';
-import { renderView } from './export/view.js';
+import { renderView, renderSceneSheet } from './export/view.js';
 import { hasReframe, writeOtio } from './export/otio.js';
 import { renderFinal, toAss } from './export/render.js';
 import { writeSrt } from './export/srt.js';
@@ -113,6 +113,27 @@ async function edit(body: Record<string, unknown>) {
   out({ ...res, hint: 'preview updated live; use `vedit view` to inspect, `vedit undo` to revert' });
 }
 
+/**
+ * Resolve `--scene <id>` sugar to (sourceId, t0, t1). Scene ids restart per
+ * source (like word ids), so when `explicitSource` isn't given this searches
+ * every source's scenes file and fails if the id is ambiguous across more
+ * than one of them.
+ */
+async function resolveScene(dir: string, sceneId: string, explicitSource?: string): Promise<{ sourceId: string; t0: number; t1: number }> {
+  const p = await Project.open(dir);
+  const m = await p.manifest();
+  const sourceIds = explicitSource ? [explicitSource] : m.sources.map((s) => s.id);
+  const hits: { sourceId: string; t0: number; t1: number }[] = [];
+  for (const sourceId of sourceIds) {
+    const f = await p.scenes(sourceId);
+    const sc = f.scenes.find((s) => s.id === sceneId);
+    if (sc) hits.push({ sourceId, t0: sc.t0, t1: sc.t1 });
+  }
+  if (hits.length === 0) fail(`scene ${sceneId} not found${explicitSource ? ` in source ${explicitSource}` : ''} — run \`vedit scenes detect\` first`);
+  if (hits.length > 1) fail(`scene id ${sceneId} is ambiguous across sources (${hits.map((h) => h.sourceId).join(', ')}); specify --source`);
+  return hits[0];
+}
+
 const HELP = `vedit — conversational local NLE
 
 usage: vedit <command> [args] [--project <dir>]
@@ -125,12 +146,17 @@ cut:       remove-words <w1 w5..w9 ...> [--source id] [--pad 0.08] | remove-rang
            approve <id...|all> | reject <id...> | trim <clipId> <in|out> <±frames>
 clips:     clip-add <sourceId> [--in s] [--out s] [--at index] | clip-remove <clipId>
            clip-move <clipId> --before <clipId|end>
+scenes:    scenes detect [--source id] [--sensitivity 0.3] [--max-len 12] [--min-len 1.5]
+           scenes [--source id]                    # packed scene list (id/range/hasSpeech/energy/note)
+           scenes sheet [--source id] [--cols n]    # contact sheet PNG (prints path; Read it)
+           scenes note <sceneId> "<text>" --by model|user [--source id]
+           --scene <sceneId> sugar on clip-add / remove-range / view (resolves to sourceId+t0+t1)
 reframe:   reframe <9:16|1:1|16:9|WxH> [--focus left|center|right|0..1]
            clip-crop <clipId> [--x 0..1] [--y 0..1]
 captions:  captions [--enabled true|false] [--style clean|bold] [--max-chars 24]
 motion:    motion-add --type chapter-card --text "..." --at 12 --duration 4 [--subtitle ...]
            motion-update <id> [--text ...] [--at ...] [--duration ...] | motion-remove <id>
-inspect:   view [--from a] [--to b] [--domain timeline|source] [--source id] (prints PNG path)
+inspect:   view [--from a] [--to b] [--domain timeline|source] [--source id] [--scene id] (prints PNG path)
 export:    export otio <out.otio> | export render <out.mp4> [--burn-captions]
            export fcp7xml <out.xml> | export srt <out.srt> | export ass <out.ass>
 presets:   preset-save <name> [--data '{"k":"v"}'] | preset-apply <name> | preset-list
@@ -280,23 +306,42 @@ async function main() {
       if (pos.length === 0) fail('usage: vedit remove-words <w12 w40..w52 ...>');
       return edit({ op: 'remove-words', ids: pos, sourceId: flags.source, pad: flags.pad !== undefined ? Number(flags.pad) : undefined });
 
-    case 'remove-range':
-      if (pos.length < 2) fail('usage: vedit remove-range <t0> <t1>');
+    case 'remove-range': {
+      if (flags.scene) {
+        if (pos.length > 0) fail('--scene cannot be combined with explicit t0/t1');
+        const dir = projectDir();
+        const r = await resolveScene(dir, String(flags.scene), flags.source as string | undefined);
+        return edit({ op: 'remove-range', t0: r.t0, t1: r.t1, sourceId: r.sourceId });
+      }
+      if (pos.length < 2) fail('usage: vedit remove-range <t0> <t1> [--scene id]');
       return edit({ op: 'remove-range', t0: Number(pos[0]), t1: Number(pos[1]), sourceId: flags.source });
+    }
 
     case 'trim':
       if (pos.length < 3) fail('usage: vedit trim <clipId> <in|out> <±frames>');
       return edit({ op: 'trim', clipId: pos[0], edge: pos[1], frames: Number(pos[2]) });
 
-    case 'clip-add':
-      if (pos.length === 0) fail('usage: vedit clip-add <sourceId> [--in s] [--out s] [--at index]');
+    case 'clip-add': {
+      if (pos.length === 0 && !flags.scene) fail('usage: vedit clip-add <sourceId> [--in s] [--out s] [--at index] [--scene id]');
+      if (flags.scene && (flags.in !== undefined || flags.out !== undefined)) fail('--scene cannot be combined with --in/--out');
+      let sourceId = pos[0];
+      let inVal = flags.in !== undefined ? Number(flags.in) : undefined;
+      let outVal = flags.out !== undefined ? Number(flags.out) : undefined;
+      if (flags.scene) {
+        const dir = projectDir();
+        const r = await resolveScene(dir, String(flags.scene), sourceId);
+        sourceId = r.sourceId;
+        inVal = r.t0;
+        outVal = r.t1;
+      }
       return edit({
         op: 'clip-add',
-        sourceId: pos[0],
-        in: flags.in !== undefined ? Number(flags.in) : undefined,
-        out: flags.out !== undefined ? Number(flags.out) : undefined,
+        sourceId,
+        in: inVal,
+        out: outVal,
         at: flags.at !== undefined ? Number(flags.at) : undefined,
       });
+    }
 
     case 'clip-remove':
       if (pos.length === 0) fail('usage: vedit clip-remove <clipId>');
@@ -305,6 +350,72 @@ async function main() {
     case 'clip-move':
       if (pos.length === 0 || flags.before === undefined) fail('usage: vedit clip-move <clipId> --before <clipId|end>');
       return edit({ op: 'clip-move', clipId: pos[0], before: flags.before });
+
+    case 'scenes': {
+      const sub = pos[0];
+
+      if (sub === 'detect') {
+        const dir = projectDir();
+        await ensureDaemon(dir);
+        const res = await api('/api/scenes/detect', {
+          method: 'POST',
+          body: JSON.stringify({
+            sourceId: flags.source,
+            sensitivity: flags.sensitivity !== undefined ? Number(flags.sensitivity) : undefined,
+            maxLen: flags['max-len'] !== undefined ? Number(flags['max-len']) : undefined,
+            minLen: flags['min-len'] !== undefined ? Number(flags['min-len']) : undefined,
+          }),
+        });
+        return out(res);
+      }
+
+      if (sub === 'sheet') {
+        const dir = projectDir();
+        const p = await Project.open(dir);
+        const m = await p.manifest();
+        const sourceId = (flags.source as string) ?? m.sources[0]?.id;
+        if (!sourceId) fail('no sources in project');
+        const file = await p.scenes(sourceId);
+        const v = await renderSceneSheet(file, dir, { cols: flags.cols ? Number(flags.cols) : undefined });
+        return out({ ...v, hint: 'Read the png to inspect scene thumbnails; grid maps cells to scene ids' });
+      }
+
+      if (sub === 'note') {
+        const sceneId = pos[1] ?? fail('usage: vedit scenes note <sceneId> "<text>" --by model|user [--source id]');
+        const text = pos[2] ?? fail('usage: vedit scenes note <sceneId> "<text>" --by model|user [--source id]');
+        const by = flags.by as string | undefined;
+        if (by !== 'user' && by !== 'model') fail('usage: vedit scenes note <sceneId> "<text>" --by model|user');
+        const dir = projectDir();
+        await ensureDaemon(dir);
+        let sourceId = flags.source as string | undefined;
+        if (!sourceId) {
+          const p = await Project.open(dir);
+          const m = await p.manifest();
+          for (const s of m.sources) {
+            const f = await p.scenes(s.id);
+            if (f.scenes.some((sc) => sc.id === sceneId)) {
+              sourceId = s.id;
+              break;
+            }
+          }
+          if (!sourceId) fail(`scene ${sceneId} not found in any source; specify --source`);
+        }
+        const res = await api('/api/scenes/note', {
+          method: 'POST',
+          body: JSON.stringify({ sourceId, id: sceneId, text, by }),
+        });
+        return out(res);
+      }
+
+      // list (packed scene text, like `vedit transcript`)
+      const dir = projectDir();
+      await ensureDaemon(dir);
+      const q = new URLSearchParams();
+      if (flags.source) q.set('source', String(flags.source));
+      const res = await fetch(`${BASE}/api/scenes?${q}`);
+      if (!res.ok) fail(await res.text());
+      return console.log(await res.text());
+    }
 
     case 'reframe':
       if (pos.length === 0) fail('usage: vedit reframe <9:16|1:1|16:9|WxH> [--focus left|center|right|0..1]');
@@ -396,11 +507,23 @@ async function main() {
       const dir = projectDir();
       const p = await Project.open(dir);
       const m = await p.manifest();
+      let sourceId = flags.source as string | undefined;
+      let from = flags.from !== undefined ? Number(flags.from) : undefined;
+      let to = flags.to !== undefined ? Number(flags.to) : undefined;
+      let domain = (flags.domain as 'timeline' | 'source') ?? 'timeline';
+      if (flags.scene) {
+        if (flags.from !== undefined || flags.to !== undefined) fail('--scene cannot be combined with --from/--to');
+        const r = await resolveScene(dir, String(flags.scene), sourceId);
+        sourceId = r.sourceId;
+        from = r.t0;
+        to = r.t1;
+        domain = 'source'; // scenes are addressed in source time (cut-away material is a valid target)
+      }
       const v = await renderView(m, dir, {
-        domain: (flags.domain as 'timeline' | 'source') ?? 'timeline',
-        sourceId: flags.source as string,
-        from: flags.from !== undefined ? Number(flags.from) : undefined,
-        to: flags.to !== undefined ? Number(flags.to) : undefined,
+        domain,
+        sourceId,
+        from,
+        to,
         cols: flags.cols ? Number(flags.cols) : undefined,
         rows: flags.rows ? Number(flags.rows) : undefined,
       });

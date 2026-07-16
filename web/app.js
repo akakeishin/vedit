@@ -15,6 +15,7 @@ const S = {
   candidatesAll: [], // includes approved/rejected, for the "ignored word" overlay
   revisions: [],
   peaks: new Map(), // sourceId -> {rate, peaks}
+  scenes: new Map(), // sourceId -> Scene[]
   currentSeg: -1,
   playing: false,
   selWords: new Set(),
@@ -52,6 +53,13 @@ async function reload() {
     }
     if (src.peaks && !S.peaks.has(src.id)) {
       S.peaks.set(src.id, await api(`/media/peaks/${src.id}`));
+    }
+    try {
+      const f = await api(`/api/scenes?source=${src.id}&full=1`);
+      if (f.scenes && f.scenes.length) S.scenes.set(src.id, f.scenes);
+      else S.scenes.delete(src.id);
+    } catch {
+      S.scenes.delete(src.id); // no scenes detected yet for this source
     }
   }
   renderAll();
@@ -296,6 +304,7 @@ function renderTimeline() {
     d.onpointerdown = () => selectClip(s.clipId);
     clips.appendChild(d);
   });
+  renderSceneMarks();
   const mrow = $('motionRow');
   mrow.innerHTML = '';
   for (const mo of S.manifest.timeline.motion) {
@@ -307,6 +316,29 @@ function renderTimeline() {
     mrow.appendChild(d);
   }
   drawWave();
+}
+
+// Thin tick marks at scene boundaries (source-of-truth: scenes-<sourceId>.json).
+// Click to seek; the culling/source-drawer UI itself is a later phase.
+function renderSceneMarks() {
+  const el = $('sceneMarks');
+  el.innerHTML = '';
+  if (!S.duration) return;
+  for (const seg of S.segments) {
+    const scenes = S.scenes.get(seg.sourceId);
+    if (!scenes) continue;
+    const segDur = seg.tlEnd - seg.tlStart;
+    for (const sc of scenes) {
+      if (sc.t0 <= seg.srcStart + 1e-6 || sc.t0 >= seg.srcStart + segDur) continue; // skip marks at/after the clip's own boundary
+      const tl = seg.tlStart + (sc.t0 - seg.srcStart);
+      const d = document.createElement('div');
+      d.className = 'sceneMark';
+      d.style.left = `${(tl / S.duration) * 100}%`;
+      d.title = `${sc.id} ${fmt(sc.t0)}`;
+      d.onpointerdown = (e) => { e.stopPropagation(); seekTl(tl, { play: false }); };
+      el.appendChild(d);
+    }
+  }
 }
 
 function drawWave() {

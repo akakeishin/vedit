@@ -26,8 +26,9 @@ import { captionCues } from '../core/captions.js';
 import { detectFillers, detectSilences, detectSilencesFromPeaks } from '../core/detect.js';
 import type { Peaks } from '../core/detect.js';
 import { packTranscript } from '../core/pack.js';
+import { detectScenesForSource, packScenes } from '../core/scenes.js';
 import { ingestFile } from '../ingest/ingest.js';
-import type { CutCandidate, Manifest, MotionItem, Transcript } from '../core/types.js';
+import type { CutCandidate, Manifest, MotionItem, SceneFile, Transcript } from '../core/types.js';
 import { freshId } from '../core/ops.js';
 
 const WEB_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'web');
@@ -234,6 +235,47 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       const all = await p.candidates();
       const pending = url.searchParams.get('all') ? all : all.filter((c) => c.status === 'proposed');
       return json(res, 200, pending);
+    }
+    if (pathname === '/api/scenes' && method === 'GET') {
+      const m = await p.manifest();
+      const requestedSource = url.searchParams.get('source');
+      const full = Boolean(url.searchParams.get('full'));
+
+      if (requestedSource) {
+        const f = await p.scenes(requestedSource);
+        if (full) return json(res, 200, f);
+        res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+        return res.end(packScenes(f));
+      }
+
+      const withScenes: string[] = [];
+      for (const s of m.sources) {
+        const f = await p.scenes(s.id);
+        if (f.scenes.length) withScenes.push(s.id);
+      }
+      if (withScenes.length === 0) {
+        return json(res, 404, { error: 'no scenes detected yet; run `vedit scenes detect`' });
+      }
+      if (withScenes.length > 1) {
+        if (full) {
+          return json(res, 400, {
+            error: 'multiple sources have scenes; specify sourceId (--source <id>)',
+            sources: withScenes,
+          });
+        }
+        const parts: string[] = [];
+        for (const id of withScenes) {
+          parts.push(`## source ${id} — use --source ${id} for edits`);
+          parts.push(packScenes(await p.scenes(id)));
+        }
+        res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+        return res.end(parts.join('\n\n'));
+      }
+
+      const only = withScenes[0];
+      if (full) return json(res, 200, await p.scenes(only));
+      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+      return res.end(packScenes(await p.scenes(only)));
     }
 
     // ---- ingest ----
@@ -474,6 +516,37 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       await p.writeCandidates(all);
       broadcast(ctx, { type: 'candidates', pending: all.filter((c) => c.status === 'proposed').length });
       return json(res, 200, { decided: target.length, state: await stateSummary(p) });
+    }
+
+    // ---- scene index (non-destructive: no baseRev, like candidates.json) ----
+    if (pathname === '/api/scenes/detect' && method === 'POST') {
+      const b = await readBody(req);
+      const m = await p.manifest();
+      const targets: string[] = b.sourceId ? [b.sourceId] : m.sources.map((s) => s.id);
+      const results: SceneFile[] = [];
+      for (const sourceId of targets) {
+        results.push(
+          await detectScenesForSource(p, m, sourceId, {
+            sensitivity: b.sensitivity,
+            maxLen: b.maxLen,
+            minLen: b.minLen,
+          }),
+        );
+      }
+      broadcast(ctx, { type: 'scenes', sources: targets });
+      return json(res, 200, { detected: results.map((f) => ({ sourceId: f.sourceId, count: f.scenes.length })) });
+    }
+    if (pathname === '/api/scenes/note' && method === 'POST') {
+      const b = await readBody(req); // { sourceId, id, text, by }
+      if (!b.sourceId || !b.id || !b.text || !b.by) {
+        return json(res, 400, { error: 'sourceId, id, text, and by are required' });
+      }
+      if (b.by !== 'user' && b.by !== 'model') {
+        return json(res, 400, { error: `by must be "user" or "model" (got ${JSON.stringify(b.by)})` });
+      }
+      const scene = await p.setSceneNote(b.sourceId, b.id, b.text, b.by);
+      broadcast(ctx, { type: 'scenes', sources: [b.sourceId] });
+      return json(res, 200, { scene });
     }
 
     return json(res, 404, { error: `no route: ${method} ${pathname}` });

@@ -1,12 +1,12 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import type { CutCandidate, Manifest, RevisionEntry, Transcript } from './types.js';
+import type { CutCandidate, Manifest, RevisionEntry, Scene, SceneFile, Transcript } from './types.js';
 import { upsertProject } from './registry.js';
 
 /**
  * Project store on disk. One directory per project:
  *   project.json / revisions.jsonl / transcript-<sourceId>.json /
- *   candidates.json / motion/ / cache/
+ *   candidates.json / scenes-<sourceId>.json / motion/ / cache/
  */
 export class Project {
   constructor(public dir: string) {}
@@ -162,5 +162,34 @@ export class Project {
 
   async writeCandidates(c: CutCandidate[]): Promise<void> {
     await fs.writeFile(this.candidatesPath, JSON.stringify(c, null, 2));
+  }
+
+  // ---- scene index (detect + annotate) ----
+
+  scenesPath(sourceId: string) {
+    return path.join(this.dir, `scenes-${sourceId}.json`);
+  }
+
+  async scenes(sourceId: string): Promise<SceneFile> {
+    try {
+      return JSON.parse(await fs.readFile(this.scenesPath(sourceId), 'utf8'));
+    } catch {
+      return { sourceId, scenes: [] };
+    }
+  }
+
+  async writeScenes(f: SceneFile): Promise<void> {
+    await fs.writeFile(this.scenesPath(f.sourceId), JSON.stringify(f, null, 2));
+  }
+
+  /** Record a note on a scene, with its provenance (outsourced from detection). */
+  async setSceneNote(sourceId: string, sceneId: string, text: string, by: 'user' | 'model'): Promise<Scene> {
+    const file = await this.scenes(sourceId);
+    const idx = file.scenes.findIndex((s) => s.id === sceneId);
+    if (idx < 0) throw new Error(`unknown scene: ${sceneId} (source ${sourceId})`);
+    const scene: Scene = { ...file.scenes[idx], note: { text, by, at: new Date().toISOString() } };
+    file.scenes[idx] = scene;
+    await this.writeScenes(file);
+    return scene;
   }
 }

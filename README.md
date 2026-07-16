@@ -69,3 +69,6 @@ node dist/cli.js serve --project <dir>   # daemon をフォアグラウンドで
 - プロジェクト一覧とスタイルプリセット: `vedit projects` で
   過去に開いたプロジェクトを一覧、`vedit preset-save` /
   `preset-apply` / `preset-list` で字幕スタイル等を使い回し
+- シーン索引: しゃべりのない素材に単語 id 相当のシーン id を付ける
+  `vedit scenes detect` / `scenes sheet` / `scenes note`。`--scene <id>` で
+  clip-add / remove-range / view に直接渡せる(タイムライン上にも境界マーカー)

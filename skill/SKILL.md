@@ -70,6 +70,11 @@ vedit view --domain source --source <id>   # カット前のソースを見る
 
 各コマにソースタイムコード焼き込み。カット適用後は必ず view で境界を確認する。
 
+しゃべりのない素材(B-roll・風景)は `vedit scenes detect` → `vedit scenes sheet` で
+シーンごとのサムネ格子を作り、それを Read して各シーンに一言注釈
+(`vedit scenes note s0003 "..." --by model`)を付けると、単語 id と同じ感覚で
+`--scene s0003` を clip-add / remove-range / view に渡せる。
+
 ## クリップ構成(取捨選択・並べ替え)
 
 ```bash

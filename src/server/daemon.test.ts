@@ -325,3 +325,97 @@ describe('daemon: clip ops and reframe', () => {
     expect(body.error).toMatch(/invalid reframe spec/);
   });
 });
+
+// ---- Suite 4: scene index routes (list/note; detect shells out to ffmpeg and
+// is covered by the pure functions in core/scenes.test.ts instead) ----
+describe('daemon: scene index routes', () => {
+  const PORT = 18182;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let project: Project;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-scenes-'));
+    const dir = path.join(root, 'proj');
+    project = await Project.create(dir, 'scenes');
+
+    await project.commit(0, 'system', 'setup', {}, 'seed source', (m) => ({
+      ...m,
+      fps: 30,
+      sources: [{ id: 's1', path: '/media/one.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: false }],
+      timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 30 }], motion: [] },
+    }));
+
+    // Seed a scenes file directly (bypasses ffmpeg — detect itself is
+    // exercised end-to-end only in the real-material smoke test).
+    await project.writeScenes({
+      sourceId: 's1',
+      scenes: [
+        { id: 's0001', t0: 0, t1: 12, thumb: 'cache/sc-s1-s0001.jpg', hasSpeech: false, energy: 0.1 },
+        { id: 's0002', t0: 12, t1: 30, thumb: 'cache/sc-s1-s0002.jpg', hasSpeech: false, energy: 0.2 },
+      ],
+    });
+
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('GET /api/scenes returns the packed text list by default', async () => {
+    const { status, text } = await getText(BASE, '/api/scenes');
+    expect(status).toBe(200);
+    expect(text).toMatch(/s0001 \[0:00\.0–0:12\.0\]/);
+    expect(text).toMatch(/s0002 \[0:12\.0–0:30\.0\]/);
+  });
+
+  it('GET /api/scenes?source=s1&full=1 returns the raw SceneFile JSON', async () => {
+    const { status, body } = await getJson(BASE, '/api/scenes?source=s1&full=1');
+    expect(status).toBe(200);
+    expect(body.sourceId).toBe('s1');
+    expect(body.scenes).toHaveLength(2);
+  });
+
+  it('GET /api/scenes for a source with no scenes file yet returns an empty packed list', async () => {
+    const { status, text } = await getText(BASE, '/api/scenes?source=nope');
+    expect(status).toBe(200);
+    expect(text).toMatch(/no scenes detected/);
+  });
+
+  it('POST /api/scenes/note records text + "by" provenance and an ISO timestamp', async () => {
+    const { status, body } = await postJson(BASE, '/api/scenes/note', {
+      sourceId: 's1',
+      id: 's0001',
+      text: 'エスカレーター上りの追い撮り',
+      by: 'model',
+    });
+    expect(status).toBe(200);
+    expect(body.scene.note).toMatchObject({ text: 'エスカレーター上りの追い撮り', by: 'model' });
+    expect(new Date(body.scene.note.at).toString()).not.toBe('Invalid Date');
+
+    const { text } = await getText(BASE, '/api/scenes?source=s1');
+    expect(text).toMatch(/s0001.*エスカレーター上りの追い撮り \(by:model\)/);
+  });
+
+  it('POST /api/scenes/note rejects a "by" value other than user/model', async () => {
+    const { status, body } = await postJson(BASE, '/api/scenes/note', {
+      sourceId: 's1',
+      id: 's0002',
+      text: 'x',
+      by: 'claude',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/by must be "user" or "model"/);
+  });
+
+  it('POST /api/scenes/note rejects an unknown scene id', async () => {
+    const { status, body } = await postJson(BASE, '/api/scenes/note', {
+      sourceId: 's1',
+      id: 's9999',
+      text: 'x',
+      by: 'user',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/unknown scene/);
+  });
+});
