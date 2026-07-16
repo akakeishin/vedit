@@ -25,7 +25,7 @@ const BASE = `http://localhost:${PORT}`;
 // leave the positional argument list empty.
 const BOOLEAN_FLAGS = new Set([
   'no-transcribe', 'no-add', 'no-fillers', 'no-silence',
-  'latest', 'full', 'all', 'burn-captions',
+  'latest', 'full', 'all', 'burn-captions', 'no-duck',
 ]);
 const argv = process.argv.slice(2);
 const cmd = argv[0];
@@ -190,6 +190,9 @@ reframe:   reframe <9:16|1:1|16:9|WxH> [--focus left|center|right|0..1]
 captions:  captions [--enabled true|false] [--style clean|bold] [--max-chars 24]
 motion:    motion-add --type chapter-card --text "..." --at 12 --duration 4 [--subtitle ...]
            motion-update <id> [--text ...] [--at ...] [--duration ...] | motion-remove <id>
+music:     music-add <file> [--at 0] [--duration N] [--src-in 0] [--gain -12] [--fade-in 1] [--fade-out 2] [--no-duck]
+           music-update <id> [同フラグ] | music-remove <id>
+           audio-mix [--target-lufs -14] [--duck-amount -10] [--crossfade-ms 12]
 inspect:   view [--from a] [--to b] [--domain timeline|source] [--source id] [--scene id] (prints PNG path)
 export:    export otio <out.otio> | export render <out.mp4> [--burn-captions]
            export fcp7xml <out.xml> | export srt <out.srt> | export ass <out.ass>
@@ -503,6 +506,49 @@ async function main() {
     }
     case 'motion-remove':
       return edit({ op: 'motion-remove', id: pos[0] ?? fail('usage: vedit motion-remove <id>') });
+
+    case 'music-add': {
+      if (pos.length === 0) {
+        fail('usage: vedit music-add <file> [--at 0] [--duration N] [--src-in 0] [--gain -12] [--fade-in 1] [--fade-out 2] [--no-duck]');
+      }
+      return edit({
+        op: 'music-add',
+        path: path.resolve(pos[0]),
+        tlStart: numFlag('at', flags.at),
+        duration: numFlag('duration', flags.duration),
+        srcIn: numFlag('src-in', flags['src-in']),
+        gain: numFlag('gain', flags.gain),
+        fadeIn: numFlag('fade-in', flags['fade-in']),
+        fadeOut: numFlag('fade-out', flags['fade-out']),
+        duck: flags['no-duck'] ? false : undefined,
+      });
+    }
+
+    case 'music-update': {
+      const id = pos[0] ?? fail('usage: vedit music-update <id> [--at ...] [--duration ...] [--src-in ...] [--gain ...] [--fade-in ...] [--fade-out ...] [--no-duck]');
+      return edit({
+        op: 'music-update',
+        id,
+        tlStart: numFlag('at', flags.at),
+        duration: numFlag('duration', flags.duration),
+        srcIn: numFlag('src-in', flags['src-in']),
+        gain: numFlag('gain', flags.gain),
+        fadeIn: numFlag('fade-in', flags['fade-in']),
+        fadeOut: numFlag('fade-out', flags['fade-out']),
+        duck: flags['no-duck'] ? false : undefined,
+      });
+    }
+
+    case 'music-remove':
+      return edit({ op: 'music-remove', id: pos[0] ?? fail('usage: vedit music-remove <id>') });
+
+    case 'audio-mix':
+      return edit({
+        op: 'audio-mix',
+        targetLufs: numFlag('target-lufs', flags['target-lufs']),
+        duckAmount: numFlag('duck-amount', flags['duck-amount']),
+        crossfadeMs: numFlag('crossfade-ms', flags['crossfade-ms']),
+      });
 
     case 'preset-save': {
       const name = pos[0] ?? fail('usage: vedit preset-save <name> [--data \'{"k":"v"}\']');

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
   addClip,
+  addMusic,
   applyReframe,
   cropGeometry,
   cropOffset,
@@ -15,12 +16,15 @@ import {
   parseFocus,
   parseReframeSpec,
   removeClip,
+  removeMusic,
   removeSourceRange,
   segments,
+  setAudioMix,
   setClipCrop,
   sourceTimeToTimeline,
   timelineDuration,
   trimClip,
+  updateMusic,
   wordRange,
 } from './ops.js';
 import { Project } from './project.js';
@@ -486,5 +490,78 @@ describe('reframe / crop', () => {
     expect(() => setClipCrop(manifest(), 'c1', { x: -0.1 })).toThrow(/x \(-0\.1\)/);
     expect(() => setClipCrop(manifest(), 'c1', { y: NaN })).toThrow(/y \(NaN\)/);
     expect(() => setClipCrop(manifest(), 'c1', { y: Infinity })).toThrow(/y \(Infinity\)/);
+  });
+});
+
+describe('background music (wave I)', () => {
+  it('addMusic fills in defaults (gain -12, fadeIn 1, fadeOut 2, duck true, at/src-in 0)', () => {
+    const m = addMusic(manifest(), '/bgm.mp3', { duration: 10 });
+    expect(m.timeline.music).toHaveLength(1);
+    const mu = m.timeline.music![0];
+    expect(mu).toMatchObject({ path: '/bgm.mp3', tlStart: 0, duration: 10, srcIn: 0, gain: -12, fadeIn: 1, fadeOut: 2, duck: true });
+    expect(mu.id).toMatch(/^mu/);
+  });
+
+  it('addMusic honors explicit fields and a caller-supplied id', () => {
+    const m = addMusic(manifest(), '/bgm.mp3', {
+      id: 'mu1', tlStart: 5, duration: 8, srcIn: 2, gain: -6, fadeIn: 0.5, fadeOut: 0.5, duck: false,
+    });
+    expect(m.timeline.music![0]).toEqual({ id: 'mu1', path: '/bgm.mp3', tlStart: 5, duration: 8, srcIn: 2, gain: -6, fadeIn: 0.5, fadeOut: 0.5, duck: false });
+  });
+
+  it('addMusic appends without disturbing existing items', () => {
+    let m = addMusic(manifest(), '/a.mp3', { id: 'mu1', duration: 5 });
+    m = addMusic(m, '/b.mp3', { id: 'mu2', duration: 5, tlStart: 10 });
+    expect(m.timeline.music!.map((x) => x.id)).toEqual(['mu1', 'mu2']);
+  });
+
+  it('addMusic rejects a duplicate id, non-positive duration, and out-of-range gain', () => {
+    expect(() => addMusic(manifest(), '/a.mp3', { id: 'mu1', duration: 5 })).not.toThrow();
+    const m = addMusic(manifest(), '/a.mp3', { id: 'mu1', duration: 5 });
+    expect(() => addMusic(m, '/b.mp3', { id: 'mu1', duration: 5 })).toThrow(/id already exists/);
+    expect(() => addMusic(manifest(), '/a.mp3', { duration: 0 })).toThrow(/duration/);
+    expect(() => addMusic(manifest(), '/a.mp3', { duration: 5, gain: 13 })).toThrow(/gain/);
+    expect(() => addMusic(manifest(), '/a.mp3', { duration: 5, gain: -61 })).toThrow(/gain/);
+    expect(() => addMusic(manifest(), '/a.mp3', { duration: 5, tlStart: -1 })).toThrow(/at/);
+  });
+
+  it('updateMusic patches only the given fields, leaving path/id and the rest untouched', () => {
+    let m = addMusic(manifest(), '/a.mp3', { id: 'mu1', duration: 5, gain: -12 });
+    m = updateMusic(m, 'mu1', { gain: -6 });
+    const mu = m.timeline.music![0];
+    expect(mu.gain).toBe(-6);
+    expect(mu.path).toBe('/a.mp3');
+    expect(mu.duration).toBe(5);
+    expect(mu.duck).toBe(true);
+  });
+
+  it('updateMusic rejects an unknown id and out-of-range values', () => {
+    const m = addMusic(manifest(), '/a.mp3', { id: 'mu1', duration: 5 });
+    expect(() => updateMusic(m, 'nope', { gain: -6 })).toThrow(/unknown music item/);
+    expect(() => updateMusic(m, 'mu1', { gain: 100 })).toThrow(/gain/);
+    expect(() => updateMusic(m, 'mu1', { duration: -1 })).toThrow(/duration/);
+    expect(() => updateMusic(m, 'mu1', { fadeIn: -1 })).toThrow(/fade-in/);
+  });
+
+  it('removeMusic drops the item; unknown id throws', () => {
+    let m = addMusic(manifest(), '/a.mp3', { id: 'mu1', duration: 5 });
+    m = addMusic(m, '/b.mp3', { id: 'mu2', duration: 5 });
+    m = removeMusic(m, 'mu1');
+    expect(m.timeline.music!.map((x) => x.id)).toEqual(['mu2']);
+    expect(() => removeMusic(m, 'mu1')).toThrow(/unknown music item/);
+  });
+
+  it('setAudioMix defaults to an empty object and merges patches without clobbering unset fields', () => {
+    let m = setAudioMix(manifest(), { targetLufs: -16 });
+    expect(m.audioMix).toEqual({ targetLufs: -16 });
+    m = setAudioMix(m, { duckAmount: -8 });
+    expect(m.audioMix).toEqual({ targetLufs: -16, duckAmount: -8 });
+  });
+
+  it('setAudioMix rejects out-of-range values', () => {
+    expect(() => setAudioMix(manifest(), { targetLufs: 0 })).toThrow(/targetLufs/);
+    expect(() => setAudioMix(manifest(), { duckAmount: 5 })).toThrow(/duckAmount/);
+    expect(() => setAudioMix(manifest(), { crossfadeMs: -1 })).toThrow(/crossfadeMs/);
+    expect(() => setAudioMix(manifest(), { crossfadeMs: 2000 })).toThrow(/crossfadeMs/);
   });
 });

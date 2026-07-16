@@ -1,4 +1,4 @@
-import type { Manifest, Segment, VideoClip, Word } from './types.js';
+import type { Manifest, MusicItem, Segment, VideoClip, Word } from './types.js';
 
 /** Snap a time to the timeline frame grid. */
 export function snap(t: number, fps: number): number {
@@ -321,6 +321,148 @@ export function applyReframe(m: Manifest, output: { width: number; height: numbe
     output,
     timeline: { ...m.timeline, video: m.timeline.video.map((c) => ({ ...c, crop: { x: focus, y: focus } })) },
   };
+}
+
+// ---- background music ----
+
+const GAIN_MIN = -60;
+const GAIN_MAX = 12;
+
+function assertGain(g: number, label: string): void {
+  if (!Number.isFinite(g) || g < GAIN_MIN || g > GAIN_MAX) {
+    throw new Error(`${label}: gain (${g}) must be a finite number between ${GAIN_MIN} and ${GAIN_MAX} dB`);
+  }
+}
+function assertNonNegative(v: number, label: string, name: string): void {
+  if (!Number.isFinite(v) || v < 0) {
+    throw new Error(`${label}: ${name} (${v}) must be a finite number >= 0`);
+  }
+}
+
+/**
+ * Add a background-music item to the timeline. Purely a manifest edit — the
+ * caller (daemon) resolves the file's duration via ffprobe beforehand and
+ * passes the already-decided `duration` (defaulting it to "shorter of the
+ * source's remaining length and the timeline's remaining length" is the
+ * caller's job, since that needs I/O this function must stay free of).
+ */
+export function addMusic(
+  m: Manifest,
+  path: string,
+  opts: {
+    tlStart?: number;
+    duration: number;
+    srcIn?: number;
+    gain?: number;
+    fadeIn?: number;
+    fadeOut?: number;
+    duck?: boolean;
+    id?: string;
+  },
+): Manifest {
+  const tlStart = opts.tlStart ?? 0;
+  const srcIn = opts.srcIn ?? 0;
+  const gain = opts.gain ?? -12;
+  const fadeIn = opts.fadeIn ?? 1;
+  const fadeOut = opts.fadeOut ?? 2;
+  const duck = opts.duck ?? true;
+  const duration = opts.duration;
+  assertNonNegative(tlStart, 'music-add', 'at');
+  assertNonNegative(srcIn, 'music-add', 'src-in');
+  if (!Number.isFinite(duration) || duration <= 0) {
+    throw new Error(`music-add: duration (${duration}) must be a finite number > 0`);
+  }
+  assertGain(gain, 'music-add');
+  assertNonNegative(fadeIn, 'music-add', 'fade-in');
+  assertNonNegative(fadeOut, 'music-add', 'fade-out');
+  const music = m.timeline.music ?? [];
+  const id = opts.id ?? freshId('mu');
+  if (music.some((x) => x.id === id)) throw new Error(`music-add: id already exists: ${id}`);
+  const item: MusicItem = { id, path, tlStart, duration, srcIn, gain, fadeIn, fadeOut, duck };
+  return { ...m, timeline: { ...m.timeline, music: [...music, item] } };
+}
+
+/** Patch an existing music item's placement/mix fields (never its path). */
+export function updateMusic(
+  m: Manifest,
+  id: string,
+  patch: {
+    tlStart?: number;
+    duration?: number;
+    srcIn?: number;
+    gain?: number;
+    fadeIn?: number;
+    fadeOut?: number;
+    duck?: boolean;
+  },
+): Manifest {
+  const music = m.timeline.music ?? [];
+  const idx = music.findIndex((x) => x.id === id);
+  if (idx < 0) throw new Error(`unknown music item: ${id}`);
+  const cur = music[idx];
+  const next: MusicItem = { ...cur };
+  if (patch.tlStart !== undefined) {
+    assertNonNegative(patch.tlStart, 'music-update', 'at');
+    next.tlStart = patch.tlStart;
+  }
+  if (patch.srcIn !== undefined) {
+    assertNonNegative(patch.srcIn, 'music-update', 'src-in');
+    next.srcIn = patch.srcIn;
+  }
+  if (patch.duration !== undefined) {
+    if (!Number.isFinite(patch.duration) || patch.duration <= 0) {
+      throw new Error(`music-update: duration (${patch.duration}) must be a finite number > 0`);
+    }
+    next.duration = patch.duration;
+  }
+  if (patch.gain !== undefined) {
+    assertGain(patch.gain, 'music-update');
+    next.gain = patch.gain;
+  }
+  if (patch.fadeIn !== undefined) {
+    assertNonNegative(patch.fadeIn, 'music-update', 'fade-in');
+    next.fadeIn = patch.fadeIn;
+  }
+  if (patch.fadeOut !== undefined) {
+    assertNonNegative(patch.fadeOut, 'music-update', 'fade-out');
+    next.fadeOut = patch.fadeOut;
+  }
+  if (patch.duck !== undefined) next.duck = Boolean(patch.duck);
+  const out = [...music];
+  out[idx] = next;
+  return { ...m, timeline: { ...m.timeline, music: out } };
+}
+
+/** Remove a music item from the timeline. */
+export function removeMusic(m: Manifest, id: string): Manifest {
+  const music = m.timeline.music ?? [];
+  const next = music.filter((x) => x.id !== id);
+  if (next.length === music.length) throw new Error(`unknown music item: ${id}`);
+  return { ...m, timeline: { ...m.timeline, music: next } };
+}
+
+/** Patch the final-render audio mastering settings. */
+export function setAudioMix(m: Manifest, patch: { targetLufs?: number; duckAmount?: number; crossfadeMs?: number }): Manifest {
+  const next = { ...(m.audioMix ?? {}) };
+  if (patch.targetLufs !== undefined) {
+    if (!Number.isFinite(patch.targetLufs) || patch.targetLufs < -40 || patch.targetLufs > -5) {
+      throw new Error(`audio-mix: targetLufs (${patch.targetLufs}) must be a finite number between -40 and -5`);
+    }
+    next.targetLufs = patch.targetLufs;
+  }
+  if (patch.duckAmount !== undefined) {
+    if (!Number.isFinite(patch.duckAmount) || patch.duckAmount < -40 || patch.duckAmount > 0) {
+      throw new Error(`audio-mix: duckAmount (${patch.duckAmount}) must be a finite number between -40 and 0 dB`);
+    }
+    next.duckAmount = patch.duckAmount;
+  }
+  if (patch.crossfadeMs !== undefined) {
+    if (!Number.isFinite(patch.crossfadeMs) || patch.crossfadeMs < 0 || patch.crossfadeMs > 1000) {
+      throw new Error(`audio-mix: crossfadeMs (${patch.crossfadeMs}) must be a finite number between 0 and 1000`);
+    }
+    next.crossfadeMs = patch.crossfadeMs;
+  }
+  return { ...m, audioMix: next };
 }
 
 /** Adjust one clip's crop position without touching the others. */

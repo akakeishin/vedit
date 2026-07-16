@@ -89,6 +89,61 @@ export function toOtio(m: Manifest): unknown {
     metadata: {},
   });
 
+  // Background music travels on its own audio track (A2), one Clip.1 per
+  // MusicItem with its own media_reference, gapped to its tlStart the same
+  // way the main audio track (A1) gaps around video-only segments — OTIO has
+  // no volume/fade/duck concept, so gain/fadeIn/fadeOut/duck ride along as
+  // opaque metadata only (mirrors how crop/reframe are carried, see
+  // hasReframe() above).
+  const musicMediaRef = (mu: NonNullable<Manifest['timeline']['music']>[number]) => ({
+    OTIO_SCHEMA: 'ExternalReference.1',
+    name: path.basename(mu.path),
+    target_url: pathToFileURL(mu.path).href,
+    // The manifest doesn't record the music file's full length, only how
+    // much of it is used — approximate the available range as exactly what
+    // this clip consumes (srcIn..srcIn+duration).
+    available_range: tr(0, mu.srcIn + mu.duration, rate),
+    metadata: {},
+  });
+  const musicTrack = () => {
+    const music = m.timeline.music ?? [];
+    if (music.length === 0) return null;
+    const children: unknown[] = [];
+    let cursor = 0;
+    for (const mu of [...music].sort((a, b) => a.tlStart - b.tlStart)) {
+      if (mu.tlStart > cursor + 1e-9) {
+        children.push({
+          OTIO_SCHEMA: 'Gap.1',
+          name: 'gap',
+          source_range: tr(0, mu.tlStart - cursor, rate),
+          effects: [],
+          markers: [],
+          metadata: {},
+        });
+      }
+      children.push({
+        OTIO_SCHEMA: 'Clip.1',
+        name: `M${children.length + 1}`,
+        source_range: tr(mu.srcIn, mu.srcIn + mu.duration, rate),
+        media_reference: musicMediaRef(mu),
+        effects: [],
+        markers: [],
+        metadata: { vedit: { musicId: mu.id, gain: mu.gain, fadeIn: mu.fadeIn, fadeOut: mu.fadeOut, duck: mu.duck } },
+      });
+      cursor = Math.max(cursor, mu.tlStart + mu.duration);
+    }
+    return {
+      OTIO_SCHEMA: 'Track.1',
+      name: 'A2',
+      kind: 'Audio',
+      children,
+      markers: [],
+      effects: [],
+      metadata: {},
+    };
+  };
+  const mTrack = musicTrack();
+
   return {
     OTIO_SCHEMA: 'Timeline.1',
     name: m.name,
@@ -96,7 +151,7 @@ export function toOtio(m: Manifest): unknown {
     tracks: {
       OTIO_SCHEMA: 'Stack.1',
       name: 'tracks',
-      children: [track('Video'), track('Audio')],
+      children: [track('Video'), track('Audio'), ...(mTrack ? [mTrack] : [])],
       markers: [],
       effects: [],
       metadata: {},

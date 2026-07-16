@@ -124,6 +124,19 @@ vedit motion-update <id> --text "..." --base <rev> / vedit motion-remove <id> --
   transcript 由来のみ。モデル創作のコピーは提案として見せ、承認後に入れる
 - スタイルの再利用: `vedit preset-save <name>` / `vedit preset-apply <name> --base <rev>`
 
+## BGM と音声仕上げ
+
+```bash
+vedit music-add <file> --at 0 --gain -12 --base <rev>   # 尺省略時は音源/タイムラインの短い方まで
+vedit music-update <id> --gain -8 --base <rev> / vedit music-remove <id> --base <rev>
+vedit audio-mix --target-lufs -14 --duck-amount -10 --crossfade-ms 12 --base <rev>
+```
+
+- `--no-duck` で自動ダッキング(発話中に自動で下げる)を無効化。既定は有効
+- レンダー時のみ音声を仕上げる(発話音声のクリック防止フェード・ダッキング・
+  ラウドネス正規化)。プレビューは `<audio>` + 簡易フェードの近似
+- **BGM ファイルの権利はユーザー責任**(出典ルールと同様、勝手に生成・DLしない)
+
 ## 仕上げ
 
 レンダー前チェックリスト(editorial-playbook.md)を通してから:

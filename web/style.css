@@ -149,6 +149,12 @@ main { flex: 1; display: flex; min-height: 0; }
   background: rgba(122, 92, 208, 0.85); font-size: 9px; color: #fff;
   overflow: hidden; white-space: nowrap; padding: 0 3px;
 }
+#musicRow { position: absolute; left: 0; right: 0; bottom: 18px; height: 12px; }
+.muBlock {
+  position: absolute; height: 100%; border-radius: 3px;
+  background: rgba(63, 185, 107, 0.8); font-size: 9px; color: #04101f;
+  overflow: hidden; white-space: nowrap; padding: 0 3px;
+}
 #playhead {
   position: absolute; top: 0; bottom: 0; width: 1px; background: #ff5252; pointer-events: none;
 }

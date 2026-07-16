@@ -15,6 +15,15 @@ export interface Manifest {
   captions: CaptionSettings;
   /** Export/preview canvas size; omitted means "use source width/height" (no reframe). */
   output?: { width: number; height: number };
+  /** Final-render audio mastering settings; all optional, see defaults on each field. */
+  audioMix?: {
+    /** Integrated loudness target (LUFS) for the final mix; default -14. */
+    targetLufs?: number;
+    /** How much a ducking music item drops under speech, in dB (negative); default -10. */
+    duckAmount?: number;
+    /** Anti-click fade applied to each speech segment's audio head/tail, in ms; default 12. */
+    crossfadeMs?: number;
+  };
 }
 
 export interface Source {
@@ -37,6 +46,8 @@ export interface Timeline {
   /** Ordered video clips; timeline position is implicit (ripple layout). */
   video: VideoClip[];
   motion: MotionItem[];
+  /** Background-music items; optional for backward compatibility with older project.json files. */
+  music?: MusicItem[];
 }
 
 export interface VideoClip {
@@ -62,6 +73,26 @@ export interface MotionItem {
   /** Timeline-domain placement. */
   tlStart: number;
   duration: number;
+}
+
+export interface MusicItem {
+  id: string;
+  /** Absolute path to the original music file. Never modified. */
+  path: string;
+  /** Timeline-domain placement, in seconds. */
+  tlStart: number;
+  /** Length placed on the timeline, in seconds (may be shorter than the source). */
+  duration: number;
+  /** Start offset within the music file, in seconds. */
+  srcIn: number;
+  /** Gain applied to the music, in dB. Default -12. */
+  gain: number;
+  /** Fade-in length, in seconds. Default 1. */
+  fadeIn: number;
+  /** Fade-out length, in seconds. Default 2. */
+  fadeOut: number;
+  /** Automatically duck under speech at render/preview time. Default true. */
+  duck: boolean;
 }
 
 export interface CaptionSettings {

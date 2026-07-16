@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, promises as fsp } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -6,6 +6,26 @@ import http, { type Server } from 'node:http';
 import { Project } from '../core/project.js';
 import { startDaemon } from './daemon.js';
 import type { Word } from '../core/types.js';
+
+// music-add shells out to ffprobe via probeAudio(); stub it so the "daemon:
+// music ops" suite below stays fast/deterministic without needing ffmpeg
+// installed (same approach as ingest.test.ts's run() mock). vi.mock is
+// hoisted above the imports above by vitest's transform, so daemon.ts's own
+// `import { probeAudio } from '../ingest/ingest.js'` picks up this stub too.
+// Every other suite in this file is unaffected since none of them touch
+// music-add.
+const { probeAudioMock } = vi.hoisted(() => ({
+  probeAudioMock: vi.fn(async (file: string) => {
+    if (file.includes('missing')) throw new Error('ffprobe failed: no such file');
+    if (file.includes('novoice')) return { duration: 30, hasAudio: false };
+    if (file.includes('short')) return { duration: 3, hasAudio: true };
+    return { duration: 300, hasAudio: true };
+  }),
+}));
+vi.mock('../ingest/ingest.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../ingest/ingest.js')>();
+  return { ...actual, probeAudio: probeAudioMock };
+});
 
 function wordsFor(prefix: string, count: number, spacing = 1, dur = 0.8): Word[] {
   const out: Word[] = [];
@@ -1039,5 +1059,158 @@ describe('daemon: restore requires and validates baseRev', () => {
     expect(status).toBe(200);
     const project = (await getJson(BASE, '/api/project')).body;
     expect(project.manifest.revision).toBe(2);
+  });
+});
+
+// ---- Suite 12: background music (Wave I) ----
+describe('daemon: music ops', () => {
+  const PORT = 18194;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let musicId: string;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-music-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'music');
+    // 20s timeline — shorter than probeAudioMock's default 300s source, so
+    // an unspecified duration should default to the timeline's remaining
+    // length, not the source's.
+    await project.commit(0, 'system', 'setup', {}, 'seed source', (m) => ({
+      ...m,
+      fps: 30,
+      sources: [{ id: 's1', path: '/media/one.mp4', duration: 20, fps: 30, width: 1920, height: 1080, hasAudio: true }],
+      timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 20 }], motion: [] },
+    }));
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('music-add rejects a missing path', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'music-add' });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/path is required/);
+  });
+
+  it('music-add rejects a file ffprobe cannot read', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'music-add', path: '/tmp/missing.mp3',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/could not read/);
+  });
+
+  it('music-add rejects a file with no audio stream', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'music-add', path: '/tmp/novoice.mp4',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/no audio stream/);
+  });
+
+  it('music-add with no explicit duration defaults to the shorter of source-remaining and timeline-remaining', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'music-add', path: '/tmp/bgm.mp3', tlStart: 5,
+    });
+    expect(status).toBe(200);
+    musicId = body.id;
+    const project = (await getJson(BASE, '/api/project')).body;
+    const mu = project.manifest.timeline.music.find((x: any) => x.id === musicId);
+    // timeline remaining from tlStart=5 on a 20s timeline is 15s, source
+    // remaining (300s mock duration) is far larger — timeline should win.
+    expect(mu.duration).toBeCloseTo(15, 5);
+    expect(mu.gain).toBe(-12); // default
+    expect(mu.duck).toBe(true); // default
+  });
+
+  it('music-add with a short source caps the default duration at the source-remaining length', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'music-add', path: '/tmp/short.mp3', tlStart: 0,
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    const mu = project.manifest.timeline.music.find((x: any) => x.id === body.id);
+    expect(mu.duration).toBeCloseTo(3, 5); // probeAudioMock('short') => 3s
+    await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: project.manifest.revision, op: 'music-remove', id: body.id });
+  });
+
+  it('music-add rejects an out-of-range gain', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'music-add', path: '/tmp/bgm.mp3', duration: 5, gain: 50,
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/gain/);
+  });
+
+  it('/api/state reports the music count', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    expect(state.music).toBe(1);
+  });
+
+  it('music-update rejects an unknown id', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'music-update', id: 'nope', gain: -6,
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/unknown music item/);
+  });
+
+  it('music-update with a valid id patches the item', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'music-update', id: musicId, gain: -6, duck: false,
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    const mu = project.manifest.timeline.music.find((x: any) => x.id === musicId);
+    expect(mu.gain).toBe(-6);
+    expect(mu.duck).toBe(false);
+  });
+
+  it('audio-mix rejects an out-of-range target LUFS', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'audio-mix', targetLufs: 10,
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/targetLufs/);
+  });
+
+  it('audio-mix with valid values patches manifest.audioMix', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'audio-mix', targetLufs: -16, duckAmount: -8, crossfadeMs: 20,
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.audioMix).toEqual({ targetLufs: -16, duckAmount: -8, crossfadeMs: 20 });
+  });
+
+  it('music-remove rejects an unknown id', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'music-remove', id: 'nope',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/unknown music item/);
+  });
+
+  it('music-remove with a valid id removes it', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'music-remove', id: musicId,
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.timeline.music).toHaveLength(0);
   });
 });

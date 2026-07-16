@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { toOtio } from './otio.js';
 import { removeSourceRange, trimClip } from '../core/ops.js';
-import type { Manifest } from '../core/types.js';
+import type { Manifest, MusicItem } from '../core/types.js';
 
 const FPS = 30000 / 1001;
 
@@ -111,5 +111,48 @@ describe('ops guards (wave D)', () => {
     const t = trimClip(m, 'c0', 'in', 1);
     expect(t.timeline.video[0].srcIn).toBeCloseTo(1 + 1 / 24, 6);
     expect(() => trimClip(m, 'c0', 'in', NaN)).toThrow(/invalid frames/);
+  });
+});
+
+describe('toOtio background music (wave I: A2 track)', () => {
+  function withMusic(music: MusicItem[]): Manifest {
+    const m = manifest([{ srcIn: 0, srcOut: 10 }]);
+    return { ...m, timeline: { ...m.timeline, music } };
+  }
+
+  it('emits no A2 track when there is no music', () => {
+    const o: any = toOtio(manifest([{ srcIn: 0, srcOut: 10 }]));
+    expect(o.tracks.children.find((t: any) => t.name === 'A2')).toBeUndefined();
+    expect(o.tracks.children).toHaveLength(2); // V1, A1 only — unchanged shape
+  });
+
+  it('emits an A2 track with one Clip.1 per music item, gapped to its tlStart', () => {
+    const music: MusicItem[] = [
+      { id: 'mu1', path: '/bgm.mp3', tlStart: 3, duration: 4, srcIn: 1, gain: -12, fadeIn: 1, fadeOut: 2, duck: true },
+    ];
+    const o: any = toOtio(withMusic(music));
+    const a2 = o.tracks.children.find((t: any) => t.name === 'A2');
+    expect(a2).toBeDefined();
+    expect(a2.kind).toBe('Audio');
+    // Gap.1 (0..3s) then Clip.1 (source_range starting at srcIn=1)
+    expect(a2.children).toHaveLength(2);
+    expect(a2.children[0].OTIO_SCHEMA).toBe('Gap.1');
+    expect(a2.children[0].source_range.duration.value).toBe(Math.round(3 * FPS));
+    const clip = a2.children[1];
+    expect(clip.OTIO_SCHEMA).toBe('Clip.1');
+    expect(clip.source_range.start_time.value).toBe(Math.round(1 * FPS)); // srcIn-anchored
+    expect(clip.media_reference.target_url).toMatch(/^file:\/\//);
+    expect(clip.metadata.vedit.musicId).toBe('mu1');
+    expect(clip.metadata.vedit.duck).toBe(true);
+  });
+
+  it('emits no leading Gap when the first music item starts at tlStart 0', () => {
+    const music: MusicItem[] = [
+      { id: 'mu1', path: '/bgm.mp3', tlStart: 0, duration: 4, srcIn: 0, gain: -12, fadeIn: 1, fadeOut: 2, duck: false },
+    ];
+    const o: any = toOtio(withMusic(music));
+    const a2 = o.tracks.children.find((t: any) => t.name === 'A2');
+    expect(a2.children).toHaveLength(1);
+    expect(a2.children[0].OTIO_SCHEMA).toBe('Clip.1');
   });
 });

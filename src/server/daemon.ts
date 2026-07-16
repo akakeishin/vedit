@@ -6,6 +6,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { Project, resolveWithinDir } from '../core/project.js';
 import {
   addClip,
+  addMusic,
   applyReframe,
   expandWordIds,
   moveClip,
@@ -13,12 +14,15 @@ import {
   parseFocus,
   parseReframeSpec,
   removeClip,
+  removeMusic,
   removeSourceRange,
   segments,
+  setAudioMix,
   setClipCrop,
   sourceRangeToTimeline,
   timelineDuration,
   trimClip,
+  updateMusic,
   wordRange,
 } from '../core/ops.js';
 import { upsertProject } from '../core/registry.js';
@@ -27,7 +31,7 @@ import { detectFillers, detectSilences, detectSilencesFromPeaks } from '../core/
 import type { Peaks } from '../core/detect.js';
 import { packTranscript } from '../core/pack.js';
 import { detectScenesForSource, packScenes } from '../core/scenes.js';
-import { ingestFile } from '../ingest/ingest.js';
+import { ingestFile, probeAudio } from '../ingest/ingest.js';
 import { run } from '../ingest/run.js';
 import type { CutCandidate, Manifest, MotionItem, SceneFile, Transcript } from '../core/types.js';
 import { freshId } from '../core/ops.js';
@@ -132,6 +136,7 @@ async function stateSummary(p: Project) {
     duration: timelineDuration(m),
     clips: m.timeline.video.length,
     motion: m.timeline.motion.length,
+    music: (m.timeline.music ?? []).length,
     sources: m.sources.map((s) => ({ id: s.id, path: s.path, duration: s.duration, transcribed: !!s.transcribed })),
     pendingCandidates: pending,
     captions: m.captions,
@@ -491,6 +496,71 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         }));
         return json(res, 200, { state: await stateSummary(p) });
       }
+      if (b.op === 'music-add') {
+        if (typeof b.path !== 'string' || !b.path) {
+          return json(res, 400, { error: 'music-add: path is required' });
+        }
+        const filePath = path.resolve(b.path);
+        let info: { duration: number; hasAudio: boolean };
+        try {
+          info = await probeAudio(filePath);
+        } catch (e: any) {
+          return json(res, 400, { error: `music-add: could not read ${filePath}: ${e?.message ?? e}` });
+        }
+        if (!info.hasAudio) {
+          return json(res, 400, { error: `music-add: no audio stream in ${filePath}` });
+        }
+        const tlStart = typeof b.tlStart === 'number' ? b.tlStart : 0;
+        if (!Number.isFinite(tlStart) || tlStart < 0) {
+          return json(res, 400, { error: 'music-add: at must be a finite number >= 0' });
+        }
+        const srcIn = typeof b.srcIn === 'number' ? b.srcIn : 0;
+        if (!Number.isFinite(srcIn) || srcIn < 0) {
+          return json(res, 400, { error: 'music-add: src-in must be a finite number >= 0' });
+        }
+        // Unspecified duration defaults to whichever runs out first: the
+        // music source (from srcIn) or the timeline (from tlStart).
+        const remainingSrc = Math.max(0, info.duration - srcIn);
+        const remainingTl = Math.max(0, timelineDuration(m0) - tlStart);
+        const duration = typeof b.duration === 'number' ? b.duration : Math.min(remainingSrc, remainingTl);
+        if (!Number.isFinite(duration) || duration <= 0) {
+          return json(res, 400, { error: 'music-add: no room for music at this position (timeline or source exhausted)' });
+        }
+        const id = freshId('mu');
+        await mutate(
+          p, actor, baseRev, 'music-add', b,
+          `music-add ${path.basename(filePath)} at ${tlStart}s (+${duration.toFixed(1)}s)`,
+          (m) => addMusic(m, filePath, { id, tlStart, srcIn, duration, gain: b.gain, fadeIn: b.fadeIn, fadeOut: b.fadeOut, duck: b.duck }),
+        );
+        return json(res, 200, { id, state: await stateSummary(p) });
+      }
+      if (b.op === 'music-update') {
+        if (!(m0.timeline.music ?? []).some((x) => x.id === b.id)) {
+          return json(res, 400, { error: `unknown music item: ${b.id}` });
+        }
+        await mutate(p, actor, baseRev, 'music-update', b, `music-update ${b.id}`, (m) =>
+          updateMusic(m, b.id, {
+            tlStart: b.tlStart, duration: b.duration, srcIn: b.srcIn,
+            gain: b.gain, fadeIn: b.fadeIn, fadeOut: b.fadeOut, duck: b.duck,
+          }),
+        );
+        return json(res, 200, { state: await stateSummary(p) });
+      }
+      if (b.op === 'music-remove') {
+        if (!(m0.timeline.music ?? []).some((x) => x.id === b.id)) {
+          return json(res, 400, { error: `unknown music item: ${b.id}` });
+        }
+        await mutate(p, actor, baseRev, 'music-remove', b, `music-remove ${b.id}`, (m) => removeMusic(m, b.id));
+        return json(res, 200, { state: await stateSummary(p) });
+      }
+      if (b.op === 'audio-mix') {
+        await mutate(
+          p, actor, baseRev, 'audio-mix', b,
+          `audio-mix target=${b.targetLufs ?? -14} duck=${b.duckAmount ?? -10} xfade=${b.crossfadeMs ?? 12}`,
+          (m) => setAudioMix(m, { targetLufs: b.targetLufs, duckAmount: b.duckAmount, crossfadeMs: b.crossfadeMs }),
+        );
+        return json(res, 200, { state: await stateSummary(p) });
+      }
       if (b.op === 'clip-add') {
         const clipId = freshId('c');
         await mutate(p, actor, baseRev, 'clip-add', b, `clip-add ${b.sourceId} [${b.in ?? 0}-${b.out ?? '*'}]`, (m) =>
@@ -692,10 +762,60 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
     }
   }
 
+  /** Guess a browser-playable audio MIME type from a music file's extension. */
+  function audioMime(file: string): string {
+    const types: Record<string, string> = {
+      '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.m4a': 'audio/mp4', '.aac': 'audio/aac',
+      '.ogg': 'audio/ogg', '.flac': 'audio/flac', '.opus': 'audio/opus',
+    };
+    return types[path.extname(file).toLowerCase()] ?? 'application/octet-stream';
+  }
+
+  /** Serve a real on-disk file with byte-range support (used by proxy/peaks/music). */
+  function serveFileWithRange(req: http.IncomingMessage, res: http.ServerResponse, full: string, stat: { size: number }, type: string) {
+    const range = req.headers.range;
+    if (range) {
+      const parsed = parseByteRange(range, stat.size);
+      if (parsed === 'unsatisfiable') {
+        res.writeHead(416, { 'content-range': `bytes */${stat.size}` });
+        return res.end();
+      }
+      if (parsed) {
+        const { start, end } = parsed;
+        res.writeHead(206, {
+          'content-type': type,
+          'content-range': `bytes ${start}-${end}/${stat.size}`,
+          'accept-ranges': 'bytes',
+          'content-length': end - start + 1,
+        });
+        createReadStream(full, { start, end }).pipe(res);
+        return;
+      }
+      // Malformed or multi-range header: ignore it and serve the full body.
+    }
+    res.writeHead(200, { 'content-type': type, 'content-length': stat.size, 'accept-ranges': 'bytes' });
+    createReadStream(full).pipe(res);
+  }
+
   async function serveMedia(p: Project, pathname: string, req: http.IncomingMessage, res: http.ServerResponse) {
-    // /media/proxy/<sourceId> | /media/peaks/<sourceId> | /media/thumb/<sourceId>
-    const [, , kind, sourceId] = pathname.split('/');
+    // /media/proxy/<sourceId> | /media/peaks/<sourceId> | /media/thumb/<sourceId> | /media/music/<musicId>
+    const [, , kind, id] = pathname.split('/');
     const m = await p.manifest();
+    if (kind === 'music') {
+      // Music items reference the original file directly (never a proxy) —
+      // same trust model as Source.path in renderFinal: an absolute path the
+      // user supplied via the CLI, not sandboxed to the project directory.
+      const mu = (m.timeline.music ?? []).find((x) => x.id === id);
+      if (!mu) return json(res, 404, { error: 'unknown music item' });
+      let stat: ReturnType<typeof statSync>;
+      try {
+        stat = statSync(mu.path);
+      } catch {
+        return json(res, 404, { error: 'music file not found' });
+      }
+      return serveFileWithRange(req, res, mu.path, stat, audioMime(mu.path));
+    }
+    const sourceId = id;
     const src = m.sources.find((s) => s.id === sourceId);
     if (!src) return json(res, 404, { error: 'unknown source' });
     if (kind === 'thumb') {
@@ -729,28 +849,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       return json(res, 404, { error: `${kind} file not found` });
     }
     const type = kind === 'proxy' ? 'video/mp4' : 'application/json';
-    const range = req.headers.range;
-    if (range) {
-      const parsed = parseByteRange(range, stat.size);
-      if (parsed === 'unsatisfiable') {
-        res.writeHead(416, { 'content-range': `bytes */${stat.size}` });
-        return res.end();
-      }
-      if (parsed) {
-        const { start, end } = parsed;
-        res.writeHead(206, {
-          'content-type': type,
-          'content-range': `bytes ${start}-${end}/${stat.size}`,
-          'accept-ranges': 'bytes',
-          'content-length': end - start + 1,
-        });
-        createReadStream(full, { start, end }).pipe(res);
-        return;
-      }
-      // Malformed or multi-range header: ignore it and serve the full body.
-    }
-    res.writeHead(200, { 'content-type': type, 'content-length': stat.size, 'accept-ranges': 'bytes' });
-    createReadStream(full).pipe(res);
+    return serveFileWithRange(req, res, full, stat, type);
   }
 
   /**

@@ -40,6 +40,7 @@ const S = {
   sourcePreview: null, // { sourceId, returnTl } | null
   mediaFocusKey: null, // sourceId — roving-tabindex focus stop in #mediaList
   expandedScenes: new Set(), // sourceIds whose scene grid is expanded
+  musicEls: new Map(), // musicItemId -> <audio> element driving background-music preview
 };
 const PLAY_RATES = [1, 1.5, 2];
 
@@ -186,6 +187,7 @@ function tick() {
     // rendering (playhead, captions, motion, word highlight) and just show
     // the source-relative timecode.
     $('tc').textContent = `${fmtF(video.currentTime)} / ${fmtF(video.duration || 0)}`;
+    syncMusicPlayback(null); // source-preview mode plays a raw source proxy, not the timeline mix
     requestAnimationFrame(tick);
     return;
   }
@@ -202,6 +204,7 @@ function tick() {
     renderCaption(tl);
     renderMotion(tl);
     highlightWord(tl);
+    syncMusicPlayback(tl);
     if (S.previewStopAt != null && S.playing && tl >= S.previewStopAt) {
       S.previewStopAt = null;
       stopPlayback();
@@ -425,6 +428,17 @@ function renderTimeline() {
     d.textContent = mo.id;
     mrow.appendChild(d);
   }
+  const murow = $('musicRow');
+  murow.innerHTML = '';
+  for (const mu of S.manifest.timeline.music ?? []) {
+    const d = document.createElement('div');
+    d.className = 'muBlock';
+    d.style.left = `${(mu.tlStart / S.duration) * 100}%`;
+    d.style.width = `${(mu.duration / S.duration) * 100}%`;
+    d.title = `${mu.id} ${basename(mu.path)} (${mu.gain}dB${mu.duck ? ', duck' : ''})`;
+    d.textContent = basename(mu.path);
+    murow.appendChild(d);
+  }
   drawWave();
 }
 
@@ -472,6 +486,71 @@ function drawWave() {
       const h = Math.max(1, v * r.height * 0.55);
       g.fillRect(x, mid - h / 2, 1.4, h);
     }
+  }
+}
+
+// ---------- background music preview ----------
+// One <audio> element per timeline.music item, kept in sync with the video
+// via rAF in tick() (see syncMusicPlayback). No Web Audio / GainNode: plain
+// audio.volume, clamped to [0,1] — a gain above 0dB can't be represented
+// this way, which is an accepted preview-only approximation (the real
+// render's ffmpeg volume filter has no such ceiling).
+function dbToLinear(db) {
+  return Math.pow(10, db / 20);
+}
+function musicUrl(id) {
+  return `/media/music/${id}`;
+}
+// Add/remove <audio> elements so they track the current manifest's music
+// list; called on every reload() so ingest/undo/music-add etc. stay in sync.
+function syncMusicElements() {
+  const music = S.manifest?.timeline.music ?? [];
+  const ids = new Set(music.map((mu) => mu.id));
+  for (const [id, el] of S.musicEls) {
+    if (ids.has(id)) continue;
+    el.pause();
+    el.remove();
+    S.musicEls.delete(id);
+  }
+  for (const mu of music) {
+    if (S.musicEls.has(mu.id)) continue;
+    const el = document.createElement('audio');
+    el.src = musicUrl(mu.id);
+    el.preload = 'auto';
+    el.style.display = 'none';
+    document.body.appendChild(el);
+    S.musicEls.set(mu.id, el);
+  }
+}
+// Whether timeline second `tl` falls inside a caption cue — used as a cheap
+// stand-in for "speech is playing right now" (keptWords' time bucketing,
+// pre-computed server-side into S.cues) so duck=true music items dip without
+// needing a separate word-level lookup in the browser.
+function speechActiveAt(tl) {
+  return S.cues.some((c) => tl >= c.tlStart && tl < c.tlEnd);
+}
+// Drive every music <audio> element's currentTime/play-state/volume from the
+// current timeline position `tl` (null while source-preview mode owns #video,
+// since the timeline mix isn't what's playing then — pauses everything).
+function syncMusicPlayback(tl) {
+  if (S.musicEls.size === 0) return;
+  const duckAmount = S.manifest?.audioMix?.duckAmount ?? -10;
+  for (const [id, el] of S.musicEls) {
+    const mu = (S.manifest?.timeline.music ?? []).find((m) => m.id === id);
+    const active = mu != null && tl != null && tl >= mu.tlStart && tl < mu.tlStart + mu.duration;
+    if (!active) {
+      if (!el.paused) el.pause();
+      continue;
+    }
+    const localT = tl - mu.tlStart + mu.srcIn;
+    if (Math.abs(el.currentTime - localT) > 0.3) el.currentTime = localT;
+    if (S.playing && el.paused) el.play().catch(() => {});
+    if (!S.playing && !el.paused) el.pause();
+    const fadeIn = mu.fadeIn > 0 ? Math.max(0, Math.min(1, (tl - mu.tlStart) / mu.fadeIn)) : 1;
+    const fadeOut = mu.fadeOut > 0 ? Math.max(0, Math.min(1, (mu.tlStart + mu.duration - tl) / mu.fadeOut)) : 1;
+    let vol = dbToLinear(mu.gain) * fadeIn * fadeOut;
+    if (mu.duck && speechActiveAt(tl)) vol *= dbToLinear(duckAmount);
+    el.volume = Math.max(0, Math.min(1, vol));
   }
 }
 
@@ -1373,6 +1452,7 @@ async function renderAll() {
   $('revLabel').textContent = `rev ${m.revision}`;
   updateUndoBtn();
   await loadMotionSpecs();
+  syncMusicElements();
   renderTimeline();
   renderTranscript();
   renderCandidates();

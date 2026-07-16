@@ -74,6 +74,38 @@ export async function probe(file: string): Promise<ProbeResult> {
   };
 }
 
+export interface AudioProbeResult {
+  duration: number;
+  hasAudio: boolean;
+}
+
+/**
+ * Lightweight ffprobe for a music file: unlike `probe()` above this never
+ * requires a video stream (music-add's inputs are typically audio-only), it
+ * only needs to confirm an audio stream exists and learn its duration.
+ */
+export async function probeAudio(file: string): Promise<AudioProbeResult> {
+  const out = await run('ffprobe', [
+    '-v', 'error',
+    '-print_format', 'json',
+    '-show_format', '-show_streams',
+    file,
+  ]);
+  const j = JSON.parse(out);
+  const a = (j.streams as any[]).find((s) => s.codec_type === 'audio');
+  const formatDuration = Number(j.format?.duration);
+  const streamDuration = a ? Number(a.duration) : NaN;
+  const duration = Number.isFinite(formatDuration) && formatDuration > 0
+    ? formatDuration
+    : Number.isFinite(streamDuration) && streamDuration > 0
+      ? streamDuration
+      : NaN;
+  if (!Number.isFinite(duration)) {
+    throw new Error(`ffprobe returned no usable duration for ${file}`);
+  }
+  return { duration, hasAudio: Boolean(a) };
+}
+
 /**
  * One-time 720p-class CFR proxy for smooth seeking; original is never touched.
  * Keeps the source fps as-is (e.g. 29.97) rather than rounding it — rounding
