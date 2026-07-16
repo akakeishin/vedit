@@ -52,9 +52,15 @@ export function sourceRangeToTimeline(m: Manifest, sourceId: string, t0: number,
  * downstream content shifts left automatically.
  */
 export function removeSourceRange(m: Manifest, sourceId: string, t0: number, t1: number): Manifest {
+  if (!Number.isFinite(t0) || !Number.isFinite(t1)) {
+    throw new Error(`invalid range: ${t0}..${t1} (must be finite seconds)`);
+  }
   const fps = m.fps;
   const a = snap(Math.min(t0, t1), fps);
   const b = snap(Math.max(t0, t1), fps);
+  // A range that collapses to a single frame boundary would split clips
+  // without removing time — a pure no-op with side effects. Refuse it.
+  if (b - a < 0.5 / fps) return m;
   const next: VideoClip[] = [];
   for (const c of m.timeline.video) {
     if (c.sourceId !== sourceId || b <= c.srcIn || a >= c.srcOut) {
@@ -125,16 +131,20 @@ export function expandWordIds(spec: string[], words: Word[]): string[] {
 
 /** Trim one edge of a clip by a signed number of frames (+ extends, - shortens... in source time). */
 export function trimClip(m: Manifest, clipId: string, edge: 'in' | 'out', frames: number): Manifest {
-  const delta = frames / m.fps;
+  if (!Number.isFinite(frames)) throw new Error(`invalid frames: ${frames}`);
   const src = new Map(m.sources.map((s) => [s.id, s]));
   const next = m.timeline.video.map((c) => {
     if (c.id !== clipId) return c;
+    // Frames are a SOURCE-time unit here: trim moves an edge across source
+    // frames, so a 24fps source on a 29.97 timeline must step in 1/24s.
+    const fps = src.get(c.sourceId)?.fps || m.fps;
+    const delta = frames / fps;
     const dur = src.get(c.sourceId)?.duration ?? Infinity;
     if (edge === 'in') {
-      const srcIn = Math.max(0, Math.min(c.srcOut - 1 / m.fps, snap(c.srcIn + delta, m.fps)));
+      const srcIn = Math.max(0, Math.min(c.srcOut - 1 / fps, snap(c.srcIn + delta, fps)));
       return { ...c, srcIn };
     }
-    const srcOut = Math.min(dur, Math.max(c.srcIn + 1 / m.fps, snap(c.srcOut + delta, m.fps)));
+    const srcOut = Math.min(dur, Math.max(c.srcIn + 1 / fps, snap(c.srcOut + delta, fps)));
     return { ...c, srcOut };
   });
   if (!m.timeline.video.some((c) => c.id === clipId)) throw new Error(`unknown clip: ${clipId}`);

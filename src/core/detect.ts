@@ -10,7 +10,8 @@ export function detectSilences(t: Transcript, minGap = 0.7, pad = 0.12): CutCand
   const w = t.words;
   for (let i = 0; i < w.length - 1; i++) {
     const gap = w[i + 1].t0 - w[i].t1;
-    if (gap >= minGap) {
+    // padding must not invert the range (short gaps just above minGap)
+    if (gap >= minGap && gap > pad * 2) {
       out.push({
         id: freshId('cand'),
         kind: 'silence',
@@ -24,7 +25,7 @@ export function detectSilences(t: Transcript, minGap = 0.7, pad = 0.12): CutCand
     }
   }
   // Leading silence before the first word.
-  if (w.length > 0 && w[0].t0 >= minGap) {
+  if (w.length > 0 && w[0].t0 >= minGap && w[0].t0 > pad) {
     out.unshift({
       id: freshId('cand'),
       kind: 'silence',

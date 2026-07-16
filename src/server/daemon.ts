@@ -459,7 +459,9 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
           }
           const waveCands = detectSilencesFromPeaks(peaks, {
             sourceId: src.id,
-            threshold: b.threshold ?? 0.06,
+            // undefined lets the per-source adaptive threshold kick in;
+            // a fixed default here would defeat it on quiet outdoor footage.
+            threshold: b.threshold,
             minGap: b.minGap ?? 0.7,
             words: wordsBySource.get(src.id),
           });
