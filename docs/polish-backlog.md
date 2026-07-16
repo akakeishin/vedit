@@ -9,9 +9,11 @@ QC・アーカイブ)を先に埋める。✅=実装済み。
 サムネ+materials、説明文はディレクター起草)+書き出しプリセット
 
 **Phase 1 — 毎週の中核ワークフロー(この順で実装)**
-1. **W1: 会話音声リペア + resume** — outdoor/indoor/wireless の保守的
-   プリセット(highpass/afftdn/deesser/acompressor)、音楽なしでも
-   2-pass loudnorm、乾音A/B。+ `vedit resume`(再開サマリの集約)
+1. **W1: 会話音声リペア + resume + 色メタデータ捕捉** — outdoor/indoor/wireless
+   の保守的プリセット(highpass/afftdn/deesser/acompressor)、音楽なしでも
+   2-pass loudnorm、乾音A/B。+ `vedit resume`(再開サマリの集約)。
+   + ingest 時に color_primaries/transfer/space/bit depth を Source に記録し、
+   Log/HLG 素材なら status と UI に「要入力変換」警告(変換自体は W5)
 2. **W2: 3状態カリング + Selects** — scene/source 単位の
    unreviewed/keep/reject(manifest 保存・undo 対象)、キーボード選別、
    残件数、「keep だけで仮タイムライン」
@@ -22,7 +24,12 @@ QC・アーカイブ)を先に埋める。✅=実装済み。
 
 **Phase 2 — 制作サイクルの外周**
 4. W4: 検証付きインジェスト(SHA-256、copy/link、重複検出、中断再開)
-5. W5: 横→縦の派生プロジェクト(variant fork、revision 固定、hardlink)
+5. **W5: 入力色管理**(汎用 — DJI D-Log(2)/HLG も他カメラの Log も対象):
+   W1 で記録した色メタデータに基づき zscale/lut3d で Rec.709 へ入力変換
+   (プロキシ生成時に適用しプレビューも正しい見た目に)、露出/WB/彩度の
+   3パラメータのみ提供、代表フレームのヒストグラム差からショットマッチ候補
+   を提案(承認制)。LUT はユーザー提供 or 標準変換式のみ
+6. W6: 横→縦の派生プロジェクト(variant fork、revision 固定、hardlink)
 6. W6: モーションの最終レンダー焼き込み(4プリセット→ASS/ffmpeg 変換のみ、
    custom-html は対象外と明示)
 7. W7: N スタイルキット(音声・モーションスキーマ確定後)
