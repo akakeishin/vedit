@@ -40,6 +40,7 @@ const S = {
   sourcePreview: null, // { sourceId, returnTl } | null
   mediaFocusKey: null, // sourceId — roving-tabindex focus stop in #mediaList
   expandedScenes: new Set(), // sourceIds whose scene grid is expanded
+  sceneFocus: new Map(), // sourceId -> sceneId, roving-tabindex focus stop within one expanded scene grid
   musicEls: new Map(), // musicItemId -> <audio> element driving background-music preview
 };
 const PLAY_RATES = [1, 1.5, 2];
@@ -605,6 +606,36 @@ function sourceUsageSeconds(sourceId) {
     .filter((s) => s.sourceId === sourceId)
     .reduce((sum, s) => sum + (s.tlEnd - s.tlStart), 0);
 }
+// ---- 3-state scene culling (keep/reject/unreviewed) ----
+// Review state lives on the manifest (S.manifest.culling[sourceId][sceneId]),
+// mirroring core/ops.ts's setSceneReview/cullingStats — read-only mirrors
+// here, all writes go through mutate({ op: 'scene-review', ... }).
+function reviewFor(sourceId, sceneId) {
+  return S.manifest?.culling?.[sourceId]?.[sceneId];
+}
+function cullingCounts(sourceId) {
+  const scenes = S.scenes.get(sourceId) ?? [];
+  let keep = 0;
+  let reject = 0;
+  for (const sc of scenes) {
+    const r = reviewFor(sourceId, sc.id);
+    if (r === 'keep') keep++;
+    else if (r === 'reject') reject++;
+  }
+  return { total: scenes.length, keep, reject, unreviewed: scenes.length - keep - reject };
+}
+async function setSceneReviewUi(sourceId, sceneId, review) {
+  // Set the roving-tabindex target before the mutation so the reload()
+  // triggered by mutate() re-renders the grid with this scene already the
+  // tabbable stop; DOM focus itself still needs reclaiming afterward since
+  // mutate() rebuilds the panel from scratch.
+  S.sceneFocus.set(sourceId, sceneId);
+  await mutate(
+    { op: 'scene-review', sourceId, sceneIds: [sceneId], review },
+    { conflictMessage: '選別状態の更新は反映されませんでした。最新状態を確認してもう一度実行してください' },
+  );
+  document.querySelector(`.sceneItem[data-source="${CSS.escape(sourceId)}"][data-scene="${CSS.escape(sceneId)}"]`)?.focus();
+}
 function setMediaFocus(sourceId, { focus = true } = {}) {
   S.mediaFocusKey = sourceId;
   for (const r of document.querySelectorAll('#mediaList .srcRow')) {
@@ -632,10 +663,36 @@ function toggleScenes(sourceId) {
 function sceneGridRow(src, scenes) {
   const wrap = document.createElement('div');
   wrap.className = 'sceneGrid';
+  wrap.setAttribute('role', 'group');
+  wrap.setAttribute('aria-label', `${basename(src.path)} のシーン一覧`);
+  let focusId = S.sceneFocus.get(src.id);
+  if (!focusId || !scenes.some((sc) => sc.id === focusId)) focusId = scenes[0]?.id;
   for (const sc of scenes) {
     const dur = Math.max(0, sc.t1 - sc.t0);
+    const review = reviewFor(src.id, sc.id);
     const item = document.createElement('div');
-    item.className = 'sceneItem';
+    item.className = 'sceneItem' + (review ? ` review-${review}` : '');
+    item.dataset.source = src.id;
+    item.dataset.scene = sc.id;
+    item.tabIndex = sc.id === focusId ? 0 : -1;
+
+    const reviewRow = document.createElement('div');
+    reviewRow.className = 'sceneReview';
+    const keepBtn = document.createElement('button');
+    keepBtn.className = 'btn-sceneKeep';
+    keepBtn.textContent = '✓';
+    keepBtn.setAttribute('aria-pressed', String(review === 'keep'));
+    keepBtn.setAttribute('aria-label', `${sc.id} を keep にする`);
+    keepBtn.onclick = (e) => { e.stopPropagation(); setSceneReviewUi(src.id, sc.id, review === 'keep' ? 'clear' : 'keep'); };
+    const rejectBtn = document.createElement('button');
+    rejectBtn.className = 'btn-sceneReject';
+    rejectBtn.textContent = '✕';
+    rejectBtn.setAttribute('aria-pressed', String(review === 'reject'));
+    rejectBtn.setAttribute('aria-label', `${sc.id} を reject にする`);
+    rejectBtn.onclick = (e) => { e.stopPropagation(); setSceneReviewUi(src.id, sc.id, review === 'reject' ? 'clear' : 'reject'); };
+    reviewRow.append(keepBtn, rejectBtn);
+    item.appendChild(reviewRow);
+
     const seekBtn = document.createElement('button');
     seekBtn.className = 'btn-sceneSeek';
     seekBtn.textContent = `${sc.id} (${dur.toFixed(1)}s)`;
@@ -700,6 +757,13 @@ function mediaRow(src) {
     !src.proxy ? '<span class="badge warn">プロキシ未生成</span>' : '',
     needsColorTransform(src.color) ? '<span class="badge warn">要色変換</span>' : '',
   ].join('');
+  if (S.scenes.has(src.id)) {
+    const c = cullingCounts(src.id);
+    const cullBadge = document.createElement('span');
+    cullBadge.className = 'badge cullBadge';
+    cullBadge.textContent = `未確認 ${c.unreviewed} / keep ${c.keep} / reject ${c.reject}`;
+    badges.appendChild(cullBadge);
+  }
   const usage = document.createElement('div');
   usage.className = 'srcUsage';
   usage.innerHTML = `<span class="srcUsageBar"><span class="srcUsageFill" style="width:${pct}%"></span></span><span class="srcUsageLabel">使用 ${used.toFixed(1)}s / ${src.duration.toFixed(1)}s</span>`;
@@ -750,7 +814,41 @@ function renderMediaPanel() {
     }
   }
 }
+// Scene-grid nav (←→, K/X/U) is scoped to a focused .sceneItem so it never
+// collides with the global JKL/arrow-seek shortcuts on document — those are
+// blocked while focus sits inside a <button> (see globalShortcutsBlocked),
+// and stopPropagation() here additionally keeps the keydown from ever
+// bubbling up to that document-level handler at all.
+function handleSceneItemKeydown(e, item) {
+  const sourceId = item.dataset.source;
+  const sceneId = item.dataset.scene;
+  const scenes = S.scenes.get(sourceId) ?? [];
+  const idx = scenes.findIndex((s) => s.id === sceneId);
+  if (idx < 0) return;
+  if (e.key === 'ArrowRight') {
+    e.preventDefault(); e.stopPropagation();
+    S.sceneFocus.set(sourceId, scenes[Math.min(idx + 1, scenes.length - 1)].id);
+    renderMediaPanel();
+    document.querySelector(`.sceneItem[data-source="${CSS.escape(sourceId)}"][data-scene="${CSS.escape(S.sceneFocus.get(sourceId))}"]`)?.focus();
+  } else if (e.key === 'ArrowLeft') {
+    e.preventDefault(); e.stopPropagation();
+    S.sceneFocus.set(sourceId, scenes[Math.max(idx - 1, 0)].id);
+    renderMediaPanel();
+    document.querySelector(`.sceneItem[data-source="${CSS.escape(sourceId)}"][data-scene="${CSS.escape(S.sceneFocus.get(sourceId))}"]`)?.focus();
+  } else if (e.key.toLowerCase() === 'k') {
+    e.preventDefault(); e.stopPropagation();
+    setSceneReviewUi(sourceId, sceneId, reviewFor(sourceId, sceneId) === 'keep' ? 'clear' : 'keep');
+  } else if (e.key.toLowerCase() === 'x') {
+    e.preventDefault(); e.stopPropagation();
+    setSceneReviewUi(sourceId, sceneId, reviewFor(sourceId, sceneId) === 'reject' ? 'clear' : 'reject');
+  } else if (e.key.toLowerCase() === 'u') {
+    e.preventDefault(); e.stopPropagation();
+    setSceneReviewUi(sourceId, sceneId, 'clear');
+  }
+}
 $('mediaList').addEventListener('keydown', (e) => {
+  const sceneItem = e.target.closest('.sceneItem');
+  if (sceneItem) { handleSceneItemKeydown(e, sceneItem); return; }
   const row = e.target.closest('.srcRow');
   if (!row) return;
   const sources = S.manifest.sources;
@@ -762,6 +860,29 @@ $('mediaList').addEventListener('keydown', (e) => {
   else if (e.key === 'End') { e.preventDefault(); setMediaFocus(sources[sources.length - 1].id); }
   else if (e.key === 'Enter') { e.preventDefault(); enterSourcePreview(row.dataset.source); }
 });
+$('buildSelectsBtn').onclick = async () => {
+  const sourcesWithScenes = S.manifest.sources.filter((s) => S.scenes.has(s.id));
+  let keepCount = 0;
+  for (const s of sourcesWithScenes) {
+    for (const sc of S.scenes.get(s.id)) {
+      if (reviewFor(s.id, sc.id) === 'keep') keepCount++;
+    }
+  }
+  if (keepCount === 0) {
+    toast('keep に設定したシーンがありません(シーンをチェックしてから実行してください)', { type: 'error' });
+    return;
+  }
+  const currentClips = S.manifest.timeline.video.length;
+  const ok = confirm(
+    `現在のタイムライン(クリップ ${currentClips} 本)を、keep にした ${keepCount} シーンだけの仮タイムラインに置き換えます。\n元のタイムラインは undo で戻せます。よろしいですか？`,
+  );
+  if (!ok) return;
+  const { ok: applied } = await mutate(
+    { op: 'selects' },
+    { conflictMessage: '仮タイムラインの作成は適用されませんでした。最新状態を確認してもう一度実行してください' },
+  );
+  if (applied) toast(`keep ${keepCount} シーンで仮タイムラインを作成しました`);
+};
 
 // ---------- clip inspector (±frame trim) ----------
 function selectClip(clipId) {

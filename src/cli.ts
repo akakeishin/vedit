@@ -5,7 +5,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { startDaemon } from './server/daemon.js';
 import { Project } from './core/project.js';
-import { segments, timelineDuration } from './core/ops.js';
+import { buildSelectsTimeline, segments, timelineDuration } from './core/ops.js';
 import { listProjects } from './core/registry.js';
 import { loadPreset, listPresets, savePreset } from './core/presets.js';
 import { renderView, renderSceneSheet } from './export/view.js';
@@ -28,7 +28,7 @@ const BASE = `http://localhost:${PORT}`;
 const BOOLEAN_FLAGS = new Set([
   'no-transcribe', 'no-add', 'no-fillers', 'no-silence',
   'latest', 'full', 'all', 'burn-captions', 'no-duck',
-  'no-repair', 'fast-loudnorm', 'deess',
+  'no-repair', 'fast-loudnorm', 'deess', 'confirm',
 ]);
 const argv = process.argv.slice(2);
 const cmd = argv[0];
@@ -184,10 +184,13 @@ cut:       remove-words <w1 w5..w9 ...> [--source id] [--pad 0.08] | remove-rang
 clips:     clip-add <sourceId> [--in s] [--out s] [--at index] | clip-remove <clipId>
            clip-move <clipId> --before <clipId|end>
 scenes:    scenes detect [--source id] [--sensitivity 0.3] [--max-len 12] [--min-len 1.5]
-           scenes [--source id]                    # packed scene list (id/range/hasSpeech/energy/note)
+           scenes [--source id]                    # packed scene list (id/range/hasSpeech/energy/[keep|reject]/note)
            scenes sheet [--source id] [--cols n]    # contact sheet PNG (prints path; Read it)
            scenes note <sceneId> "<text>" --by model|user [--source id]
            --scene <sceneId> sugar on clip-add / remove-range / view (resolves to sourceId+t0+t1)
+culling:   review <sceneId...> keep|reject|clear [--source id] --base <rev>   # 3状態カリング(未確認/keep/reject)
+           review-status                            # keep/reject/未確認の集計 + 次に確認すべきシーン id
+           selects --base <rev> [--confirm]         # keep シーンだけの仮タイムラインでタイムラインを置換(--confirm 無しはプレビューのみ)
 reframe:   reframe <9:16|1:1|16:9|WxH> [--focus left|center|right|0..1]
            clip-crop <clipId> [--x 0..1] [--y 0..1]
 captions:  captions [--enabled true|false] [--style clean|bold] [--max-chars 24]
@@ -472,6 +475,68 @@ async function main() {
       const res = await fetch(`${BASE}/api/scenes?${q}`);
       if (!res.ok) fail(await res.text());
       return console.log(await res.text());
+    }
+
+    case 'review': {
+      if (pos.length < 2) fail('usage: vedit review <sceneId...> keep|reject|clear [--source id] --base <rev>');
+      const verdict = pos[pos.length - 1];
+      if (verdict !== 'keep' && verdict !== 'reject' && verdict !== 'clear') {
+        fail('usage: vedit review <sceneId...> keep|reject|clear [--source id] --base <rev>');
+      }
+      const sceneIds = pos.slice(0, -1);
+      const dir = projectDir();
+      let sourceId = flags.source as string | undefined;
+      if (!sourceId) {
+        const p = await Project.open(dir);
+        const m = await p.manifest();
+        for (const s of m.sources) {
+          const f = await p.scenes(s.id);
+          if (sceneIds.every((id) => f.scenes.some((sc) => sc.id === id))) {
+            sourceId = s.id;
+            break;
+          }
+        }
+        if (!sourceId) fail(`scene(s) ${sceneIds.join(',')} not found together in any single source; specify --source`);
+      }
+      return edit({ op: 'scene-review', sourceId, sceneIds, review: verdict });
+    }
+
+    case 'review-status': {
+      const dir = projectDir();
+      await ensureDaemon(dir);
+      return out(await api('/api/review-status'));
+    }
+
+    case 'selects': {
+      const dir = projectDir();
+      const p = await Project.open(dir);
+      const m = await p.manifest();
+      const sceneFiles = [];
+      for (const s of m.sources) {
+        const f = await p.scenes(s.id);
+        if (f.scenes.length) sceneFiles.push(f);
+      }
+      const newVideo = buildSelectsTimeline(m, sceneFiles);
+      const preview = {
+        currentClips: m.timeline.video.length,
+        currentDuration: Number(timelineDuration(m).toFixed(2)),
+        newClips: newVideo.length,
+        newDuration: Number(newVideo.reduce((sum, c) => sum + (c.srcOut - c.srcIn), 0).toFixed(2)),
+      };
+      if (!flags.confirm) {
+        return out({
+          ...preview,
+          applied: false,
+          hint: 'プレビューのみ(タイムラインは未変更)。適用するには --confirm を付けて再実行してください',
+        });
+      }
+      await ensureDaemon(dir);
+      const state = await api('/api/state');
+      const res = await api('/api/edit', {
+        method: 'POST',
+        body: JSON.stringify({ baseRev: baseRevOf(state), actor: flags.actor ?? 'claude', op: 'selects' }),
+      });
+      return out({ ...res, ...preview, applied: true, hint: MUTATE_HINT });
     }
 
     case 'reframe':

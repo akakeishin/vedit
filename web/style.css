@@ -298,9 +298,17 @@ aside {
   display: flex; flex-direction: column; gap: 4px; padding: 6px; border-radius: 6px;
   background: #14171d; border: 1px solid var(--edge);
 }
+.sceneItem:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.sceneItem.review-keep { border-color: var(--ok); box-shadow: 0 0 0 1px var(--ok); }
+.sceneItem.review-reject { border-color: var(--bad); opacity: 0.55; }
 .btn-sceneSeek, .btn-sceneAdd { font-size: 11px; padding: 2px 6px; }
 .btn-sceneSeek { font-variant-numeric: tabular-nums; }
 .sceneNote { color: var(--dim); font-size: 11px; font-style: italic; overflow-wrap: break-word; }
+.sceneReview { display: flex; gap: 4px; }
+.btn-sceneKeep, .btn-sceneReject { font-size: 11px; padding: 1px 8px; line-height: 1.4; }
+.btn-sceneKeep[aria-pressed="true"] { background: var(--ok); border-color: var(--ok); color: #06210f; }
+.btn-sceneReject[aria-pressed="true"] { background: var(--bad); border-color: var(--bad); color: #2a0505; }
+.cullBadge { background: #33405a; }
 
 #toast {
   position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);

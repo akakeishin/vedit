@@ -1,4 +1,4 @@
-import type { Manifest, MusicItem, Segment, Source, VideoClip, Word } from './types.js';
+import type { Manifest, MusicItem, SceneFile, Segment, Source, VideoClip, Word } from './types.js';
 
 /** Snap a time to the timeline frame grid. */
 export function snap(t: number, fps: number): number {
@@ -523,4 +523,85 @@ export function setClipCrop(m: Manifest, clipId: string, patch: { x?: number; y?
       video: m.timeline.video.map((c) => (c.id === clipId ? { ...c, crop: { ...c.crop, ...clean } } : c)),
     },
   };
+}
+
+// ---- scene culling (3-state review: unreviewed / keep / reject) ----
+
+/**
+ * Set (or clear) a scene's review verdict on the manifest. Purely a
+ * manifest edit — it doesn't check that `sceneId` actually exists in the
+ * source's scene index (this function has no access to it); the daemon
+ * validates that against the real scenes-<sourceId>.json before calling in,
+ * same division of labor as motion-update validating against the timeline
+ * before touching the sidecar. Empty per-source/per-manifest maps are
+ * pruned rather than left as `{}` so an all-cleared project's manifest
+ * looks identical to one that was never culled.
+ */
+export function setSceneReview(m: Manifest, sourceId: string, sceneId: string, review: 'keep' | 'reject' | 'clear'): Manifest {
+  if (!m.sources.some((s) => s.id === sourceId)) throw new Error(`unknown source: ${sourceId}`);
+  if (review !== 'keep' && review !== 'reject' && review !== 'clear') {
+    throw new Error(`invalid review: ${JSON.stringify(review)} (must be "keep", "reject", or "clear")`);
+  }
+  const culling = { ...(m.culling ?? {}) };
+  const forSource = { ...(culling[sourceId] ?? {}) };
+  if (review === 'clear') {
+    delete forSource[sceneId];
+  } else {
+    forSource[sceneId] = review;
+  }
+  if (Object.keys(forSource).length === 0) delete culling[sourceId];
+  else culling[sourceId] = forSource;
+  return { ...m, culling };
+}
+
+/** Per-source and overall keep/reject/unreviewed tallies, for status reporting. */
+export function cullingStats(
+  m: Manifest,
+  sceneFiles: SceneFile[],
+): {
+  perSource: { sourceId: string; total: number; keep: number; reject: number; unreviewed: number }[];
+  totals: { total: number; keep: number; reject: number; unreviewed: number };
+} {
+  const perSource = sceneFiles.map((f) => {
+    const forSource = m.culling?.[f.sourceId] ?? {};
+    let keep = 0;
+    let reject = 0;
+    for (const sc of f.scenes) {
+      const r = forSource[sc.id];
+      if (r === 'keep') keep++;
+      else if (r === 'reject') reject++;
+    }
+    const total = f.scenes.length;
+    return { sourceId: f.sourceId, total, keep, reject, unreviewed: total - keep - reject };
+  });
+  const totals = perSource.reduce(
+    (acc, s) => ({
+      total: acc.total + s.total,
+      keep: acc.keep + s.keep,
+      reject: acc.reject + s.reject,
+      unreviewed: acc.unreviewed + s.unreviewed,
+    }),
+    { total: 0, keep: 0, reject: 0, unreviewed: 0 },
+  );
+  return { perSource, totals };
+}
+
+/**
+ * Build a replacement video[] from every scene marked 'keep', in detection
+ * order (source order as given, then scene order within each source — the
+ * scenes files are already t0-sorted by detectScenesForSource). This does
+ * NOT touch `m.timeline.video` — it's the caller's job to decide whether to
+ * apply the replacement (the daemon's 'selects' op, after the CLI/UI has
+ * shown a confirm-before-replace preview).
+ */
+export function buildSelectsTimeline(m: Manifest, sceneFiles: SceneFile[]): VideoClip[] {
+  const out: VideoClip[] = [];
+  for (const f of sceneFiles) {
+    const forSource = m.culling?.[f.sourceId] ?? {};
+    for (const sc of f.scenes) {
+      if (forSource[sc.id] !== 'keep') continue;
+      out.push({ id: freshId('c'), sourceId: f.sourceId, srcIn: sc.t0, srcOut: sc.t1 });
+    }
+  }
+  return out;
 }

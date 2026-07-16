@@ -34,6 +34,17 @@ export interface Manifest {
     preset: 'outdoor' | 'indoor' | 'wireless' | 'off';
     deess?: boolean;
   };
+  /**
+   * Scene-level keep/reject review verdicts, keyed by sourceId then sceneId.
+   * Lives on the manifest (not the scenes-<sourceId>.json index) so it rides
+   * along with revision history / undo / the 409 stale-baseRev guard like
+   * every other edit. A scene with no entry here is unreviewed; an entry is
+   * only ever 'keep' or 'reject' — "clear" is an action (setSceneReview),
+   * never a stored value. Optional for backward compatibility with existing
+   * project.json files. Sources with no detected scenes are out of scope
+   * for culling (see scenes.ts) so never appear as a key here.
+   */
+  culling?: Record<string, Record<string, 'keep' | 'reject'>>;
 }
 
 export interface Source {

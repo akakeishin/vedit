@@ -6,10 +6,12 @@ import {
   addClip,
   addMusic,
   applyReframe,
+  buildSelectsTimeline,
   COLOR_WARNING_MESSAGE,
   cropGeometry,
   cropOffset,
   cropWindow,
+  cullingStats,
   expandWordIds,
   keptWords,
   moveClip,
@@ -24,6 +26,7 @@ import {
   setAudioMix,
   setAudioRepair,
   setClipCrop,
+  setSceneReview,
   sourceTimeToTimeline,
   timelineDuration,
   trimClip,
@@ -32,7 +35,7 @@ import {
 } from './ops.js';
 import { Project } from './project.js';
 import { detectFillers, detectSilences, detectSilencesFromPeaks } from './detect.js';
-import type { Manifest, Transcript, Word } from './types.js';
+import type { Manifest, SceneFile, Transcript, Word } from './types.js';
 
 function manifest(): Manifest {
   return {
@@ -623,5 +626,151 @@ describe('needsColorTransform', () => {
 
   it('exposes a stable warning message constant', () => {
     expect(COLOR_WARNING_MESSAGE).toMatch(/Log\/HLG/);
+  });
+});
+
+// ---- W2: scene culling (3-state review + selects timeline) ----
+
+function twoSourceManifest(): Manifest {
+  const m = manifest();
+  return {
+    ...m,
+    sources: [
+      ...m.sources,
+      { id: 's2', path: '/y.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: true },
+    ],
+  };
+}
+
+function sceneFiles(): SceneFile[] {
+  return [
+    {
+      sourceId: 's1',
+      scenes: [
+        { id: 'sc1', t0: 0, t1: 5, thumb: 'cache/sc-s1-sc1.jpg', hasSpeech: false, energy: 0.1 },
+        { id: 'sc2', t0: 5, t1: 10, thumb: 'cache/sc-s1-sc2.jpg', hasSpeech: false, energy: 0.2 },
+        { id: 'sc3', t0: 10, t1: 15, thumb: 'cache/sc-s1-sc3.jpg', hasSpeech: true, energy: 0.3 },
+      ],
+    },
+    {
+      sourceId: 's2',
+      scenes: [
+        { id: 'sc1', t0: 0, t1: 8, thumb: 'cache/sc-s2-sc1.jpg', hasSpeech: false, energy: 0.4 },
+      ],
+    },
+  ];
+}
+
+describe('setSceneReview', () => {
+  it('records a keep/reject verdict under manifest.culling[sourceId][sceneId]', () => {
+    let m = twoSourceManifest();
+    m = setSceneReview(m, 's1', 'sc1', 'keep');
+    expect(m.culling).toEqual({ s1: { sc1: 'keep' } });
+    m = setSceneReview(m, 's1', 'sc2', 'reject');
+    expect(m.culling).toEqual({ s1: { sc1: 'keep', sc2: 'reject' } });
+  });
+
+  it('overwrites an existing verdict for the same scene', () => {
+    let m = twoSourceManifest();
+    m = setSceneReview(m, 's1', 'sc1', 'keep');
+    m = setSceneReview(m, 's1', 'sc1', 'reject');
+    expect(m.culling).toEqual({ s1: { sc1: 'reject' } });
+  });
+
+  it('"clear" removes the entry, pruning an emptied source/manifest map entirely', () => {
+    let m = twoSourceManifest();
+    m = setSceneReview(m, 's1', 'sc1', 'keep');
+    m = setSceneReview(m, 's1', 'sc1', 'clear');
+    expect(m.culling).toEqual({});
+  });
+
+  it('keeps per-source maps independent', () => {
+    let m = twoSourceManifest();
+    m = setSceneReview(m, 's1', 'sc1', 'keep');
+    m = setSceneReview(m, 's2', 'sc1', 'reject');
+    expect(m.culling).toEqual({ s1: { sc1: 'keep' }, s2: { sc1: 'reject' } });
+  });
+
+  it('rejects an unknown source', () => {
+    expect(() => setSceneReview(manifest(), 'nope', 'sc1', 'keep')).toThrow(/unknown source/);
+  });
+
+  it('rejects an invalid review value', () => {
+    expect(() => setSceneReview(manifest(), 's1', 'sc1', 'maybe' as any)).toThrow(/must be "keep", "reject", or "clear"/);
+  });
+
+  it('does not mutate the input manifest (pure)', () => {
+    const m = twoSourceManifest();
+    const before = JSON.stringify(m);
+    setSceneReview(m, 's1', 'sc1', 'keep');
+    expect(JSON.stringify(m)).toBe(before);
+  });
+});
+
+describe('cullingStats', () => {
+  it('tallies keep/reject/unreviewed per source and overall, for an unculled manifest', () => {
+    const m = twoSourceManifest();
+    const stats = cullingStats(m, sceneFiles());
+    expect(stats.perSource).toEqual([
+      { sourceId: 's1', total: 3, keep: 0, reject: 0, unreviewed: 3 },
+      { sourceId: 's2', total: 1, keep: 0, reject: 0, unreviewed: 1 },
+    ]);
+    expect(stats.totals).toEqual({ total: 4, keep: 0, reject: 0, unreviewed: 4 });
+  });
+
+  it('reflects keep/reject verdicts recorded on the manifest', () => {
+    let m = twoSourceManifest();
+    m = setSceneReview(m, 's1', 'sc1', 'keep');
+    m = setSceneReview(m, 's1', 'sc2', 'reject');
+    m = setSceneReview(m, 's2', 'sc1', 'keep');
+    const stats = cullingStats(m, sceneFiles());
+    expect(stats.perSource).toEqual([
+      { sourceId: 's1', total: 3, keep: 1, reject: 1, unreviewed: 1 },
+      { sourceId: 's2', total: 1, keep: 1, reject: 0, unreviewed: 0 },
+    ]);
+    expect(stats.totals).toEqual({ total: 4, keep: 2, reject: 1, unreviewed: 1 });
+  });
+
+  it('returns all-zero stats for an empty sceneFiles list', () => {
+    expect(cullingStats(twoSourceManifest(), [])).toEqual({ perSource: [], totals: { total: 0, keep: 0, reject: 0, unreviewed: 0 } });
+  });
+});
+
+describe('buildSelectsTimeline', () => {
+  it('returns only "keep" scenes, in scene-file order (source order, then detection order within a source)', () => {
+    let m = twoSourceManifest();
+    m = setSceneReview(m, 's1', 'sc1', 'keep');
+    m = setSceneReview(m, 's1', 'sc3', 'keep');
+    m = setSceneReview(m, 's2', 'sc1', 'keep');
+    const video = buildSelectsTimeline(m, sceneFiles());
+    expect(video.map((c) => [c.sourceId, c.srcIn, c.srcOut])).toEqual([
+      ['s1', 0, 5],
+      ['s1', 10, 15],
+      ['s2', 0, 8],
+    ]);
+    for (const c of video) expect(typeof c.id).toBe('string');
+    // Fresh, distinct clip ids (not scene ids) — freshId() throughout ops.ts.
+    expect(new Set(video.map((c) => c.id)).size).toBe(video.length);
+  });
+
+  it('excludes rejected and unreviewed scenes', () => {
+    let m = twoSourceManifest();
+    m = setSceneReview(m, 's1', 'sc1', 'reject');
+    m = setSceneReview(m, 's1', 'sc2', 'keep');
+    // sc3 left unreviewed, s2/sc1 left unreviewed.
+    const video = buildSelectsTimeline(m, sceneFiles());
+    expect(video.map((c) => [c.sourceId, c.srcIn, c.srcOut])).toEqual([['s1', 5, 10]]);
+  });
+
+  it('returns an empty array when nothing is marked keep', () => {
+    expect(buildSelectsTimeline(twoSourceManifest(), sceneFiles())).toEqual([]);
+  });
+
+  it('does not touch m.timeline.video — it only returns a candidate replacement', () => {
+    let m = twoSourceManifest();
+    m = setSceneReview(m, 's1', 'sc1', 'keep');
+    const before = JSON.stringify(m.timeline.video);
+    buildSelectsTimeline(m, sceneFiles());
+    expect(JSON.stringify(m.timeline.video)).toBe(before);
   });
 });

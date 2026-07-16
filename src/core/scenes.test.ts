@@ -210,6 +210,35 @@ describe('packScenes', () => {
     expect(text).toMatch(/s0002 \[0:04\.2–0:09\.0\] 4\.8s speech energy=0\.55/);
     expect(text).not.toMatch(/s0002.*—/); // no note appended for s0002
   });
+
+  // ---- W2: 3-state culling markers ----
+
+  it('adds a trailing [keep]/[reject] marker when a review map is given, before any note', () => {
+    const file: SceneFile = {
+      sourceId: 's1',
+      scenes: [
+        { id: 's0001', t0: 0, t1: 4.2, thumb: 'cache/sc-s1-s0001.jpg', hasSpeech: false, energy: 0.12 },
+        {
+          id: 's0002', t0: 4.2, t1: 9.0, thumb: 'cache/sc-s1-s0002.jpg', hasSpeech: true, energy: 0.55,
+          note: { text: '見せ場', by: 'user', at: '2026-07-16T00:00:00.000Z' },
+        },
+        { id: 's0003', t0: 9.0, t1: 12.0, thumb: 'cache/sc-s1-s0003.jpg', hasSpeech: false, energy: 0.02 },
+      ],
+    };
+    const text = packScenes(file, { s0001: 'keep', s0002: 'reject' });
+    expect(text).toMatch(/s0001 \[0:00\.0–0:04\.2\] 4\.2s silent energy=0\.12 \[keep\]$/m);
+    expect(text).toMatch(/s0002 \[0:04\.2–0:09\.0\] 4\.8s speech energy=0\.55 \[reject\] — 見せ場 \(by:user\)/);
+    // s0003 has no entry in the review map — unreviewed, no marker at all.
+    expect(text).toMatch(/s0003 \[0:09\.0–0:12\.0\] 3\.0s silent energy=0\.02$/m);
+  });
+
+  it('omits markers entirely when no review map is passed (backward compatible)', () => {
+    const file: SceneFile = {
+      sourceId: 's1',
+      scenes: [{ id: 's0001', t0: 0, t1: 1, thumb: 'cache/sc-s1-s0001.jpg', hasSpeech: false, energy: 0 }],
+    };
+    expect(packScenes(file)).not.toMatch(/\[keep\]|\[reject\]/);
+  });
 });
 
 // ---- sceneThumbPath: containment for the thumbnail write path ----

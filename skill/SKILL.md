@@ -101,6 +101,13 @@ vedit clip-move <clipId> --before <clipId|end> --base <rev>
 多数クリップの取捨選択は: 全部 `--no-add` で ingest → 分析エージェントに
 transcript+view で「使う/使わない」推薦を作らせる → ユーザー承認 → clip-add。
 
+しゃべりのない素材の大量選別は3状態カリング(未確認/keep/reject)を使う:
+`vedit scenes detect` → 分析エージェントが `scenes sheet` を見て keep/reject を推薦
+→ ユーザー確認 → `vedit review <sceneId...> keep|reject --base <rev>`
+→ `vedit selects --confirm --base <rev>` で keep シーンだけの仮タイムラインに置換
+(`--confirm` 無しはプレビューのみ。既存タイムラインは丸ごと置き換わるので
+undo で戻せることを伝える)。進捗確認は `vedit review-status`。
+
 ## 縦ショート(9:16)
 
 ```bash

@@ -645,6 +645,165 @@ describe('daemon: scene index routes', () => {
   });
 });
 
+// ---- W2: 3-state scene culling (scene-review op, review-status, selects) ----
+describe('daemon: scene culling (review / selects)', () => {
+  const PORT = 18196;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let project: Project;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-culling-'));
+    const dir = path.join(root, 'proj');
+    project = await Project.create(dir, 'culling');
+
+    await project.commit(0, 'system', 'setup', {}, 'seed sources', (m) => ({
+      ...m,
+      fps: 30,
+      sources: [
+        { id: 's1', path: '/media/one.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: false },
+        { id: 's2', path: '/media/two.mp4', duration: 10, fps: 30, width: 1920, height: 1080, hasAudio: false },
+      ],
+      timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 30 }], motion: [] },
+    }));
+
+    await project.writeScenes({
+      sourceId: 's1',
+      scenes: [
+        { id: 'sc1', t0: 0, t1: 5, thumb: 'cache/sc-s1-sc1.jpg', hasSpeech: false, energy: 0.1 },
+        { id: 'sc2', t0: 5, t1: 10, thumb: 'cache/sc-s1-sc2.jpg', hasSpeech: false, energy: 0.2 },
+        { id: 'sc3', t0: 10, t1: 30, thumb: 'cache/sc-s1-sc3.jpg', hasSpeech: true, energy: 0.3 },
+      ],
+    });
+    await project.writeScenes({
+      sourceId: 's2',
+      scenes: [{ id: 'sc1', t0: 0, t1: 10, thumb: 'cache/sc-s2-sc1.jpg', hasSpeech: false, energy: 0.4 }],
+    });
+
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('rejects /api/edit scene-review for actor=claude without a numeric baseRev', async () => {
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', op: 'scene-review', sourceId: 's1', sceneIds: ['sc1'], review: 'keep',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/baseRev is required/);
+  });
+
+  it('scene-review rejects an unknown source', async () => {
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'ui', op: 'scene-review', sourceId: 'nope', sceneIds: ['sc1'], review: 'keep',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/unknown source/);
+  });
+
+  it('scene-review rejects an invalid review value', async () => {
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'ui', op: 'scene-review', sourceId: 's1', sceneIds: ['sc1'], review: 'maybe',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/must be "keep", "reject", or "clear"/);
+  });
+
+  it('scene-review rejects an unknown scene id without recording anything', async () => {
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'ui', op: 'scene-review', sourceId: 's1', sceneIds: ['sc1', 'sc9999'], review: 'keep',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/unknown scene id/);
+    const { body: full } = await getJson(BASE, '/api/scenes?source=s1&full=1');
+    expect(full.scenes.find((s: any) => s.id === 'sc1').review).toBeUndefined();
+  });
+
+  it('scene-review sets keep/reject for multiple sceneIds in one call, merged into GET /api/scenes', async () => {
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'ui', op: 'scene-review', sourceId: 's1', sceneIds: ['sc1', 'sc2'], review: 'keep',
+    });
+    expect(status).toBe(200);
+
+    const { body: full } = await getJson(BASE, '/api/scenes?source=s1&full=1');
+    expect(full.scenes.find((s: any) => s.id === 'sc1').review).toBe('keep');
+    expect(full.scenes.find((s: any) => s.id === 'sc2').review).toBe('keep');
+    expect(full.scenes.find((s: any) => s.id === 'sc3').review).toBeUndefined();
+
+    const { text } = await getText(BASE, '/api/scenes?source=s1');
+    expect(text).toMatch(/sc1 .*\[keep\]/);
+    expect(text).toMatch(/sc2 .*\[keep\]/);
+    expect(text).not.toMatch(/sc3 .*\[(keep|reject)\]/);
+  });
+
+  it('scene-review "clear" removes a previously-recorded verdict', async () => {
+    await postJson(BASE, '/api/edit', { actor: 'ui', op: 'scene-review', sourceId: 's1', sceneIds: ['sc2'], review: 'clear' });
+    const { body: full } = await getJson(BASE, '/api/scenes?source=s1&full=1');
+    expect(full.scenes.find((s: any) => s.id === 'sc2').review).toBeUndefined();
+    // sc1 (still 'keep' from the previous test) is untouched by clearing sc2.
+    expect(full.scenes.find((s: any) => s.id === 'sc1').review).toBe('keep');
+  });
+
+  it('GET /api/review-status tallies keep/reject/unreviewed across sources and names the next unreviewed scene', async () => {
+    await postJson(BASE, '/api/edit', { actor: 'ui', op: 'scene-review', sourceId: 's2', sceneIds: ['sc1'], review: 'reject' });
+    const { status, body } = await getJson(BASE, '/api/review-status');
+    expect(status).toBe(200);
+    // sc1(s1)=keep, sc1(s2)=reject at this point in the suite; sc2(s1)/sc3(s1) unreviewed.
+    expect(body.perSource).toEqual(
+      expect.arrayContaining([
+        { sourceId: 's1', total: 3, keep: 1, reject: 0, unreviewed: 2 },
+        { sourceId: 's2', total: 1, keep: 0, reject: 1, unreviewed: 0 },
+      ]),
+    );
+    expect(body.totals).toEqual({ total: 4, keep: 1, reject: 1, unreviewed: 2 });
+    // First unreviewed scene in source order: s1/sc2 (sc1 is keep, sc2 has no verdict).
+    expect(body.next).toEqual({ sourceId: 's1', sceneId: 'sc2' });
+  });
+
+  it('selects refuses to run (400) when nothing is marked keep', async () => {
+    // Clear s1/sc1's 'keep' from earlier tests so nothing is keep for this check.
+    const state0 = await getJson(BASE, '/api/state');
+    await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state0.body.revision, op: 'scene-review', sourceId: 's1', sceneIds: ['sc1'], review: 'clear',
+    });
+    const { status, body } = await postJson(BASE, '/api/edit', { actor: 'ui', op: 'selects' });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/no scenes are marked "keep"/);
+  });
+
+  it('selects replaces the timeline with keep-scene clips, reporting previous/new clip counts', async () => {
+    // Mark s1/sc1 and s1/sc3 keep, s2/sc1 stays 'reject' from earlier.
+    await postJson(BASE, '/api/edit', { actor: 'ui', op: 'scene-review', sourceId: 's1', sceneIds: ['sc1', 'sc3'], review: 'keep' });
+    const before = await getJson(BASE, '/api/project');
+    expect(before.body.manifest.timeline.video).toHaveLength(1); // the original seeded clip c1
+
+    const state = await getJson(BASE, '/api/state');
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.body.revision, op: 'selects',
+    });
+    expect(status).toBe(200);
+    expect(body.previousClips).toBe(1);
+    expect(body.newClips).toBe(2); // s1/sc1 [0,5) + s1/sc3 [10,30) — s2/sc1 is 'reject', not included
+
+    const after = await getJson(BASE, '/api/project');
+    const video = after.body.manifest.timeline.video;
+    expect(video).toHaveLength(2);
+    expect(video.map((c: any) => [c.sourceId, c.srcIn, c.srcOut])).toEqual([
+      ['s1', 0, 5],
+      ['s1', 10, 30],
+    ]);
+    // Replaced entirely — the original seeded clip c1 is gone.
+    expect(video.some((c: any) => c.id === 'c1')).toBe(false);
+  });
+
+  it('selects rejects /api/edit for actor=claude without a numeric baseRev, same as any other mutating op', async () => {
+    const { status, body } = await postJson(BASE, '/api/edit', { actor: 'claude', op: 'selects' });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/baseRev is required/);
+  });
+});
+
 // ---- Suite 5: path containment (security) — /api/transcript, /media escape ----
 describe('daemon: path containment (security)', () => {
   const PORT = 18186;

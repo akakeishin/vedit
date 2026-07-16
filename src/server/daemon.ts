@@ -8,7 +8,9 @@ import {
   addClip,
   addMusic,
   applyReframe,
+  buildSelectsTimeline,
   COLOR_WARNING_MESSAGE,
+  cullingStats,
   expandWordIds,
   moveClip,
   needsColorTransform,
@@ -22,6 +24,7 @@ import {
   setAudioMix,
   setAudioRepair,
   setClipCrop,
+  setSceneReview,
   sourceRangeToTimeline,
   timelineDuration,
   trimClip,
@@ -125,6 +128,26 @@ function broadcast(ctx: Ctx, msg: unknown) {
 function ambiguousSources(m: Manifest): { id: string; path: string }[] | null {
   const transcribed = m.sources.filter((s) => s.transcribed);
   return transcribed.length >= 2 ? transcribed.map((s) => ({ id: s.id, path: path.basename(s.path) })) : null;
+}
+
+/** Every source's scenes file, skipping sources with no detected scenes (out of culling scope). */
+async function sceneFilesFor(p: Project, m: Manifest): Promise<SceneFile[]> {
+  const out: SceneFile[] = [];
+  for (const s of m.sources) {
+    const f = await p.scenes(s.id);
+    if (f.scenes.length) out.push(f);
+  }
+  return out;
+}
+
+function reviewMapFor(m: Manifest, sourceId: string): Record<string, 'keep' | 'reject'> {
+  return m.culling?.[sourceId] ?? {};
+}
+
+/** Merge review verdicts onto a SceneFile's scenes for API responses, without ever writing them back to scenes-<sourceId>.json (review state lives only on the manifest). */
+function withReview(f: SceneFile, m: Manifest): { sourceId: string; scenes: (SceneFile['scenes'][number] & { review?: 'keep' | 'reject' })[] } {
+  const rv = reviewMapFor(m, f.sourceId);
+  return { ...f, scenes: f.scenes.map((s) => (rv[s.id] ? { ...s, review: rv[s.id] } : s)) };
 }
 
 /** Snapshot the state Claude/UI needs after every mutation. */
@@ -310,9 +333,9 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
 
       if (requestedSource) {
         const f = await p.scenes(requestedSource);
-        if (full) return json(res, 200, f);
+        if (full) return json(res, 200, withReview(f, m));
         res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
-        return res.end(packScenes(f));
+        return res.end(packScenes(f, reviewMapFor(m, requestedSource)));
       }
 
       const withScenes: string[] = [];
@@ -333,16 +356,32 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         const parts: string[] = [];
         for (const id of withScenes) {
           parts.push(`## source ${id} — use --source ${id} for edits`);
-          parts.push(packScenes(await p.scenes(id)));
+          parts.push(packScenes(await p.scenes(id), reviewMapFor(m, id)));
         }
         res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
         return res.end(parts.join('\n\n'));
       }
 
       const only = withScenes[0];
-      if (full) return json(res, 200, await p.scenes(only));
+      if (full) return json(res, 200, withReview(await p.scenes(only), m));
       res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
-      return res.end(packScenes(await p.scenes(only)));
+      return res.end(packScenes(await p.scenes(only), reviewMapFor(m, only)));
+    }
+    if (pathname === '/api/review-status' && method === 'GET') {
+      const m = await p.manifest();
+      const sceneFiles = await sceneFilesFor(p, m);
+      const stats = cullingStats(m, sceneFiles);
+      let next: { sourceId: string; sceneId: string } | null = null;
+      outer: for (const f of sceneFiles) {
+        const rv = reviewMapFor(m, f.sourceId);
+        for (const sc of f.scenes) {
+          if (!rv[sc.id]) {
+            next = { sourceId: f.sourceId, sceneId: sc.id };
+            break outer;
+          }
+        }
+      }
+      return json(res, 200, { ...stats, next });
     }
 
     // ---- ingest ----
@@ -608,6 +647,49 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
           setClipCrop(m, b.clipId, { x: b.x, y: b.y }),
         );
         return json(res, 200, { state: await stateSummary(p) });
+      }
+      if (b.op === 'scene-review') {
+        const sourceId = b.sourceId as string | undefined;
+        if (!sourceId) return json(res, 400, { error: 'scene-review: sourceId is required' });
+        if (!m0.sources.some((s) => s.id === sourceId)) {
+          return json(res, 400, { error: `unknown source: ${sourceId}` });
+        }
+        const review = b.review;
+        if (review !== 'keep' && review !== 'reject' && review !== 'clear') {
+          return json(res, 400, { error: `scene-review: review must be "keep", "reject", or "clear" (got ${JSON.stringify(review)})` });
+        }
+        const sceneIds: string[] = Array.isArray(b.sceneIds) ? b.sceneIds : b.sceneId ? [b.sceneId] : [];
+        if (sceneIds.length === 0) {
+          return json(res, 400, { error: 'scene-review: sceneIds (or sceneId) is required' });
+        }
+        const sceneFile = await p.scenes(sourceId);
+        const known = new Set(sceneFile.scenes.map((s) => s.id));
+        const unknown = sceneIds.filter((id) => !known.has(id));
+        if (unknown.length) return json(res, 400, { error: `unknown scene id(s): ${unknown.join(', ')} (source ${sourceId})` });
+        await mutate(
+          p, actor, baseRev, 'scene-review', b,
+          `scene-review ${sourceId} ${sceneIds.join(',')} -> ${review}`,
+          (m) => {
+            let cur = m;
+            for (const id of sceneIds) cur = setSceneReview(cur, sourceId, id, review);
+            return cur;
+          },
+        );
+        return json(res, 200, { state: await stateSummary(p) });
+      }
+      if (b.op === 'selects') {
+        const sceneFiles = await sceneFilesFor(p, m0);
+        const newVideo = buildSelectsTimeline(m0, sceneFiles);
+        if (newVideo.length === 0) {
+          return json(res, 400, { error: 'selects: no scenes are marked "keep" — nothing to build a timeline from' });
+        }
+        const previousClips = m0.timeline.video.length;
+        await mutate(
+          p, actor, baseRev, 'selects', b,
+          `selects: replaced ${previousClips} clip(s) with ${newVideo.length} keep-scene clip(s)`,
+          (m) => ({ ...m, timeline: { ...m.timeline, video: newVideo } }),
+        );
+        return json(res, 200, { previousClips, newClips: newVideo.length, state: await stateSummary(p) });
       }
       if (b.op === 'restore') {
         // `baseRev` here is the same value every other /api/edit op uses

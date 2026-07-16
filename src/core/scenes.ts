@@ -261,20 +261,29 @@ export async function detectScenesForSource(
 
 // ---- text rendering (pure) ----
 
-/** Packed scene list: the compact text view Claude reads instead of raw JSON. */
-export function packScenes(file: SceneFile): string {
+/**
+ * Packed scene list: the compact text view Claude reads instead of raw
+ * JSON. `review`, when given, maps sceneId -> 'keep'/'reject' (the manifest's
+ * `culling[sourceId]`, read-only here) — scenes with a verdict get a
+ * trailing `[keep]`/`[reject]` marker so an analysis agent can see culling
+ * state that was applied in a previous turn without a second round-trip.
+ * Optional and defaults to no markers, so existing callers are unaffected.
+ */
+export function packScenes(file: SceneFile, review: Record<string, 'keep' | 'reject'> = {}): string {
   if (file.scenes.length === 0) return '(no scenes detected; run `vedit scenes detect`)';
   const lines = file.scenes.map((s) => {
     const dur = (s.t1 - s.t0).toFixed(1);
     const speech = s.hasSpeech ? 'speech' : 'silent';
     const energy = s.energy.toFixed(2);
+    const marker = review[s.id] ? ` [${review[s.id]}]` : '';
     const note = s.note ? ` — ${s.note.text} (by:${s.note.by})` : '';
-    return `${s.id} [${ts(s.t0)}–${ts(s.t1)}] ${dur}s ${speech} energy=${energy}${note}`;
+    return `${s.id} [${ts(s.t0)}–${ts(s.t1)}] ${dur}s ${speech} energy=${energy}${marker}${note}`;
   });
   const header = [
     `# scenes (source ${file.sourceId}, ${file.scenes.length} scenes)`,
-    `# id [start–end] duration hasSpeech energy note`,
+    `# id [start–end] duration hasSpeech energy [keep|reject] note`,
     `# use --scene <id> with clip-add / remove-range / view; annotate with \`vedit scenes note <id> "..." --by model\``,
+    `# select: \`vedit review <id...> keep|reject|clear --base <rev>\`; review-status for tallies; selects --confirm to rebuild the timeline from keep`,
   ];
   return [...header, ...lines].join('\n');
 }
