@@ -28,6 +28,7 @@ import type { Peaks } from '../core/detect.js';
 import { packTranscript } from '../core/pack.js';
 import { detectScenesForSource, packScenes } from '../core/scenes.js';
 import { ingestFile } from '../ingest/ingest.js';
+import { run } from '../ingest/run.js';
 import type { CutCandidate, Manifest, MotionItem, SceneFile, Transcript } from '../core/types.js';
 import { freshId } from '../core/ops.js';
 
@@ -632,11 +633,25 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
   }
 
   async function serveMedia(p: Project, pathname: string, req: http.IncomingMessage, res: http.ServerResponse) {
-    // /media/proxy/<sourceId> | /media/peaks/<sourceId>
+    // /media/proxy/<sourceId> | /media/peaks/<sourceId> | /media/thumb/<sourceId>
     const [, , kind, sourceId] = pathname.split('/');
     const m = await p.manifest();
     const src = m.sources.find((s) => s.id === sourceId);
     if (!src) return json(res, 404, { error: 'unknown source' });
+    if (kind === 'thumb') {
+      // Poster frame for the media pool panel; generated once, then cached.
+      const relThumb = `cache/thumb-${src.id}.jpg`;
+      const fullThumb = path.join(p.dir, relThumb);
+      try {
+        await fs.access(fullThumb);
+      } catch {
+        const media = src.proxy ? path.join(p.dir, src.proxy) : src.path;
+        const at = Math.min(src.duration * 0.25, 30);
+        await run('ffmpeg', ['-y', '-v', 'error', '-ss', String(at), '-i', media, '-frames:v', '1', '-vf', 'scale=320:-2', '-q:v', '4', fullThumb]);
+      }
+      res.writeHead(200, { 'content-type': 'image/jpeg', 'cache-control': 'max-age=3600' });
+      return createReadStream(fullThumb).pipe(res);
+    }
     const rel = kind === 'proxy' ? src.proxy : src.peaks;
     if (!rel) return json(res, 404, { error: `no ${kind} for source` });
     // The manifest is on-disk data, not trusted input: a tampered/corrupted
