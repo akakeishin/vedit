@@ -11,6 +11,7 @@ import { loadPreset, listPresets, savePreset } from './core/presets.js';
 import { renderView, renderSceneSheet } from './export/view.js';
 import { hasReframe, writeOtio } from './export/otio.js';
 import { renderFinal, toAss } from './export/render.js';
+import { publishPack } from './export/publish.js';
 import { writeSrt } from './export/srt.js';
 import { downloadWhisperModel, findWhisperModel } from './ingest/ingest.js';
 import { ffmpegBin, ffmpegHasFilter, run } from './ingest/run.js';
@@ -194,8 +195,9 @@ music:     music-add <file> [--at 0] [--duration N] [--src-in 0] [--gain -12] [-
            music-update <id> [同フラグ] | music-remove <id>
            audio-mix [--target-lufs -14] [--duck-amount -10] [--crossfade-ms 12]
 inspect:   view [--from a] [--to b] [--domain timeline|source] [--source id] [--scene id] (prints PNG path)
-export:    export otio <out.otio> | export render <out.mp4> [--burn-captions]
+export:    export otio <out.otio> | export render <out.mp4> [--burn-captions] [--preset youtube|shorts|x]
            export fcp7xml <out.xml> | export srt <out.srt> | export ass <out.ass>
+publish:   publish-pack <outdir> [--thumbs 6]   # chapters.txt + thumbnails/ + materials.json (read-only)
 presets:   preset-save <name> [--data '{"k":"v"}'] | preset-apply <name> | preset-list
 misc:      doctor [--download-model [name]] | serve [--port]
 
@@ -644,9 +646,16 @@ async function main() {
         });
       }
       if (kind === 'render') {
+        const presetRaw = flags.preset as string | undefined;
+        if (presetRaw !== undefined && !['youtube', 'shorts', 'x'].includes(presetRaw)) {
+          fail(`unknown --preset: ${presetRaw} (use youtube, shorts, or x)`);
+        }
         console.error('rendering from original sources (this encodes the full timeline)...');
-        await renderFinal(m, await transcriptsOf(), path.resolve(dest), { burnCaptions: Boolean(flags['burn-captions']) });
-        return out({ ok: true, file: dest });
+        const res = await renderFinal(m, await transcriptsOf(), path.resolve(dest), {
+          burnCaptions: Boolean(flags['burn-captions']),
+          preset: presetRaw as 'youtube' | 'shorts' | 'x' | undefined,
+        });
+        return out({ ok: true, file: dest, ...(res.warnings.length ? { warnings: res.warnings } : {}) });
       }
       if (kind === 'fcp7xml') {
         const otioTmp = path.resolve(dest) + '.otio';
@@ -670,6 +679,24 @@ async function main() {
       }
       fail(`unknown export kind: ${kind}`);
       return;
+    }
+
+    case 'publish-pack': {
+      const outdir = path.resolve(pos[0] ?? fail('usage: vedit publish-pack <outdir> [--thumbs 6]'));
+      const dir = projectDir();
+      const p = await Project.open(dir);
+      const m = await p.manifest();
+      const transcripts: Transcript[] = [];
+      for (const s of m.sources) if (s.transcribed) transcripts.push(await p.transcript(s.id));
+      const thumbs = numFlag('thumbs', flags.thumbs) ?? 6;
+      const res = await publishPack(p, m, transcripts, outdir, { thumbs });
+      return out({
+        ok: true,
+        outdir,
+        files: res.files,
+        ...(res.chaptersReason ? { chaptersSkipped: res.chaptersReason } : {}),
+        hint: 'タイトル/説明文は materials.json と transcript を材料に会話で起草する(モデル創作コピーはユーザー承認後のみ書き込む)',
+      });
     }
 
     case 'doctor': {

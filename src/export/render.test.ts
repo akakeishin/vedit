@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildFilterGraph, toAss } from './render.js';
+import { buildFilterGraph, planExportPreset, resolveRenderParams, toAss } from './render.js';
 import type { Manifest, MusicItem, Transcript } from '../core/types.js';
 
 function manifest(style: string): Manifest {
@@ -192,5 +192,109 @@ describe('buildFilterGraph: with music, duck=true', () => {
     const m = baseManifest({ music: [music({ id: 'mu1', path: '/bgm.mp3', duck: true })], audioMix: { duckAmount: -20 } });
     const built = buildFilterGraph(m);
     expect(built.graph).toContain('sidechaincompress=threshold=0.02:ratio=8:attack=20:release=400:makeup=1');
+  });
+});
+
+// ---- planExportPreset / resolveRenderParams (Wave M: publish presets) ----
+
+function presetManifest(opts: {
+  output?: { width: number; height: number };
+  durationSec?: number;
+  audioMix?: Manifest['audioMix'];
+} = {}): Manifest {
+  const dur = opts.durationSec ?? 15;
+  return {
+    version: 1,
+    name: 't',
+    revision: 0,
+    fps: 30,
+    width: 1920,
+    height: 1080,
+    output: opts.output,
+    sources: [{ id: 's1', path: '/x.mp4', duration: dur, fps: 30, width: 1920, height: 1080, hasAudio: true }],
+    timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: dur }], motion: [] },
+    captions: { enabled: true, style: 'clean', maxChars: 24 },
+    audioMix: opts.audioMix,
+  };
+}
+
+describe('planExportPreset', () => {
+  it('youtube: keeps resolution untouched, crf 18 preset medium, aac 256k, forces loudnorm at audioMix.targetLufs ?? -14', () => {
+    const plan = planExportPreset('youtube', { width: 1920, height: 1080 }, 30, -14);
+    expect(plan).toMatchObject({ crf: 18, encPreset: 'medium', audioBitrate: '256k', forceLoudnormI: -14, postFilter: null, warnings: [] });
+  });
+
+  it('youtube: forced loudnorm target follows the passed-in default (audioMix.targetLufs)', () => {
+    const plan = planExportPreset('youtube', { width: 1920, height: 1080 }, 30, -18);
+    expect(plan.forceLoudnormI).toBe(-18);
+  });
+
+  it('shorts: throws (does not silently reframe) when the output is not portrait', () => {
+    expect(() => planExportPreset('shorts', { width: 1920, height: 1080 }, 30, -14)).toThrow(/portrait/);
+    expect(() => planExportPreset('shorts', { width: 1080, height: 1080 }, 30, -14)).toThrow(/portrait/); // square doesn't qualify either
+  });
+
+  it('shorts: on a portrait output, scales to 1080x1920, crf 20, aac 192k, loudnorm -14', () => {
+    const plan = planExportPreset('shorts', { width: 720, height: 1280 }, 30, -14);
+    expect(plan.crf).toBe(20);
+    expect(plan.audioBitrate).toBe('192k');
+    expect(plan.forceLoudnormI).toBe(-14);
+    expect(plan.postFilter).toContain('scale=1080:1920');
+    expect(plan.warnings).toEqual([]);
+  });
+
+  it('shorts: warns (does not throw) when duration exceeds 60s', () => {
+    const plan = planExportPreset('shorts', { width: 1080, height: 1920 }, 75, -14);
+    expect(plan.warnings).toHaveLength(1);
+    expect(plan.warnings[0]).toMatch(/60s/);
+  });
+
+  it('x: scales the long edge down to 1280 when it exceeds it, crf 23, aac 128k, no forced loudnorm', () => {
+    const plan = planExportPreset('x', { width: 3840, height: 2160 }, 30, -14);
+    expect(plan.crf).toBe(23);
+    expect(plan.audioBitrate).toBe('128k');
+    expect(plan.forceLoudnormI).toBeNull();
+    expect(plan.postFilter).toBe('scale=1280:720');
+  });
+
+  it('x: does not add a scale filter when already within 1280 on the long edge', () => {
+    const plan = planExportPreset('x', { width: 1280, height: 720 }, 30, -14);
+    expect(plan.postFilter).toBeNull();
+  });
+
+  it('x: warns (does not throw) when duration exceeds 140s', () => {
+    const plan = planExportPreset('x', { width: 1280, height: 720 }, 150, -14);
+    expect(plan.warnings).toHaveLength(1);
+    expect(plan.warnings[0]).toMatch(/140s/);
+  });
+});
+
+describe('resolveRenderParams', () => {
+  it('with no preset and no overrides, reproduces the pre-Wave-M hardcoded defaults exactly (regression zero)', () => {
+    const params = resolveRenderParams(presetManifest());
+    expect(params).toMatchObject({ crf: 18, encPreset: 'medium', audioBitrate: '192k', forceLoudnormI: null, postFilter: null, warnings: [] });
+  });
+
+  it('applies a preset', () => {
+    const m = presetManifest({ output: { width: 1080, height: 1920 } });
+    const params = resolveRenderParams(m, { preset: 'shorts' });
+    expect(params.crf).toBe(20);
+    expect(params.audioBitrate).toBe('192k');
+    expect(params.postFilter).toContain('scale=1080:1920');
+  });
+
+  it('an explicit override beats the preset-derived value', () => {
+    const m = presetManifest({ output: { width: 1080, height: 1920 } });
+    const params = resolveRenderParams(m, { preset: 'shorts', crf: 16, audioBitrate: '320k' });
+    expect(params.crf).toBe(16);
+    expect(params.audioBitrate).toBe('320k');
+    // untouched fields still come from the preset
+    expect(params.postFilter).toContain('scale=1080:1920');
+  });
+
+  it('youtube forced loudnorm follows the manifest\'s own audioMix.targetLufs when set', () => {
+    const m = presetManifest({ audioMix: { targetLufs: -16 } });
+    const params = resolveRenderParams(m, { preset: 'youtube' });
+    expect(params.forceLoudnormI).toBe(-16);
   });
 });

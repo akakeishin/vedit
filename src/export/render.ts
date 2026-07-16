@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
-import { cropGeometry, segments } from '../core/ops.js';
+import { cropGeometry, segments, timelineDuration } from '../core/ops.js';
 import { captionCues } from '../core/captions.js';
 import type { Manifest, Transcript } from '../core/types.js';
 import { ffmpegHasFilter, run } from '../ingest/run.js';
@@ -188,9 +188,119 @@ export function buildFilterGraph(m: Manifest): FilterGraphBuild {
   return { inputPaths, graph, videoLabel: '[vc]', audioLabel };
 }
 
+// ---- Wave M: publish presets ----
+//
+// A preset picks encode parameters (crf/preset/audio bitrate), an optional
+// forced loudnorm target, and an optional post-processing video filter
+// (resize) — layered on top of the existing trim+concat(+music) filtergraph
+// from buildFilterGraph above, never replacing it. No preset (the default)
+// must reproduce the exact ffmpeg args this module emitted before presets
+// existed, so `vedit export render` without --preset never regresses.
+
+export type ExportPreset = 'youtube' | 'shorts' | 'x';
+
+/** crf/preset/audio-bitrate defaults matching this module's pre-Wave-M behavior — the "no preset" baseline. */
+const DEFAULT_CRF = 18;
+const DEFAULT_ENC_PRESET = 'medium';
+const DEFAULT_AUDIO_BITRATE = '192k';
+
+export interface ExportPresetPlan {
+  crf: number;
+  encPreset: string;
+  audioBitrate: string;
+  /** loudnorm integrated-loudness target to force onto the audio graph even when buildFilterGraph wouldn't add one itself (musicless projects); null = don't force. */
+  forceLoudnormI: number | null;
+  /** Extra ffmpeg video filter to append after the existing video label (e.g. a resize), or null. */
+  postFilter: string | null;
+  /** Non-fatal advisories (e.g. duration over a platform's soft limit) — never thrown, only surfaced. */
+  warnings: string[];
+}
+
+/**
+ * Preset -> encode params + post-filter, as a pure function of the current
+ * output canvas size and timeline duration (both cheap to compute from the
+ * manifest, so the caller passes them in rather than this needing I/O).
+ * Throws only for a genuinely unsatisfiable request (shorts on a landscape
+ * canvas) — duration overages are warnings, never errors, per spec.
+ */
+export function planExportPreset(
+  preset: ExportPreset,
+  output: { width: number; height: number },
+  durationSeconds: number,
+  targetLufsDefault: number,
+): ExportPresetPlan {
+  const warnings: string[] = [];
+  if (preset === 'youtube') {
+    // Resolution untouched (manifest.output, or the source's, wins as-is).
+    return { crf: 18, encPreset: 'medium', audioBitrate: '256k', forceLoudnormI: targetLufsDefault, postFilter: null, warnings };
+  }
+  if (preset === 'shorts') {
+    if (!(output.height > output.width)) {
+      throw new Error(
+        `--preset shorts requires a portrait output (height > width); current output is ${output.width}x${output.height}. ` +
+          'Run `vedit reframe 9:16` (or another portrait target) first — shorts will not auto-reframe for you.',
+      );
+    }
+    if (durationSeconds > 60) {
+      warnings.push(`duration ${durationSeconds.toFixed(1)}s exceeds the recommended 60s for Shorts`);
+    }
+    return {
+      crf: 20,
+      encPreset: 'medium',
+      audioBitrate: '192k',
+      forceLoudnormI: -14,
+      postFilter: 'scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2',
+      warnings,
+    };
+  }
+  // x
+  if (durationSeconds > 140) {
+    warnings.push(`duration ${durationSeconds.toFixed(1)}s exceeds the recommended 140s for X`);
+  }
+  const longEdge = Math.max(output.width, output.height);
+  let postFilter: string | null = null;
+  if (longEdge > 1280) {
+    const scale = 1280 / longEdge;
+    const w = Math.max(2, Math.round((output.width * scale) / 2) * 2);
+    const h = Math.max(2, Math.round((output.height * scale) / 2) * 2);
+    postFilter = `scale=${w}:${h}`;
+  }
+  return { crf: 23, encPreset: 'medium', audioBitrate: '128k', forceLoudnormI: null, postFilter, warnings };
+}
+
+/** Explicit per-call overrides — these beat whatever the preset would otherwise pick. */
+export interface RenderParamOverrides {
+  preset?: ExportPreset;
+  crf?: number;
+  encPreset?: string;
+  audioBitrate?: string;
+}
+
+/**
+ * Resolve the final encode params for a render: preset-derived values with
+ * explicit overrides taking precedence, falling back to the pre-Wave-M
+ * hardcoded defaults when no preset (and no override) is given at all — the
+ * "regression zero" contract for `vedit export render` without --preset.
+ */
+export function resolveRenderParams(m: Manifest, opts: RenderParamOverrides = {}): ExportPresetPlan {
+  const output = m.output ?? { width: m.width, height: m.height };
+  const plan = opts.preset
+    ? planExportPreset(opts.preset, output, timelineDuration(m), m.audioMix?.targetLufs ?? -14)
+    : null;
+  return {
+    crf: opts.crf ?? plan?.crf ?? DEFAULT_CRF,
+    encPreset: opts.encPreset ?? plan?.encPreset ?? DEFAULT_ENC_PRESET,
+    audioBitrate: opts.audioBitrate ?? plan?.audioBitrate ?? DEFAULT_AUDIO_BITRATE,
+    forceLoudnormI: plan?.forceLoudnormI ?? null,
+    postFilter: plan?.postFilter ?? null,
+    warnings: plan?.warnings ?? [],
+  };
+}
+
 /**
  * Final render from ORIGINAL sources (not proxies): trim+concat filtergraph,
- * optional music mix/duck/loudnorm, optional ASS caption burn. Motion
+ * optional music mix/duck/loudnorm, optional ASS caption burn, optional
+ * publish preset (encode params + forced loudnorm + resize). Motion
  * overlays are not baked yet (preview-only for now; on NLE export they
  * travel as markers + spec sidecars).
  */
@@ -198,12 +308,15 @@ export async function renderFinal(
   m: Manifest,
   transcripts: Transcript[],
   outPath: string,
-  opts: { burnCaptions?: boolean } = {},
-): Promise<string> {
+  opts: { burnCaptions?: boolean } & RenderParamOverrides = {},
+): Promise<{ file: string; warnings: string[] }> {
   const built = buildFilterGraph(m);
   let graph = built.graph;
   const inputs: string[] = [];
   for (const p of built.inputPaths) inputs.push('-i', p);
+
+  const params = resolveRenderParams(m, opts);
+  for (const w of params.warnings) console.error(`警告: ${w}`);
 
   let assPath: string | null = null;
   if (opts.burnCaptions && m.captions.enabled && !ffmpegHasFilter('ass')) {
@@ -219,17 +332,33 @@ export async function renderFinal(
     vLabel = '[vout]';
   }
 
+  // Forced loudnorm only kicks in when the base graph wouldn't already
+  // normalize (i.e. no music — buildFilterGraph's own music path already
+  // applies loudnorm at audioMix.targetLufs, which for the youtube preset is
+  // the exact same value; double-applying it would be wrong).
+  let audioLabel = built.audioLabel;
+  const musicless = (m.timeline.music ?? []).length === 0;
+  if (params.forceLoudnormI !== null && musicless) {
+    graph += `;${audioLabel}loudnorm=I=${params.forceLoudnormI}:TP=-1.5:LRA=11[presetAudio]`;
+    audioLabel = '[presetAudio]';
+  }
+
+  if (params.postFilter) {
+    graph += `;${vLabel}${params.postFilter}[presetVideo]`;
+    vLabel = '[presetVideo]';
+  }
+
   await run('ffmpeg', [
     '-y', ...inputs,
     '-filter_complex', graph,
-    '-map', vLabel, '-map', built.audioLabel,
-    '-c:v', 'libx264', '-preset', 'medium', '-crf', '18',
+    '-map', vLabel, '-map', audioLabel,
+    '-c:v', 'libx264', '-preset', params.encPreset, '-crf', String(params.crf),
     '-pix_fmt', 'yuv420p',
-    '-c:a', 'aac', '-b:a', '192k',
+    '-c:a', 'aac', '-b:a', params.audioBitrate,
     '-dn', // drop any data streams (e.g. DJI tmcd) that survived the filtergraph
     '-movflags', '+faststart',
     outPath,
   ]);
   if (assPath) await fs.rm(assPath, { force: true });
-  return outPath;
+  return { file: outPath, warnings: params.warnings };
 }

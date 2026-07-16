@@ -147,11 +147,21 @@ vedit export otio out.otio        # Resolve 18.5+(無料版OK): File > Import > 
 vedit export srt out.srt / ass out.ass
 vedit export fcp7xml out.xml      # Premiere(uv 必要)
 vedit export render final.mp4 --burn-captions   # 唯一の全編エンコード
+vedit export render final.mp4 --preset youtube  # crf18/aac256k/loudnorm-14, 解像度そのまま
+vedit export render short.mp4 --preset shorts   # 1080x1920固定, 縦でなければエラー(reframe案内)
+vedit export render clip.mp4 --preset x         # 長辺1280に縮小, 尺140s超は警告のみ
 ```
 
 注意: リフレーム(crop)は render には反映されるが OTIO には乗らない
 (メタデータ記録のみ)。プレビューと view は品質保証ではない —
 公開判断は render の実ファイルで。
+
+```bash
+vedit publish-pack outdir --thumbs 6   # chapters.txt + thumbnails/ + materials.json(読み取り専用)
+```
+
+公開素材一式を生成(タイトル・説明文は起草しない — 起草手順は
+editorial-playbook.md の「公開パックの起草手順」参照)。
 
 ## トラブル時
 

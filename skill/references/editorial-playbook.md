@@ -83,3 +83,23 @@
 しゃべりのないB-roll区間を差し込みたい場合は `vedit scenes detect` +
 `vedit scenes sheet` で視覚版の「packed transcript」を作り、注釈付きの
 シーンを `clip-add --scene s0003` で直接指定する(タイムコード手計算不要)。
+
+## 公開パックの起草手順
+
+`vedit publish-pack <outdir>` は chapters.txt / thumbnails/ / materials.json
+を生成するだけで、**タイトル・説明文・タグは書かない**(自動生成しない —
+文言の出典ルールと同じ理由: モデル創作コピーは提案として見せ、承認後にだけ
+書き込む)。起草はディレクター(あなた)が会話で行う:
+
+1. `vedit publish-pack outdir` を実行し、materials.json と thumbnails/ を確認
+   (thumbnails は Read してどれがサムネ候補として強いか目視判断する)
+2. materials.json(duration / chapterList / sources / keptWordCount /
+   captionsCueCount)と `vedit transcript` の引用を材料に、**タイトル案3つ・
+   説明文1案・タグ案**をユーザーに提示する。説明文は transcript からの
+   引用・要約かユーザー提供情報のみで組み立て、断定的な誇張(捏造を含む
+   再生数・効果の主張等)を避ける
+3. ユーザーが選択・修正して承認したら、その**承認済み文面をそのまま**
+   `outdir/description.md` に書き込む(Write はディレクターが行う。
+   モデルの下書きをユーザー承認なしに書き込まない)
+4. chapters.txt はそのまま YouTube の概要欄チャプター欄に貼れる形式。
+   thumbnails/ から実際に使うサムネをユーザーに選んでもらう
