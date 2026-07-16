@@ -8,6 +8,9 @@ QC・アーカイブ)を先に埋める。✅=実装済み。
 **完了**: ✅ I: BGM+ダッキング+loudnorm / ✅ J+M: 公開パック(チャプター+
 サムネ+materials、説明文はディレクター起草)+書き出しプリセット
 
+✅ Phase 1 完了(W1 リペア/resume/色メタ、W2 カリング、W3 B-roll V2 —
+実素材で B-roll 合成・2-pass loudnorm・preset render を確認済み)
+
 **Phase 1 — 毎週の中核ワークフロー(この順で実装)**
 1. **W1: 会話音声リペア + resume + 色メタデータ捕捉** — outdoor/indoor/wireless
    の保守的プリセット(highpass/afftdn/deesser/acompressor)、音楽なしでも
@@ -30,17 +33,16 @@ QC・アーカイブ)を先に埋める。✅=実装済み。
    3パラメータのみ提供、代表フレームのヒストグラム差からショットマッチ候補
    を提案(承認制)。LUT はユーザー提供 or 標準変換式のみ
 6. W6: 横→縦の派生プロジェクト(variant fork、revision 固定、hardlink)
-6. W6: モーションの最終レンダー焼き込み(4プリセット→ASS/ffmpeg 変換のみ、
+7. W7: モーションの最終レンダー焼き込み(4プリセット→ASS/ffmpeg 変換のみ、
    custom-html は対象外と明示)
-7. W7: N スタイルキット(音声・モーションスキーマ確定後)
-8. W8: 公開前QC(blackdetect/silencedetect/ebur128 → HTML レポート)
-9. W9: アーカイブ/再リンク(コピー+SHA-256+相対パス化、dry-run、元素材不削除)
+8. W8: N スタイルキット(音声・モーションスキーマ確定後)
+9. W9: 公開前QC(blackdetect/silencedetect/ebur128 → HTML レポート)
+10. W10: アーカイブ/再リンク(コピー+SHA-256+相対パス化、dry-run、元素材不削除)
 
 **Phase 3 — 差別化・分析**
-10. W10: K マルチテイク選択(カリング実装後。n-gram+編集距離)
-11. W11: Analytics CSV→タイムライン振り返り(比較データ3本たまってから)
-12. W12: L 倍速ジャンプカット(1倍速前提を崩す高コスト変更。フリーズは保留)
-13. W13: DJI 色管理 — **実素材が BT.709 通常プロファイルと確認済みのため低優先**
+11. W11: K マルチテイク選択(カリング実装後。n-gram+編集距離)
+12. W12: Analytics CSV→タイムライン振り返り(比較データ3本たまってから)
+13. W13: L 倍速ジャンプカット(1倍速前提を崩す高コスト変更。フリーズは保留)
 
 **作らないもの(戦略判断)**: 汎用マルチトラック、YouTube 直接アップロード、
 クラウド素材検索、フルカラーグレーディング UI、タグ自動生成(YouTube 公式が
@@ -84,8 +86,7 @@ QC・アーカイブ)を先に埋める。✅=実装済み。
 
 ## エクスポート(Codex 採点 3/5 → D で Gap/丸め/URL は対応済み)
 
-- [ ] golden export テスト: 23.976/29.97/30、混在 fps、44.1/48kHz、
-      音声なし素材の .otio を固定化し、otio ライブラリ再読込を CI に
+- [x] golden export テスト(実装済み: golden.test.ts + npm run smoke:export)
 - [ ] Resolve / Premiere への実 import をリリース前 smoke test として手順化
 
 ## UX(Codex レビューから見送り分)
