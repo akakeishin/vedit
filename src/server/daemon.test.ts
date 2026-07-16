@@ -1214,3 +1214,61 @@ describe('daemon: music ops', () => {
     expect(project.manifest.timeline.music).toHaveLength(0);
   });
 });
+
+// ---- Suite 13: audio-repair op (W1) + color warning in stateSummary ----
+describe('daemon: audio-repair op and color warning', () => {
+  const PORT = 18195;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-repair-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'repair');
+    await project.commit(0, 'system', 'setup', {}, 'seed source', (m) => ({
+      ...m,
+      fps: 30,
+      sources: [
+        {
+          id: 's1', path: '/media/hlg.mp4', duration: 20, fps: 30, width: 1920, height: 1080, hasAudio: true,
+          color: { transfer: 'arib-std-b67', primaries: 'bt2020' },
+        },
+        { id: 's2', path: '/media/normal.mp4', duration: 20, fps: 30, width: 1920, height: 1080, hasAudio: true, color: { transfer: 'bt709' } },
+      ],
+      timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 20 }], motion: [] },
+    }));
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('rejects an unknown preset without touching the manifest', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'audio-repair', preset: 'studio',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/outdoor\/indoor\/wireless\/off/);
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.audioRepair).toBeUndefined();
+  });
+
+  it('accepts a valid preset (+deess) and patches manifest.audioRepair', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'audio-repair', preset: 'outdoor', deess: true,
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.audioRepair).toEqual({ preset: 'outdoor', deess: true });
+  });
+
+  it('/api/state surfaces colorWarning only for the HLG-tagged source', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const s1 = state.sources.find((s: any) => s.id === 's1');
+    const s2 = state.sources.find((s: any) => s.id === 's2');
+    expect(s1.colorWarning).toMatch(/Log\/HLG/);
+    expect(s2.colorWarning).toBeUndefined();
+  });
+});

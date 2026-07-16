@@ -6,12 +6,14 @@ import {
   addClip,
   addMusic,
   applyReframe,
+  COLOR_WARNING_MESSAGE,
   cropGeometry,
   cropOffset,
   cropWindow,
   expandWordIds,
   keptWords,
   moveClip,
+  needsColorTransform,
   padWordRange,
   parseFocus,
   parseReframeSpec,
@@ -20,6 +22,7 @@ import {
   removeSourceRange,
   segments,
   setAudioMix,
+  setAudioRepair,
   setClipCrop,
   sourceTimeToTimeline,
   timelineDuration,
@@ -563,5 +566,62 @@ describe('background music (wave I)', () => {
     expect(() => setAudioMix(manifest(), { duckAmount: 5 })).toThrow(/duckAmount/);
     expect(() => setAudioMix(manifest(), { crossfadeMs: -1 })).toThrow(/crossfadeMs/);
     expect(() => setAudioMix(manifest(), { crossfadeMs: 2000 })).toThrow(/crossfadeMs/);
+  });
+});
+
+// ---- W1: audio-repair setting ----
+
+describe('setAudioRepair', () => {
+  it('accepts each valid preset and stores it verbatim', () => {
+    for (const preset of ['outdoor', 'indoor', 'wireless', 'off']) {
+      const m = setAudioRepair(manifest(), { preset });
+      expect(m.audioRepair).toEqual({ preset });
+    }
+  });
+
+  it('carries deess through only when explicitly given', () => {
+    let m = setAudioRepair(manifest(), { preset: 'outdoor', deess: true });
+    expect(m.audioRepair).toEqual({ preset: 'outdoor', deess: true });
+    m = setAudioRepair(manifest(), { preset: 'outdoor' });
+    expect(m.audioRepair).toEqual({ preset: 'outdoor' });
+  });
+
+  it('rejects an unknown preset', () => {
+    expect(() => setAudioRepair(manifest(), { preset: 'studio' })).toThrow(/outdoor\/indoor\/wireless\/off/);
+  });
+});
+
+// ---- W1: color metadata / Log-HLG detection ----
+
+describe('needsColorTransform', () => {
+  it('returns false when color metadata is absent entirely', () => {
+    expect(needsColorTransform(undefined)).toBe(false);
+  });
+
+  it('returns false for known-SDR transfer curves (bt709/srgb)', () => {
+    expect(needsColorTransform({ transfer: 'bt709' })).toBe(false);
+    expect(needsColorTransform({ transfer: 'srgb' })).toBe(false);
+    expect(needsColorTransform({ transfer: 'bt709', primaries: 'bt709' })).toBe(false);
+  });
+
+  it('flags an explicit HLG/PQ/log transfer curve regardless of primaries', () => {
+    expect(needsColorTransform({ transfer: 'arib-std-b67' })).toBe(true); // HLG
+    expect(needsColorTransform({ transfer: 'smpte2084' })).toBe(true); // PQ
+    expect(needsColorTransform({ transfer: 'log100' })).toBe(true);
+  });
+
+  it('flags an untagged/"unknown" transfer paired with bt2020 primaries (e.g. DJI D-Log)', () => {
+    expect(needsColorTransform({ transfer: 'unknown', primaries: 'bt2020' })).toBe(true);
+    expect(needsColorTransform({ primaries: 'bt2020' })).toBe(true); // transfer absent entirely
+  });
+
+  it('does not flag an untagged transfer without bt2020 primaries', () => {
+    expect(needsColorTransform({ transfer: 'unknown', primaries: 'bt709' })).toBe(false);
+    expect(needsColorTransform({})).toBe(false);
+    expect(needsColorTransform({ bitDepth: 10 })).toBe(false);
+  });
+
+  it('exposes a stable warning message constant', () => {
+    expect(COLOR_WARNING_MESSAGE).toMatch(/Log\/HLG/);
   });
 });

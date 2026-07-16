@@ -15,6 +15,7 @@ import { publishPack } from './export/publish.js';
 import { writeSrt } from './export/srt.js';
 import { downloadWhisperModel, findWhisperModel } from './ingest/ingest.js';
 import { ffmpegBin, ffmpegHasFilter, run } from './ingest/run.js';
+import { buildResume } from './core/resume.js';
 import type { Transcript } from './core/types.js';
 
 const PORT = Number(process.env.VEDIT_PORT ?? 7799);
@@ -27,6 +28,7 @@ const BASE = `http://localhost:${PORT}`;
 const BOOLEAN_FLAGS = new Set([
   'no-transcribe', 'no-add', 'no-fillers', 'no-silence',
   'latest', 'full', 'all', 'burn-captions', 'no-duck',
+  'no-repair', 'fast-loudnorm', 'deess',
 ]);
 const argv = process.argv.slice(2);
 const cmd = argv[0];
@@ -173,7 +175,7 @@ const HELP = `vedit — conversational local NLE
 
 usage: vedit <command> [args] [--project <dir>]
 
-project:   create <dir> [--name n] | status | revisions | undo [--rev N] | open | projects
+project:   create <dir> [--name n] | status | resume | revisions | undo [--rev N] | open | projects
 ingest:    ingest <file...> [--language ja] [--no-transcribe] [--no-add]
 read:      transcript [--full] [--source id] | candidates [--all] | sources
 detect:    detect [--min-gap 0.7] [--threshold 0.06] [--no-fillers] [--no-silence]
@@ -194,8 +196,10 @@ motion:    motion-add --type chapter-card --text "..." --at 12 --duration 4 [--s
 music:     music-add <file> [--at 0] [--duration N] [--src-in 0] [--gain -12] [--fade-in 1] [--fade-out 2] [--no-duck]
            music-update <id> [同フラグ] | music-remove <id>
            audio-mix [--target-lufs -14] [--duck-amount -10] [--crossfade-ms 12]
+           audio-repair --preset outdoor|indoor|wireless|off [--deess]   # 会話音声リペア(既定 off)
 inspect:   view [--from a] [--to b] [--domain timeline|source] [--source id] [--scene id] (prints PNG path)
 export:    export otio <out.otio> | export render <out.mp4> [--burn-captions] [--preset youtube|shorts|x]
+           export render ... [--no-repair] [--fast-loudnorm]   # 乾音A/B比較 / 1-passループドネスに落とす
            export fcp7xml <out.xml> | export srt <out.srt> | export ass <out.ass>
 publish:   publish-pack <outdir> [--thumbs 6]   # chapters.txt + thumbnails/ + materials.json (read-only)
 presets:   preset-save <name> [--data '{"k":"v"}'] | preset-apply <name> | preset-list
@@ -239,6 +243,18 @@ async function main() {
       await ensureDaemon(dir);
       const state = await api('/api/state');
       return out({ ...state, previewUrl: BASE, hint: 'pass --base ' + state.revision + ' to mutating commands' });
+    }
+
+    case 'resume': {
+      // Read-only session-resume snapshot — deliberately reads project.json
+      // + revisions.jsonl + candidates.json directly (like `sources`), no
+      // daemon required, no --base needed.
+      const dir = projectDir();
+      const p = await Project.open(dir);
+      const m = await p.manifest();
+      const revs = await p.revisions();
+      const cands = await p.candidates();
+      return out(buildResume(m, dir, revs, cands));
     }
 
     case 'projects': {
@@ -552,6 +568,14 @@ async function main() {
         crossfadeMs: numFlag('crossfade-ms', flags['crossfade-ms']),
       });
 
+    case 'audio-repair': {
+      const preset = flags.preset as string | undefined;
+      if (!preset || !['outdoor', 'indoor', 'wireless', 'off'].includes(preset)) {
+        fail('usage: vedit audio-repair --preset outdoor|indoor|wireless|off [--deess] --base <rev>');
+      }
+      return edit({ op: 'audio-repair', preset, deess: flags.deess ? true : undefined });
+    }
+
     case 'preset-save': {
       const name = pos[0] ?? fail('usage: vedit preset-save <name> [--data \'{"k":"v"}\']');
       const dir = projectDir();
@@ -654,6 +678,8 @@ async function main() {
         const res = await renderFinal(m, await transcriptsOf(), path.resolve(dest), {
           burnCaptions: Boolean(flags['burn-captions']),
           preset: presetRaw as 'youtube' | 'shorts' | 'x' | undefined,
+          noRepair: Boolean(flags['no-repair']),
+          fastLoudnorm: Boolean(flags['fast-loudnorm']),
         });
         return out({ ok: true, file: dest, ...(res.warnings.length ? { warnings: res.warnings } : {}) });
       }

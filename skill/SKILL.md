@@ -42,10 +42,11 @@ vedit detect                              # 無音(波形+単語ギャップ)・
 
 プロジェクト指定は `--project <dir>` または env `VEDIT_PROJECT`。
 
-**セッション再開**(週をまたぐ場合): `vedit projects` で一覧 → `vedit open` →
-`vedit status` で現在 revision を取得 → `vedit revisions` の actor 列で
-前回以降のユーザー編集([ui])を確認 → `vedit candidates --all` で
-承認済み/保留の候補を再確認してから編集を再開する。
+**セッション再開**(週をまたぐ場合): `vedit resume --project <dir>` 1コマンドで
+revision・直近セッションの履歴・ユーザー([ui])による編集有無・保留候補の
+件数内訳・色警告・機械的に導ける次の一手までまとめて返る(読み取り専用、
+--base 不要)。resume が使えないとき: `vedit projects` → `vedit open` →
+`vedit status` → `vedit revisions` の actor 列を確認 → `vedit candidates --all`。
 
 Web UI には「素材」タブ(ポスター・使用状況バー・ソースプレビュー・
 シーン展開からの区間追加)がある。`--no-add` で取り込んだ素材の選定は
@@ -134,8 +135,19 @@ vedit audio-mix --target-lufs -14 --duck-amount -10 --crossfade-ms 12 --base <re
 
 - `--no-duck` で自動ダッキング(発話中に自動で下げる)を無効化。既定は有効
 - レンダー時のみ音声を仕上げる(発話音声のクリック防止フェード・ダッキング・
-  ラウドネス正規化)。プレビューは `<audio>` + 簡易フェードの近似
+  2-passラウドネス正規化)。プレビューは `<audio>` + 簡易フェードの近似
 - **BGM ファイルの権利はユーザー責任**(出典ルールと同様、勝手に生成・DLしない)
+
+```bash
+vedit audio-repair --preset outdoor --base <rev>    # 屋外ノイズ想定(highpass+ノイズ抑制+コンプレッサ)
+vedit audio-repair --preset indoor --deess --base <rev>
+vedit audio-repair --preset off --base <rev>        # 補正なし(既定)
+vedit export render final.mp4 --no-repair           # 乾音A/B比較(この書き出しだけ補正を無効化)
+vedit export render final.mp4 --fast-loudnorm       # 2-passラウドネス正規化を1-passに落とす(高速だが精度は劣る)
+```
+
+会話音声リペアは録音環境が悪い(屋外風切り音・部屋鳴り・ワイヤレスマイクの
+こもり)ときだけ使う。効果は必ず `--no-repair` の乾音と聴き比べてから確定する。
 
 ## 仕上げ
 

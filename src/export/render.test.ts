@@ -1,6 +1,25 @@
-import { describe, expect, it } from 'vitest';
-import { buildFilterGraph, planExportPreset, resolveRenderParams, toAss } from './render.js';
+import { describe, expect, it, vi } from 'vitest';
 import type { Manifest, MusicItem, Transcript } from '../core/types.js';
+
+// renderFinal shells out to ffmpeg via run()/runCapture(); stub both (and
+// ffmpegHasFilter/ffmpegBin) so the 2-pass-loudnorm orchestration tests below
+// only assert on the constructed argv/graph, without needing ffmpeg
+// installed (same approach as ingest.test.ts / daemon.test.ts's mocks).
+// buildFilterGraph/toAss/planExportPreset/resolveRenderParams never touch
+// run.js, so every pre-existing test in this file is unaffected.
+const { runMock, runCaptureMock } = vi.hoisted(() => ({
+  runMock: vi.fn(async () => ''),
+  runCaptureMock: vi.fn(async () => ({ stdout: '', stderr: '' })),
+}));
+vi.mock('../ingest/run.js', () => ({
+  run: (...args: unknown[]) => runMock(...args),
+  runCapture: (...args: unknown[]) => runCaptureMock(...args),
+  runBinary: vi.fn(),
+  ffmpegBin: () => 'ffmpeg',
+  ffmpegHasFilter: () => true,
+}));
+
+import { buildFilterGraph, buildRepairChain, loudnormClause, planExportPreset, renderFinal, resolveRenderParams, toAss } from './render.js';
 
 function manifest(style: string): Manifest {
   return {
@@ -296,5 +315,187 @@ describe('resolveRenderParams', () => {
     const m = presetManifest({ audioMix: { targetLufs: -16 } });
     const params = resolveRenderParams(m, { preset: 'youtube' });
     expect(params.forceLoudnormI).toBe(-16);
+  });
+});
+
+// ---- W1: conversational-audio repair chain ----
+
+describe('buildRepairChain', () => {
+  it('returns an empty chain when audioRepair is absent (regression: no filter at all)', () => {
+    expect(buildRepairChain(undefined)).toBe('');
+  });
+
+  it('returns an empty chain when preset is "off"', () => {
+    expect(buildRepairChain({ preset: 'off' })).toBe('');
+  });
+
+  it('builds highpass -> afftdn -> acompressor for outdoor, in order, no deesser by default', () => {
+    const chain = buildRepairChain({ preset: 'outdoor' });
+    expect(chain).toBe('highpass=f=80,afftdn=nr=12:nf=-40,acompressor=threshold=-18dB:ratio=3:attack=20:release=250');
+  });
+
+  it('indoor uses its own highpass/nr/nf values', () => {
+    const chain = buildRepairChain({ preset: 'indoor' });
+    expect(chain).toBe('highpass=f=60,afftdn=nr=10:nf=-45,acompressor=threshold=-18dB:ratio=3:attack=20:release=250');
+  });
+
+  it('wireless uses its own highpass/nr/nf values', () => {
+    const chain = buildRepairChain({ preset: 'wireless' });
+    expect(chain).toBe('highpass=f=100,afftdn=nr=18:nf=-35,acompressor=threshold=-18dB:ratio=3:attack=20:release=250');
+  });
+
+  it('deess:true inserts deesser between afftdn and acompressor', () => {
+    const chain = buildRepairChain({ preset: 'outdoor', deess: true });
+    expect(chain).toBe('highpass=f=80,afftdn=nr=12:nf=-40,deesser,acompressor=threshold=-18dB:ratio=3:attack=20:release=250');
+  });
+});
+
+describe('buildFilterGraph: audioRepair splices into the per-segment audio chain', () => {
+  it('off/undefined leaves the segment audio chain byte-identical to before this feature existed', () => {
+    const built = buildFilterGraph(baseManifest());
+    expect(built.graph).not.toMatch(/highpass|afftdn|acompressor|deesser/);
+    expect(built.graph).toContain('[0:a]atrim=start=0:end=5,asetpts=PTS-STARTPTS,afade=t=in');
+  });
+
+  it('an active preset is spliced in after asetpts and before the anti-click afade, once per segment', () => {
+    const m = baseManifest();
+    m.audioRepair = { preset: 'outdoor' };
+    const built = buildFilterGraph(m);
+    const chainCount = (built.graph.match(/highpass=f=80/g) ?? []).length;
+    expect(chainCount).toBe(2); // one per segment (baseManifest has 2 segments)
+    expect(built.graph).toContain(
+      '[0:a]atrim=start=0:end=5,asetpts=PTS-STARTPTS,highpass=f=80,afftdn=nr=12:nf=-40,acompressor=threshold=-18dB:ratio=3:attack=20:release=250,afade=t=in',
+    );
+  });
+});
+
+// ---- W1: loudnormClause (2-pass loudnorm) ----
+
+describe('loudnormClause', () => {
+  it('plain form (no opts): matches the pre-2-pass hardcoded loudnorm string exactly', () => {
+    expect(loudnormClause(-14)).toBe('loudnorm=I=-14:TP=-1.5:LRA=11');
+  });
+
+  it('printJson form appends print_format=json and nothing else', () => {
+    expect(loudnormClause(-14, { printJson: true })).toBe('loudnorm=I=-14:TP=-1.5:LRA=11:print_format=json');
+  });
+
+  it('measured form substitutes measured_I/TP/LRA/thresh and offset from pass 1', () => {
+    const measured = { input_i: '-23.5', input_tp: '-4.2', input_lra: '5.0', input_thresh: '-33.5', target_offset: '0.10' };
+    expect(loudnormClause(-14, { measured })).toBe(
+      'loudnorm=I=-14:TP=-1.5:LRA=11:measured_I=-23.5:measured_TP=-4.2:measured_LRA=5.0:measured_thresh=-33.5:offset=0.10',
+    );
+  });
+});
+
+// ---- W1: renderFinal 2-pass loudnorm + repair orchestration (mocked ffmpeg) ----
+
+function loudnormStderr(): string {
+  return (
+    'other ffmpeg log noise\n' +
+    JSON.stringify({
+      input_i: '-23.5', input_tp: '-4.2', input_lra: '5.0', input_thresh: '-33.5',
+      output_i: '-14.0', output_tp: '-1.5', output_lra: '6.0', output_thresh: '-24.5',
+      normalization_type: 'dynamic', target_offset: '0.10',
+    }) +
+    '\nmore noise\n'
+  );
+}
+
+function outPathIn(dir: string): string {
+  return `${dir}/out.mp4`;
+}
+
+describe('renderFinal: regression (no preset, no repair, no music)', () => {
+  it('never runs a measurement pass and never applies loudnorm at all', async () => {
+    runMock.mockClear();
+    runCaptureMock.mockClear();
+    const m = baseManifest();
+    await renderFinal(m, [], outPathIn('/tmp'));
+    expect(runCaptureMock).not.toHaveBeenCalled();
+    expect(runMock).toHaveBeenCalledTimes(1);
+    const args = runMock.mock.calls[0][1] as string[];
+    const graph = args[args.indexOf('-filter_complex') + 1];
+    expect(graph).not.toMatch(/loudnorm/);
+  });
+});
+
+describe('renderFinal: 2-pass loudnorm (musicless, repair-triggered)', () => {
+  it('runs a measurement pass first, then feeds measured_* into the real render', async () => {
+    runMock.mockClear();
+    runCaptureMock.mockClear();
+    runCaptureMock.mockResolvedValueOnce({ stdout: '', stderr: loudnormStderr() });
+    const m = baseManifest();
+    m.audioRepair = { preset: 'outdoor' };
+    await renderFinal(m, [], outPathIn('/tmp'));
+
+    expect(runCaptureMock).toHaveBeenCalledTimes(1);
+    const measureArgs = runCaptureMock.mock.calls[0][1] as string[];
+    expect(measureArgs).toContain('-f');
+    expect(measureArgs[measureArgs.indexOf('-f') + 1]).toBe('null');
+    const measureGraph = measureArgs[measureArgs.indexOf('-filter_complex') + 1];
+    expect(measureGraph).toMatch(/print_format=json/);
+
+    expect(runMock).toHaveBeenCalledTimes(1);
+    const renderArgs = runMock.mock.calls[0][1] as string[];
+    const renderGraph = renderArgs[renderArgs.indexOf('-filter_complex') + 1];
+    expect(renderGraph).toContain('measured_I=-23.5');
+    expect(renderGraph).toContain('measured_TP=-4.2');
+    expect(renderGraph).toContain('measured_LRA=5.0');
+    expect(renderGraph).toContain('measured_thresh=-33.5');
+    expect(renderGraph).toContain('offset=0.10');
+    expect(renderGraph).toContain('highpass=f=80'); // repair chain present too
+  });
+
+  it('--fast-loudnorm (fastLoudnorm) skips the measurement pass and applies plain 1-pass loudnorm', async () => {
+    runMock.mockClear();
+    runCaptureMock.mockClear();
+    const m = baseManifest();
+    m.audioRepair = { preset: 'outdoor' };
+    await renderFinal(m, [], outPathIn('/tmp'), { fastLoudnorm: true });
+
+    expect(runCaptureMock).not.toHaveBeenCalled();
+    expect(runMock).toHaveBeenCalledTimes(1);
+    const args = runMock.mock.calls[0][1] as string[];
+    const graph = args[args.indexOf('-filter_complex') + 1];
+    expect(graph).toContain('loudnorm=I=-14:TP=-1.5:LRA=11[presetAudio]');
+    expect(graph).not.toMatch(/measured_/);
+  });
+
+  it('--no-repair (noRepair) drops the repair chain even when manifest.audioRepair is set, but still applies loudnorm (repair being requested is not required once no-repair overrides it, so plain 1-pass/2-pass follows preset/music state only)', async () => {
+    runMock.mockClear();
+    runCaptureMock.mockClear();
+    const m = baseManifest();
+    m.audioRepair = { preset: 'outdoor' };
+    await renderFinal(m, [], outPathIn('/tmp'), { noRepair: true, fastLoudnorm: true });
+
+    expect(runCaptureMock).not.toHaveBeenCalled(); // fast, so no measurement anyway
+    const args = runMock.mock.calls[0][1] as string[];
+    const graph = args[args.indexOf('-filter_complex') + 1];
+    expect(graph).not.toMatch(/highpass|afftdn|acompressor/);
+    // No preset, no music, and the repair chain is now inactive -> back to
+    // the full regression case, so no loudnorm at all either.
+    expect(graph).not.toMatch(/loudnorm/);
+  });
+});
+
+describe('renderFinal: 2-pass loudnorm (music present)', () => {
+  it('measures against the music-mixed graph, then feeds measured_* into the [final] loudnorm', async () => {
+    runMock.mockClear();
+    runCaptureMock.mockClear();
+    runCaptureMock.mockResolvedValueOnce({ stdout: '', stderr: loudnormStderr() });
+    const m = baseManifest({ music: [music({ id: 'mu1', path: '/bgm.mp3', duck: false })] });
+    await renderFinal(m, [], outPathIn('/tmp'));
+
+    expect(runCaptureMock).toHaveBeenCalledTimes(1);
+    const measureArgs = runCaptureMock.mock.calls[0][1] as string[];
+    const measureGraph = measureArgs[measureArgs.indexOf('-filter_complex') + 1];
+    expect(measureGraph).toMatch(/print_format=json\[final\]/);
+    expect(measureArgs[measureArgs.indexOf('-map') + 1]).toBe('[final]');
+
+    const renderArgs = runMock.mock.calls[0][1] as string[];
+    const renderGraph = renderArgs[renderArgs.indexOf('-filter_complex') + 1];
+    expect(renderGraph).toContain('measured_I=-23.5');
+    expect(renderGraph).toContain('offset=0.10[final]');
   });
 });

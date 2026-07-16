@@ -157,6 +157,68 @@ describe('probe', () => {
     );
     await expect(probe('/in.mp4')).rejects.toThrow(/duration/i);
   });
+
+  // ---- W1: color metadata extraction ----
+
+  it('extracts color_primaries/color_transfer/color_space/bits_per_raw_sample when ffprobe reports them', async () => {
+    runMock.mockReset();
+    runMock.mockResolvedValue(
+      JSON.stringify({
+        format: { duration: '10' },
+        streams: [
+          {
+            codec_type: 'video', avg_frame_rate: '30/1', width: 1920, height: 1080, duration: '10',
+            color_primaries: 'bt2020', color_transfer: 'arib-std-b67', color_space: 'bt2020nc', bits_per_raw_sample: '10',
+          },
+        ],
+      }),
+    );
+    const p = await probe('/in.mp4');
+    expect(p.color).toEqual({ primaries: 'bt2020', transfer: 'arib-std-b67', space: 'bt2020nc', bitDepth: 10 });
+  });
+
+  it('leaves color undefined when ffprobe reports no color fields at all', async () => {
+    runMock.mockReset();
+    runMock.mockResolvedValue(
+      JSON.stringify({
+        format: { duration: '10' },
+        streams: [{ codec_type: 'video', avg_frame_rate: '30/1', width: 1920, height: 1080, duration: '10' }],
+      }),
+    );
+    const p = await probe('/in.mp4');
+    expect(p.color).toBeUndefined();
+  });
+
+  it('still captures a numeric bits_per_raw_sample even when ffprobe reports it as a JSON number, not a string', async () => {
+    runMock.mockReset();
+    runMock.mockResolvedValue(
+      JSON.stringify({
+        format: { duration: '10' },
+        streams: [
+          { codec_type: 'video', avg_frame_rate: '30/1', width: 1920, height: 1080, duration: '10', bits_per_raw_sample: 8 },
+        ],
+      }),
+    );
+    const p = await probe('/in.mp4');
+    expect(p.color).toEqual({ bitDepth: 8 });
+  });
+
+  it('carries the literal "unknown" string through for an explicitly-tagged-unknown transfer (needsColorTransform interprets it, probe does not judge)', async () => {
+    runMock.mockReset();
+    runMock.mockResolvedValue(
+      JSON.stringify({
+        format: { duration: '10' },
+        streams: [
+          {
+            codec_type: 'video', avg_frame_rate: '30/1', width: 1920, height: 1080, duration: '10',
+            color_transfer: 'unknown', color_primaries: 'bt2020',
+          },
+        ],
+      }),
+    );
+    const p = await probe('/in.mp4');
+    expect(p.color).toEqual({ transfer: 'unknown', primaries: 'bt2020' });
+  });
 });
 
 describe('transcribe', () => {

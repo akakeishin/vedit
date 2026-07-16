@@ -1,4 +1,4 @@
-import type { Manifest, MusicItem, Segment, VideoClip, Word } from './types.js';
+import type { Manifest, MusicItem, Segment, Source, VideoClip, Word } from './types.js';
 
 /** Snap a time to the timeline frame grid. */
 export function snap(t: number, fps: number): number {
@@ -463,6 +463,45 @@ export function setAudioMix(m: Manifest, patch: { targetLufs?: number; duckAmoun
     next.crossfadeMs = patch.crossfadeMs;
   }
   return { ...m, audioMix: next };
+}
+
+// ---- conversational-audio repair (manifest.audioRepair) ----
+
+const AUDIO_REPAIR_PRESETS = new Set(['outdoor', 'indoor', 'wireless', 'off']);
+
+/** Patch the conversational-audio repair setting (manifest.audioRepair). */
+export function setAudioRepair(m: Manifest, patch: { preset: string; deess?: boolean }): Manifest {
+  if (!AUDIO_REPAIR_PRESETS.has(patch.preset)) {
+    throw new Error(`audio-repair: preset (${JSON.stringify(patch.preset)}) must be one of outdoor/indoor/wireless/off`);
+  }
+  const next: NonNullable<Manifest['audioRepair']> = { preset: patch.preset as 'outdoor' | 'indoor' | 'wireless' | 'off' };
+  if (patch.deess !== undefined) next.deess = Boolean(patch.deess);
+  return { ...m, audioRepair: next };
+}
+
+// ---- color metadata (Log/HLG detection) ----
+
+/** Surfaced verbatim on sources flagged by `needsColorTransform`. */
+export const COLOR_WARNING_MESSAGE = 'Log/HLG素材 — 入力変換は未実装(W5)。プレビュー・レンダーの色が浅く見えます';
+
+/**
+ * Whether a source's captured color metadata implies Log/HLG/PQ material
+ * that the (RGB/SDR-only) pipeline doesn't transform — the picture will
+ * preview/render looking flat/washed out. A transfer curve outside the
+ * known-SDR set (bt709/srgb) is a direct signal (HLG=arib-std-b67,
+ * PQ=smpte2084, or an explicit log curve). Many cameras' log profiles
+ * (e.g. DJI D-Log) don't tag a transfer curve at all, so an untagged/
+ * "unknown" transfer paired with bt2020 primaries is treated as the same
+ * signal. Missing color metadata entirely is NOT flagged — absence of
+ * information isn't evidence of a problem.
+ */
+export function needsColorTransform(color: Source['color']): boolean {
+  if (!color) return false;
+  const transfer = color.transfer;
+  const KNOWN_SDR_TRANSFERS = new Set(['bt709', 'srgb']);
+  if (transfer && transfer !== 'unknown' && !KNOWN_SDR_TRANSFERS.has(transfer)) return true;
+  if ((!transfer || transfer === 'unknown') && color.primaries === 'bt2020') return true;
+  return false;
 }
 
 /** Adjust one clip's crop position without touching the others. */

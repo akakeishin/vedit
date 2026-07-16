@@ -8,8 +8,10 @@ import {
   addClip,
   addMusic,
   applyReframe,
+  COLOR_WARNING_MESSAGE,
   expandWordIds,
   moveClip,
+  needsColorTransform,
   padWordRange,
   parseFocus,
   parseReframeSpec,
@@ -18,6 +20,7 @@ import {
   removeSourceRange,
   segments,
   setAudioMix,
+  setAudioRepair,
   setClipCrop,
   sourceRangeToTimeline,
   timelineDuration,
@@ -137,7 +140,13 @@ async function stateSummary(p: Project) {
     clips: m.timeline.video.length,
     motion: m.timeline.motion.length,
     music: (m.timeline.music ?? []).length,
-    sources: m.sources.map((s) => ({ id: s.id, path: s.path, duration: s.duration, transcribed: !!s.transcribed })),
+    sources: m.sources.map((s) => ({
+      id: s.id,
+      path: s.path,
+      duration: s.duration,
+      transcribed: !!s.transcribed,
+      ...(needsColorTransform(s.color) ? { colorWarning: COLOR_WARNING_MESSAGE } : {}),
+    })),
     pendingCandidates: pending,
     captions: m.captions,
     // Set only when Project.open() had to repair a crash-damaged
@@ -558,6 +567,14 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
           p, actor, baseRev, 'audio-mix', b,
           `audio-mix target=${b.targetLufs ?? -14} duck=${b.duckAmount ?? -10} xfade=${b.crossfadeMs ?? 12}`,
           (m) => setAudioMix(m, { targetLufs: b.targetLufs, duckAmount: b.duckAmount, crossfadeMs: b.crossfadeMs }),
+        );
+        return json(res, 200, { state: await stateSummary(p) });
+      }
+      if (b.op === 'audio-repair') {
+        await mutate(
+          p, actor, baseRev, 'audio-repair', b,
+          `audio-repair preset=${b.preset}${b.deess ? ' deess' : ''}`,
+          (m) => setAudioRepair(m, { preset: b.preset, deess: b.deess }),
         );
         return json(res, 200, { state: await stateSummary(p) });
       }

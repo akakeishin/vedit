@@ -658,6 +658,17 @@ function sceneGridRow(src, scenes) {
   }
   return wrap;
 }
+// Mirrors core/ops.ts's needsColorTransform (web has no access to the TS
+// build, so the judgment is duplicated here — badge display only, never
+// used for any actual color transform).
+function needsColorTransform(color) {
+  if (!color) return false;
+  const KNOWN_SDR = new Set(['bt709', 'srgb']);
+  const transfer = color.transfer;
+  if (transfer && transfer !== 'unknown' && !KNOWN_SDR.has(transfer)) return true;
+  if ((!transfer || transfer === 'unknown') && color.primaries === 'bt2020') return true;
+  return false;
+}
 function mediaRow(src) {
   const name = basename(src.path);
   const used = sourceUsageSeconds(src.id);
@@ -687,6 +698,7 @@ function mediaRow(src) {
     src.transcribed ? '<span class="badge ok">文字起こし済み</span>' : '',
     !src.hasAudio ? '<span class="badge warn">音声なし</span>' : '',
     !src.proxy ? '<span class="badge warn">プロキシ未生成</span>' : '',
+    needsColorTransform(src.color) ? '<span class="badge warn">要色変換</span>' : '',
   ].join('');
   const usage = document.createElement('div');
   usage.className = 'srcUsage';

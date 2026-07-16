@@ -12,6 +12,8 @@ export interface ProbeResult {
   width: number;
   height: number;
   hasAudio: boolean;
+  /** Color metadata from the video stream, when ffprobe reports any of it. */
+  color?: Source['color'];
 }
 
 /**
@@ -65,12 +67,27 @@ export async function probe(file: string): Promise<ProbeResult> {
     );
   }
 
+  // ffprobe reports the literal string "unknown" for an untagged color_*
+  // field rather than omitting it; bits_per_raw_sample may come through as
+  // either a JSON number or a numeric string depending on ffprobe version.
+  const bitDepth = Number(v.bits_per_raw_sample);
+  const hasColorInfo = Boolean(v.color_primaries) || Boolean(v.color_transfer) || Boolean(v.color_space) || Number.isFinite(bitDepth);
+  const color: ProbeResult['color'] = hasColorInfo
+    ? {
+        ...(v.color_primaries ? { primaries: String(v.color_primaries) } : {}),
+        ...(v.color_transfer ? { transfer: String(v.color_transfer) } : {}),
+        ...(v.color_space ? { space: String(v.color_space) } : {}),
+        ...(Number.isFinite(bitDepth) ? { bitDepth } : {}),
+      }
+    : undefined;
+
   return {
     duration,
     fps,
     width: v.width,
     height: v.height,
     hasAudio: Boolean(a),
+    color,
   };
 }
 
@@ -406,6 +423,7 @@ export async function ingestFile(
     proxy: proxyRel,
     peaks: p.hasAudio ? peaksRel : undefined,
     transcribed: false,
+    color: p.color,
   };
   if (p.hasAudio && opts.transcribe !== false) {
     notify('transcribing (whisper)');

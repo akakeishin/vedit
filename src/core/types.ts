@@ -24,6 +24,16 @@ export interface Manifest {
     /** Anti-click fade applied to each speech segment's audio head/tail, in ms; default 12. */
     crossfadeMs?: number;
   };
+  /**
+   * Conversational-audio repair chain applied to speech segments at render
+   * time (highpass + noise reduction + compressor, optionally de-esser).
+   * Optional; absent (or preset 'off') means no repair chain at all —
+   * byte-for-byte the same audio graph as before this feature existed.
+   */
+  audioRepair?: {
+    preset: 'outdoor' | 'indoor' | 'wireless' | 'off';
+    deess?: boolean;
+  };
 }
 
 export interface Source {
@@ -40,6 +50,18 @@ export interface Source {
   peaks?: string;
   /** Set once transcription completed. */
   transcribed?: boolean;
+  /**
+   * Color metadata captured from the video stream at ingest, when ffprobe
+   * reports it. Optional/absent for sources ingested before this field
+   * existed, or when the container carries no color tags at all — absence
+   * is not evidence of anything, just missing information.
+   */
+  color?: {
+    primaries?: string;
+    transfer?: string;
+    space?: string;
+    bitDepth?: number;
+  };
 }
 
 export interface Timeline {
