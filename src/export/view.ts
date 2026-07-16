@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { segments } from '../core/ops.js';
 import type { Manifest } from '../core/types.js';
-import { run } from '../ingest/run.js';
+import { ffmpegHasFilter, run } from '../ingest/run.js';
 
 /**
  * Filmstrip + waveform digest PNG so Claude can inspect footage without
@@ -21,7 +21,7 @@ export async function renderView(
     cols?: number;
     rows?: number;
   } = {},
-): Promise<string> {
+): Promise<{ png: string; timecodesBurnedIn: boolean; grid: string[] }> {
   const cols = opts.cols ?? 6;
   const rows = opts.rows ?? 2;
   const n = cols * rows;
@@ -50,6 +50,7 @@ export async function renderView(
   }
 
   // Extract each frame (proxy, fast seeks), stamp timecode, tile, add waveform.
+  const canDrawText = ffmpegHasFilter('drawtext');
   const tmpFrames: string[] = [];
   const outPath = path.join(projectDir, 'cache', `view-${Date.now()}.png`);
   for (let i = 0; i < points.length; i++) {
@@ -59,18 +60,18 @@ export async function renderView(
     const f = path.join(projectDir, 'cache', `.vf${i}.png`);
     const mm = Math.floor(pt.t / 60);
     const ss = (pt.t % 60).toFixed(1).padStart(4, '0');
-    await run('ffmpeg', [
-      '-y', '-v', 'error', '-ss', String(pt.t), '-i', media,
-      '-frames:v', '1',
-      '-vf',
-      `scale=320:-2,drawtext=text='${mm}\\:${ss}':x=6:y=h-th-6:fontsize=22:fontcolor=white:box=1:boxcolor=black@0.6`,
-      f,
-    ]);
+    const vf = canDrawText
+      ? `scale=320:-2,drawtext=text='${mm}\\:${ss}':x=6:y=h-th-6:fontsize=22:fontcolor=white:box=1:boxcolor=black@0.6`
+      : 'scale=320:-2';
+    await run('ffmpeg', ['-y', '-v', 'error', '-ss', String(pt.t), '-i', media, '-frames:v', '1', '-vf', vf, f]);
     tmpFrames.push(f);
   }
   const inputs = tmpFrames.flatMap((f) => ['-i', f]);
   const tile = tmpFrames.map((_, i) => `[${i}:v]`).join('') + `xstack=grid=${cols}x${rows}[strip]`;
   await run('ffmpeg', ['-y', '-v', 'error', ...inputs, '-filter_complex', tile, '-map', '[strip]', outPath]);
   await run('rm', tmpFrames);
-  return outPath;
+  // Grid legend (left-to-right, top-to-bottom): source times of each cell,
+  // essential when timecodes could not be burned in.
+  const grid = points.map((pt, i) => `cell${i + 1}(r${Math.floor(i / cols) + 1}c${(i % cols) + 1})=${pt.t.toFixed(1)}s@${pt.sourceId}`);
+  return { png: outPath, timecodesBurnedIn: canDrawText, grid };
 }

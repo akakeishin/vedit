@@ -9,7 +9,7 @@ import { renderView } from './export/view.js';
 import { writeOtio } from './export/otio.js';
 import { renderFinal } from './export/render.js';
 import { downloadWhisperModel, findWhisperModel } from './ingest/ingest.js';
-import { run } from './ingest/run.js';
+import { ffmpegBin, ffmpegHasFilter, run } from './ingest/run.js';
 import type { Transcript } from './core/types.js';
 
 const PORT = Number(process.env.VEDIT_PORT ?? 7799);
@@ -294,7 +294,7 @@ async function main() {
       const dir = projectDir();
       const p = await Project.open(dir);
       const m = await p.manifest();
-      const png = await renderView(m, dir, {
+      const v = await renderView(m, dir, {
         domain: (flags.domain as 'timeline' | 'source') ?? 'timeline',
         sourceId: flags.source as string,
         from: flags.from !== undefined ? Number(flags.from) : undefined,
@@ -302,7 +302,7 @@ async function main() {
         cols: flags.cols ? Number(flags.cols) : undefined,
         rows: flags.rows ? Number(flags.rows) : undefined,
       });
-      return out({ png, hint: 'Read this file to inspect frames (source timecodes burned in)' });
+      return out({ ...v, hint: 'Read the png to inspect frames; grid maps cells to source times' });
     }
 
     case 'export': {
@@ -351,6 +351,7 @@ async function main() {
           checks[bin] = 'MISSING — ' + (bin === 'whisper-cli' ? 'brew install whisper-cpp' : `brew install ${bin === 'ffprobe' ? 'ffmpeg' : bin}`);
         }
       }
+      checks['ffmpeg (resolved)'] = `${ffmpegBin()} — drawtext:${ffmpegHasFilter('drawtext') ? 'ok' : 'NO (view timecodes off)'} ass:${ffmpegHasFilter('ass') ? 'ok' : 'NO (caption burn off; brew install ffmpeg-full)'}`;
       let model = await findWhisperModel();
       if (flags['download-model']) {
         const name = typeof flags['download-model'] === 'string' ? (flags['download-model'] as string) : 'ggml-large-v3-turbo';

@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs';
 import { segments } from '../core/ops.js';
 import { captionCues } from '../core/captions.js';
 import type { Manifest, Transcript } from '../core/types.js';
-import { run } from '../ingest/run.js';
+import { ffmpegHasFilter, run } from '../ingest/run.js';
 
 function assTime(t: number): string {
   const h = Math.floor(t / 3600);
@@ -67,6 +67,11 @@ export async function renderFinal(
   let graph = parts.join(';') + `;${labels.join('')}concat=n=${segs.length}:v=1:a=1[vc][ac]`;
 
   let assPath: string | null = null;
+  if (opts.burnCaptions && m.captions.enabled && !ffmpegHasFilter('ass')) {
+    throw new Error(
+      'this ffmpeg build lacks the `ass` filter (caption burn). Install `brew install ffmpeg-full` or set VEDIT_FFMPEG, or export without --burn-captions.',
+    );
+  }
   if (opts.burnCaptions && m.captions.enabled) {
     assPath = path.join(path.dirname(outPath), '.vedit-captions.ass');
     await fs.writeFile(assPath, toAss(m, transcripts));
