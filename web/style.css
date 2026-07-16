@@ -1,4 +1,6 @@
 * { box-sizing: border-box; margin: 0; }
+/* author display rules (e.g. display:flex) must never resurrect [hidden] elements */
+[hidden] { display: none !important; }
 :root {
   --bg: #101216; --panel: #16191f; --edge: #262b34; --text: #d7dce3; --dim: #7d8590;
   --accent: #4b9fff; --cut: #5a3038; --keep: #23384e; --ok: #3fb96b; --bad: #d05656;
