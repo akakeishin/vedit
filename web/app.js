@@ -145,7 +145,9 @@ function renderTimeline() {
     d.style.left = `${(s.tlStart / S.duration) * 100}%`;
     d.style.width = `${((s.tlEnd - s.tlStart) / S.duration) * 100}%`;
     d.title = `${s.clipId} (${fmt(s.tlEnd - s.tlStart)})`;
-    d.onpointerdown = (e) => { e.stopPropagation(); selectClip(s.clipId); seekTl(s.tlStart); };
+    // Select on click but let the event bubble so the strip's scrub handler
+    // still seeks to the pointer position.
+    d.onpointerdown = () => selectClip(s.clipId);
     clips.appendChild(d);
   }
   const mrow = $('motionRow');
