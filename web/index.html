@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>vedit</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <span id="projName">vedit</span>
+  <span id="stat"></span>
+  <span class="spacer"></span>
+  <button id="undoBtn" title="直前のリビジョンに戻す">⟲ undo</button>
+  <span id="conn" class="conn">●</span>
+</header>
+
+<main>
+  <section id="stage">
+    <div id="videoWrap">
+      <video id="video" playsinline></video>
+      <div id="captionLayer"></div>
+      <div id="motionLayer"></div>
+      <div id="ingestOverlay" hidden><div class="spin"></div><span id="ingestStep"></span></div>
+    </div>
+    <div id="transport">
+      <button id="playBtn">▶</button>
+      <span id="tc">0:00.0 / 0:00.0</span>
+      <span class="spacer"></span>
+      <span id="revLabel"></span>
+    </div>
+    <div id="timeline">
+      <canvas id="wave"></canvas>
+      <div id="clips"></div>
+      <div id="motionRow"></div>
+      <div id="playhead"></div>
+    </div>
+    <div id="clipInspector" hidden>
+      <span id="clipLabel"></span>
+      <span>IN</span>
+      <button data-trim="in:-1">−1f</button><button data-trim="in:1">+1f</button>
+      <span>OUT</span>
+      <button data-trim="out:-1">−1f</button><button data-trim="out:1">+1f</button>
+      <button id="clipClose">×</button>
+    </div>
+  </section>
+
+  <aside>
+    <div class="tabs">
+      <button class="tab active" data-panel="transcriptPanel">Transcript</button>
+      <button class="tab" data-panel="candPanel">提案 <span id="candCount"></span></button>
+      <button class="tab" data-panel="histPanel">履歴</button>
+    </div>
+    <div id="transcriptPanel" class="panel active">
+      <div class="panelbar">
+        <button id="removeSelBtn" disabled>選択を削除</button>
+        <span class="hintText">ドラッグで単語選択 / クリックでシーク</span>
+      </div>
+      <div id="words"></div>
+    </div>
+    <div id="candPanel" class="panel">
+      <div class="panelbar">
+        <button id="approveAllBtn">すべて承認</button>
+      </div>
+      <div id="candList"></div>
+    </div>
+    <div id="histPanel" class="panel">
+      <div id="histList"></div>
+    </div>
+  </aside>
+</main>
+<div id="toast" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>

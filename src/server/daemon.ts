@@ -1,0 +1,381 @@
+import http from 'node:http';
+import { promises as fs, createReadStream, statSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { WebSocketServer, WebSocket } from 'ws';
+import { Project } from '../core/project.js';
+import {
+  expandWordIds,
+  removeSourceRange,
+  segments,
+  sourceRangeToTimeline,
+  timelineDuration,
+  trimClip,
+  wordRange,
+} from '../core/ops.js';
+import { captionCues } from '../core/captions.js';
+import { detectFillers, detectSilences } from '../core/detect.js';
+import { packTranscript } from '../core/pack.js';
+import { ingestFile } from '../ingest/ingest.js';
+import type { CutCandidate, Manifest, MotionItem, Transcript } from '../core/types.js';
+import { freshId } from '../core/ops.js';
+
+const WEB_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'web');
+
+interface Ctx {
+  project: Project | null;
+  clients: Set<WebSocket>;
+}
+
+async function allTranscripts(p: Project): Promise<Transcript[]> {
+  const m = await p.manifest();
+  const out: Transcript[] = [];
+  for (const s of m.sources) {
+    if (!s.transcribed) continue;
+    try {
+      out.push(await p.transcript(s.id));
+    } catch { /* transcript file missing; skip */ }
+  }
+  return out;
+}
+
+function json(res: http.ServerResponse, status: number, body: unknown) {
+  const data = JSON.stringify(body, null, 1);
+  res.writeHead(status, { 'content-type': 'application/json' });
+  res.end(data);
+}
+
+async function readBody(req: http.IncomingMessage): Promise<any> {
+  const chunks: Buffer[] = [];
+  for await (const c of req) chunks.push(c as Buffer);
+  const raw = Buffer.concat(chunks).toString('utf8');
+  return raw ? JSON.parse(raw) : {};
+}
+
+function broadcast(ctx: Ctx, msg: unknown) {
+  const data = JSON.stringify(msg);
+  for (const ws of ctx.clients) if (ws.readyState === WebSocket.OPEN) ws.send(data);
+}
+
+/** Snapshot the state Claude/UI needs after every mutation. */
+async function stateSummary(p: Project) {
+  const m = await p.manifest();
+  const cands = await p.candidates();
+  const pending = cands.filter((c) => c.status === 'proposed').length;
+  return {
+    revision: m.revision,
+    name: m.name,
+    fps: m.fps,
+    duration: timelineDuration(m),
+    clips: m.timeline.video.length,
+    motion: m.timeline.motion.length,
+    sources: m.sources.map((s) => ({ id: s.id, path: s.path, duration: s.duration, transcribed: !!s.transcribed })),
+    pendingCandidates: pending,
+    captions: m.captions,
+  };
+}
+
+export async function startDaemon(opts: { port?: number; projectDir?: string } = {}) {
+  const port = opts.port ?? Number(process.env.VEDIT_PORT ?? 7799);
+  const ctx: Ctx = { project: null, clients: new Set() };
+  if (opts.projectDir) {
+    try {
+      ctx.project = await Project.open(opts.projectDir);
+    } catch {
+      ctx.project = await Project.create(opts.projectDir, path.basename(opts.projectDir));
+    }
+  }
+
+  const server = http.createServer(async (req, res) => {
+    const url = new URL(req.url ?? '/', `http://localhost:${port}`);
+    try {
+      await route(ctx, req, res, url);
+    } catch (e: any) {
+      const status = e?.code === 'STALE_REVISION' ? 409 : 400;
+      json(res, status, { error: e?.message ?? String(e), code: e?.code });
+    }
+  });
+
+  const wss = new WebSocketServer({ server, path: '/ws' });
+  wss.on('connection', (ws) => {
+    ctx.clients.add(ws);
+    ws.on('close', () => ctx.clients.delete(ws));
+  });
+
+  // The single mutation wrapper: commit + notify everyone.
+  async function mutate(
+    actor: 'claude' | 'ui' | 'system',
+    baseRev: number,
+    op: string,
+    params: unknown,
+    summary: string,
+    fn: (m: Manifest) => Manifest,
+  ) {
+    const p = ctx.project!;
+    const m = await p.commit(baseRev, actor, op, params, summary, fn);
+    broadcast(ctx, { type: 'update', revision: m.revision, op, summary });
+    return m;
+  }
+
+  async function route(ctx: Ctx, req: http.IncomingMessage, res: http.ServerResponse, url: URL) {
+    const { pathname } = url;
+    const method = req.method ?? 'GET';
+
+    // ---- project lifecycle ----
+    if (pathname === '/api/open' && method === 'POST') {
+      const b = await readBody(req);
+      const dir = path.resolve(b.dir);
+      try {
+        ctx.project = await Project.open(dir);
+      } catch {
+        ctx.project = await Project.create(dir, b.name ?? path.basename(dir));
+      }
+      broadcast(ctx, { type: 'project', dir });
+      return json(res, 200, { ok: true, dir, state: await stateSummary(ctx.project) });
+    }
+    if (pathname === '/api/ping') return json(res, 200, { ok: true, project: ctx.project?.dir ?? null });
+
+    const p = ctx.project;
+    if (!p) {
+      if (pathname.startsWith('/api/')) return json(res, 400, { error: 'no project open; POST /api/open {dir}' });
+    }
+
+    // ---- static web UI + media ----
+    if (!pathname.startsWith('/api/') && method === 'GET') {
+      if (pathname.startsWith('/media/') && p) return serveMedia(p, pathname, req, res);
+      return serveStatic(pathname, res);
+    }
+    if (!p) return json(res, 400, { error: 'no project open' });
+
+    // ---- reads ----
+    if (pathname === '/api/state') return json(res, 200, await stateSummary(p));
+    if (pathname === '/api/project') {
+      const m = await p.manifest();
+      return json(res, 200, { manifest: m, segments: segments(m), duration: timelineDuration(m) });
+    }
+    if (pathname === '/api/revisions') return json(res, 200, await p.revisions());
+    if (pathname === '/api/transcript') {
+      const m = await p.manifest();
+      const sourceId = url.searchParams.get('source') ?? m.sources.find((s) => s.transcribed)?.id;
+      if (!sourceId) return json(res, 404, { error: 'no transcribed source' });
+      const t = await p.transcript(sourceId);
+      if (url.searchParams.get('full')) return json(res, 200, t);
+      const cands = await p.candidates();
+      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+      return res.end(packTranscript(m, t, cands));
+    }
+    if (pathname === '/api/captions') {
+      const m = await p.manifest();
+      return json(res, 200, captionCues(m, await allTranscripts(p)));
+    }
+    if (pathname.startsWith('/api/motion/') && method === 'GET') {
+      const id = pathname.split('/')[3];
+      try {
+        const spec = JSON.parse(await fs.readFile(path.join(p.motionDir, `${id}.json`), 'utf8'));
+        return json(res, 200, spec);
+      } catch {
+        return json(res, 404, { error: `no motion spec: ${id}` });
+      }
+    }
+    if (pathname === '/api/candidates') {
+      const all = await p.candidates();
+      const pending = url.searchParams.get('all') ? all : all.filter((c) => c.status === 'proposed');
+      return json(res, 200, pending);
+    }
+
+    // ---- ingest ----
+    if (pathname === '/api/ingest' && method === 'POST') {
+      const b = await readBody(req);
+      broadcast(ctx, { type: 'ingest-start', file: b.file });
+      const src = await ingestFile(p, b.file, {
+        language: b.language,
+        transcribe: b.transcribe,
+        onProgress: (step) => broadcast(ctx, { type: 'ingest-progress', step }),
+      });
+      broadcast(ctx, { type: 'update', revision: (await p.manifest()).revision, op: 'ingest', summary: `ingested ${b.file}` });
+      return json(res, 200, { source: src, state: await stateSummary(p) });
+    }
+
+    // ---- edits ----
+    if (pathname === '/api/edit' && method === 'POST') {
+      const b = await readBody(req);
+      const actor = b.actor ?? 'claude';
+      const m0 = await p.manifest();
+      const baseRev = b.baseRev ?? m0.revision;
+
+      if (b.op === 'remove-words') {
+        const sourceId = b.sourceId ?? m0.sources.find((s) => s.transcribed)?.id;
+        const t = await p.transcript(sourceId);
+        const ids = expandWordIds(b.ids, t.words);
+        const r = wordRange(t.words, ids);
+        const removed = ids.length;
+        const text = t.words.filter((w) => ids.includes(w.id)).map((w) => w.text).join('');
+        await mutate(actor, baseRev, 'remove-words', b, `removed ${removed} words (${(r.t1 - r.t0).toFixed(1)}s): "${text.slice(0, 40)}"`, (m) =>
+          removeSourceRange(m, sourceId, r.t0, r.t1),
+        );
+        return json(res, 200, { removedSeconds: r.t1 - r.t0, state: await stateSummary(p) });
+      }
+      if (b.op === 'remove-range') {
+        const sourceId = b.sourceId ?? m0.sources[0]?.id;
+        await mutate(actor, baseRev, 'remove-range', b, `removed ${(b.t1 - b.t0).toFixed(1)}s of source ${sourceId}`, (m) =>
+          removeSourceRange(m, sourceId, b.t0, b.t1),
+        );
+        return json(res, 200, { state: await stateSummary(p) });
+      }
+      if (b.op === 'trim') {
+        await mutate(actor, baseRev, 'trim', b, `trim ${b.clipId} ${b.edge} ${b.frames}f`, (m) =>
+          trimClip(m, b.clipId, b.edge, b.frames),
+        );
+        return json(res, 200, { state: await stateSummary(p) });
+      }
+      if (b.op === 'captions') {
+        await mutate(actor, baseRev, 'captions', b, `captions ${JSON.stringify(b.patch)}`, (m) => ({
+          ...m,
+          captions: { ...m.captions, ...b.patch },
+        }));
+        return json(res, 200, { state: await stateSummary(p) });
+      }
+      if (b.op === 'motion-add') {
+        const specId = freshId('mo');
+        const specFile = `${specId}.json`;
+        await fs.writeFile(path.join(p.motionDir, specFile), JSON.stringify({ id: specId, ...b.spec }, null, 2));
+        const item: MotionItem = { id: specId, spec: specFile, tlStart: b.tlStart, duration: b.duration };
+        await mutate(actor, baseRev, 'motion-add', b, `motion ${b.spec.type} at ${b.tlStart}s`, (m) => ({
+          ...m,
+          timeline: { ...m.timeline, motion: [...m.timeline.motion, item] },
+        }));
+        return json(res, 200, { id: specId, state: await stateSummary(p) });
+      }
+      if (b.op === 'motion-update') {
+        const specPath = path.join(p.motionDir, `${b.id}.json`);
+        if (b.spec) {
+          const old = JSON.parse(await fs.readFile(specPath, 'utf8'));
+          await fs.writeFile(specPath, JSON.stringify({ ...old, ...b.spec, id: b.id }, null, 2));
+        }
+        await mutate(actor, baseRev, 'motion-update', b, `motion ${b.id} updated`, (m) => ({
+          ...m,
+          timeline: {
+            ...m.timeline,
+            motion: m.timeline.motion.map((x) =>
+              x.id === b.id
+                ? { ...x, tlStart: b.tlStart ?? x.tlStart, duration: b.duration ?? x.duration }
+                : x,
+            ),
+          },
+        }));
+        return json(res, 200, { state: await stateSummary(p) });
+      }
+      if (b.op === 'motion-remove') {
+        await mutate(actor, baseRev, 'motion-remove', b, `motion ${b.id} removed`, (m) => ({
+          ...m,
+          timeline: { ...m.timeline, motion: m.timeline.motion.filter((x) => x.id !== b.id) },
+        }));
+        return json(res, 200, { state: await stateSummary(p) });
+      }
+      if (b.op === 'restore') {
+        const m = await p.restore(b.rev, actor);
+        broadcast(ctx, { type: 'update', revision: m.revision, op: 'restore', summary: `restored r${b.rev}` });
+        return json(res, 200, { state: await stateSummary(p) });
+      }
+      return json(res, 400, { error: `unknown op: ${b.op}` });
+    }
+
+    // ---- detection & candidate queue ----
+    if (pathname === '/api/detect' && method === 'POST') {
+      const b = await readBody(req);
+      const m = await p.manifest();
+      const out: CutCandidate[] = [];
+      for (const t of await allTranscripts(p)) {
+        if (b.silence !== false) out.push(...detectSilences(t, b.minGap ?? 0.7));
+        if (b.fillers !== false) out.push(...detectFillers(t));
+      }
+      // Keep prior decisions: don't resurrect ranges already approved/rejected.
+      const prior = await p.candidates();
+      const decided = prior.filter((c) => c.status !== 'proposed');
+      const fresh = out.filter(
+        (c) => !decided.some((d) => d.sourceId === c.sourceId && Math.abs(d.t0 - c.t0) < 0.05 && Math.abs(d.t1 - c.t1) < 0.05),
+      );
+      const merged = [...decided, ...fresh];
+      await p.writeCandidates(merged);
+      broadcast(ctx, { type: 'candidates', pending: fresh.length });
+      return json(res, 200, {
+        pending: fresh.filter((c) => c.status === 'proposed'),
+        summary: `${fresh.length} candidates (use approve/reject; approving applies the cut)`,
+        revision: m.revision,
+      });
+    }
+    if (pathname === '/api/candidates/decide' && method === 'POST') {
+      const b = await readBody(req); // { ids: string[] | 'all', decision, actor, baseRev }
+      const all = await p.candidates();
+      const target = b.ids === 'all' ? all.filter((c) => c.status === 'proposed') : all.filter((c) => b.ids.includes(c.id));
+      if (target.length === 0) return json(res, 400, { error: 'no matching pending candidates' });
+      const actor = b.actor ?? 'ui';
+      if (b.decision === 'approve') {
+        const m0 = await p.manifest();
+        let baseRev = b.baseRev ?? m0.revision;
+        // Apply all approved cuts in ONE revision so undo is atomic.
+        const totalSec = target.reduce((a, c) => a + (c.t1 - c.t0), 0);
+        await mutate(actor, baseRev, 'apply-candidates', { ids: target.map((c) => c.id) },
+          `applied ${target.length} cuts (-${totalSec.toFixed(1)}s)`, (m) => {
+            let cur = m;
+            for (const c of target) cur = removeSourceRange(cur, c.sourceId, c.t0, c.t1);
+            return cur;
+          });
+      }
+      for (const c of target) c.status = b.decision === 'approve' ? 'approved' : 'rejected';
+      await p.writeCandidates(all);
+      broadcast(ctx, { type: 'candidates', pending: all.filter((c) => c.status === 'proposed').length });
+      return json(res, 200, { decided: target.length, state: await stateSummary(p) });
+    }
+
+    return json(res, 404, { error: `no route: ${method} ${pathname}` });
+  }
+
+  function serveStatic(pathname: string, res: http.ServerResponse) {
+    const file = pathname === '/' ? 'index.html' : pathname.slice(1);
+    const full = path.join(WEB_DIR, path.normalize(file));
+    if (!full.startsWith(WEB_DIR)) return json(res, 403, { error: 'forbidden' });
+    try {
+      const data = statSync(full);
+      const types: Record<string, string> = {
+        '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml',
+      };
+      res.writeHead(200, { 'content-type': types[path.extname(full)] ?? 'application/octet-stream', 'content-length': data.size });
+      createReadStream(full).pipe(res);
+    } catch {
+      json(res, 404, { error: 'not found' });
+    }
+  }
+
+  async function serveMedia(p: Project, pathname: string, req: http.IncomingMessage, res: http.ServerResponse) {
+    // /media/proxy/<sourceId> | /media/peaks/<sourceId>
+    const [, , kind, sourceId] = pathname.split('/');
+    const m = await p.manifest();
+    const src = m.sources.find((s) => s.id === sourceId);
+    if (!src) return json(res, 404, { error: 'unknown source' });
+    const rel = kind === 'proxy' ? src.proxy : src.peaks;
+    if (!rel) return json(res, 404, { error: `no ${kind} for source` });
+    const full = path.join(p.dir, rel);
+    const stat = statSync(full);
+    const type = kind === 'proxy' ? 'video/mp4' : 'application/json';
+    const range = req.headers.range;
+    if (range) {
+      const [a, b] = range.replace('bytes=', '').split('-');
+      const start = Number(a);
+      const end = b ? Number(b) : stat.size - 1;
+      res.writeHead(206, {
+        'content-type': type,
+        'content-range': `bytes ${start}-${end}/${stat.size}`,
+        'accept-ranges': 'bytes',
+        'content-length': end - start + 1,
+      });
+      createReadStream(full, { start, end }).pipe(res);
+    } else {
+      res.writeHead(200, { 'content-type': type, 'content-length': stat.size, 'accept-ranges': 'bytes' });
+      createReadStream(full).pipe(res);
+    }
+  }
+
+  await new Promise<void>((resolve) => server.listen(port, '127.0.0.1', resolve));
+  return { server, port, url: `http://localhost:${port}` };
+}
