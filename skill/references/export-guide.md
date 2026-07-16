@@ -8,6 +8,13 @@ vedit export otio project.otio
 
 Resolve 18.5 以降(無料版含む)で File > Import > Timeline から .otio を
 選ぶ。カット構造(V1/A1 のクリップ列)がそのまま乗る。
+**字幕は同時に生成される同名 .srt を File > Import > Subtitle で読み込む**
+(OTIO 単体には字幕が乗らない)。
+
+注意: `vedit reframe` のクロップは OTIO では再現されない(クリップの
+metadata.vedit.crop に記録されるのみ)。縦ショートの完成は
+`vedit export render` で行い、Resolve へは横のまま渡して向こうで
+リフレームし直すのが確実。
 
 - メディアが「オフライン」になったら: Media Pool で右クリック →
   Relink Media で元素材の場所を指す
