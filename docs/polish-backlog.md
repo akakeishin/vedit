@@ -1,19 +1,43 @@
 # 磨き込みバックログ & 機能ロードマップ
 
-## 機能ロードマップ(ユーザー承認済み 2026-07-16、実装順)
+## 機能ロードマップ v2(2026-07-17 Codex コンサル反映)
 
-1. **Wave I: BGM トラック + 音声仕上げ** — BGM 配置・自動ダッキング
-   (sidechaincompress)・カット点クロスフェード・ラウドネス正規化(-14 LUFS)。
-   要ミニ仕様(manifest の audio トラックスキーマ)
-2. **Wave J: 公開パック生成** — YouTube チャプターテキスト、サムネ候補
-   フレーム抽出、transcript 由来のタイトル/説明/タグ案。既存部品の組み合わせ
-3. **Wave K: マルチテイク選択** — 類似発話クラスタリングでテイク検出、
-   ベスト候補提示。transcript-first の差別化機能
-4. **Wave L: 倍速・ジャンプカット演出** — クリップ属性 speed、フリーズフレーム
-5. **Wave M: 書き出しプリセット** — `--preset youtube|shorts|x`
-6. **Wave N: スタイルキット** — preset をチャンネル資産に拡張
-   (モーション配色・フォント・定型・フィラー辞書)
-7. **Wave O: `vedit resume`** — 再開サマリ(履歴要約+未処理+次の一手)
+方針: 派手な機能より「毎週の反復作業」(選別・B-roll・音声修復・派生版・
+QC・アーカイブ)を先に埋める。✅=実装済み。
+
+**完了**: ✅ I: BGM+ダッキング+loudnorm / ✅ J+M: 公開パック(チャプター+
+サムネ+materials、説明文はディレクター起草)+書き出しプリセット
+
+**Phase 1 — 毎週の中核ワークフロー(この順で実装)**
+1. **W1: 会話音声リペア + resume** — outdoor/indoor/wireless の保守的
+   プリセット(highpass/afftdn/deesser/acompressor)、音楽なしでも
+   2-pass loudnorm、乾音A/B。+ `vedit resume`(再開サマリの集約)
+2. **W2: 3状態カリング + Selects** — scene/source 単位の
+   unreviewed/keep/reject(manifest 保存・undo 対象)、キーボード選別、
+   残件数、「keep だけで仮タイムライン」
+3. **W3: B-roll V2 トラック + J/Lカット** — 重複不可の V2 一層のみ。
+   OverlayClip を clipId/wordId/sceneId+offset にアンカー、
+   audioMode: mute|mix|replace。web は第二 video、render は overlay、
+   OTIO は V2 出力。※最大の設計変更、着手前に Fable がミニ仕様を書く
+
+**Phase 2 — 制作サイクルの外周**
+4. W4: 検証付きインジェスト(SHA-256、copy/link、重複検出、中断再開)
+5. W5: 横→縦の派生プロジェクト(variant fork、revision 固定、hardlink)
+6. W6: モーションの最終レンダー焼き込み(4プリセット→ASS/ffmpeg 変換のみ、
+   custom-html は対象外と明示)
+7. W7: N スタイルキット(音声・モーションスキーマ確定後)
+8. W8: 公開前QC(blackdetect/silencedetect/ebur128 → HTML レポート)
+9. W9: アーカイブ/再リンク(コピー+SHA-256+相対パス化、dry-run、元素材不削除)
+
+**Phase 3 — 差別化・分析**
+10. W10: K マルチテイク選択(カリング実装後。n-gram+編集距離)
+11. W11: Analytics CSV→タイムライン振り返り(比較データ3本たまってから)
+12. W12: L 倍速ジャンプカット(1倍速前提を崩す高コスト変更。フリーズは保留)
+13. W13: DJI 色管理 — **実素材が BT.709 通常プロファイルと確認済みのため低優先**
+
+**作らないもの(戦略判断)**: 汎用マルチトラック、YouTube 直接アップロード、
+クラウド素材検索、フルカラーグレーディング UI、タグ自動生成(YouTube 公式が
+効果を綴り補正程度と説明)、ニューラルVAD全面置換、フリーズフレーム
 
 
 更新: 2026-07-16(Codex 4観点レビュー後の triage で「今回見送り」とした項目)。
