@@ -41,7 +41,15 @@ vedit detect                              # 無音(波形+単語ギャップ)・
 ```
 
 プロジェクト指定は `--project <dir>` または env `VEDIT_PROJECT`。
-既存プロジェクトの再開は `vedit projects` で一覧 → `vedit open`。
+
+**セッション再開**(週をまたぐ場合): `vedit projects` で一覧 → `vedit open` →
+`vedit status` で現在 revision を取得 → `vedit revisions` の actor 列で
+前回以降のユーザー編集([ui])を確認 → `vedit candidates --all` で
+承認済み/保留の候補を再確認してから編集を再開する。
+
+Web UI には「素材」タブ(ポスター・使用状況バー・ソースプレビュー・
+シーン展開からの区間追加)がある。`--no-add` で取り込んだ素材の選定は
+ユーザーにこのタブを案内するとよい。
 
 ## 編集の鉄則
 
@@ -54,10 +62,14 @@ vedit detect                              # 無音(波形+単語ギャップ)・
 3. **ソースが2つ以上ある時は `--source <id>` 必須**(単語 id はソースごとに
    w0000 から振られ衝突する)。packed transcript の各セクション見出しに
    ソース id が出る。
-4. **検出候補を全承認しない。** 明白な無音だけ `vedit approve <id...>`。
-   `(transcript timing unreliable)` ラベル付き候補は必ずプレビューか view で
-   確認してから判断。迷うものは UI の提案タブに残しユーザーに委ねる。
-5. 削りすぎたら `vedit undo --base <rev>`。履歴は `vedit revisions`。
+4. **検出候補を全承認しない。** 候補一覧は `vedit candidates`(--all で決定済みも)。
+   明白な無音だけ `vedit approve <id...> --base <rev>`。
+   `(transcript disagrees — preview before approving)` ラベル付き候補は
+   必ずプレビューか view で確認してから判断。迷うものは UI の提案タブに残し
+   ユーザーに委ねる。
+5. 削りすぎたら `vedit undo`(1つ戻る。undo だけは --base 不要)。
+   特定 revision へは `vedit undo --rev N`。履歴は `vedit revisions` —
+   **actor 列(`[ui]`=ユーザーの手動編集 / `[claude]`)で誰の編集かが分かる**。
 6. 大きく削る前に「何秒→何秒になるか」を言葉で確認する。
 
 ## 目で確認する
