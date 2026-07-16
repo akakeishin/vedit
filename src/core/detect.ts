@@ -240,12 +240,24 @@ export function detectSilencesFromPeaks(
   const emit = (startIdx: number, endIdx: number) => {
     let t0 = startIdx / rate;
     let t1 = endIdx / rate;
-    if (t1 - t0 < minGap) return;
+    const rawSpan = t1 - t0;
+    if (rawSpan < minGap) return;
+    // conflict: transcript claims speech inside a physically quiet window
+    // (soft laughter, whispered asides, fabricated word boundaries). Strong
+    // waveform evidence still surfaces the candidate — flagged for preview —
+    // instead of being silently vetoed; the approve queue exists for exactly
+    // this ambiguity.
+    let conflict = packed;
     if (opts.words && opts.words.length && !packed) {
       const clamped = clampToWordBoundaries(t0, t1, opts.words);
-      if (!clamped || clamped.t1 - clamped.t0 < minGap) return;
-      t0 = clamped.t0;
-      t1 = clamped.t1;
+      if (clamped && clamped.t1 - clamped.t0 >= minGap) {
+        t0 = clamped.t0;
+        t1 = clamped.t1;
+      } else if (rawSpan >= minGap * 1.5) {
+        conflict = true; // keep the raw window, but demand a preview
+      } else {
+        return;
+      }
     }
     const a = t0 + pad;
     const b = t1 - pad;
@@ -257,7 +269,7 @@ export function detectSilencesFromPeaks(
       t0: a,
       t1: b,
       wordIds: [],
-      label: `${(t1 - t0).toFixed(1)}s silence (waveform${packed ? '; transcript timing unreliable — preview before approving' : ''})`,
+      label: `${(t1 - t0).toFixed(1)}s silence (waveform${conflict ? '; transcript disagrees — preview before approving' : ''})`,
       status: 'proposed',
     });
   };

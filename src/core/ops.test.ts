@@ -309,7 +309,7 @@ describe('timestampsArePacked', () => {
     const peaks = [...Array(rate).fill(0.5), ...Array(rate * 2).fill(0.01), ...Array(rate * 2).fill(0.5)];
     const cands = detectSilencesFromPeaks({ rate, peaks }, { sourceId: 's1', words: packed });
     expect(cands.length).toBe(1);
-    expect(cands[0].label).toContain('unreliable');
+    expect(cands[0].label).toContain('transcript disagrees');
   });
   it('healthy transcripts still clamp', async () => {
     const { timestampsArePacked } = await import('./detect.js');

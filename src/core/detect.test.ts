@@ -116,3 +116,29 @@ describe('detectFillers — n-gram matching', () => {
     expect(detectFillers(t)).toHaveLength(1);
   });
 });
+
+describe('waveform vs transcript conflict (soft speech)', () => {
+  it('surfaces a strongly-quiet window overlapped by claimed speech, flagged for preview', async () => {
+    const { detectSilencesFromPeaks } = await import('./detect.js');
+    const rate = 25;
+    // 1s loud, 2s quiet, 1s loud — transcript claims a word inside the quiet
+    const peaks = [...Array(rate).fill(0.5), ...Array(rate * 2).fill(0.01), ...Array(rate).fill(0.5)];
+    const words = [
+      { id: 'w0', text: 'a', t0: 0.2, t1: 0.9, p: 0.9 },
+      { id: 'w1', text: 'ふふ', t0: 1.0, t1: 2.6, p: 0.8 }, // covers most of the quiet
+      { id: 'w2', text: 'b', t0: 3.1, t1: 3.8, p: 0.9 },
+    ];
+    const cands = detectSilencesFromPeaks({ rate, peaks }, { sourceId: 's1', words });
+    expect(cands).toHaveLength(1);
+    expect(cands[0].label).toContain('transcript disagrees');
+  });
+  it('still drops weak-evidence windows that clamp below minGap', async () => {
+    const { detectSilencesFromPeaks } = await import('./detect.js');
+    const rate = 25;
+    // quiet window only 0.8s (< minGap*1.5), word covers half of it
+    const peaks = [...Array(rate).fill(0.5), ...Array(Math.round(rate * 0.8)).fill(0.01), ...Array(rate).fill(0.5)];
+    const words = [{ id: 'w0', text: 'x', t0: 1.0, t1: 1.5, p: 0.9 }];
+    const cands = detectSilencesFromPeaks({ rate, peaks }, { sourceId: 's1', words, minGap: 0.7 });
+    expect(cands).toHaveLength(0);
+  });
+});
