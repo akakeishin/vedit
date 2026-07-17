@@ -339,6 +339,17 @@ function tickComposition() {
   }
 }
 
+// If S.playing is true but the <video> element itself is paused (e.g. a
+// segment's source proxy hits its own natural end exactly at the segment
+// boundary — the browser fires 'ended'/pauses before our -0.02s lookahead
+// gets there — or a play() call got silently interrupted), nothing was
+// left to drive video forward again: the old boundary check required
+// `!video.paused`, which can never be true again once the browser beats us
+// to pausing it. Track how long we've been stuck so we can retry play()
+// for a bit, then give up and sync S.playing to reality instead of the UI
+// claiming playback forever.
+let stalledSince = null;
+
 // The frame loop: cross segment boundaries, drive playhead/captions/motion.
 function tick() {
   if (isComposition()) {
@@ -361,9 +372,32 @@ function tick() {
   const i = S.currentSeg;
   if (i >= 0 && S.segments[i]) {
     const s = S.segments[i];
-    if (!video.paused && video.currentTime >= s.srcStart + (s.tlEnd - s.tlStart) - 0.02) {
+    // Gate on S.playing (our intent), not video.paused (the DOM's state) —
+    // the latter can flip true on its own right at this exact boundary (see
+    // stalledSince comment above), and once it does, a `!video.paused` gate
+    // would never fire again.
+    if (S.playing && video.currentTime >= s.srcStart + (s.tlEnd - s.tlStart) - 0.02) {
+      stalledSince = null;
       if (i + 1 < S.segments.length) loadSeg(i + 1, { play: true });
       else { video.pause(); S.playing = false; setPlayBtnState(false); }
+    } else if (S.playing && video.paused) {
+      // Unexpectedly paused mid-segment (not a boundary crossing above).
+      // readyState >= 2 means there's actual data to play from, so this
+      // isn't just the normal async gap while loadSeg() waits on
+      // 'loadedmetadata' after a cross-source switch.
+      if (video.readyState >= 2) {
+        if (stalledSince == null) stalledSince = performance.now();
+        else if (performance.now() - stalledSince > 800) {
+          // Retried for ~800ms with no luck — stop pretending we're playing.
+          stalledSince = null;
+          S.playing = false;
+          setPlayBtnState(false);
+        } else {
+          video.play().catch(() => {});
+        }
+      }
+    } else {
+      stalledSince = null;
     }
     const tl = tlNow();
     $('playhead').style.left = `${(tl / S.duration) * 100}%`;
@@ -2479,7 +2513,8 @@ function renderTranscript() {
     const heading = document.createElement('div');
     heading.className = 'srcHeading';
     heading.setAttribute('role', 'presentation');
-    heading.textContent = `📄 ${basename(src.path)} (${src.id})`;
+    heading.textContent = `📄 ${sourceLabel(src)}`;
+    heading.title = basename(src.path);
     el.appendChild(heading);
     const kept = keptSet(src.id);
     let prev = null;
