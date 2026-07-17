@@ -345,8 +345,32 @@ describe('toAss: W-ANIME dialogue speech bubbles', () => {
     };
     const ass = toAss(m, [], kit);
     const styleLine = ass.split('\n').find((l) => l.startsWith('Style: dialogue,'))!;
-    // #ff00ff box -> ASS BGR FF00FF, back colour field.
-    expect(styleLine).toContain('&H00FF00FF');
+    const f = styleLine.replace('Style: dialogue,', '').split(',');
+    // libass draws the BorderStyle=3 box in the OUTLINE colour, padded by the
+    // Outline width — the box colour anywhere else (or Outline=0) renders as
+    // plain floating text with no bubble at all.
+    expect(f[4]).toBe('&H00FF00FF'); // OutlineColour = #ff00ff box fill (BGR)
+    expect(f[14]).toBe('3'); // BorderStyle=3 opaque box
+    expect(Number(f[15])).toBeGreaterThan(0); // Outline = box padding
+  });
+
+  it('anchors the bubble to the sprite\'s VISIBLE top, not the full PNG top (transparent headroom)', () => {
+    const mk = (y0: number): KitFile => ({
+      version: 'vedit-kit/v1',
+      assets: [{
+        id: 'char1', path: 'assets/characters/char1.png', type: 'sprite', width: 200, height: 400,
+        visible_bounds_normalized: { x0: 0, y0, x1: 1, y1: 1 },
+        ground_anchor_normalized: { x: 0.5, y: 1 },
+      }],
+    });
+    let m = manifest('clean');
+    m = addSprite(m, 'char1', { id: 'sp1', anchor: { sourceId: 's1', srcTime: 1 }, position: { x: 0.5, y: 0.9 }, scale: 0.3 });
+    m = addDialogue(m, 'hi', { tlStart: 1, duration: 1, id: 'dl1', spriteId: 'sp1' });
+    const yOf = (kit: KitFile) =>
+      Number(toAss(m, [], kit).split('\n').find((l) => l.includes(',dialogue,,'))!.match(/\\pos\(\d+,(\d+)\)/)![1]);
+    // More transparent headroom (larger y0) pushes the FULL-image top higher
+    // while the visible head stays put — the bubble's y must not drift up.
+    expect(Math.abs(yOf(mk(0.4)) - yOf(mk(0)))).toBeLessThan(2);
   });
 });
 

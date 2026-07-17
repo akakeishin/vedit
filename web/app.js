@@ -2184,7 +2184,10 @@ function dialogueAnchorPx(d, out) {
   const asset = sprite ? (S.kit?.kit?.assets ?? []).find((a) => a.id === sprite.assetId) : undefined;
   if (sprite && asset) {
     const geo = spriteGeometryJS(asset, sprite.position, sprite.scale, out, sprite.flip);
-    return { x: geo.anchorX, y: Math.max(out.height * 0.08, geo.y - out.height * 0.04), sprite };
+    // geo.y is the FULL image top (transparent headroom included) — anchor
+    // off the visible top like render.ts, or the bubble floats too high.
+    const visibleTop = geo.y + (asset.visible_bounds_normalized?.y0 ?? 0) * geo.height;
+    return { x: geo.anchorX, y: Math.max(out.height * 0.08, visibleTop - out.height * 0.04), sprite };
   }
   return { x: out.width / 2, y: out.height * 0.15, sprite: undefined };
 }

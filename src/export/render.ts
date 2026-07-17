@@ -128,17 +128,23 @@ const DIALOGUE_STYLE_NAME = 'dialogue';
  * plain solid rectangle in the bubble's colors, positioned via each
  * Dialogue event's own `\pos()` override (see dialogueAssLines) rather than
  * this style's shared Alignment/MarginV.
+ *
+ * libass draws the BorderStyle=3 box in the OUTLINE colour, padded by the
+ * Outline width — Outline=0 draws no box at all (plain floating text), so
+ * the bubble fill must go in `outline` with a real width; the bubble's own
+ * outline colour survives only as the Shadow box (a small offset accent).
  */
 function speechBubbleAssStyle(bubble: SpeechBubbleStyle, outputHeight: number): AssStylePreset {
+  const fontsize = Math.round(outputHeight * 0.04);
   return {
     primary: assColor(bubble.palette.text, '111111'),
-    outline: assColor(bubble.palette.outline, '111111'),
-    back: assColor(bubble.palette.box, 'FFFFFF'),
+    outline: assColor(bubble.palette.box, 'FFFFFF'),
+    back: assColor(bubble.palette.outline, '111111'),
     bold: 0,
     borderStyle: 3,
-    outlineWidth: 0,
-    shadow: 0,
-    fontsize: Math.round(outputHeight * 0.04),
+    outlineWidth: Math.round(fontsize * 0.4),
+    shadow: 2,
+    fontsize,
   };
 }
 
@@ -159,7 +165,11 @@ function dialogueAnchorPixels(
   const asset = sprite ? kit?.assets?.find((a) => a.id === sprite.assetId) : undefined;
   if (sprite && asset) {
     const geo = spriteGeometry(asset, sprite.position, sprite.scale, output, { flip: sprite.flip });
-    return { x: geo.anchorX, y: Math.max(output.height * 0.08, geo.y - output.height * 0.04) };
+    // geo.y is the FULL image's top — transparent headroom included — so the
+    // bubble must anchor off the visible top (y0 into the full height) or it
+    // floats far above characters whose PNGs have padding above the head.
+    const visibleTop = geo.y + (asset.visible_bounds_normalized?.y0 ?? 0) * geo.height;
+    return { x: geo.anchorX, y: Math.max(output.height * 0.08, visibleTop - output.height * 0.04) };
   }
   return { x: output.width / 2, y: output.height * 0.15 };
 }
