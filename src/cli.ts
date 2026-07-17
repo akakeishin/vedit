@@ -46,6 +46,7 @@ import {
 } from './ingest/batch.js';
 import { ffmpegBin, ffmpegHasFilter, run } from './ingest/run.js';
 import { buildResume } from './core/resume.js';
+import { appendNote, markTodoDone, readNotes, type NoteType } from './core/notes.js';
 import { detectTakes, packTakes } from './core/takes.js';
 import { buildRetrospective, parseRetentionCsv } from './core/analytics.js';
 import type { KitAsset, KitProfile, SceneFile, Transcript } from './core/types.js';
@@ -337,6 +338,12 @@ const HELP = `vedit — conversational local NLE
 usage: vedit <command> [args] [--project <dir>]
 
 project:   create <dir> [--name n] | status | resume | revisions | undo [--rev N] | open | projects
+notes:     note "<text>" [--type policy|decision|todo|pref]   # 低摩擦メモ(既定 decision; revision が読めれば rev N も記録)
+           notes [--limit N]                    # 直近のメモ一覧(既定10件。todo には note-done 用の番号付き)
+           note-done <todo番号>                   # 未完了 todo を完了にする(番号は vedit notes の todos[].no)
+             # manifest は変更しないので --base 不要。revision ログが「何をしたか」を記録するので、
+             # メモは「なぜ/次に何を」だけを残す(重複記録しない)。vedit resume が直近の policy/pref・
+             # 未完了todo全件・直近decision2件を自動で拾う
 ingest:    ingest <file...> [--language ja] [--transcribe] [--no-scenes] [--no-add]
              # 既定: プロキシ+波形+シーン検出まで(文字起こしはしない)。旧挙動(即時transcribe)は --transcribe
            ingest-batch <dir|files...> [--plan] [--copy destDir | --link] [--no-verify]
@@ -593,7 +600,57 @@ async function main() {
         const f = await p.scenes(s.id);
         if (f.scenes.length) sceneFiles.push(f);
       }
-      return out(buildResume(m, dir, revs, cands, kit, sceneFiles));
+      // 低摩擦編集メモ(NOTES.md, 無ければ [])— see core/notes.ts / core/resume.ts's ResumeNotesSummary.
+      const notes = await readNotes(dir);
+      return out(buildResume(m, dir, revs, cands, kit, sceneFiles, notes));
+    }
+
+    case 'note': {
+      // NOTES.md への追記(core/notes.ts)。manifest を一切変更しないので
+      // revision の安全機構(--base)の対象外——`show` と同じ「いつでも呼べる」
+      // 系のコマンド。revision 番号は分かれば記録するだけで、読めなくても失敗しない。
+      const USAGE = 'usage: vedit note "<text>" [--type policy|decision|todo|pref]';
+      const text = pos[0] ?? fail(USAGE);
+      const type = (flags.type as string) ?? 'decision';
+      if (type !== 'policy' && type !== 'decision' && type !== 'todo' && type !== 'pref') {
+        fail(`--type must be one of: policy | decision | todo | pref (got ${JSON.stringify(type)})`);
+      }
+      const dir = projectDir();
+      let rev: number | undefined;
+      try {
+        const m = await (await Project.open(dir)).manifest();
+        rev = m.revision;
+      } catch { /* manifest unreadable — note still gets written, just without a rev number */ }
+      await appendNote(dir, { type: type as NoteType, text, rev });
+      return out({ ok: true, type, rev });
+    }
+
+    case 'notes': {
+      // Read-only, no daemon required (same as `resume`/`sources`).
+      const dir = projectDir();
+      const all = await readNotes(dir);
+      // `note-done` 用の連番(ファイル全体を通した未完了 todo の出現順)を
+      // 表示にも付与する——`--limit` で切っても番号自体はファイル全体基準のまま。
+      let n = 0;
+      const numbered = all.map((e) => ({
+        ...e,
+        ...(e.todos ? { todos: e.todos.map((t) => (t.done ? t : { ...t, no: ++n })) } : {}),
+      }));
+      const limit = numFlag('limit', flags.limit) ?? 10;
+      return out(numbered.slice(-limit));
+    }
+
+    case 'note-done': {
+      const USAGE = 'usage: vedit note-done <todo番号> (番号は `vedit notes` の todos[].no を参照)';
+      const idx = Number(pos[0]);
+      if (!Number.isInteger(idx) || idx < 1) fail(USAGE);
+      const dir = projectDir();
+      try {
+        const { text } = await markTodoDone(dir, idx);
+        return out({ ok: true, done: text });
+      } catch (e: any) {
+        fail(e?.message ?? String(e));
+      }
     }
 
     case 'projects': {

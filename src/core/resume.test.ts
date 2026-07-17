@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { buildResume, type ResumeRevisionEntry } from './resume.js';
+import type { NoteEntry } from './notes.js';
 import type { CutCandidate, Manifest } from './types.js';
 
 function manifest(partial: Partial<Manifest> = {}): Manifest {
@@ -302,5 +303,45 @@ describe('buildResume: talk-likely untranscribed nextSteps hint (W-LAZY)', () =>
     const cands = [candidate({ id: 'c1', kind: 'silence', status: 'proposed' })];
     const r = buildResume(m, '/d', [], cands, null, [sceneFile('s1', [0.3])]);
     expect(r.nextSteps.length).toBeLessThanOrEqual(3);
+  });
+});
+
+// ---- NOTES.md excerpt (buildResume's optional `notes` param) ----
+
+function note(partial: Partial<NoteEntry> & { type: string }): NoteEntry {
+  return { ts: '2026-07-17 09:00', text: '', ...partial };
+}
+
+describe('buildResume: NOTES.md excerpt', () => {
+  it('omits `notes` entirely with no NOTES.md, and surfaces the latest policy/pref + all unfinished todos + latest 2 decisions when mixed entries are given', () => {
+    expect(buildResume(manifest(), '/d', [], []).notes).toBeUndefined();
+
+    const notes: NoteEntry[] = [
+      note({ type: 'policy', ts: '2026-07-17 09:00', rev: 3, text: '最初は落ち着いたトーン' }),
+      note({ type: 'decision', ts: '2026-07-17 09:10', rev: 4, text: '古い判断1' }),
+      note({ type: 'decision', ts: '2026-07-17 09:20', rev: 5, text: '古い判断2' }),
+      note({ type: 'decision', ts: '2026-07-17 09:30', rev: 6, text: '最新の判断' }),
+      note({
+        type: 'todo',
+        ts: '2026-07-17 09:40',
+        text: '- [ ] a\n- [x] b',
+        todos: [
+          { done: false, text: 'a' },
+          { done: true, text: 'b' },
+        ],
+      }),
+      note({ type: 'pref', ts: '2026-07-17 09:50', text: 'テンポ重視が好み' }),
+      note({ type: 'policy', ts: '2026-07-17 10:00', rev: 7, text: '後半はしっとり路線に変更' }),
+    ];
+    const r = buildResume(manifest(), '/d', [], [], null, [], notes);
+    expect(r.notes).toEqual({
+      policy: { ts: '2026-07-17 10:00', rev: 7, text: '後半はしっとり路線に変更' },
+      pref: { ts: '2026-07-17 09:50', text: 'テンポ重視が好み' },
+      todos: [{ text: 'a' }],
+      recentDecisions: [
+        { ts: '2026-07-17 09:20', rev: 5, text: '古い判断2' },
+        { ts: '2026-07-17 09:30', rev: 6, text: '最新の判断' },
+      ],
+    });
   });
 });

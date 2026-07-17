@@ -72,6 +72,16 @@ revision・直近セッションの履歴・ユーザー([ui])による編集有
 --base 不要)。resume が使えないとき: `vedit projects` → `vedit open` →
 `vedit status` → `vedit revisions` の actor 列を確認 → `vedit candidates --all`。
 
+**編集メモ**(低摩擦・セッションまたぎ): revision ログは「何をしたか」を
+op ごとに既に完全記録しているので、メモは**なぜ/次に何を**だけを残す
+(重複記録はしない)。ディレクターは (a) 方針を宣言したら
+`vedit note "<方針>" --type policy`、(b) ユーザーが承認/却下した重要な
+判断は理由込みで `vedit note "<判断+理由>"`(既定 decision)、(c) セッション
+終了時に残作業を `vedit note "<内容>" --type todo` で残す。一覧は
+`vedit notes [--limit N]`、完了は `vedit note-done <番号>`。manifest を
+変更しないので --base は不要。`vedit resume` が直近の policy/pref・
+未完了 todo 全件・直近 decision 2件を自動で拾う。
+
 Web UI には「素材」タブ(ポスター・使用状況バー・ソースプレビュー・
 シーン展開からの区間追加)がある。`--no-add` で取り込んだ素材の選定は
 ユーザーにこのタブを案内するとよい。

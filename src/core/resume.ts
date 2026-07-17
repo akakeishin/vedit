@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { COLOR_WARNING_MESSAGE, needsColorTransform, orphanedOverlays, orphanedSprites, timelineDuration } from './ops.js';
 import { kitProfileHighlights, type KitProfileHighlights } from './kit.js';
+import type { NoteEntry } from './notes.js';
 import type { CutCandidate, KitFile, Manifest, RevisionEntry, Scene } from './types.js';
 
 /**
@@ -37,6 +38,28 @@ export interface ResumeRevisionSummary {
   summary: string;
 }
 
+interface ResumeNoteRef {
+  ts: string;
+  rev?: number;
+  text: string;
+}
+
+/**
+ * NOTES.md(core/notes.ts)からの抜粋——「なぜ/次に何を」だけを resume に
+ * 混ぜる。revision 側が既に記録している「何をしたか」とは重複させない
+ * (詳細は notes.ts のモジュール doc)。
+ */
+export interface ResumeNotesSummary {
+  /** 直近の policy(方針宣言)1件。無ければ省略。 */
+  policy?: ResumeNoteRef;
+  /** 直近の pref(ユーザーの好み)1件。無ければ省略。 */
+  pref?: ResumeNoteRef;
+  /** 未完了 todo 全件(古い順)。 */
+  todos: { text: string }[];
+  /** 直近の decision(判断+理由)最大2件(古い順)。 */
+  recentDecisions: ResumeNoteRef[];
+}
+
 export interface ResumeSummary {
   project: {
     name: string;
@@ -60,6 +83,8 @@ export interface ResumeSummary {
   orphanedSprites: { id: string; reason: string }[];
   /** Linked kit's profile highlights (tone_tags/duration/pacing/spine/quiet_pause_policy), when a kit is linked AND it has a profile section. */
   kitProfile: KitProfileHighlights | null;
+  /** NOTES.md excerpt (see ResumeNotesSummary). Omitted entirely when the project has no NOTES.md (or it has no parseable entries). */
+  notes?: ResumeNotesSummary;
   /** Up to 3 mechanically-derivable next actions. */
   nextSteps: string[];
 }
@@ -78,7 +103,9 @@ function toSummary(r: ResumeRevisionEntry): ResumeRevisionSummary {
  * (W-LAZY), when given, is every already-read SceneFile (see
  * `Project.scenes`) — used only for the "talk-likely but untranscribed"
  * nextSteps hint below; defaults to `[]` (no hint) for callers that don't
- * have scene data handy.
+ * have scene data handy. `notes`, when given, is the already-read NOTES.md
+ * (see `readNotes` in notes.ts) — defaults to `[]` (no notes section) for
+ * callers that don't have it handy.
  */
 export function buildResume(
   m: Manifest,
@@ -87,6 +114,7 @@ export function buildResume(
   candidates: CutCandidate[],
   kit?: KitFile | null,
   sceneFiles: { sourceId: string; scenes: Pick<Scene, 't0' | 't1' | 'energy'>[] }[] = [],
+  notes: NoteEntry[] = [],
 ): ResumeSummary {
   const last5 = revisions.slice(-5).map(toSummary);
   const updatedAt = revisions.length ? revisions[revisions.length - 1].ts : null;
@@ -153,6 +181,23 @@ export function buildResume(
     nextSteps.push('素材を ingest してタイムラインを作成する');
   }
 
+  // NOTES.md excerpt: latest policy/pref (1 each), every unfinished todo,
+  // and the latest 2 decisions — see ResumeNotesSummary's doc for why this
+  // stays a small excerpt rather than the whole file.
+  const toRef = (n: NoteEntry): ResumeNoteRef => ({ ts: n.ts, ...(n.rev !== undefined ? { rev: n.rev } : {}), text: n.text });
+  const latestOfType = (type: string) => {
+    for (let i = notes.length - 1; i >= 0; i--) if (notes[i].type === type) return notes[i];
+    return undefined;
+  };
+  const policy = latestOfType('policy');
+  const pref = latestOfType('pref');
+  const todos = notes.flatMap((n) => (n.todos ?? []).filter((t) => !t.done).map((t) => ({ text: t.text })));
+  const recentDecisions = notes.filter((n) => n.type === 'decision').slice(-2).map(toRef);
+  const notesSummary: ResumeNotesSummary | undefined =
+    notes.length > 0
+      ? { ...(policy ? { policy: toRef(policy) } : {}), ...(pref ? { pref: toRef(pref) } : {}), todos, recentDecisions }
+      : undefined;
+
   return {
     project: { name: m.name, dir, revision: m.revision, duration: timelineDuration(m), output: m.output ?? null },
     lastSession: { revisions: last5, updatedAt },
@@ -162,6 +207,7 @@ export function buildResume(
     orphanedOverlays: orphans,
     orphanedSprites: spriteOrphans,
     kitProfile,
+    ...(notesSummary ? { notes: notesSummary } : {}),
     nextSteps: nextSteps.slice(0, 3),
   };
 }
