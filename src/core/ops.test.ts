@@ -1329,11 +1329,16 @@ describe('resolveSprites / resolvedActiveSprites / orphanedSprites', () => {
     expect(orphans[0].reason).toMatch(/not on the timeline/);
   });
 
-  it('resolvedActiveSprites sorts by resolved tlStart', () => {
+  it('resolvedActiveSprites keeps MANIFEST ARRAY ORDER (z-order: later entry = on top), NOT tlStart order', () => {
+    // Added first but anchored LATER in time; the second sprite is earlier
+    // in time. Array order must survive — the render stacks overlays in this
+    // order, and the web preview draws in array order, so re-sorting by
+    // tlStart here would make the final render z-stack differ from preview.
     let r = addSprite(m(), 'c1', { id: 'spLater', anchor: { sourceId: 's1', srcTime: 8 }, duration: 2 });
     r = addSprite(r, 'c2', { id: 'spEarlier', anchor: { sourceId: 's1', srcTime: 2 }, duration: 2 });
     const active = resolvedActiveSprites(r);
-    expect(active.map((a) => a.sprite.id)).toEqual(['spEarlier', 'spLater']);
+    expect(active.map((a) => a.sprite.id)).toEqual(['spLater', 'spEarlier']);
+    expect(active.map((a) => a.tlStart)).toEqual([8, 2]); // resolved times still correct, just not re-sorted
     expect(active[0].tlEnd - active[0].tlStart).toBeCloseTo(2);
   });
 
@@ -1606,6 +1611,54 @@ describe('setComposition', () => {
     m = setComposition(m, { duration: 30, width: 720, height: 1280 });
     expect(m.composition!.duration).toBe(30);
     expect(m.width).toBe(720);
+  });
+
+  // ---- P0 fix: re-compose must not wipe composition state it wasn't asked to change ----
+
+  it('re-compose preserves backgroundTrack (the 紙芝居 cuts survive a duration/size re-tune)', () => {
+    let m = compositionManifest(); // duration 20
+    m = setBackgroundAt(m, 5, { type: 'color', hex: '#00ff00' });
+    m = setBackgroundAt(m, 10, { type: 'color', hex: '#0000ff' });
+    m = setComposition(m, { duration: 30, width: 720, height: 1280 });
+    expect(m.composition!.backgroundTrack).toEqual([
+      { t: 5, ref: { type: 'color', hex: '#00ff00' } },
+      { t: 10, ref: { type: 'color', hex: '#0000ff' } },
+    ]);
+    expect(m.composition!.duration).toBe(30);
+  });
+
+  it('re-compose with background omitted keeps the existing background (no silent reset to black)', () => {
+    let m = setComposition(blankManifest(), {
+      duration: 20, width: 1080, height: 1920, background: { type: 'asset', assetId: 'bg1' },
+    });
+    m = setComposition(m, { duration: 25, width: 1080, height: 1920 });
+    expect(m.composition!.background).toEqual({ type: 'asset', assetId: 'bg1' });
+  });
+
+  it('re-compose with an explicit background updates it while still preserving backgroundTrack', () => {
+    let m = compositionManifest();
+    m = setBackgroundAt(m, 5, { type: 'color', hex: '#00ff00' });
+    m = setComposition(m, { duration: 20, width: 1080, height: 1920, background: { type: 'color', hex: '#ffffff' } });
+    expect(m.composition!.background).toEqual({ type: 'color', hex: '#ffffff' });
+    expect(m.composition!.backgroundTrack).toEqual([{ t: 5, ref: { type: 'color', hex: '#00ff00' } }]);
+  });
+
+  it('shrinking duration drops backgroundTrack cuts now at/after the new end (they would be unreachable)', () => {
+    let m = compositionManifest(); // duration 20
+    m = setBackgroundAt(m, 5, { type: 'color', hex: '#00ff00' });
+    m = setBackgroundAt(m, 15, { type: 'color', hex: '#0000ff' });
+    m = setComposition(m, { duration: 10, width: 1080, height: 1920 });
+    expect(m.composition!.backgroundTrack).toEqual([{ t: 5, ref: { type: 'color', hex: '#00ff00' } }]);
+    // Shrink past every cut: the emptied track key is pruned, not left as [].
+    m = setComposition(m, { duration: 3, width: 1080, height: 1920 });
+    expect(m.composition!.backgroundTrack).toBeUndefined();
+    expect(m.composition!.background).toEqual({ type: 'color', hex: '#000000' }); // base layer untouched
+  });
+
+  it('first-time compose is unchanged: no track, background defaults to black only because nothing existed', () => {
+    const m = setComposition(blankManifest(), { duration: 20, width: 1080, height: 1920 });
+    expect(m.composition).toEqual({ duration: 20, background: { type: 'color', hex: '#000000' } });
+    expect(m.composition!.backgroundTrack).toBeUndefined();
   });
 });
 

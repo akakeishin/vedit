@@ -1038,14 +1038,24 @@ export interface ResolvedSprite {
   tlEnd: number;
 }
 
-/** Non-orphan sprites with a resolved [tlStart, tlEnd) placement, sorted by tlStart — what render/view/OTIO/web actually touch. */
+/**
+ * Non-orphan sprites with a resolved [tlStart, tlEnd) placement, in MANIFEST
+ * ARRAY ORDER — what render/view/OTIO/web actually touch. Array order IS the
+ * z-order contract: a later `timeline.sprites` entry composites on top of an
+ * earlier one wherever they overlap. The web preview always drew in array
+ * order (later DOM node = on top); render.ts overlays in this function's
+ * iteration order — it used to re-sort by tlStart here, which made the final
+ * render stack overlapping sprites differently from the preview whenever
+ * they were added out of time order. Do NOT re-add a time sort: no consumer
+ * needs one (view/otio/publish are order-insensitive), and it would
+ * reintroduce that preview/render mismatch.
+ */
 export function resolvedActiveSprites(m: Manifest): ResolvedSprite[] {
   const out: ResolvedSprite[] = [];
   for (const r of resolveSprites(m)) {
     if (r.tlStart === null) continue;
     out.push({ sprite: r.sprite, tlStart: r.tlStart, tlEnd: r.tlStart + r.sprite.duration });
   }
-  out.sort((a, b) => a.tlStart - b.tlStart);
   return out;
 }
 
@@ -1539,8 +1549,16 @@ function assertBackgroundRef(ref: BackgroundRef, label: string): void {
  * Refuses a project that already has ingested sources/clips — composition
  * and normal A-roll editing are mutually exclusive modes on one project.
  * Calling this again on an already-composed (still source-less) project is
- * allowed and simply updates duration/size/background; there's no separate
- * "uncompose" short of `vedit undo`, same as any other manifest edit.
+ * allowed and updates ONLY the explicitly-given fields: duration/size are
+ * always applied (they're required args), `background` only when passed —
+ * an omitted `--background` on a re-compose keeps the existing background
+ * instead of resetting it to black, and everything else already on the
+ * composition (backgroundTrack's "紙芝居" cuts, any future field) is
+ * carried over untouched. The only re-compose side effect: shrinking
+ * `duration` drops backgroundTrack cuts now at/after the new end (they'd
+ * be unreachable — backgroundIntervals only iterates t < duration), which
+ * is silent for now (the return is a bare Manifest with no warning
+ * channel). First-time compose is unchanged: background defaults to black.
  * `width`/`height` are written directly onto the manifest (there is no
  * source to derive them from, unlike a normal project's ingest-time fps/
  * width/height) and rounded to the nearest even pixel (yuv420p requirement,
@@ -1559,13 +1577,22 @@ export function setComposition(
   if (!Number.isFinite(opts.width) || opts.width <= 0 || !Number.isFinite(opts.height) || opts.height <= 0) {
     throw new Error('compose: size must be positive width/height');
   }
-  const background = opts.background ?? { type: 'color', hex: '#000000' };
+  const prev = m.composition;
+  const background = opts.background ?? prev?.background ?? { type: 'color', hex: '#000000' };
   assertBackgroundRef(background, 'compose');
+  // Spread the previous composition first so backgroundTrack and any future
+  // field survive a re-compose; then overwrite just what this call sets.
+  const composition: NonNullable<Manifest['composition']> = { ...prev, duration: opts.duration, background };
+  if (composition.backgroundTrack) {
+    const inRange = composition.backgroundTrack.filter((e) => e.t < opts.duration);
+    if (inRange.length) composition.backgroundTrack = inRange;
+    else delete composition.backgroundTrack;
+  }
   return {
     ...m,
     width: Math.max(2, Math.round(opts.width / 2) * 2),
     height: Math.max(2, Math.round(opts.height / 2) * 2),
-    composition: { duration: opts.duration, background },
+    composition,
   };
 }
 

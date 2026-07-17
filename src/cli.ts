@@ -416,7 +416,8 @@ qc:        qc [--render <out.mp4>] [--report <out.html>]
 export:    export otio <out.otio> | export render <out.mp4> [--burn-captions] [--preset youtube|shorts|x]
            export render ... [--no-repair] [--fast-loudnorm]   # 乾音A/B比較 / 1-passループドネスに落とす
            export fcp7xml <out.xml> | export srt <out.srt> | export ass <out.ass>
-publish:   publish-pack <outdir> [--thumbs 6]   # chapters.txt + thumbnails/ + materials.json (read-only)
+publish:   publish-pack <outdir> [--thumbs 6] [--render <file>]   # chapters.txt + thumbnails/ + materials.json (read-only)
+             # --render <file>: コンポジション(スプライトアニメ)PJのサムネイルは書き出し済みファイルから抽出(未指定なら理由付きでスキップ)
 analytics: retro <csv> [--render-duration 秒]
              # YouTube Studio の視聴者維持率CSVを取り込み、構造化JSON+人間向けサマリを出力(仮説は含まない・事実のみ)
 presets:   preset-save <name> [--data '{"k":"v"}'] | preset-apply <name> | preset-list
@@ -1829,19 +1830,26 @@ async function main() {
     }
 
     case 'publish-pack': {
-      const outdir = path.resolve(pos[0] ?? fail('usage: vedit publish-pack <outdir> [--thumbs 6]'));
+      const outdir = path.resolve(pos[0] ?? fail('usage: vedit publish-pack <outdir> [--thumbs 6] [--render <file>]'));
       const dir = projectDir();
       const p = await Project.open(dir);
       const m = await p.manifest();
       const transcripts: Transcript[] = [];
       for (const s of m.sources) if (s.transcribed) transcripts.push(await p.transcript(s.id));
       const thumbs = numFlag('thumbs', flags.thumbs) ?? 6;
-      const res = await publishPack(p, m, transcripts, outdir, { thumbs });
+      // --render: an already-rendered output file (same path.resolve pattern
+      // as `vedit qc --render`) — a composition (W-ANIME) project has no
+      // original source to extract thumbnails from, so publishPack pulls
+      // them from this file instead; without it, thumbnail extraction is
+      // skipped and thumbnailsSkipped (below) explains why.
+      const renderedFile = flags.render ? path.resolve(String(flags.render)) : undefined;
+      const res = await publishPack(p, m, transcripts, outdir, { thumbs, renderedFile });
       return out({
         ok: true,
         outdir,
         files: res.files,
         ...(res.chaptersReason ? { chaptersSkipped: res.chaptersReason } : {}),
+        ...(res.thumbnailsReason ? { thumbnailsSkipped: res.thumbnailsReason } : {}),
         hint: 'タイトル/説明文は materials.json と transcript を材料に会話で起草する(モデル創作コピーはユーザー承認後のみ書き込む)',
       });
     }
