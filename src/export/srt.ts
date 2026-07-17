@@ -1,5 +1,6 @@
 import { promises as fs } from 'node:fs';
-import { captionCues } from '../core/captions.js';
+import { captionCues, captionCuesWithExclusions, formatCaptionExclusionWarning } from '../core/captions.js';
+import type { CaptionCue } from '../core/captions.js';
 import type { Manifest, Transcript } from '../core/types.js';
 
 // SRT export exists because OTIO drops captions entirely (no cue-list
@@ -38,14 +39,26 @@ export function wrapSrtLine(text: string, maxChars: number): string {
   return text.slice(0, breakAt).trimEnd() + '\n' + text.slice(breakAt + 1).trimStart();
 }
 
-export function toSrt(m: Manifest, transcripts: Transcript[]): string {
-  const cues = captionCues(m, transcripts);
+function srtFromCues(cues: CaptionCue[], maxChars: number): string {
   return cues
-    .map((c, i) => `${i + 1}\n${srtTime(c.tlStart)} --> ${srtTime(c.tlEnd)}\n${wrapSrtLine(c.text, m.captions.maxChars)}\n`)
+    .map((c, i) => `${i + 1}\n${srtTime(c.tlStart)} --> ${srtTime(c.tlEnd)}\n${wrapSrtLine(c.text, maxChars)}\n`)
     .join('\n');
 }
 
+export function toSrt(m: Manifest, transcripts: Transcript[]): string {
+  return srtFromCues(captionCues(m, transcripts), m.captions.maxChars);
+}
+
+/**
+ * P1: same non-speech-tag exclusion captionCues applies internally (a
+ * Whisper hallucination like "[MÚSICA DE FUNDO]" never becomes an SRT cue),
+ * surfaced here as a stderr warning — the same "警告: " channel renderFinal
+ * uses — so running `vedit export srt` directly (without a full render)
+ * still makes a dropped cue visible instead of silent.
+ */
 export async function writeSrt(m: Manifest, transcripts: Transcript[], outPath: string): Promise<string> {
-  await fs.writeFile(outPath, toSrt(m, transcripts));
+  const { cues, excluded } = captionCuesWithExclusions(m, transcripts);
+  if (excluded.length > 0) console.error(`警告: ${formatCaptionExclusionWarning(excluded)}`);
+  await fs.writeFile(outPath, srtFromCues(cues, m.captions.maxChars));
   return outPath;
 }

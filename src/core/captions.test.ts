@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { captionCueKey, captionCues, sanitizeCaptionText } from './captions.js';
+import {
+  captionCueKey,
+  captionCues,
+  captionCuesWithExclusions,
+  formatCaptionExclusionWarning,
+  isNonSpeechAnnotation,
+  sanitizeCaptionText,
+} from './captions.js';
 import type { Manifest, Transcript, Word } from './types.js';
 
 function manifest(clips: { srcIn: number; srcOut: number }[] = [{ srcIn: 0, srcOut: 20 }]): Manifest {
@@ -194,5 +201,158 @@ describe('captionCues', () => {
         without.map((c) => ({ text: c.text, tlStart: c.tlStart, tlEnd: c.tlEnd })),
       );
     });
+  });
+
+  describe('non-speech tag exclusion (P1)', () => {
+    it('real-world regression: a whisper hallucination tag split across words (like "[MÚSICA DE FUNDO]") never becomes a cue', () => {
+      const m = manifest([{ srcIn: 0, srcOut: 20 }]);
+      // Same shape as the actual whisper.cpp output that triggered the bug:
+      // the bracketed annotation split into separate word tokens with no
+      // punctuation, joined back into one line by the normal flush() logic.
+      const words: Word[] = [
+        { id: 'w0', text: '[MÚSICA', t0: 0.01, t1: 8.0, p: 0.22 },
+        { id: 'w1', text: 'DE', t0: 8.0, t1: 10.0, p: 0.23 },
+        { id: 'w2', text: 'FUNDO]', t0: 10.0, t1: 16.0, p: 0.9 },
+      ];
+      const t: Transcript = { sourceId: 's1', language: 'pt', words };
+      const cues = captionCues(m, [t]);
+      expect(cues).toHaveLength(0);
+    });
+
+    it('a cue mixing a bracketed aside with real spoken words is kept as-is (partial match never excludes)', () => {
+      const m = manifest([{ srcIn: 0, srcOut: 20 }]);
+      const words: Word[] = [
+        { id: 'w0', text: 'そう思う(拍手)', t0: 1.0, t1: 1.5, p: 0.9 },
+      ];
+      const t: Transcript = { sourceId: 's1', language: 'ja', words };
+      const cues = captionCues(m, [t]);
+      expect(cues).toHaveLength(1);
+      expect(cues[0].text).toBe('そう思う(拍手)');
+    });
+
+    it('a bracketed tag outside the known vocabulary is kept (conservative — not every bracketed aside is excluded)', () => {
+      const m = manifest([{ srcIn: 0, srcOut: 20 }]);
+      const words: Word[] = [{ id: 'w0', text: '[Explosion sound]', t0: 1.0, t1: 1.5, p: 0.9 }];
+      const t: Transcript = { sourceId: 's1', language: 'en', words };
+      const cues = captionCues(m, [t]);
+      expect(cues).toHaveLength(1);
+      expect(cues[0].text).toBe('[Explosion sound]');
+    });
+
+    it('Japanese full-width brackets 【音楽】 are excluded the same as ASCII brackets', () => {
+      const m = manifest([{ srcIn: 0, srcOut: 20 }]);
+      const words: Word[] = [{ id: 'w0', text: '【音楽】', t0: 1.0, t1: 1.5, p: 0.9 }];
+      const t: Transcript = { sourceId: 's1', language: 'ja', words };
+      const cues = captionCues(m, [t]);
+      expect(cues).toHaveLength(0);
+    });
+
+    it('a bare run of musical-note symbols is excluded even without bracket wrapping', () => {
+      const m = manifest([{ srcIn: 0, srcOut: 20 }]);
+      const words: Word[] = [{ id: 'w0', text: '♪♪♪', t0: 1.0, t1: 1.5, p: 0.9 }];
+      const t: Transcript = { sourceId: 's1', language: 'en', words };
+      const cues = captionCues(m, [t]);
+      expect(cues).toHaveLength(0);
+    });
+
+    it('note symbols around real lyrics are kept — only a NOTE-ONLY cue is excluded', () => {
+      const m = manifest([{ srcIn: 0, srcOut: 20 }]);
+      const words: Word[] = [{ id: 'w0', text: '♪ La la la ♪', t0: 1.0, t1: 1.5, p: 0.9 }];
+      const t: Transcript = { sourceId: 's1', language: 'en', words };
+      const cues = captionCues(m, [t]);
+      expect(cues).toHaveLength(1);
+      expect(cues[0].text).toBe('♪ La la la ♪');
+    });
+
+    it('real speech before and after a hallucinated tag survives — only the tag cue is dropped', () => {
+      const m = manifest([{ srcIn: 0, srcOut: 20 }]);
+      const words: Word[] = [
+        { id: 'w0', text: 'Hello.', t0: 1.0, t1: 1.5, p: 0.9 },
+        { id: 'w1', text: '[Music]', t0: 5.0, t1: 5.5, p: 0.2 },
+        { id: 'w2', text: 'World.', t0: 10.0, t1: 10.5, p: 0.9 },
+      ];
+      const t: Transcript = { sourceId: 's1', language: 'en', words };
+      const { cues, excluded } = captionCuesWithExclusions(m, [t]);
+      expect(cues.map((c) => c.text)).toEqual(['Hello.', 'World.']);
+      expect(excluded).toEqual([{ text: '[Music]' }]);
+    });
+
+    it('a manual captionTextOverrides edit on a hallucinated cue wins — the correction is kept, not dropped', () => {
+      const base = manifest([{ srcIn: 0, srcOut: 20 }]);
+      const words: Word[] = [{ id: 'wtag', text: '[Music]', t0: 1.0, t1: 1.5, p: 0.2 }];
+      const t: Transcript = { sourceId: 's1', language: 'en', words };
+      const m: Manifest = { ...base, captionTextOverrides: { 's1:wtag': 'Thanks everyone!' } };
+      const { cues, excluded } = captionCuesWithExclusions(m, [t]);
+      expect(cues).toHaveLength(1);
+      expect(cues[0].text).toBe('Thanks everyone!');
+      expect(excluded).toHaveLength(0);
+    });
+  });
+});
+
+describe('isNonSpeechAnnotation (P1)', () => {
+  it('recognizes the reported real-world case', () => {
+    expect(isNonSpeechAnnotation('[MÚSICA DE FUNDO]')).toBe(true);
+  });
+
+  it.each([
+    '[Music]',
+    '[MUSIC]',
+    '(music)',
+    '[background music]',
+    '(Applause)',
+    '[applause]',
+    '[Laughter]',
+    '(laughing)',
+    '[Silence]',
+    '[inaudible]',
+    '(música)',
+    '[música de fondo]',
+    '(musik)',
+    '[Hintergrundmusik]',
+    '(musique)',
+    '[applaudissements]',
+    '(musica)',
+    '[applausi]',
+    '【音楽】',
+    '(拍手)',
+    '[BGM]',
+    '[bgm]',
+    '(笑い声)',
+    '[音乐]',
+    '(鼓掌)',
+    '[음악]',
+    '(박수)',
+  ])('treats %s as a non-speech annotation', (text) => {
+    expect(isNonSpeechAnnotation(text)).toBe(true);
+  });
+
+  it.each([
+    'Hello there.',
+    'そう思う(拍手)', // mixed real speech + aside -> partial match, never excluded
+    '(Applause) thank you all', // tag word present but cue isn't ONLY the tag
+    '[Explosion sound]', // bracketed but not in the known vocabulary
+    'music', // bare vocabulary word with NO bracket wrap -> not treated as an annotation
+    '',
+  ])('does not treat %s as a non-speech annotation', (text) => {
+    expect(isNonSpeechAnnotation(text)).toBe(false);
+  });
+});
+
+describe('formatCaptionExclusionWarning (P1)', () => {
+  it('formats a single exclusion exactly as the spec\'s example', () => {
+    expect(formatCaptionExclusionWarning([{ text: '[MÚSICA DE FUNDO]' }])).toBe(
+      '非発話タグを字幕から除外(1件: [MÚSICA DE FUNDO])',
+    );
+  });
+
+  it('lists up to 3 examples verbatim when there are exactly 3', () => {
+    const excluded = [{ text: '[Music]' }, { text: '[Applause]' }, { text: '【音楽】' }];
+    expect(formatCaptionExclusionWarning(excluded)).toBe('非発話タグを字幕から除外(3件: [Music]、[Applause]、【音楽】)');
+  });
+
+  it('summarizes remaining examples beyond 3 as "他N件"', () => {
+    const excluded = [{ text: '[Music]' }, { text: '[Applause]' }, { text: '[Laughter]' }, { text: '[Silence]' }, { text: '[Noise]' }];
+    expect(formatCaptionExclusionWarning(excluded)).toBe('非発話タグを字幕から除外(5件: [Music]、[Applause]、[Laughter] 他2件)');
   });
 });

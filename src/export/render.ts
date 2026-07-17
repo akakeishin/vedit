@@ -13,7 +13,7 @@ import {
   spriteMotionPlan,
   timelineDuration,
 } from '../core/ops.js';
-import { captionCues } from '../core/captions.js';
+import { captionCues, captionCuesWithExclusions, formatCaptionExclusionWarning } from '../core/captions.js';
 import type { CaptionSettings, KitFile, KitStyle, Manifest, MotionSpec, MusicItem, Transcript } from '../core/types.js';
 import {
   AMBIENT_LAYER_OPACITY,
@@ -1244,7 +1244,18 @@ export async function renderFinal(
   // caption" case byte-for-byte regression-safe (no stray empty ass filter).
   const noBurnCaptions = Boolean(opts.noBurnCaptions);
   const burnCaptionsNow = effectiveM.captions.enabled && !noBurnCaptions;
-  const cues = burnCaptionsNow ? captionCues(effectiveM, transcripts) : [];
+  const { cues, excluded: nonSpeechExcluded } = burnCaptionsNow
+    ? captionCuesWithExclusions(effectiveM, transcripts)
+    : { cues: [], excluded: [] };
+  // P1: a Whisper hallucination ("[MÚSICA DE FUNDO]" etc.) never makes it
+  // into `cues` at all (captionCuesWithExclusions already dropped it) — this
+  // just makes the drop visible rather than silent, same warnings channel
+  // every other render advisory (kit issues, preset overages) already uses.
+  if (nonSpeechExcluded.length > 0) {
+    const w = formatCaptionExclusionWarning(nonSpeechExcluded);
+    console.error(`警告: ${w}`);
+    warnings.push(w);
+  }
   const dialogueCount = (effectiveM.timeline.dialogue ?? []).length;
   const hasDialogue = dialogueCount > 0;
   const needsAssBurn = cues.length > 0 || hasDialogue;
