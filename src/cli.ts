@@ -482,11 +482,27 @@ async function main() {
       if (!flags.size) fail(USAGE);
       const size = parseReframeSpec(String(flags.size));
       await ensureDaemon(dir);
+      // Kit must link BEFORE the compose op: `--background <kitAssetId>`
+      // resolves against the manifest's linked kit at apply time.
+      if (flags.kit) {
+        const state0 = await api('/api/state');
+        await api('/api/edit', {
+          method: 'POST',
+          body: JSON.stringify({
+            baseRev: state0.revision, actor: flags.actor ?? 'claude',
+            op: 'kit-link', path: path.resolve(String(flags.kit)),
+          }),
+        });
+      }
       const state = await api('/api/state');
       const res = await api('/api/edit', {
         method: 'POST',
         body: JSON.stringify({
-          baseRev: baseRevOf(state), actor: flags.actor ?? 'claude',
+          // compose is a create-class command: it opened/created the project
+          // itself just above, so demanding --base here would only add
+          // friction with nothing to protect (like `create`, unlike edits).
+          baseRev: flags.base !== undefined ? Number(flags.base) : state.revision,
+          actor: flags.actor ?? 'claude',
           op: 'compose', duration, width: size.width, height: size.height,
           background: flags.background,
           // Resolved against THIS process's cwd (the user's actual shell),
@@ -494,16 +510,6 @@ async function main() {
           backgroundPathHint: flags.background ? path.resolve(String(flags.background)) : undefined,
         }),
       });
-      if (flags.kit) {
-        const state2 = await api('/api/state');
-        await api('/api/edit', {
-          method: 'POST',
-          body: JSON.stringify({
-            baseRev: state2.revision, actor: flags.actor ?? 'claude',
-            op: 'kit-link', path: path.resolve(String(flags.kit)),
-          }),
-        });
-      }
       return out({
         ok: true, dir, ...res,
         hint: 'vedit sprite-add <assetId> --at <t> --pos x,y --scale .. --enter .. --loop .. --base <rev>',
