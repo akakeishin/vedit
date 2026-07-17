@@ -19,6 +19,19 @@
 - ⏳ CLI 配線残: publish-pack --render / W7 motionSpecs(loadMotionSpecs)/ selects --raw の daemon 配線
 - ⏳ smoke:compose(実レンダー統合検知 — loudnorm/breathe 級のバグの恒久対策)
 
+**再発防止の規律(Codex 3分類レビュー 2026-07-17 採用 — 検証ループ後に導入)**
+- **Capability Registry**: 全機能に uiExposure
+  (direct / inspector / claude-only-with-guidance / result-only / internal)
+  を宣言する単一の正を作り、daemon dispatcher / CLI switch / web の露出を
+  CI で照合(未分類=fail)。「入口のない機能」を構造的に再発不能に
+- **Parity 契約**: 機能ごとに exact / approximate / export-only /
+  omitted-on-export を宣言し、approximate 以下は UI に自己申告バッジ。
+  manifest fixture でプレビュー/レンダー差分をテスト固定
+- **mutation 状態機械**: 全 mutate を idle→pending→committed/syncing→
+  succeeded / failed-before-commit / committed-but-refresh-failed に統一
+  (「保存成功なのに再読込失敗を編集失敗と誤表示」等の解消)。
+  応答エンベロープ {operationId, revision, summary, warnings, noOp} 統一
+
 **Fix 波B — 検証前に判断(小さく効く)**
 - **`vedit shift --from <t> --by <±秒>`**: t 以降の背景切替点・スプライト・セリフ・
   music tlStart を一括平行移動(Codex 提案「シーン単位リップル(L)」の S/M 代替。

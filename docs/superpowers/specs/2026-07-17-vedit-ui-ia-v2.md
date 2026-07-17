@@ -138,9 +138,14 @@ UI は確認・承認・微調整)を壊さずに借りること。
   アセット数。未リンクなら非表示)。
 - **自動保存の明示**: ヘッダーの版表示に「自動保存」を添える
   (「保存」という語が UI に一度も出ない現状の解消)。
-- 別枠(波3以降・要設計): 書き出しの UI 到達(daemon に export ルートが
-  構造的に無い。会話主導原則と整合する形 — 最低限 custom-html 警告等の
-  結果カード表出 — を Fable が設計してから)。コンポジション編集 UI。
+- **波3確定(Codex 推奨採用): 書き出し結果カード** — 実行 UI は作らない。
+  CLI が書き出し完了時に {ts, kind, file, ok, revision, options, warnings,
+  captionsBurned…} を cache/export-results.json に原子的追記(直近20件)、
+  daemon は読み取り専用 `GET /api/export-results` のみ、web は確認タブに
+  「最後の書き出し」カード(revision が現在と違えば「古い版 — 再書き出しを
+  Claude に頼んでください」警告、custom-html 警告等もここに残る)。
+  空状態は「Claude に『MP4 を書き出して』と伝えてください」。
+  コンポジション編集 UI は引き続き別枠(claude-only-with-guidance)。
 
 ## 実装ノート
 
