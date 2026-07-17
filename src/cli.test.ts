@@ -30,8 +30,12 @@ const REPO_ROOT = path.resolve(path.dirname(THIS_FILE), '..');
 const TSX_BIN = path.join(REPO_ROOT, 'node_modules', '.bin', 'tsx');
 const CLI_ENTRY = path.join(REPO_ROOT, 'src', 'cli.ts');
 
-function runCli(args: string[]): { status: number; stdout: string; stderr: string } {
-  const res = spawnSync(TSX_BIN, [CLI_ENTRY, ...args], { encoding: 'utf8', timeout: 20000 });
+function runCli(args: string[], env?: Record<string, string>): { status: number; stdout: string; stderr: string } {
+  const res = spawnSync(TSX_BIN, [CLI_ENTRY, ...args], {
+    encoding: 'utf8',
+    timeout: 20000,
+    ...(env ? { env: { ...process.env, ...env } } : {}),
+  });
   return { status: res.status ?? -1, stdout: res.stdout ?? '', stderr: res.stderr ?? '' };
 }
 
@@ -114,6 +118,87 @@ describe('cli: vedit takes', () => {
     expect(stdout).toMatch(/multi-take groups \(1 detected/);
     expect(stdout).toMatch(/★/); // recommendation marker
     expect(stdout).not.toMatch(/^\{/); // packTakes text, not JSON — out() prints strings verbatim
+  });
+});
+
+/**
+ * W7: `export render` must load motion sidecars (loadMotionSpecs) and pass
+ * them to renderFinal/renderComposition. These spawn the real CLI like every
+ * other test in this file, but point $VEDIT_FFMPEG at a tiny stub script (a
+ * real render is neither needed nor wanted here): the stub answers the
+ * `-filters` capability probe (drawtext + ass, so ffmpegBin resolution and
+ * the motion burn's ffmpegHasFilter('ass') gate both pass) and logs every
+ * other invocation's argv to $FFMPEG_ARGS_LOG. `export` never touches the
+ * daemon (Project.open reads directly), so this stays within this file's
+ * "no ensureDaemon commands" scope.
+ */
+describe('cli: vedit export render wires motion sidecars into the render (W7)', () => {
+  let stub: string;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-cli-ffstub-'));
+    stub = path.join(root, 'ffmpeg-stub.sh');
+    await fsp.writeFile(
+      stub,
+      '#!/bin/bash\n' +
+        'if [ "$1" = "-hide_banner" ] && [ "$2" = "-filters" ]; then\n' +
+        '  printf " T.. drawtext          Draw text\\n T.. ass               Render ASS\\n"\n' +
+        '  exit 0\n' +
+        'fi\n' +
+        'if [ -n "$FFMPEG_ARGS_LOG" ]; then printf "%s\\n" "$@" >> "$FFMPEG_ARGS_LOG"; fi\n' +
+        'exit 0\n',
+      { mode: 0o755 },
+    );
+  });
+
+  it('renderFinal path: a custom-html motion item surfaces the 焼き込み対象外 warning in the CLI JSON output', async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-cli-render-motion-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'render-motion');
+    await fsp.writeFile(path.join(dir, 'motion', 'm1.json'), JSON.stringify({ id: 'm1', type: 'custom-html', params: {}, html: '<div/>' }));
+    await project.commit(0, 'system', 'setup', {}, 'seed', (m) => ({
+      ...m,
+      sources: [{ id: 's1', path: '/media/one.mp4', duration: 10, fps: 30, width: 1920, height: 1080, hasAudio: true }],
+      timeline: {
+        ...m.timeline,
+        video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 10 }],
+        motion: [{ id: 'm1', spec: 'motion/m1.json', tlStart: 0, duration: 2 }],
+      },
+    }));
+    const { status, stdout, stderr } = runCli(
+      ['export', 'render', path.join(root, 'out.mp4'), '--project', dir],
+      { VEDIT_FFMPEG: stub },
+    );
+    expect(status, stderr).toBe(0);
+    const body = JSON.parse(stdout);
+    expect(body.ok).toBe(true);
+    // The warning ONLY exists when cli.ts actually loaded the sidecar and
+    // passed opts.motionSpecs through — with the pre-wiring behavior
+    // (motionSpecs omitted) this render is warning-free by design.
+    expect(body.warnings).toContain('custom-html は焼き込み対象外(1件)');
+  });
+
+  it('renderComposition path: a burnable motion item lands a .vedit-motion.ass ass filter in the ffmpeg graph', async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-cli-render-comp-motion-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'comp-motion');
+    await fsp.writeFile(path.join(dir, 'motion', 'm1.json'), JSON.stringify({ id: 'm1', type: 'cta', params: { text: 'Subscribe' } }));
+    await project.commit(0, 'system', 'setup', {}, 'seed', (m) => ({
+      ...m,
+      width: 1080,
+      height: 1920,
+      composition: { duration: 5, background: { type: 'color', hex: '#000000' } },
+      timeline: { ...m.timeline, motion: [{ id: 'm1', spec: 'motion/m1.json', tlStart: 1, duration: 2 }] },
+    }));
+    const argsLog = path.join(root, 'ffmpeg-args.log');
+    const { status, stdout, stderr } = runCli(
+      ['export', 'render', path.join(root, 'out.mp4'), '--project', dir],
+      { VEDIT_FFMPEG: stub, FFMPEG_ARGS_LOG: argsLog },
+    );
+    expect(status, stderr).toBe(0);
+    expect(JSON.parse(stdout).ok).toBe(true);
+    const logged = await fsp.readFile(argsLog, 'utf8');
+    expect(logged).toMatch(/\.vedit-motion\.ass/); // the burn filter reached ffmpeg — motionSpecs were wired through
   });
 });
 

@@ -393,6 +393,13 @@ export interface MusicItem {
   fadeOut: number;
   /** Automatically duck under speech at render/preview time. Default true. */
   duck: boolean;
+  /**
+   * What this item IS, for display/reporting only — no renderer branches on
+   * it (an SFX behaves like SFX because `vedit music-add --sfx` writes
+   * duck:false + 0.03s click-guard fades, all above). Optional for backward
+   * compatibility: absent (every pre-existing item) reads as BGM.
+   */
+  role?: 'bgm' | 'sfx';
 }
 
 export interface CaptionSettings {

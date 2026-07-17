@@ -18,7 +18,7 @@ import { listProjects } from './core/registry.js';
 import { loadPreset, listPresets, savePreset } from './core/presets.js';
 import { renderView, renderSceneSheet } from './export/view.js';
 import { hasReframe, writeOtio } from './export/otio.js';
-import { renderComposition, renderFinal, toAss } from './export/render.js';
+import { loadMotionSpecs, renderComposition, renderFinal, toAss } from './export/render.js';
 import { chaptersFromMotion, loadPeaksBySource, publishPack } from './export/publish.js';
 import {
   buildQcReport,
@@ -73,7 +73,7 @@ const BOOLEAN_FLAGS = new Set([
   'latest', 'full', 'all', 'burn-captions', 'no-duck',
   'no-repair', 'fast-loudnorm', 'deess', 'confirm',
   'plan', 'link', 'no-verify', 'force', 'flip', 'no-flip',
-  'clear', 'no-motion', 'no-sprite', 'raw',
+  'clear', 'no-motion', 'no-sprite', 'raw', 'keep-duration', 'sfx',
 ]);
 const argv = process.argv.slice(2);
 const cmd = argv[0];
@@ -375,7 +375,8 @@ captions:  captions [--enabled true|false] [--style clean|bold|<kitStyleId>] [--
            fonts   # 利用可能なフォント一覧(キット内 + システム、read-only)
 motion:    motion-add --type chapter-card --text "..." --at 12 --duration 4 [--subtitle ...]
            motion-update <id> [--text ...] [--at ...] [--duration ...] | motion-remove <id>
-music:     music-add <file> [--at 0] [--duration N] [--src-in 0] [--gain -12] [--fade-in 1] [--fade-out 2] [--no-duck]
+music:     music-add <file> [--at 0] [--duration N] [--src-in 0] [--gain -12] [--fade-in 1] [--fade-out 2] [--no-duck] [--sfx]
+             # --sfx: SE(効果音)糖衣 — duck無効+0.03sクリックガードfade+role:'sfx'。明示フラグが常に優先
            music-update <id> [同フラグ] | music-remove <id>
            audio-mix [--target-lufs -14] [--duck-amount -10] [--crossfade-ms 12]
            audio-repair --preset outdoor|indoor|wireless|off [--deess]   # 会話音声リペア(既定 off)
@@ -402,6 +403,9 @@ anime:     compose <dir> --duration 秒 --size WxH|比率 [--name n] [--backgrou
            dialogue-add "セリフ" --at t [--duration s] [--sprite <spriteItemId>] [--voice <音声ファイル>] --base <rev>
            dialogue-update <id> ["新テキスト"] [--at t] [--duration s] [--sprite <id>|--no-sprite] --base <rev>
            dialogue-remove <id> --base <rev>
+           shift --from <t> --by <±秒> [--keep-duration] --base <rev>
+             # 「間」の一括調整(コンポジション専用): t>=from の sprite/dialogue/music/背景切替を平行移動。
+             # 既定は duration も伸縮、--keep-duration で尺固定(はみ出す項目はエラー、黙って消さない)
 takes:     takes [--source id]   # 言い直し(撮り直し)候補の検出結果を表示(read-only、何も適用しない)
 intent:    intent-add <sourceId> <t0> <t1> --label "余韻" [--kind quiet|hold] --base <rev>
              # 「静寂スコア」保護区間: --kind quiet(既定)は無音検出の自動除外+BGMダッキング警告、hold は検出除外のみ
@@ -415,6 +419,7 @@ qc:        qc [--render <out.mp4>] [--report <out.html>]
              # kit があれば tempo contract(表示のみ・合否判定なし)も付与。--report で buildQcReport の HTML を書き出し
 export:    export otio <out.otio> | export render <out.mp4> [--burn-captions] [--preset youtube|shorts|x]
            export render ... [--no-repair] [--fast-loudnorm]   # 乾音A/B比較 / 1-passループドネスに落とす
+             # motion(チャプターカード等4プリセット)は自動で焼き込み。custom-html は対象外(警告を出力)
            export fcp7xml <out.xml> | export srt <out.srt> | export ass <out.ass>
 publish:   publish-pack <outdir> [--thumbs 6] [--render <file>]   # chapters.txt + thumbnails/ + materials.json (read-only)
              # --render <file>: コンポジション(スプライトアニメ)PJのサムネイルは書き出し済みファイルから抽出(未指定なら理由付きでスキップ)
@@ -535,6 +540,17 @@ async function main() {
 
     case 'bg-remove':
       return edit({ op: 'bg-remove', t: numFlag('at', flags.at) ?? fail('usage: vedit bg-remove --at <t> --base <rev>') });
+
+    case 'shift': {
+      // Composition-only "間" adjustment (see ops.ts's shiftComposition):
+      // translate every sprite/dialogue/music/bg-cut at/after --from by --by
+      // seconds; duration stretches by the same amount unless
+      // --keep-duration pins it (out-of-range then errors, never drops).
+      const USAGE = 'usage: vedit shift --from <t> --by <±秒> [--keep-duration] --base <rev>';
+      const from = numFlag('from', flags.from) ?? fail(USAGE);
+      const by = numFlag('by', flags.by) ?? fail(USAGE);
+      return edit({ op: 'shift', from, by, keepDuration: Boolean(flags['keep-duration']) });
+    }
 
     case 'dialogue-add': {
       const USAGE = 'usage: vedit dialogue-add "text" --at <t> [--duration s] [--sprite <spriteItemId>] [--voice <audioFile>] --base <rev>';
@@ -1254,8 +1270,14 @@ async function main() {
 
     case 'music-add': {
       if (pos.length === 0) {
-        fail('usage: vedit music-add <file> [--at 0] [--duration N] [--src-in 0] [--gain -12] [--fade-in 1] [--fade-out 2] [--no-duck]');
+        fail('usage: vedit music-add <file> [--at 0] [--duration N] [--src-in 0] [--gain -12] [--fade-in 1] [--fade-out 2] [--no-duck] [--sfx]');
       }
+      // --sfx (SE 糖衣): one-shot sound-effect defaults — no speech ducking
+      // and 0.03s click-guard micro-fades instead of the BGM-ish 1s/2s —
+      // plus a role:'sfx' tag on the item. Every explicitly-passed flag
+      // (--fade-in/--fade-out/--no-duck/--gain/...) still wins over the
+      // sugar, same precedence rule as kit defaults vs explicit flags.
+      const sfx = Boolean(flags.sfx);
       return edit({
         op: 'music-add',
         path: path.resolve(pos[0]),
@@ -1263,9 +1285,10 @@ async function main() {
         duration: numFlag('duration', flags.duration),
         srcIn: numFlag('src-in', flags['src-in']),
         gain: numFlag('gain', flags.gain),
-        fadeIn: numFlag('fade-in', flags['fade-in']),
-        fadeOut: numFlag('fade-out', flags['fade-out']),
-        duck: flags['no-duck'] ? false : undefined,
+        fadeIn: numFlag('fade-in', flags['fade-in']) ?? (sfx ? 0.03 : undefined),
+        fadeOut: numFlag('fade-out', flags['fade-out']) ?? (sfx ? 0.03 : undefined),
+        duck: flags['no-duck'] ? false : sfx ? false : undefined,
+        ...(sfx ? { role: 'sfx' } : {}),
       });
     }
 
@@ -1783,9 +1806,21 @@ async function main() {
         // is the dedicated background/sprite/dialogue pipeline instead. The
         // existing export presets (crf/audio-bitrate/resize/loudnorm target)
         // apply unchanged either way (resolveRenderParams is shared).
+        // W7 motion burn-in: resolve motion sidecars (motion/<id>.json) and
+        // opt in to the burn for both render pipelines. Loaded only when the
+        // timeline actually has motion items — a motion-less project passes
+        // no motionSpecs at all, keeping its filtergraph byte-for-byte on
+        // the pre-W7 regression contract (see renderFinal's doc). Warnings
+        // (e.g. 「custom-html は焼き込み対象外(N件)」) come back on
+        // res.warnings and flow into the JSON output below like every other
+        // render warning.
+        const motionSpecs = m.timeline.motion.length > 0 ? await loadMotionSpecs(p, m) : undefined;
         if (m.composition) {
           console.error('rendering composition (background + sprites + dialogue)...');
-          const res = await renderComposition(m, path.resolve(dest), { preset: presetRaw as 'youtube' | 'shorts' | 'x' | undefined });
+          const res = await renderComposition(m, path.resolve(dest), {
+            preset: presetRaw as 'youtube' | 'shorts' | 'x' | undefined,
+            ...(motionSpecs ? { motionSpecs } : {}),
+          });
           return out({ ok: true, file: dest, ...(res.warnings.length ? { warnings: res.warnings } : {}) });
         }
         console.error('rendering from original sources (this encodes the full timeline)...');
@@ -1794,6 +1829,7 @@ async function main() {
           preset: presetRaw as 'youtube' | 'shorts' | 'x' | undefined,
           noRepair: Boolean(flags['no-repair']),
           fastLoudnorm: Boolean(flags['fast-loudnorm']),
+          ...(motionSpecs ? { motionSpecs } : {}),
         });
         return out({ ok: true, file: dest, ...(res.warnings.length ? { warnings: res.warnings } : {}) });
       }

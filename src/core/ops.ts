@@ -405,6 +405,8 @@ export function addMusic(
     fadeIn?: number;
     fadeOut?: number;
     duck?: boolean;
+    /** Display/reporting tag (see MusicItem.role) — persisted only when given, so pre-existing callers/items are byte-for-byte unchanged. */
+    role?: 'bgm' | 'sfx';
     id?: string;
   },
 ): Manifest {
@@ -423,10 +425,15 @@ export function addMusic(
   assertGain(gain, 'music-add');
   assertNonNegative(fadeIn, 'music-add', 'fade-in');
   assertNonNegative(fadeOut, 'music-add', 'fade-out');
+  // Runtime guard (not just TS): the future daemon wiring passes b.role from
+  // the request body verbatim.
+  if (opts.role !== undefined && opts.role !== 'bgm' && opts.role !== 'sfx') {
+    throw new Error(`music-add: role (${JSON.stringify(opts.role)}) must be "bgm" or "sfx"`);
+  }
   const music = m.timeline.music ?? [];
   const id = opts.id ?? freshId('mu');
   if (music.some((x) => x.id === id)) throw new Error(`music-add: id already exists: ${id}`);
-  const item: MusicItem = { id, path, tlStart, duration, srcIn, gain, fadeIn, fadeOut, duck };
+  const item: MusicItem = { id, path, tlStart, duration, srcIn, gain, fadeIn, fadeOut, duck, ...(opts.role ? { role: opts.role } : {}) };
   return { ...m, timeline: { ...m.timeline, music: [...music, item] } };
 }
 
@@ -1667,6 +1674,130 @@ export function backgroundIntervals(m: Manifest): BackgroundInterval[] {
     out.push({ t0, t1, ref: resolvedBackgroundAt(m, t0) });
   }
   return out;
+}
+
+/** How many items `shiftComposition` moved, plus the composition's duration AFTER the shift. */
+export interface ShiftSummary {
+  sprites: number;
+  dialogue: number;
+  music: number;
+  bgCuts: number;
+  duration: number;
+}
+
+/**
+ * `vedit shift --from <t> --by <±秒>`: composition-only "間" (pacing gap)
+ * adjustment — translate everything placed at/after `from` by `by` seconds
+ * in one move: sprites (their `__comp__` anchor srcTime IS the timeline
+ * time in a composition — see COMP_SOURCE_ID), dialogue, music, and
+ * backgroundTrack cuts. An item sitting exactly AT `from` moves.
+ *
+ * A normal (source-driven) project is refused outright: its cut editing
+ * already ripples automatically (remove-range/remove-words shift everything
+ * downstream), so a manual shift op would only fight that model.
+ *
+ * Duration: stretches/shrinks by `by` by default (making room / closing a
+ * gap); `opts.keepDuration` pins it instead, in which case any item or cut
+ * that the shift would push beyond the end is an ERROR — never silently
+ * dropped. In every mode, an item that would land at t < 0, or that this
+ * op's own duration shrink would strand beyond the new end, is an error
+ * too. All validation happens BEFORE anything is applied — on error the
+ * manifest is untouched (no partial application). Items that were ALREADY
+ * out of range before the call (e.g. a sprite orphaned by an earlier
+ * duration change) are left alone rather than blocking the shift.
+ *
+ * backgroundTrack is re-sorted after the move (a negative shift can carry a
+ * moved cut past an unmoved one), preserving setBackgroundAt's
+ * sorted-ascending invariant.
+ */
+export function shiftComposition(
+  m: Manifest,
+  from: number,
+  by: number,
+  opts?: { keepDuration?: boolean },
+): { manifest: Manifest; summary: ShiftSummary } {
+  if (!m.composition) {
+    throw new Error('shift: コンポジション専用の操作です。実写プロジェクトはカット編集が自動リップルします — remove-range / remove-words / clip-move 等を使ってください');
+  }
+  if (!Number.isFinite(from) || from < 0) throw new Error(`shift: from (${from}) must be a finite number >= 0`);
+  if (!Number.isFinite(by) || by === 0) throw new Error(`shift: by (${by}) must be a finite, non-zero number of seconds`);
+  const EPS = 1e-6;
+  const keep = opts?.keepDuration ?? false;
+  const oldDuration = m.composition.duration;
+  const newDuration = keep ? oldDuration : oldDuration + by;
+  if (newDuration <= EPS) {
+    throw new Error(`shift: 移動後の duration (${newDuration.toFixed(3)}s) が 0 以下になります`);
+  }
+
+  // Validate-then-apply: collect every violation first; throw before any
+  // part of the manifest is rebuilt if there is one.
+  const problems: string[] = [];
+  /** moved=true: the shifted position must land inside [0, newDuration]. moved=false: only flag it if THIS op's duration change strands a previously-in-range item. */
+  const check = (label: string, id: string, tNew: number, moved: boolean, tOld: number): void => {
+    if (moved && tNew < -EPS) {
+      problems.push(`${label} ${id}: 移動後 t=${tNew.toFixed(3)}s が 0 秒より前になります`);
+    } else if (tNew > newDuration + EPS && (moved || tOld <= oldDuration + EPS)) {
+      problems.push(`${label} ${id}: 移動後 t=${tNew.toFixed(3)}s が duration (${newDuration.toFixed(3)}s) を超えます${keep ? '(--keep-duration 指定のため尺は伸びません)' : ''}`);
+    }
+  };
+
+  let spriteCount = 0;
+  const sprites = (m.timeline.sprites ?? []).map((s) => {
+    const moved = s.anchor.sourceId === COMP_SOURCE_ID && s.anchor.srcTime >= from;
+    const t = moved ? s.anchor.srcTime + by : s.anchor.srcTime;
+    check('sprite', s.id, t, moved, s.anchor.srcTime);
+    if (!moved) return s;
+    spriteCount++;
+    return { ...s, anchor: { ...s.anchor, srcTime: t } };
+  });
+
+  let dialogueCount = 0;
+  const dialogue = (m.timeline.dialogue ?? []).map((d) => {
+    const moved = d.tlStart >= from;
+    const t = moved ? d.tlStart + by : d.tlStart;
+    check('dialogue', d.id, t, moved, d.tlStart);
+    if (!moved) return d;
+    dialogueCount++;
+    return { ...d, tlStart: t };
+  });
+
+  let musicCount = 0;
+  const music = (m.timeline.music ?? []).map((mu) => {
+    const moved = mu.tlStart >= from;
+    const t = moved ? mu.tlStart + by : mu.tlStart;
+    check('music', mu.id, t, moved, mu.tlStart);
+    if (!moved) return mu;
+    musicCount++;
+    return { ...mu, tlStart: t };
+  });
+
+  let bgCount = 0;
+  const bgTrack = (m.composition.backgroundTrack ?? []).map((e, i) => {
+    const moved = e.t >= from;
+    const t = moved ? e.t + by : e.t;
+    check('bg-cut', `#${i + 1}@${e.t}s`, t, moved, e.t);
+    if (!moved) return e;
+    bgCount++;
+    return { ...e, t };
+  });
+
+  if (problems.length) {
+    throw new Error(`shift: 適用できません(部分適用はしません):\n- ${problems.join('\n- ')}`);
+  }
+
+  const composition = { ...m.composition, duration: newDuration };
+  if (m.composition.backgroundTrack) {
+    composition.backgroundTrack = [...bgTrack].sort((a, b) => a.t - b.t);
+  }
+  const timeline = { ...m.timeline };
+  if (m.timeline.sprites) timeline.sprites = sprites;
+  if (m.timeline.dialogue) timeline.dialogue = dialogue;
+  if (m.timeline.music) timeline.music = music;
+
+  return {
+    manifest: { ...m, composition, timeline },
+    summary: { sprites: spriteCount, dialogue: dialogueCount, music: musicCount, bgCuts: bgCount, duration: newDuration },
+  };
 }
 
 // ---- dialogue (W-ANIME speech bubbles) ----

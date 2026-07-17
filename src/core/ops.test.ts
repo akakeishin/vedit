@@ -54,6 +54,7 @@ import {
   setColorTransform,
   setComposition,
   setSceneReview,
+  shiftComposition,
   sourceTimeToTimeline,
   spriteGeometry,
   spriteMotionPlan,
@@ -562,6 +563,14 @@ describe('background music (wave I)', () => {
     expect(() => addMusic(manifest(), '/a.mp3', { duration: 5, gain: 13 })).toThrow(/gain/);
     expect(() => addMusic(manifest(), '/a.mp3', { duration: 5, gain: -61 })).toThrow(/gain/);
     expect(() => addMusic(manifest(), '/a.mp3', { duration: 5, tlStart: -1 })).toThrow(/at/);
+  });
+
+  it('addMusic persists role when given, omits the key entirely when not (backward compat), and rejects garbage', () => {
+    const withRole = addMusic(manifest(), '/hit.wav', { id: 'mu1', duration: 0.5, role: 'sfx' });
+    expect(withRole.timeline.music![0].role).toBe('sfx');
+    const without = addMusic(manifest(), '/bgm.mp3', { id: 'mu1', duration: 5 });
+    expect('role' in without.timeline.music![0]).toBe(false); // absent key, not role:undefined — keeps pre-existing manifests byte-identical
+    expect(() => addMusic(manifest(), '/x.mp3', { duration: 5, role: 'stinger' as any })).toThrow(/role/);
   });
 
   it('updateMusic patches only the given fields, leaving path/id and the rest untouched', () => {
@@ -1751,6 +1760,97 @@ describe('timelineDuration / sourceTimeToTimeline (composition)', () => {
     expect(sourceTimeToTimeline(m, COMP_SOURCE_ID, 20)).toBe(20); // inclusive at the end (see doc)
     expect(sourceTimeToTimeline(m, COMP_SOURCE_ID, -1)).toBeNull();
     expect(sourceTimeToTimeline(m, COMP_SOURCE_ID, 21)).toBeNull();
+  });
+});
+
+describe('shiftComposition (vedit shift — composition-only 間 adjustment)', () => {
+  /** duration 20; sprite@4, sprite@10, dialogue@10, dialogue@3, music@12, bg cuts @5 and @10. */
+  function populated(): Manifest {
+    let m = compositionManifest(); // duration 20, 1080x1920
+    m = addSprite(m, 'char1', { id: 'spA', anchor: { sourceId: COMP_SOURCE_ID, srcTime: 4 }, duration: 3 });
+    m = addSprite(m, 'char2', { id: 'spB', anchor: { sourceId: COMP_SOURCE_ID, srcTime: 10 }, duration: 3 });
+    m = addDialogue(m, 'before', { id: 'dlA', tlStart: 3 });
+    m = addDialogue(m, 'after', { id: 'dlB', tlStart: 10 });
+    m = addMusic(m, '/bgm.mp3', { id: 'muA', tlStart: 12, duration: 4 });
+    m = setBackgroundAt(m, 5, { type: 'color', hex: '#00ff00' });
+    m = setBackgroundAt(m, 10, { type: 'color', hex: '#0000ff' });
+    return m;
+  }
+
+  it('positive shift moves everything at/after from (boundary INCLUSIVE) and stretches duration; earlier items stay', () => {
+    const { manifest: r, summary } = shiftComposition(populated(), 10, 2.5);
+    // Exactly-at-from items move: spB@10, dlB@10, bg cut@10. Earlier ones don't: spA@4, dlA@3, bg cut@5.
+    expect(r.timeline.sprites!.map((s) => [s.id, s.anchor.srcTime])).toEqual([['spA', 4], ['spB', 12.5]]);
+    expect(r.timeline.dialogue!.map((d) => [d.id, d.tlStart])).toEqual([['dlA', 3], ['dlB', 12.5]]);
+    expect(r.timeline.music!.map((mu) => [mu.id, mu.tlStart])).toEqual([['muA', 14.5]]);
+    expect(r.composition!.backgroundTrack!.map((e) => e.t)).toEqual([5, 12.5]);
+    expect(r.composition!.duration).toBe(22.5);
+    expect(summary).toEqual({ sprites: 1, dialogue: 1, music: 1, bgCuts: 1, duration: 22.5 });
+  });
+
+  it('negative shift closes a gap, shrinking duration; backgroundTrack stays sorted even when a moved cut passes an unmoved one', () => {
+    let m = compositionManifest(); // duration 20
+    m = setBackgroundAt(m, 4, { type: 'color', hex: '#111111' });
+    m = setBackgroundAt(m, 6, { type: 'color', hex: '#222222' });
+    const { manifest: r, summary } = shiftComposition(m, 6, -3);
+    // Moved cut 6 -> 3 lands BEFORE the unmoved cut at 4 — sorted-ascending invariant must hold.
+    expect(r.composition!.backgroundTrack!.map((e) => [e.t, (e.ref as any).hex])).toEqual([
+      [3, '#222222'],
+      [4, '#111111'],
+    ]);
+    expect(r.composition!.duration).toBe(17);
+    expect(summary).toEqual({ sprites: 0, dialogue: 0, music: 0, bgCuts: 1, duration: 17 });
+  });
+
+  it('refuses a normal (source-driven) project, pointing at the auto-ripple cut commands instead', () => {
+    expect(() => shiftComposition(manifest(), 5, 2)).toThrow(/自動リップル|remove-range/);
+  });
+
+  it('errors (without applying anything) when a shifted item would land at t < 0', () => {
+    const m = populated();
+    // dlA@3 and spA@4 would go negative with from=0, by=-5.
+    expect(() => shiftComposition(m, 0, -5)).toThrow(/0 秒より前|部分適用はしません/);
+  });
+
+  it('--keep-duration: an item pushed beyond the fixed end is an ERROR, never silently dropped', () => {
+    const m = populated(); // duration 20, muA@12 (+4s)
+    expect(() => shiftComposition(m, 10, 9, { keepDuration: true })).toThrow(/duration.*超えます|部分適用はしません/);
+    // The same shift WITHOUT keepDuration is fine — duration stretches to 29.
+    const { manifest: r, summary } = shiftComposition(m, 10, 9);
+    expect(r.composition!.duration).toBe(29);
+    expect(summary.duration).toBe(29);
+    expect(r.timeline.music![0].tlStart).toBe(21);
+  });
+
+  it('--keep-duration: an in-range shift keeps duration pinned', () => {
+    const { manifest: r, summary } = shiftComposition(populated(), 10, 2, { keepDuration: true });
+    expect(r.composition!.duration).toBe(20);
+    expect(summary).toEqual({ sprites: 1, dialogue: 1, music: 1, bgCuts: 1, duration: 20 });
+    expect(r.timeline.music![0].tlStart).toBe(14);
+  });
+
+  it('default-mode shrink that would strand an UNMOVED item beyond the new end is an error too (no silent orphaning)', () => {
+    let m = compositionManifest(); // duration 20
+    m = setBackgroundAt(m, 15, { type: 'color', hex: '#333333' }); // before from — does not move
+    // from=18, by=-10: newDuration 10; the unmoved cut at 15 would be stranded beyond it.
+    expect(() => shiftComposition(m, 18, -10)).toThrow(/超えます/);
+  });
+
+  it('rejects a shift whose resulting duration would be <= 0, and invalid from/by', () => {
+    const m = compositionManifest(); // duration 20
+    expect(() => shiftComposition(m, 0, -20)).toThrow(/duration.*0 以下/);
+    expect(() => shiftComposition(m, -1, 2)).toThrow(/from/);
+    expect(() => shiftComposition(m, 0, 0)).toThrow(/by/);
+    expect(() => shiftComposition(m, Number.NaN, 2)).toThrow(/from/);
+  });
+
+  it('does not mutate the input manifest (validate-then-apply, and pure on success too)', () => {
+    const m = populated();
+    const before = JSON.stringify(m);
+    shiftComposition(m, 10, 2.5);
+    expect(JSON.stringify(m)).toBe(before);
+    expect(() => shiftComposition(m, 0, -5)).toThrow();
+    expect(JSON.stringify(m)).toBe(before);
   });
 });
 
