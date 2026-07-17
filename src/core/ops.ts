@@ -1,4 +1,4 @@
-import type { Manifest, MusicItem, OverlayClip, SceneFile, Segment, Source, SpriteItem, VideoClip, Word } from './types.js';
+import type { IntentZoneItem, Manifest, MusicItem, OverlayClip, SceneFile, Segment, Source, SpriteItem, VideoClip, Word } from './types.js';
 
 /** Snap a time to the timeline frame grid. */
 export function snap(t: number, fps: number): number {
@@ -1092,4 +1092,92 @@ export function spriteGeometry(
   const anchorX = position.x * outputWH.width;
   const anchorY = position.y * outputWH.height;
   return { x: anchorX - anchorPxX, y: anchorY - anchorPxY, width: fullWidth, height: fullHeight, anchorX, anchorY };
+}
+
+// ---- intent zones ("静寂スコア" protection zones — W-INTENT) ------------------
+//
+// Source-domain ranges the director has flagged as deliberate (a meaningful
+// pause, a held reaction) so detection/ducking stop treating them as
+// defects — see Manifest.intentZones / IntentZoneItem in types.ts. Two pure
+// mutators (add/remove) plus overlap-query helpers consumed by the daemon's
+// /api/detect exclusion and music-add/-update duck warning, and by the CLI's
+// `vedit qc --render` (which maps a zone's source range onto the rendered
+// timeline via sourceRangeToTimeline before handing it to qc.ts's
+// probeRenderedFile — that mapping lives in cli.ts, not here, since it needs
+// both this module's sourceRangeToTimeline AND qc.ts's IntentZone shape).
+
+const INTENT_ZONE_KINDS = new Set(['quiet', 'hold']);
+
+/** Add a protection zone. `t0`/`t1` are in `sourceId`'s own time domain (see IntentZoneItem doc). Kind defaults to 'quiet'. */
+export function addIntentZone(
+  m: Manifest,
+  sourceId: string,
+  t0: number,
+  t1: number,
+  opts: { label: string; kind?: 'quiet' | 'hold'; id?: string },
+): Manifest {
+  if (!m.sources.some((s) => s.id === sourceId)) throw new Error(`intent-add: unknown source: ${sourceId}`);
+  if (!Number.isFinite(t0) || !Number.isFinite(t1)) {
+    throw new Error(`intent-add: t0/t1 must be finite numbers (got t0=${t0}, t1=${t1})`);
+  }
+  if (t0 < 0) throw new Error(`intent-add: t0 (${t0}) must be >= 0`);
+  if (t1 <= t0) throw new Error(`intent-add: t1 (${t1}) must be greater than t0 (${t0})`);
+  if (typeof opts.label !== 'string' || !opts.label.trim()) {
+    throw new Error('intent-add: label is required');
+  }
+  const kind = opts.kind ?? 'quiet';
+  if (!INTENT_ZONE_KINDS.has(kind)) {
+    throw new Error(`intent-add: kind (${JSON.stringify(kind)}) must be "quiet" or "hold"`);
+  }
+  const zones = m.intentZones ?? [];
+  const id = opts.id ?? freshId('iz');
+  if (zones.some((z) => z.id === id)) throw new Error(`intent-add: id already exists: ${id}`);
+  const zone: IntentZoneItem = { id, sourceId, t0, t1, label: opts.label, kind };
+  return { ...m, intentZones: [...zones, zone] };
+}
+
+/** Remove a protection zone. */
+export function removeIntentZone(m: Manifest, id: string): Manifest {
+  const zones = m.intentZones ?? [];
+  const next = zones.filter((z) => z.id !== id);
+  if (next.length === zones.length) throw new Error(`unknown intent zone: ${id}`);
+  return { ...m, intentZones: next };
+}
+
+/** Every intent zone for one source, source-domain (unfiltered by kind). */
+export function intentZonesForSource(m: Manifest, sourceId: string): IntentZoneItem[] {
+  return (m.intentZones ?? []).filter((z) => z.sourceId === sourceId);
+}
+
+/** Zones (from `zones`, already narrowed to one source — see intentZonesForSource) whose [t0,t1) overlaps the given source-domain range at all. */
+export function overlappingIntentZones(zones: IntentZoneItem[], t0: number, t1: number): IntentZoneItem[] {
+  return zones.filter((z) => Math.max(t0, z.t0) < Math.min(t1, z.t1));
+}
+
+/**
+ * 'quiet'-kind zones overlapping a TIMELINE-domain range (e.g. a BGM item's
+ * [tlStart, tlStart+duration)) — walks the range's segments() and maps each
+ * back to source time before comparing against that segment's source's
+ * zones, since Manifest.intentZones itself is source-domain. Used by
+ * music-add/-update's duck warning (a duck region swallowing a deliberate
+ * quiet moment is worth flagging, even though it's never rejected — see
+ * daemon.ts). 'hold'-kind zones are deliberately excluded: they protect a
+ * moment from being CUT, not from BGM ducking.
+ */
+export function quietZonesOverlappingTimelineRange(m: Manifest, tlStart: number, tlEnd: number): IntentZoneItem[] {
+  const zones = m.intentZones ?? [];
+  if (zones.length === 0) return [];
+  const hits: IntentZoneItem[] = [];
+  for (const seg of segments(m)) {
+    const a = Math.max(tlStart, seg.tlStart);
+    const b = Math.min(tlEnd, seg.tlEnd);
+    if (b <= a) continue;
+    const srcA = seg.srcStart + (a - seg.tlStart);
+    const srcB = seg.srcStart + (b - seg.tlStart);
+    for (const z of zones) {
+      if (z.kind !== 'quiet' || z.sourceId !== seg.sourceId) continue;
+      if (Math.max(srcA, z.t0) < Math.min(srcB, z.t1) && !hits.some((h) => h.id === z.id)) hits.push(z);
+    }
+  }
+  return hits;
 }

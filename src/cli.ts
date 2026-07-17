@@ -5,13 +5,21 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { startDaemon } from './server/daemon.js';
 import { Project } from './core/project.js';
-import { buildSelectsTimeline, segments, timelineDuration, timelineTimeToSource } from './core/ops.js';
+import { buildSelectsTimeline, segments, sourceRangeToTimeline, timelineDuration, timelineTimeToSource } from './core/ops.js';
 import { listProjects } from './core/registry.js';
 import { loadPreset, listPresets, savePreset } from './core/presets.js';
 import { renderView, renderSceneSheet } from './export/view.js';
 import { hasReframe, writeOtio } from './export/otio.js';
 import { renderFinal, toAss } from './export/render.js';
-import { publishPack } from './export/publish.js';
+import { chaptersFromMotion, loadPeaksBySource, publishPack } from './export/publish.js';
+import {
+  buildQcReport,
+  probeRenderedFile,
+  staticChecks,
+  tempoContractLite,
+  type ProbeRenderedFileResult,
+  type TempoFacts,
+} from './export/qc.js';
 import { writeSrt } from './export/srt.js';
 import { downloadWhisperModel, findWhisperModel, sha256File } from './ingest/ingest.js';
 import { proposeColorMatch } from './export/color.js';
@@ -30,7 +38,9 @@ import {
 } from './ingest/batch.js';
 import { ffmpegBin, ffmpegHasFilter, run } from './ingest/run.js';
 import { buildResume } from './core/resume.js';
-import type { Transcript } from './core/types.js';
+import { detectTakes, packTakes } from './core/takes.js';
+import { buildRetrospective, parseRetentionCsv } from './core/analytics.js';
+import type { KitProfile, SceneFile, Transcript } from './core/types.js';
 import {
   kitProfileHighlights,
   packKitAssets,
@@ -331,14 +341,23 @@ kit:       kit-init <dir> [--name n]                  # 雛形生成(kit.json + 
 sprites:   sprite-add <assetId> (--at-word wXXXX [--source aRollSrc] | --at-src aRollSrc t | --at-tl t)
              [--pos x,y] [--scale 0..1] [--opacity 0..1] [--duration s] [--flip] --base <rev>
            sprite-update <id> [同フラグ] --base <rev> | sprite-remove <id> --base <rev>
+takes:     takes [--source id]   # 言い直し(撮り直し)候補の検出結果を表示(read-only、何も適用しない)
+intent:    intent-add <sourceId> <t0> <t1> --label "余韻" [--kind quiet|hold] --base <rev>
+             # 「静寂スコア」保護区間: --kind quiet(既定)は無音検出の自動除外+BGMダッキング警告、hold は検出除外のみ
+           intent-remove <id> --base <rev>
 show:      show range <t0> <t1> | show words <w1 w5..w9 ...> [--source id] | show candidate <id>
-           show compare <revA> <revB> | show source <id> [--at s]
+           show compare <revA> <revB> | show source <id> [--at s] | show takes <sourceId> <groupId>
              # 隣の画面(web UI)へジャンプ/ハイライトの合図を送るだけ(revision を作らない、--base 不要)
 inspect:   view [--from a] [--to b] [--domain timeline|source] [--source id] [--scene id] (prints PNG path)
+qc:        qc [--render <out.mp4>] [--report <out.html>]
+             # 静的チェック(未処理候補/orphan/字幕重複/色警告/素材欠落/kit尺乖離)。--render で暗転・無音・ラウドネスも実測
+             # kit があれば tempo contract(表示のみ・合否判定なし)も付与。--report で buildQcReport の HTML を書き出し
 export:    export otio <out.otio> | export render <out.mp4> [--burn-captions] [--preset youtube|shorts|x]
            export render ... [--no-repair] [--fast-loudnorm]   # 乾音A/B比較 / 1-passループドネスに落とす
            export fcp7xml <out.xml> | export srt <out.srt> | export ass <out.ass>
 publish:   publish-pack <outdir> [--thumbs 6]   # chapters.txt + thumbnails/ + materials.json (read-only)
+analytics: retro <csv> [--render-duration 秒]
+             # YouTube Studio の視聴者維持率CSVを取り込み、構造化JSON+人間向けサマリを出力(仮説は含まない・事実のみ)
 presets:   preset-save <name> [--data '{"k":"v"}'] | preset-apply <name> | preset-list
 misc:      doctor [--download-model [name]] | serve [--port]
 
@@ -347,6 +366,37 @@ current one); if the project changed since that revision the edit is
 REJECTED (409) — re-read state first. Exception: \`undo\` never needs --base —
 it always bases itself on the current revision, since undoing inherently
 means "from here, go back one step".`;
+
+/** "1:23.4" — same compact timestamp convention as qc.ts's fmtTl / takes.ts's ts. */
+function tsFmt(t: number): string {
+  const m = Math.floor(t / 60);
+  const s = (t % 60).toFixed(1).padStart(4, '0');
+  return `${m}:${s}`;
+}
+
+/**
+ * Human-readable rendering of `buildRetrospective`'s FACTS-ONLY output
+ * (analytics.ts deliberately returns no hypotheses field — see its doc
+ * comment) — this stays equally fact-only: numbers, quotes, chapter/scene
+ * context, no causal claims. Interpreting *why* a dip happened is the
+ * director's job in conversation (per SKILL.md's 振り返り section), not
+ * something baked into CLI output.
+ */
+function formatRetrospective(r: ReturnType<typeof buildRetrospective>): string {
+  const lines: string[] = ['視聴者維持率ふりかえり(事実のみ・原因の断定は含みません)'];
+  lines.push(`- イントロ離脱: -${r.introDropPct.toFixed(1)}pt`);
+  const pushEvent = (e: (typeof r.dips)[number], sign: string) => {
+    const chap = e.chapter ? ` [${e.chapter.title}]` : '';
+    const quote = e.quote ? ` "${e.quote}"` : '';
+    lines.push(`  - ${e.positionPct.toFixed(1)}% (t=${tsFmt(e.tlTime)}, ${sign}${Math.abs(e.deltaPct).toFixed(1)}pt)${chap}${quote}`);
+  };
+  lines.push(`- 落ち込み: ${r.dips.length}件`);
+  for (const e of r.dips) pushEvent(e, '-');
+  lines.push(`- 伸び: ${r.spikes.length}件`);
+  for (const e of r.spikes) pushEvent(e, '+');
+  lines.push('※ 数値は実測値です。原因はディレクターとの対話で整理してください(このコマンドは仮説を出しません)');
+  return lines.join('\n');
+}
 
 async function main() {
   switch (cmd) {
@@ -657,6 +707,29 @@ async function main() {
       const dir = projectDir();
       await ensureDaemon(dir);
       return out(await api(`/api/candidates${flags.all ? '?all=1' : ''}`));
+    }
+
+    case 'takes': {
+      // Read-only: detectTakes → packTakes, straight through (see
+      // core/takes.js's module doc — nothing here ever edits the manifest).
+      // Reads project.json/transcript-*.json directly, no daemon required
+      // (same "read-only doesn't need the daemon" pattern as `sources`/`kit`).
+      const dir = projectDir();
+      const p = await Project.open(dir);
+      const m = await p.manifest();
+      let sourceId = flags.source as string | undefined;
+      if (!sourceId) {
+        const transcribed = m.sources.filter((s) => s.transcribed);
+        if (transcribed.length === 0) fail('no transcribed source; run `vedit transcribe <sourceId|all>` first');
+        if (transcribed.length > 1) {
+          fail(`multiple transcribed sources; specify --source (${transcribed.map((s) => s.id).join(', ')})`);
+        }
+        sourceId = transcribed[0].id;
+      } else if (!m.sources.some((s) => s.id === sourceId && s.transcribed)) {
+        fail(`source has no transcript: ${sourceId}`);
+      }
+      const t = await p.transcript(sourceId);
+      return out(packTakes(detectTakes(t)));
     }
 
     case 'sources': {
@@ -1121,6 +1194,25 @@ async function main() {
     case 'broll-remove':
       return edit({ op: 'broll-remove', id: pos[0] ?? fail('usage: vedit broll-remove <id>') });
 
+    case 'intent-add': {
+      const USAGE = 'usage: vedit intent-add <sourceId> <t0> <t1> --label "余韻" [--kind quiet|hold] --base <rev>';
+      if (pos.length < 3) fail(USAGE);
+      const kind = flags.kind as string | undefined;
+      if (kind !== undefined && kind !== 'quiet' && kind !== 'hold') fail(`--kind must be "quiet" or "hold"\n${USAGE}`);
+      if (!flags.label) fail(`--label は必須です\n${USAGE}`);
+      return edit({
+        op: 'intent-add',
+        sourceId: pos[0],
+        t0: numArg('t0', pos[1]),
+        t1: numArg('t1', pos[2]),
+        label: flags.label,
+        kind,
+      });
+    }
+
+    case 'intent-remove':
+      return edit({ op: 'intent-remove', id: pos[0] ?? fail('usage: vedit intent-remove <id> --base <rev>') });
+
     case 'kit-init': {
       const dir = path.resolve(pos[0] ?? fail('usage: vedit kit-init <dir> [--name n]'));
       const name = (flags.name as string) ?? path.basename(dir);
@@ -1286,7 +1378,7 @@ async function main() {
     }
 
     case 'show': {
-      const USAGE = 'usage: vedit show range <t0> <t1> | show words <w1 w5..w9 ...> [--source id] | show candidate <id> | show compare <revA> <revB> | show source <id> [--at s]';
+      const USAGE = 'usage: vedit show range <t0> <t1> | show words <w1 w5..w9 ...> [--source id] | show candidate <id> | show compare <revA> <revB> | show source <id> [--at s] | show takes <sourceId> <groupId>';
       const sub = pos[0];
       const dir = projectDir();
       await ensureDaemon(dir);
@@ -1323,6 +1415,13 @@ async function main() {
           body: JSON.stringify({ kind: 'source', sourceId: id, at: numFlag('at', flags.at) }),
         }));
       }
+      if (sub === 'takes') {
+        if (pos.length < 3) fail(USAGE);
+        return out(await api('/api/show', {
+          method: 'POST',
+          body: JSON.stringify({ kind: 'takes', sourceId: pos[1], groupId: pos[2] }),
+        }));
+      }
       fail(USAGE);
       return;
     }
@@ -1352,6 +1451,69 @@ async function main() {
         rows: numFlag('rows', flags.rows),
       });
       return out({ ...v, hint: 'Read the png to inspect frames; grid maps cells to source times' });
+    }
+
+    case 'qc': {
+      // Read-only (no --base): manifest-level staticChecks always run;
+      // --render additionally ffmpeg-probes an already-rendered file
+      // (probeRenderedFile) for black/silence/loudness/clipping — intent
+      // zones (Manifest.intentZones) are mapped from source time onto that
+      // render's timeline via sourceRangeToTimeline before being handed to
+      // qc.ts, since qc.ts's IntentZone is deliberately timeline-domain
+      // (see its doc comment) while Manifest.intentZones is source-domain.
+      // A linked kit additionally gets tempoContractLite (display-only, no
+      // verdict). --report writes buildQcReport's self-contained HTML.
+      const dir = projectDir();
+      const p = await Project.open(dir);
+      const m = await p.manifest();
+      const transcripts: Transcript[] = [];
+      for (const s of m.sources) if (s.transcribed) transcripts.push(await p.transcript(s.id));
+      const sceneFiles: SceneFile[] = [];
+      for (const s of m.sources) {
+        const f = await p.scenes(s.id);
+        if (f.scenes.length) sceneFiles.push(f);
+      }
+      const candidates = await p.candidates();
+      let kitProfile: KitProfile | null = null;
+      if (m.kit) {
+        try {
+          kitProfile = (await readKitFile(m.kit.path)).profile ?? null;
+        } catch { /* kit unreadable — proceed without kitProfile, same degrade-not-fail convention as `vedit kit` */ }
+      }
+      const staticReport = await staticChecks(m, transcripts, sceneFiles, { candidates, kitProfile });
+
+      let probe: ProbeRenderedFileResult | undefined;
+      if (flags.render) {
+        const renderPath = path.resolve(String(flags.render));
+        const intentZones = (m.intentZones ?? [])
+          .map((z) => {
+            const tl = sourceRangeToTimeline(m, z.sourceId, z.t0, z.t1);
+            return tl ? { t0: tl.tlStart, t1: tl.tlEnd, reason: z.label } : null;
+          })
+          .filter((z): z is { t0: number; t1: number; reason: string } => z !== null);
+        probe = await probeRenderedFile(renderPath, { intentZones, targetLufs: m.audioMix?.targetLufs });
+      }
+
+      let tempo: TempoFacts | undefined;
+      if (m.kit && kitProfile) {
+        const peaksBySource = await loadPeaksBySource(p, m);
+        tempo = tempoContractLite(m, kitProfile, { peaksBySource });
+      }
+
+      const result: Record<string, unknown> = {
+        static: staticReport,
+        ...(probe ? { probe } : {}),
+        ...(tempo ? { tempo } : {}),
+      };
+
+      if (flags.report) {
+        const reportPath = path.resolve(String(flags.report));
+        const html = buildQcReport({ title: `QC Report — ${m.name}`, staticReport, probe, tempo });
+        await fs.writeFile(reportPath, html);
+        result.report = reportPath;
+      }
+
+      return out(result);
     }
 
     case 'export': {
@@ -1451,6 +1613,38 @@ async function main() {
         ...(res.chaptersReason ? { chaptersSkipped: res.chaptersReason } : {}),
         hint: 'タイトル/説明文は materials.json と transcript を材料に会話で起草する(モデル創作コピーはユーザー承認後のみ書き込む)',
       });
+    }
+
+    case 'retro': {
+      const csvPath = pos[0] ?? fail('usage: vedit retro <csv> [--render-duration 秒]');
+      const dir = projectDir();
+      const p = await Project.open(dir);
+      const m = await p.manifest();
+      const csvText = await fs
+        .readFile(path.resolve(csvPath), 'utf8')
+        .catch((e: any) => fail(`retro: could not read ${csvPath}: ${e?.message ?? e}`));
+      const points = parseRetentionCsv(csvText);
+      const renderDurationSeconds = numFlag('render-duration', flags['render-duration']) ?? timelineDuration(m);
+      const transcripts: Transcript[] = [];
+      for (const s of m.sources) if (s.transcribed) transcripts.push(await p.transcript(s.id));
+      const sceneFiles: SceneFile[] = [];
+      for (const s of m.sources) {
+        const f = await p.scenes(s.id);
+        if (f.scenes.length) sceneFiles.push(f);
+      }
+      // Chapter context (publish.ts's chaptersFromMotion, per the spec) —
+      // reads each motion sidecar directly, same pattern publishPack itself uses.
+      const motionEntries: { tlStart: number; type: string; text?: string }[] = [];
+      for (const item of m.timeline.motion) {
+        try {
+          const spec = (await p.readMotionSpec(item.id)) as { type: string; params?: Record<string, unknown> };
+          const text = typeof spec.params?.text === 'string' ? (spec.params.text as string) : undefined;
+          motionEntries.push({ tlStart: item.tlStart, type: spec.type, text });
+        } catch { /* sidecar missing/unreadable; skip this overlay for chapter purposes */ }
+      }
+      const chapters = chaptersFromMotion(motionEntries);
+      const retro = buildRetrospective(points, renderDurationSeconds, m, transcripts, sceneFiles, chapters);
+      return out({ ...retro, summary: formatRetrospective(retro) });
     }
 
     case 'doctor': {

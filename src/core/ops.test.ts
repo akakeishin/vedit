@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
   addClip,
+  addIntentZone,
   addMusic,
   addOverlay,
   addSprite,
@@ -15,16 +16,20 @@ import {
   cropWindow,
   cullingStats,
   expandWordIds,
+  intentZonesForSource,
   keptWords,
   moveClip,
   needsColorTransform,
   orphanedOverlays,
   orphanedSprites,
+  overlappingIntentZones,
   OVERLAY_GAIN_DEFAULT,
   padWordRange,
   parseFocus,
   parseReframeSpec,
+  quietZonesOverlappingTimelineRange,
   removeClip,
+  removeIntentZone,
   removeMusic,
   removeOverlay,
   removeSourceRange,
@@ -1277,5 +1282,152 @@ describe('spriteGeometry (ground-anchor placement, scale, flip, defaults)', () =
     expect(geo.width).toBeCloseTo(geo.height); // square fallback aspect
     expect(geo.anchorX - geo.x).toBeCloseTo(0.5 * geo.width); // anchor.x fallback = 0.5
     expect(geo.anchorY - geo.y).toBeCloseTo(1.0 * geo.height); // anchor.y fallback = 1 (bottom)
+  });
+});
+
+// ---- intent zones ("静寂スコア" protection zones — W-INTENT) ----
+describe('addIntentZone / removeIntentZone', () => {
+  it('adds a zone with defaults (kind=quiet, freshId)', () => {
+    const m = addIntentZone(manifest(), 's1', 10, 15, { label: '余韻' });
+    expect(m.intentZones).toHaveLength(1);
+    expect(m.intentZones![0]).toMatchObject({ sourceId: 's1', t0: 10, t1: 15, label: '余韻', kind: 'quiet' });
+    expect(m.intentZones![0].id).toMatch(/^iz/);
+  });
+
+  it('accepts an explicit kind and id', () => {
+    const m = addIntentZone(manifest(), 's1', 10, 15, { label: '見せ場の間', kind: 'hold', id: 'iz-fixed' });
+    expect(m.intentZones![0]).toMatchObject({ id: 'iz-fixed', kind: 'hold' });
+  });
+
+  it('rejects an unknown source', () => {
+    expect(() => addIntentZone(manifest(), 'nope', 0, 5, { label: 'x' })).toThrow(/unknown source/);
+  });
+
+  it('rejects t1 <= t0, negative t0, non-finite times, and an empty/whitespace label', () => {
+    expect(() => addIntentZone(manifest(), 's1', 10, 10, { label: 'x' })).toThrow(/t1 .* must be greater than t0/);
+    expect(() => addIntentZone(manifest(), 's1', 10, 5, { label: 'x' })).toThrow(/t1 .* must be greater than t0/);
+    expect(() => addIntentZone(manifest(), 's1', -1, 5, { label: 'x' })).toThrow(/t0 .* must be >= 0/);
+    expect(() => addIntentZone(manifest(), 's1', 0, Infinity, { label: 'x' })).toThrow(/finite numbers/);
+    expect(() => addIntentZone(manifest(), 's1', 0, 5, { label: '' })).toThrow(/label is required/);
+    expect(() => addIntentZone(manifest(), 's1', 0, 5, { label: '   ' })).toThrow(/label is required/);
+  });
+
+  it('rejects an unrecognized kind', () => {
+    expect(() => addIntentZone(manifest(), 's1', 0, 5, { label: 'x', kind: 'loud' as any })).toThrow(/must be "quiet" or "hold"/);
+  });
+
+  it('rejects a duplicate explicit id', () => {
+    const m = addIntentZone(manifest(), 's1', 0, 5, { label: 'a', id: 'iz1' });
+    expect(() => addIntentZone(m, 's1', 10, 15, { label: 'b', id: 'iz1' })).toThrow(/id already exists/);
+  });
+
+  it('appends to an existing list rather than replacing it', () => {
+    let m = addIntentZone(manifest(), 's1', 0, 5, { label: 'a' });
+    m = addIntentZone(m, 's1', 10, 15, { label: 'b' });
+    expect(m.intentZones).toHaveLength(2);
+  });
+
+  it('removes a zone by id', () => {
+    let m = addIntentZone(manifest(), 's1', 0, 5, { label: 'a', id: 'iz1' });
+    m = addIntentZone(m, 's1', 10, 15, { label: 'b', id: 'iz2' });
+    m = removeIntentZone(m, 'iz1');
+    expect(m.intentZones).toHaveLength(1);
+    expect(m.intentZones![0].id).toBe('iz2');
+  });
+
+  it('throws removing an unknown id', () => {
+    expect(() => removeIntentZone(manifest(), 'nope')).toThrow(/unknown intent zone/);
+  });
+});
+
+describe('intentZonesForSource / overlappingIntentZones', () => {
+  it('filters zones by source and overlap (half-open ranges)', () => {
+    let m = addIntentZone(manifest(), 's1', 10, 20, { label: 'a', id: 'a' });
+    m = addIntentZone(m, 's1', 30, 40, { label: 'b', id: 'b' });
+    const zones = intentZonesForSource(m, 's1');
+    expect(zones.map((z) => z.id)).toEqual(['a', 'b']);
+    expect(overlappingIntentZones(zones, 15, 25).map((z) => z.id)).toEqual(['a']);
+    expect(overlappingIntentZones(zones, 25, 35).map((z) => z.id)).toEqual(['b']);
+    expect(overlappingIntentZones(zones, 0, 10)).toEqual([]); // touches but doesn't overlap (half-open)
+    expect(overlappingIntentZones(zones, 20, 30)).toEqual([]); // gap between the two zones
+    expect(overlappingIntentZones(zones, 5, 45).map((z) => z.id)).toEqual(['a', 'b']); // fully contains both
+  });
+
+  it('intentZonesForSource returns [] for a source with no zones (including an unset Manifest.intentZones)', () => {
+    expect(intentZonesForSource(manifest(), 's1')).toEqual([]);
+    const m = addIntentZone(manifest(), 's1', 0, 5, { label: 'x' });
+    expect(intentZonesForSource(m, 's2')).toEqual([]);
+  });
+});
+
+describe('quietZonesOverlappingTimelineRange', () => {
+  function twoSourceManifest(): Manifest {
+    return {
+      version: 1,
+      name: 't',
+      revision: 0,
+      fps: 30,
+      width: 1920,
+      height: 1080,
+      sources: [
+        { id: 's1', path: '/a.mp4', duration: 60, fps: 30, width: 1920, height: 1080, hasAudio: true },
+        { id: 's2', path: '/b.mp4', duration: 60, fps: 30, width: 1920, height: 1080, hasAudio: true },
+      ],
+      timeline: {
+        video: [
+          { id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 20 }, // tl [0,20) <- s1 [0,20)
+          { id: 'c2', sourceId: 's2', srcIn: 0, srcOut: 20 }, // tl [20,40) <- s2 [0,20)
+        ],
+        motion: [],
+      },
+      captions: { enabled: true, style: 'clean', maxChars: 24 },
+    };
+  }
+
+  it('maps a timeline range back to source time and only matches "quiet"-kind zones', () => {
+    let m = twoSourceManifest();
+    m = addIntentZone(m, 's1', 5, 10, { label: '静寂ゾーン', kind: 'quiet', id: 'q1' });
+    // BGM sitting at tl [3,8) overlaps s1 source time [3,8), which overlaps [5,10).
+    expect(quietZonesOverlappingTimelineRange(m, 3, 8).map((z) => z.id)).toEqual(['q1']);
+    // A duck region entirely before the zone (tl [0,3) -> src [0,3)) doesn't overlap.
+    expect(quietZonesOverlappingTimelineRange(m, 0, 3)).toEqual([]);
+  });
+
+  it('excludes "hold"-kind zones (they protect against cuts, not BGM ducking)', () => {
+    let m = twoSourceManifest();
+    m = addIntentZone(m, 's1', 5, 10, { label: '見せ場', kind: 'hold', id: 'h1' });
+    expect(quietZonesOverlappingTimelineRange(m, 0, 20)).toEqual([]);
+  });
+
+  it('checks the SECOND source too, mapping through its own segment', () => {
+    let m = twoSourceManifest();
+    m = addIntentZone(m, 's2', 5, 10, { label: 'B-rollの静寂', kind: 'quiet', id: 'q2' });
+    // s2's source time [5,10) sits at timeline [20+5, 20+10) = [25,30).
+    expect(quietZonesOverlappingTimelineRange(m, 24, 26).map((z) => z.id)).toEqual(['q2']);
+    expect(quietZonesOverlappingTimelineRange(m, 0, 20)).toEqual([]); // s1's segment carries no zone here
+  });
+
+  it('returns [] when the manifest has no intentZones at all', () => {
+    expect(quietZonesOverlappingTimelineRange(twoSourceManifest(), 0, 40)).toEqual([]);
+  });
+
+  it('never double-reports the same zone id across multiple segments', () => {
+    // A source whose footage appears twice on the timeline (two clips of s1).
+    const m: Manifest = {
+      version: 1, name: 't', revision: 0, fps: 30, width: 1920, height: 1080,
+      sources: [{ id: 's1', path: '/a.mp4', duration: 60, fps: 30, width: 1920, height: 1080, hasAudio: true }],
+      timeline: {
+        video: [
+          { id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 20 }, // tl [0,20) <- s1 [0,20)
+          { id: 'c2', sourceId: 's1', srcIn: 10, srcOut: 20 }, // tl [20,30) <- s1 [10,20) (re-appears)
+        ],
+        motion: [],
+      },
+      captions: { enabled: true, style: 'clean', maxChars: 24 },
+    };
+    const zoned = addIntentZone(m, 's1', 12, 18, { label: 'z', kind: 'quiet', id: 'z1' });
+    // A duck range spanning the whole timeline overlaps s1's [12,18) via BOTH clips.
+    const hits = quietZonesOverlappingTimelineRange(zoned, 0, 30);
+    expect(hits.map((z) => z.id)).toEqual(['z1']);
   });
 });

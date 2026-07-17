@@ -77,6 +77,8 @@ const S = {
   transcribing: new Set(), // W-LAZY: sourceIds with an in-flight `vedit transcribe` background job (seeded from /api/project's `transcribing`, kept live via transcribe-progress/-done/-error WS messages)
   timelineDrag: null, // in-progress timeline drag/trim (see startClipReorderDrag/startTrimDrag/startBlockDrag)
   fontsList: null, // W-CAP: /api/fonts response ({kit:[{name,family?,path}], system:[{family}]}), refreshed every reload()
+  qc: { issues: [], counts: { errors: 0, warnings: 0, infos: 0 } }, // W9: /api/qc static report, refreshed every reload()
+  takesCache: new Map(), // W-INTENT/W11: sourceId -> TakeGroup[], fetched on demand (GET /api/takes) when a "show takes" directive arrives
 };
 const PLAY_RATES = [1, 1.5, 2];
 
@@ -115,6 +117,8 @@ async function reload() {
     S.candidates = await api('/api/candidates');
     S.candidatesAll = await api('/api/candidates?all=1');
     S.revisions = await api('/api/revisions');
+    // W9: static-only QC pass (cheap — see daemon.ts's GET /api/qc doc), merged into renderInbox() below.
+    S.qc = await api('/api/qc').catch(() => ({ issues: [], counts: { errors: 0, warnings: 0, infos: 0 } }));
     for (const src of S.manifest.sources) {
       if (src.transcribed && !S.transcripts.has(src.id)) {
         const t = await api(`/api/transcript?full=1&source=${src.id}`);
@@ -668,7 +672,50 @@ function renderTimeline() {
   }
   renderOverlayRow();
   renderSpriteRow();
+  renderIntentZoneRow();
   drawWave();
+}
+
+// W-INTENT: map one intentZone (Manifest.intentZones — SOURCE-domain t0/t1)
+// onto the current timeline. A JS port of ops.ts's sourceRangeToTimeline
+// (pure math kept in sync by hand; same duplication rationale as
+// spriteGeometryJS above — the browser has no access to core/ops.js).
+// Combines every matching segment into one [tlStart,tlEnd] span (min start /
+// max end), same as the engine function — a zone whose source range spans a
+// clip that got split by an unrelated cut in between still reads as one
+// continuous protected span, matching what `vedit qc --render` protects.
+function intentZoneTimelineRanges(zone) {
+  let start = null;
+  let end = null;
+  for (const s of S.segments) {
+    if (s.sourceId !== zone.sourceId) continue;
+    const segDur = s.tlEnd - s.tlStart;
+    const srcEnd = s.srcStart + segDur;
+    const a = Math.max(zone.t0, s.srcStart);
+    const b = Math.min(zone.t1, srcEnd);
+    if (b <= a) continue;
+    const tlA = s.tlStart + (a - s.srcStart);
+    const tlB = s.tlStart + (b - s.srcStart);
+    if (start === null || tlA < start) start = tlA;
+    if (end === null || tlB > end) end = tlB;
+  }
+  return start === null ? null : { tlStart: start, tlEnd: end };
+}
+function renderIntentZoneRow() {
+  const row = $('intentZoneRow');
+  if (!row) return;
+  row.innerHTML = '';
+  if (!S.duration) return;
+  for (const zone of S.manifest.intentZones ?? []) {
+    const r = intentZoneTimelineRanges(zone);
+    if (!r) continue; // fully cut away — nothing to protect anymore
+    const d = document.createElement('div');
+    d.className = `intentZoneBlock ${zone.kind}`;
+    d.style.left = `${(r.tlStart / S.duration) * 100}%`;
+    d.style.width = `${Math.max(0, (r.tlEnd - r.tlStart) / S.duration) * 100}%`;
+    d.title = `${zone.label}(${zone.kind === 'quiet' ? '静寂' : '保持'})`;
+    row.appendChild(d);
+  }
 }
 
 // B-roll V2 row (W3): one teal block per resolved overlay, positioned like
@@ -2168,6 +2215,12 @@ function highlightWord(tl) {
 const KIND_LABEL = { silence: '無音', filler: 'フィラー', retake: '言い直し', 'low-energy': '低テンション' };
 const KIND_ORDER = ['silence', 'filler', 'retake', 'low-energy'];
 
+// W9: QC categories (see export/qc.js's QcCategory) surfaced in the いま
+// inbox — every OTHER category (candidates/scene-review/overlay-orphan/
+// sprite-orphan/color) already has its own dedicated inbox surface, so
+// merging those too would double-count the same issue (see renderInbox).
+const QC_INBOX_CATEGORIES = new Set(['captions', 'source-missing', 'kit-duration']);
+
 // Map a candidate's (padded) source-time point to a timeline seconds value,
 // clamped to the segment that currently contains its source range — used by
 // both the row's seek-on-click and the "前後を再生" preview.
@@ -2329,6 +2382,16 @@ function renderInbox() {
     const name = src ? basename(src.path) : lc.sourceId;
     el.appendChild(inboxWarningRow(`⚠ 低信頼のトランスクリプト: ${name} に${lc.count}語(Transcript タブの"?"付きを確認)`, {
       onClick: () => activateTab($('tab-transcriptPanel'), { focus: false }),
+    }));
+  }
+
+  // W9: QC-derived warnings (字幕重複/速すぎ・素材欠落・kit尺乖離) — see
+  // QC_INBOX_CATEGORIES's doc above for why only these three categories.
+  for (const issue of S.qc?.issues ?? []) {
+    if (!QC_INBOX_CATEGORIES.has(issue.category)) continue;
+    count++;
+    el.appendChild(inboxWarningRow(`⚠ ${issue.message}`, {
+      onClick: issue.category === 'captions' ? () => activateTab($('tab-transcriptPanel'), { focus: false }) : undefined,
     }));
   }
 
@@ -2583,6 +2646,7 @@ function handleShowDirective(d) {
   if (d.kind === 'candidate') return showCandidateDirective(d);
   if (d.kind === 'compare') return showCompareDirective(d);
   if (d.kind === 'source') return showSourceDirective(d);
+  if (d.kind === 'takes') return showTakesDirective(d);
 }
 // Jump to `tlStart`, highlight [tlStart,tlEnd] on the strip (a dedicated
 // #showHighlight element — deliberately NOT the I/O range-selection UI,
@@ -2688,6 +2752,86 @@ $('compareCardClose').onclick = hideCompareCard;
 function showCompareDirective(d) {
   renderCompareCard(d);
 }
+
+// Takes card (W-INTENT/W11): a card STACK — one row per detected take in the
+// group, each with 前後再生 (reuses candidateTl's segment-lookup math, fed a
+// {sourceId} stand-in since it only reads that field) and 「これを残す」
+// (deletes every OTHER take's words via the same remove-words op the
+// Transcript panel's delete-selection uses — see mutate() below; confirm()
+// first since it's destructive and spans possibly multiple utterances).
+async function fetchTakesForSource(sourceId) {
+  if (!S.takesCache.has(sourceId)) {
+    S.takesCache.set(sourceId, await api(`/api/takes?source=${encodeURIComponent(sourceId)}`));
+  }
+  return S.takesCache.get(sourceId);
+}
+function renderTakesCard(sourceId, group) {
+  const body = $('takesCardBody');
+  body.innerHTML = '';
+  const header = document.createElement('div');
+  header.className = 'showCardLbl';
+  header.textContent = `言い直し候補 — ${group.utterances.length}テイク検出(★は推薦)`;
+  body.appendChild(header);
+  const hint = document.createElement('div');
+  hint.className = 'hintText';
+  hint.textContent = group.recommendation.reason;
+  body.appendChild(hint);
+
+  group.utterances.forEach((u, idx) => {
+    const isRecommended = idx === group.recommendation.utteranceIndex;
+    const row = document.createElement('div');
+    row.className = 'takeRow' + (isRecommended ? ' recommended' : '');
+    const confPct = Math.round((1 - u.features.lowConfidenceRatio) * 100);
+    row.innerHTML =
+      `<div class="showCardLbl">${isRecommended ? '★ ' : ''}"${esc(u.text)}"</div>` +
+      `<div class="hintText">${fmt(u.t0)}–${fmt(u.t1)} conf=${confPct}%</div>`;
+    const actions = document.createElement('div');
+    actions.className = 'candActions';
+    const preview = document.createElement('button');
+    preview.className = 'btn-preview';
+    preview.textContent = '前後を再生';
+    preview.onclick = () => {
+      const startTl = candidateTl(Math.max(0, u.t0 - 1), { sourceId });
+      const endTl = candidateTl(u.t1 + 1, { sourceId });
+      if (startTl == null) return;
+      S.previewStopAt = endTl;
+      seekTl(startTl, { play: true });
+      S.playing = true;
+      setPlayBtnState(true);
+    };
+    const keep = document.createElement('button');
+    keep.className = 'btn-approve';
+    keep.textContent = 'これを残す';
+    keep.onclick = async () => {
+      const others = group.utterances.filter((_, i) => i !== idx);
+      const wordIds = others.flatMap((o) => o.wordIds);
+      if (wordIds.length === 0) return;
+      if (!confirm(`他の${others.length}テイクを削除します。よろしいですか？`)) return;
+      const { ok } = await mutate({ op: 'remove-words', ids: wordIds, sourceId });
+      if (ok) hideTakesCard();
+    };
+    actions.append(preview, keep);
+    row.appendChild(actions);
+    body.appendChild(row);
+  });
+  $('takesCard').hidden = false;
+}
+function hideTakesCard() { $('takesCard').hidden = true; }
+$('takesCardClose').onclick = hideTakesCard;
+async function showTakesDirective(d) {
+  if (!d.sourceId || !d.groupId) return;
+  let groups;
+  try {
+    groups = await fetchTakesForSource(d.sourceId);
+  } catch (e) {
+    toast(e.message, { type: 'error' });
+    return;
+  }
+  const group = groups.find((g) => g.id === d.groupId);
+  if (!group) { toast(`テイクグループ ${d.groupId} が見つかりません`, { type: 'error' }); return; }
+  renderTakesCard(d.sourceId, group);
+}
+
 // Source preview mode, opened from a "show" directive (Claude directing
 // attention to raw, uncut material).
 function showSourceDirective(d) {

@@ -42,6 +42,11 @@
         <button class="cardClose" id="compareCardClose" aria-label="閉じる">×</button>
         <div id="compareCardBody"></div>
       </div>
+      <!-- W-INTENT/W11: multi-take card stack (show takes <sourceId> <groupId>) -->
+      <div id="takesCard" class="showCard wide" hidden role="dialog" aria-label="テイクカード">
+        <button class="cardClose" id="takesCardClose" aria-label="閉じる">×</button>
+        <div id="takesCardBody"></div>
+      </div>
     </div>
     <div id="transport">
       <button id="playBtn" aria-label="再生" aria-pressed="false">▶</button>
@@ -57,6 +62,8 @@
       <div id="clips"></div>
       <div id="dropIndicator" hidden></div>
       <div id="sceneMarks"></div>
+      <!-- W-INTENT: 「静寂スコア」保護区間の薄い帯(Manifest.intentZones, hover でラベル) -->
+      <div id="intentZoneRow"></div>
       <div id="musicRow"></div>
       <div id="motionRow"></div>
       <div id="rangeSel" hidden></div>

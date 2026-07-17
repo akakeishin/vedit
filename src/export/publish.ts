@@ -184,7 +184,8 @@ export function buildMaterials(m: Manifest, transcripts: Transcript[], chapterLi
 
 // ---- orchestration (impure: fs + ffmpeg) ----
 
-async function loadPeaksBySource(project: Project, m: Manifest): Promise<Record<string, Peaks>> {
+/** Exported for reuse by `vedit qc`'s tempoContractLite wiring (cli.ts) — same peaks-by-source shape qc.ts's tempoContractLite expects. */
+export async function loadPeaksBySource(project: Project, m: Manifest): Promise<Record<string, Peaks>> {
   const out: Record<string, Peaks> = {};
   for (const s of m.sources) {
     if (!s.peaks) continue;

@@ -6,6 +6,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { Project, resolveWithinDir } from '../core/project.js';
 import {
   addClip,
+  addIntentZone,
   addMusic,
   addOverlay,
   addSprite,
@@ -14,14 +15,18 @@ import {
   COLOR_WARNING_MESSAGE,
   cullingStats,
   expandWordIds,
+  intentZonesForSource,
   moveClip,
   needsColorTransform,
   orphanedOverlays,
   orphanedSprites,
+  overlappingIntentZones,
   padWordRange,
   parseFocus,
   parseReframeSpec,
+  quietZonesOverlappingTimelineRange,
   removeClip,
+  removeIntentZone,
   removeMusic,
   removeOverlay,
   removeSourceRange,
@@ -49,9 +54,11 @@ import { detectFillers, detectSilences, detectSilencesFromPeaks } from '../core/
 import type { Peaks } from '../core/detect.js';
 import { packTranscript } from '../core/pack.js';
 import { detectScenesForSource, packScenes } from '../core/scenes.js';
+import { detectTakes, type TakeGroup } from '../core/takes.js';
+import { staticChecks } from '../export/qc.js';
 import { ingestFile, makeProxy, probeAudio, transcribe } from '../ingest/ingest.js';
 import { run } from '../ingest/run.js';
-import type { CaptionSettings, CutCandidate, Manifest, MotionItem, RevisionEntry, SceneFile, Transcript } from '../core/types.js';
+import type { CaptionSettings, CutCandidate, KitProfile, Manifest, MotionItem, MusicItem, RevisionEntry, SceneFile, Transcript } from '../core/types.js';
 import { freshId } from '../core/ops.js';
 import { applyKitDefaults, readKitFile, recognizedKitSections } from '../core/kit.js';
 import { listSystemFonts, scanKitFonts } from '../core/fonts.js';
@@ -71,6 +78,18 @@ interface Ctx {
    * per source from /api/state (see stateSummary's `transcribing` field).
    */
   transcribeJobs: Set<string>;
+  /**
+   * sourceId -> detectTakes(transcript) result, memoized. detectTakes (W11)
+   * assigns each TakeGroup a freshId() — regenerated (and therefore
+   * DIFFERENT) on every call — so re-running it inside a second request
+   * (e.g. POST /api/show's kind='takes' validating a groupId a client just
+   * got from GET /api/takes moments earlier) would never find a matching
+   * id. Caching per sourceId gives every route within one daemon lifetime a
+   * stable, comparable id for the same transcript. Cleared on /api/open
+   * (see below) so a project switch can't serve another project's cached
+   * groups under a colliding sourceId.
+   */
+  takesCache: Map<string, TakeGroup[]>;
 }
 
 async function allTranscripts(p: Project): Promise<Transcript[]> {
@@ -334,6 +353,40 @@ function reviewMapFor(m: Manifest, sourceId: string): Record<string, 'keep' | 'r
   return m.culling?.[sourceId] ?? {};
 }
 
+/** The linked kit's profile section, or null when no kit is linked / it's unreadable — same "degrade, never fail" contract as every other kit-optional lookup in this file (see /api/kit above). Shared by GET /api/qc (staticChecks' checkKitDuration) and could be reused by future kit-aware reads. */
+async function kitProfileFor(m: Manifest): Promise<KitProfile | null> {
+  if (!m.kit) return null;
+  try {
+    return (await readKitFile(m.kit.path)).profile ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Memoized detectTakes(t) per sourceId — see Ctx.takesCache's doc for why this can't just call detectTakes fresh on every route. */
+function takesFor(ctx: Ctx, sourceId: string, t: Transcript): TakeGroup[] {
+  if (!ctx.takesCache.has(sourceId)) ctx.takesCache.set(sourceId, detectTakes(t));
+  return ctx.takesCache.get(sourceId)!;
+}
+
+/**
+ * W-INTENT: non-blocking warning when a music item's duck region overlaps a
+ * director-flagged 'quiet' intent zone (see ops.ts's
+ * quietZonesOverlappingTimelineRange) — never rejects the music-add/-update,
+ * just surfaces it in the response so the director can decide (lower the
+ * duck amount, move the BGM, or accept it). `item` must already be the
+ * item's state AS COMMITTED (post-mutate), not the pre-mutate request body,
+ * so a music-update that only changes `gain` still gets warned against its
+ * unchanged tlStart/duration/duck.
+ */
+function duckWarningFor(m: Manifest, item: MusicItem): string | undefined {
+  if (!item.duck) return undefined;
+  const zones = quietZonesOverlappingTimelineRange(m, item.tlStart, item.tlStart + item.duration);
+  if (zones.length === 0) return undefined;
+  const labels = zones.map((z) => z.label).join(', ');
+  return `duck対象区間が意図ゾーン(quiet: ${labels})と重なっています — 発話扱いで自動的に音量が下がる可能性があります(拒否はしません; 気になる場合は --no-duck か配置をずらしてください)`;
+}
+
 /** Merge review verdicts onto a SceneFile's scenes for API responses, without ever writing them back to scenes-<sourceId>.json (review state lives only on the manifest). */
 function withReview(f: SceneFile, m: Manifest): { sourceId: string; scenes: (SceneFile['scenes'][number] & { review?: 'keep' | 'reject' })[] } {
   const rv = reviewMapFor(m, f.sourceId);
@@ -392,7 +445,7 @@ async function stateSummary(p: Project, transcribingIds: Set<string> = new Set()
 
 export async function startDaemon(opts: { port?: number; projectDir?: string } = {}) {
   const port = opts.port ?? Number(process.env.VEDIT_PORT ?? 7799);
-  const ctx: Ctx = { project: null, clients: new Set(), transcribeJobs: new Set() };
+  const ctx: Ctx = { project: null, clients: new Set(), transcribeJobs: new Set(), takesCache: new Map() };
   if (opts.projectDir) {
     const { project } = await openOrCreateProject(opts.projectDir, path.basename(opts.projectDir));
     ctx.project = project;
@@ -457,6 +510,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       if (!src) throw new Error(`unknown source: ${sourceId}`); // shouldn't happen: caller resolved this against a manifest read moments earlier
       const t = await transcribe(src.path, sourceId, { language, sourceDuration: src.duration });
       await p.writeTranscript(t);
+      ctx.takesCache.delete(sourceId); // a re-transcribe invalidates any memoized take groups for this source (see Ctx.takesCache's doc)
       const MAX_STALE_RETRIES = 20;
       for (let attempt = 0; ; attempt++) {
         const cur = await p.manifest();
@@ -491,6 +545,11 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       const dir = path.resolve(b.dir);
       const { project, created } = await openOrCreateProject(dir, b.name ?? path.basename(dir));
       ctx.project = project;
+      // A switched-to project's sourceIds could collide with the previous
+      // project's — clear the take-group memoization so /api/takes and
+      // /api/show's kind='takes' never serve another project's cached
+      // groups (and their ephemeral ids) under a same-named sourceId.
+      ctx.takesCache.clear();
       if (!created) await upsertProject(dir, (await project.manifest()).name); // Project.create() upserts on its own path
       broadcast(ctx, { type: 'project', dir });
       return json(res, 200, { ok: true, dir, state: await stateSummary(ctx.project, ctx.transcribeJobs) });
@@ -671,6 +730,51 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         }
       }
       return json(res, 200, { ...stats, next });
+    }
+
+    // ---- W9 QC / W11 multi-take (both read-only) ----
+    if (pathname === '/api/qc' && method === 'GET') {
+      // Static-only: manifest-level checks that need no rendered file (see
+      // qc.ts's staticChecks doc) — deliberately cheap enough to call on
+      // every "いま" tab render. The heavier probeRenderedFile/
+      // tempoContractLite passes are `vedit qc --render`-only (CLI, not the
+      // daemon) since they need an actual rendered file / ffmpeg probe.
+      const m = await p.manifest();
+      const [transcripts, sceneFiles, candidates, kitProfile] = await Promise.all([
+        allTranscripts(p),
+        sceneFilesFor(p, m),
+        p.candidates(),
+        kitProfileFor(m),
+      ]);
+      const report = await staticChecks(m, transcripts, sceneFiles, { candidates, kitProfile });
+      return json(res, 200, report);
+    }
+    if (pathname === '/api/takes' && method === 'GET') {
+      // Read-only: detectTakes → raw TakeGroup[] JSON (see core/takes.js's
+      // module doc — this never edits the manifest). Same
+      // "?source= optional, ambiguous across >1 transcribed source" contract
+      // as /api/transcript above.
+      const m = await p.manifest();
+      const requestedSource = url.searchParams.get('source');
+      if (requestedSource && !m.sources.some((s) => s.id === requestedSource)) {
+        return json(res, 404, { error: `unknown source: ${requestedSource}` });
+      }
+      const transcribedSrcs = m.sources.filter((s) => s.transcribed);
+      if (transcribedSrcs.length === 0) return json(res, 404, { error: 'no transcribed source' });
+      let sourceId = requestedSource ?? undefined;
+      if (!sourceId) {
+        if (transcribedSrcs.length > 1) {
+          return json(res, 400, {
+            error: 'multiple transcribed sources; specify sourceId (--source <id>)',
+            sources: transcribedSrcs.map((s) => ({ id: s.id, path: path.basename(s.path) })),
+          });
+        }
+        sourceId = transcribedSrcs[0].id;
+      } else if (!transcribedSrcs.some((s) => s.id === sourceId)) {
+        return json(res, 400, { error: `source has no transcript: ${sourceId}` });
+      }
+      const t = await p.transcript(sourceId);
+      return json(res, 200, takesFor(ctx, sourceId, t));
     }
 
     // ---- ingest ----
@@ -866,8 +970,30 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
           if (!Number.isFinite(at)) return json(res, 400, { error: 'show source: at must be a finite number' });
         }
         directive = { kind: 'source', sourceId, ...(at !== undefined ? { at } : {}) };
+      } else if (b.kind === 'takes') {
+        // W-INTENT/W11: {sourceId, groupId} only (mirrors 'candidate' —
+        // the web client re-derives the full group via GET /api/takes rather
+        // than this endpoint embedding utterance data, since that JSON can
+        // be sizeable and the client already caches it per source).
+        const sourceId = b.sourceId as string | undefined;
+        if (!sourceId || !m.sources.some((s) => s.id === sourceId)) {
+          return json(res, 400, { error: `unknown source: ${sourceId}` });
+        }
+        if (typeof b.groupId !== 'string' || !b.groupId) {
+          return json(res, 400, { error: 'show takes: groupId is required' });
+        }
+        let t;
+        try {
+          t = await p.transcript(sourceId);
+        } catch {
+          return json(res, 400, { error: `show takes: source has no transcript: ${sourceId}` });
+        }
+        if (!takesFor(ctx, sourceId, t).some((g) => g.id === b.groupId)) {
+          return json(res, 400, { error: `unknown take group: ${b.groupId}` });
+        }
+        directive = { kind: 'takes', sourceId, groupId: b.groupId };
       } else {
-        return json(res, 400, { error: `unknown show kind: ${JSON.stringify(b.kind)} (use range/words/candidate/compare/source)` });
+        return json(res, 400, { error: `unknown show kind: ${JSON.stringify(b.kind)} (use range/words/candidate/compare/source/takes)` });
       }
 
       broadcast(ctx, { type: 'show', directive });
@@ -1111,24 +1237,28 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
           return json(res, 400, { error: 'music-add: no room for music at this position (timeline or source exhausted)' });
         }
         const id = freshId('mu');
-        await mutate(
+        const updated = await mutate(
           p, actor, baseRev, 'music-add', b,
           `music-add ${path.basename(filePath)} at ${tlStart}s (+${duration.toFixed(1)}s)`,
           (m) => addMusic(m, filePath, { id, tlStart, srcIn, duration, gain: b.gain, fadeIn: b.fadeIn, fadeOut: b.fadeOut, duck: b.duck }),
         );
-        return json(res, 200, { id, state: await stateSummary(p, ctx.transcribeJobs) });
+        const addedItem = (updated.timeline.music ?? []).find((x) => x.id === id)!;
+        const warning = duckWarningFor(updated, addedItem);
+        return json(res, 200, { id, ...(warning ? { warning } : {}), state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'music-update') {
         if (!(m0.timeline.music ?? []).some((x) => x.id === b.id)) {
           return json(res, 400, { error: `unknown music item: ${b.id}` });
         }
-        await mutate(p, actor, baseRev, 'music-update', b, `music-update ${b.id}`, (m) =>
+        const updated = await mutate(p, actor, baseRev, 'music-update', b, `music-update ${b.id}`, (m) =>
           updateMusic(m, b.id, {
             tlStart: b.tlStart, duration: b.duration, srcIn: b.srcIn,
             gain: b.gain, fadeIn: b.fadeIn, fadeOut: b.fadeOut, duck: b.duck,
           }),
         );
-        return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
+        const updatedItem = (updated.timeline.music ?? []).find((x) => x.id === b.id)!;
+        const warning = duckWarningFor(updated, updatedItem);
+        return json(res, 200, { ...(warning ? { warning } : {}), state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'music-remove') {
         if (!(m0.timeline.music ?? []).some((x) => x.id === b.id)) {
@@ -1390,6 +1520,26 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         });
         return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
       }
+      if (b.op === 'intent-add') {
+        const sourceId = b.sourceId as string | undefined;
+        if (!sourceId) return json(res, 400, { error: 'intent-add: sourceId is required' });
+        const t0 = Number(b.t0);
+        const t1 = Number(b.t1);
+        const id = freshId('iz');
+        await mutate(
+          p, actor, baseRev, 'intent-add', b,
+          `intent-add ${sourceId} [${t0}-${t1}] "${b.label ?? ''}" (${b.kind ?? 'quiet'})`,
+          (m) => addIntentZone(m, sourceId, t0, t1, { label: b.label, kind: b.kind, id }),
+        );
+        return json(res, 200, { id, state: await stateSummary(p, ctx.transcribeJobs) });
+      }
+      if (b.op === 'intent-remove') {
+        if (!(m0.intentZones ?? []).some((z) => z.id === b.id)) {
+          return json(res, 400, { error: `unknown intent zone: ${b.id}` });
+        }
+        await mutate(p, actor, baseRev, 'intent-remove', b, `intent-remove ${b.id}`, (m) => removeIntentZone(m, b.id));
+        return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
+      }
       if (b.op === 'restore') {
         // `baseRev` here is the same value every other /api/edit op uses
         // (b.baseRev, falling back to the pre-request revision for
@@ -1441,10 +1591,24 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
           }
         }
       }
+      // W-INTENT: exclude silence candidates whose range overlaps a
+      // director-flagged protection zone (Manifest.intentZones) — a "余韻"
+      // shouldn't be re-proposed as a cut just because detect() ran again.
+      // Filler candidates are left alone (a filler word inside a protected
+      // zone is still a filler word, not the silence itself).
+      let excludedByIntentZones = 0;
+      const withinIntentZones = out.filter((c) => {
+        if (c.kind !== 'silence') return true;
+        const zones = intentZonesForSource(m, c.sourceId);
+        if (zones.length === 0) return true;
+        if (overlappingIntentZones(zones, c.t0, c.t1).length === 0) return true;
+        excludedByIntentZones++;
+        return false;
+      });
       // Keep prior decisions: don't resurrect ranges already approved/rejected.
       const prior = await p.candidates();
       const decided = prior.filter((c) => c.status !== 'proposed');
-      const fresh = out.filter(
+      const fresh = withinIntentZones.filter(
         (c) => !decided.some((d) => d.sourceId === c.sourceId && Math.abs(d.t0 - c.t0) < 0.05 && Math.abs(d.t1 - c.t1) < 0.05),
       );
       const merged = [...decided, ...fresh];
@@ -1454,6 +1618,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         pending: fresh.filter((c) => c.status === 'proposed'),
         summary: `${fresh.length} candidates (use approve/reject; approving applies the cut)`,
         revision: m.revision,
+        ...(excludedByIntentZones > 0 ? { excludedByIntentZones } : {}),
       });
     }
     if (pathname === '/api/candidates/decide' && method === 'POST') {

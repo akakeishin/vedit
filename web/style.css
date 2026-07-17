@@ -206,6 +206,16 @@ main { flex: 1; display: flex; min-height: 0; }
   background: rgba(255, 255, 255, 0.4); pointer-events: auto; cursor: pointer;
 }
 .sceneMark:hover { background: var(--accent); width: 2px; }
+/* W-INTENT: thin protected-region band, underlining the clip row rather than
+   covering it, so it never competes with clip drag/trim pointer targets
+   (only the thin bar itself re-enables pointer-events, for the hover title
+   tooltip — see intentZoneTimelineRanges/renderIntentZoneRow in app.js). */
+#intentZoneRow { position: absolute; left: 0; right: 0; top: 12%; height: 50%; pointer-events: none; }
+.intentZoneBlock {
+  position: absolute; bottom: 0; height: 4px; border-radius: 2px;
+  background: rgba(224, 178, 90, 0.65); pointer-events: auto; cursor: default;
+}
+.intentZoneBlock.hold { background: rgba(122, 92, 208, 0.65); }
 .clip {
   position: absolute; top: 8%; height: 84%; cursor: grab;
   background: var(--keep); border: 1px solid #526c8b; border-left: 1px solid rgba(255,255,255,0.22);
@@ -342,6 +352,9 @@ aside {
   color: var(--text); font-size: 13px;
 }
 .showCardLbl { font-weight: 600; margin: 6px 0; line-height: 1.5; }
+/* W-INTENT/W11: takes card is a stack of rows (one per detected take), so it
+   needs more breathing room than the single-fact candidate/compare cards. */
+.showCard.wide { max-width: 420px; max-height: 70vh; overflow-y: auto; }
 .cardClose {
   position: absolute; top: 6px; right: 6px; padding: 0 6px; line-height: 1.4;
   border-radius: 4px; background: none; border: 1px solid var(--edge);
@@ -349,6 +362,11 @@ aside {
 .compareOps { list-style: none; margin-top: 8px; display: flex; flex-direction: column; gap: 4px; max-height: 160px; overflow-y: auto; }
 .compareOps li { font-size: 11px; color: var(--dim); border-left: 2px solid var(--edge); padding-left: 6px; }
 .compareOps li b { color: var(--text); }
+.takeRow {
+  padding: 8px; margin-top: 8px; border-radius: 6px; border: 1px solid var(--edge); background: #1a1e26;
+}
+.takeRow.recommended { border-color: var(--ok); }
+.takeRow .showCardLbl { margin: 0 0 4px; font-weight: 500; }
 .ingestFlowCard { position: fixed; z-index: 20; }
 
 #words { padding: 10px 12px; user-select: none; overflow-y: auto; }

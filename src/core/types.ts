@@ -83,6 +83,39 @@ export interface Manifest {
    * unaffected (full regression).
    */
   captionTextOverrides?: Record<string, string>;
+  /**
+   * "静寂スコア" protection zones (andashi 採用案): source-domain ranges the
+   * director has explicitly marked as deliberate — a meaningful pause, a
+   * held reaction shot — so automated tooling stops treating them as
+   * defects. `sourceId`+`t0`/`t1` are in that source's own time domain (NOT
+   * timeline time), matching CutCandidate's convention, since a protected
+   * moment is a property of the FOOTAGE, not of wherever it currently sits
+   * on the timeline. Optional for backward compatibility with existing
+   * project.json files; an empty/absent list changes nothing (every
+   * consumer — detect's silence-candidate filter, music-add/update's duck
+   * warning, qc.ts's probeRenderedFile via `vedit qc --render` — degrades to
+   * its pre-W-INTENT behavior). Set via `vedit intent-add`/`intent-remove`
+   * (see ops.ts's addIntentZone/removeIntentZone).
+   */
+  intentZones?: IntentZoneItem[];
+}
+
+/** One "静寂スコア" protection zone — see Manifest.intentZones. */
+export interface IntentZoneItem {
+  id: string;
+  /** Source-domain: the footage this zone protects, independent of where it currently sits on the timeline. */
+  sourceId: string;
+  t0: number;
+  t1: number;
+  /** Human-readable reason ("見せ場直後の余韻" etc.); shown on hover in the web timeline and threaded into qc.ts's probe issues as IntentZone.reason. */
+  label: string;
+  /**
+   * 'quiet' = protects against silence-candidate auto-detection and warns
+   * BGM ducking not to swallow it; 'hold' = a held shot/reaction the
+   * director wants kept regardless of audio content (protects detection
+   * only, no duck-warning implication).
+   */
+  kind: 'quiet' | 'hold';
 }
 
 export interface Source {

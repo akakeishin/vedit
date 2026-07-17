@@ -2882,3 +2882,381 @@ describe('daemon: transcribe job failure (W-LAZY)', () => {
     }
   });
 });
+
+// ---- W-INTENT: intent zones (静寂スコア protection zones) ----
+describe('daemon: intent zones (W-INTENT ops)', () => {
+  const PORT = 18240;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let zoneId: string;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-intent-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'intent');
+    await project.commit(0, 'system', 'setup', {}, 'seed source', (m) => ({
+      ...m,
+      fps: 30,
+      sources: [{ id: 's1', path: '/media/one.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: true }],
+      timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 30 }], motion: [] },
+    }));
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('rejects intent-add for actor=claude without a numeric baseRev', async () => {
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', op: 'intent-add', sourceId: 's1', t0: 1, t1: 2, label: '間',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/baseRev is required/);
+  });
+
+  it('intent-add rejects an unknown source', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'intent-add', sourceId: 'nope', t0: 1, t1: 2, label: '間',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/unknown source/);
+  });
+
+  it('intent-add rejects t1 <= t0', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'intent-add', sourceId: 's1', t0: 5, t1: 5, label: '間',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/must be greater than t0/);
+  });
+
+  it('intent-add creates a zone with default kind=quiet, reflected in /api/project', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'intent-add', sourceId: 's1', t0: 5, t1: 10, label: '余韻',
+    });
+    expect(status).toBe(200);
+    zoneId = body.id;
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.intentZones).toEqual([{ id: zoneId, sourceId: 's1', t0: 5, t1: 10, label: '余韻', kind: 'quiet' }]);
+  });
+
+  it('intent-add accepts an explicit kind=hold', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'intent-add', sourceId: 's1', t0: 15, t1: 20, label: '見せ場', kind: 'hold',
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.intentZones).toHaveLength(2);
+    expect(project.manifest.intentZones.find((z: any) => z.id === body.id).kind).toBe('hold');
+  });
+
+  it('intent-remove rejects an unknown id', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'intent-remove', id: 'nope',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/unknown intent zone/);
+  });
+
+  it('intent-remove removes the zone', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'intent-remove', id: zoneId,
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.intentZones).toHaveLength(1);
+    expect(project.manifest.intentZones.some((z: any) => z.id === zoneId)).toBe(false);
+  });
+});
+
+// ---- W-INTENT: /api/detect auto-excludes silence candidates inside a zone ----
+describe('daemon: /api/detect excludes silence candidates inside intent zones', () => {
+  const PORT = 18241;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-detect-intent-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'detect-intent');
+    // gap1 [1,3) — inside the intent zone; gap2 [4,10) — outside it.
+    const words: Word[] = [
+      { id: 'w0000', text: 'a', t0: 0, t1: 1, p: 0.9 },
+      { id: 'w0001', text: 'b', t0: 3, t1: 4, p: 0.9 },
+      { id: 'w0002', text: 'c', t0: 10, t1: 11, p: 0.9 },
+    ];
+    await project.writeTranscript({ sourceId: 's1', language: 'en', words });
+    await project.commit(0, 'system', 'setup', {}, 'seed source', (m) => ({
+      ...m,
+      fps: 30,
+      sources: [{ id: 's1', path: '/media/one.mp4', duration: 12, fps: 30, width: 1920, height: 1080, hasAudio: true, transcribed: true }],
+      timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 12 }], motion: [] },
+      intentZones: [{ id: 'iz1', sourceId: 's1', t0: 1, t1: 3, label: '間', kind: 'quiet' }],
+    }));
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('excludes the silence candidate overlapping the intent zone and reports the count', async () => {
+    const { status, body } = await postJson(BASE, '/api/detect', {});
+    expect(status).toBe(200);
+    expect(body.excludedByIntentZones).toBe(1);
+    expect(body.pending).toHaveLength(1);
+    expect(body.pending[0].t0).toBeGreaterThan(4); // the [4,10) gap's candidate, not the protected [1,3) one
+  });
+});
+
+// ---- W-INTENT: music-add/-update duck warning near a 'quiet' zone (never rejects) ----
+describe('daemon: music duck warning near a quiet intent zone', () => {
+  const PORT = 18242;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let musicId2: string;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-duck-warn-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'duck-warn');
+    await project.commit(0, 'system', 'setup', {}, 'seed source', (m) => ({
+      ...m,
+      fps: 30,
+      sources: [{ id: 's1', path: '/media/one.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: true }],
+      timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 30 }], motion: [] },
+      // quiet zone at source time [10,15) -> timeline [10,15) (single 1:1 clip)
+      intentZones: [{ id: 'iz1', sourceId: 's1', t0: 10, t1: 15, label: '余韻', kind: 'quiet' }],
+    }));
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('music-add with default duck warns when the placed region overlaps the quiet zone (never rejects)', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'music-add', path: '/tmp/bgm.mp3', tlStart: 8, duration: 5, // [8,13) overlaps [10,15)
+    });
+    expect(status).toBe(200);
+    expect(body.warning).toMatch(/余韻/);
+  });
+
+  it('music-add with --no-duck does not warn even though the region overlaps', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'music-add', path: '/tmp/bgm2.mp3', tlStart: 8, duration: 5, duck: false,
+    });
+    expect(status).toBe(200);
+    expect(body.warning).toBeUndefined();
+    musicId2 = body.id;
+  });
+
+  it('music-add away from the zone does not warn', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'music-add', path: '/tmp/bgm3.mp3', tlStart: 0, duration: 3,
+    });
+    expect(status).toBe(200);
+    expect(body.warning).toBeUndefined();
+  });
+
+  it('music-update turning duck on for an overlapping item surfaces the warning without re-specifying tlStart/duration', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'music-update', id: musicId2, duck: true,
+    });
+    expect(status).toBe(200);
+    expect(body.warning).toMatch(/余韻/);
+  });
+});
+
+// ---- W9: GET /api/qc (static-only report, merged into the いま inbox) ----
+describe('daemon: GET /api/qc (static-only report)', () => {
+  const PORT = 18243;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let kitDir: string;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-qc-'));
+    const dir = path.join(root, 'proj');
+    kitDir = path.join(root, 'kit');
+    await fsp.mkdir(kitDir, { recursive: true });
+    await writeKitFile(kitDir, { version: 'vedit-kit/v1', profile: { duration_seconds: { target: 10 } } });
+
+    const project = await Project.create(dir, 'qc');
+    await project.commit(0, 'system', 'setup', {}, 'seed source', (m) => ({
+      ...m,
+      fps: 30,
+      sources: [
+        { id: 's1', path: '/media/one.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: true },
+        { id: 's2', path: path.join(root, 'does-not-exist.mp4'), duration: 5, fps: 30, width: 1920, height: 1080, hasAudio: false },
+      ],
+      timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 30 }], motion: [] },
+      kit: { path: kitDir },
+    }));
+    await project.writeCandidates([
+      { id: 'cand1', kind: 'silence', sourceId: 's1', t0: 5, t1: 6, wordIds: [], label: '無音 1.0s', status: 'proposed' } as CutCandidate,
+    ]);
+
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('returns a StaticCheckReport surfacing pending candidates, a missing source file, and a kit duration mismatch — never a render probe', async () => {
+    const { status, body } = await getJson(BASE, '/api/qc');
+    expect(status).toBe(200);
+    expect(body.probe).toBeUndefined(); // static-only — never ffmpeg-probes a render
+    expect(body.tempo).toBeUndefined();
+    expect(body.issues.some((i: any) => i.category === 'candidates')).toBe(true);
+    expect(body.issues.some((i: any) => i.category === 'source-missing' && i.message.includes('s2'))).toBe(true);
+    expect(body.issues.some((i: any) => i.category === 'kit-duration')).toBe(true);
+    expect(body.counts.errors).toBeGreaterThanOrEqual(1); // source-missing is an error
+    expect(body.counts.warnings).toBeGreaterThanOrEqual(2); // pending candidate + kit-duration
+  });
+});
+
+// ---- W11: GET /api/takes (read-only detectTakes wiring) ----
+describe('daemon: GET /api/takes', () => {
+  const PORT = 18244;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+
+  function retakeWords(startAt: number): Word[] {
+    return [
+      { id: `w${startAt}0`, text: 'hello', t0: startAt, t1: startAt + 0.5, p: 0.9 },
+      { id: `w${startAt}1`, text: 'there', t0: startAt + 0.5, t1: startAt + 1.0, p: 0.9 },
+      { id: `w${startAt}2`, text: 'friend', t0: startAt + 1.0, t1: startAt + 1.5, p: 0.9 },
+    ];
+  }
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-takes-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'takes');
+    // s1: same "hello there friend" said twice, 1.5s apart -> one retake group.
+    await project.writeTranscript({ sourceId: 's1', language: 'en', words: [...retakeWords(0), ...retakeWords(3)] });
+    await project.writeTranscript({ sourceId: 's2', language: 'en', words: wordsFor('s2w', 4) });
+    await project.commit(0, 'system', 'setup', {}, 'seed sources', (m) => ({
+      ...m,
+      fps: 30,
+      sources: [
+        { id: 's1', path: '/media/one.mp4', duration: 10, fps: 30, width: 1920, height: 1080, hasAudio: true, transcribed: true },
+        { id: 's2', path: '/media/two.mp4', duration: 10, fps: 30, width: 1920, height: 1080, hasAudio: true, transcribed: true },
+        { id: 's3', path: '/media/three.mp4', duration: 10, fps: 30, width: 1920, height: 1080, hasAudio: true, transcribed: false },
+      ],
+      timeline: { video: [], motion: [] },
+    }));
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('returns detected take groups (raw TakeGroup[] JSON) for an explicit source', async () => {
+    const { status, body } = await getJson(BASE, '/api/takes?source=s1');
+    expect(status).toBe(200);
+    expect(Array.isArray(body)).toBe(true);
+    expect(body).toHaveLength(1);
+    expect(body[0].utterances).toHaveLength(2);
+  });
+
+  it('with no source and multiple transcribed sources: 400 listing the candidates', async () => {
+    const { status, body } = await getJson(BASE, '/api/takes');
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/multiple transcribed sources/);
+    expect(body.sources.map((s: any) => s.id).sort()).toEqual(['s1', 's2']);
+  });
+
+  it('rejects an unknown source (404)', async () => {
+    const { status, body } = await getJson(BASE, '/api/takes?source=nope');
+    expect(status).toBe(404);
+    expect(body.error).toMatch(/unknown source/);
+  });
+
+  it('rejects a source that exists but has no transcript (400)', async () => {
+    const { status, body } = await getJson(BASE, '/api/takes?source=s3');
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/no transcript/);
+  });
+});
+
+// ---- W-INTENT/W11: POST /api/show kind='takes' ----
+describe('daemon: show takes directive', () => {
+  const PORT = 18245;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let groupId: string;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-show-takes-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'show-takes');
+    const words: Word[] = [
+      { id: 'w0000', text: 'hello', t0: 0, t1: 0.5, p: 0.9 },
+      { id: 'w0001', text: 'there', t0: 0.5, t1: 1.0, p: 0.9 },
+      { id: 'w0002', text: 'friend', t0: 1.0, t1: 1.5, p: 0.9 },
+      { id: 'w0003', text: 'hello', t0: 3.0, t1: 3.5, p: 0.9 },
+      { id: 'w0004', text: 'there', t0: 3.5, t1: 4.0, p: 0.9 },
+      { id: 'w0005', text: 'friend', t0: 4.0, t1: 4.5, p: 0.9 },
+    ];
+    await project.writeTranscript({ sourceId: 's1', language: 'en', words });
+    await project.commit(0, 'system', 'setup', {}, 'seed source', (m) => ({
+      ...m,
+      fps: 30,
+      sources: [{ id: 's1', path: '/media/one.mp4', duration: 10, fps: 30, width: 1920, height: 1080, hasAudio: true, transcribed: true }],
+      timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 10 }], motion: [] },
+    }));
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+
+    const takes = (await getJson(BASE, '/api/takes?source=s1')).body;
+    groupId = takes[0].id;
+  });
+
+  afterAll(() => server.close());
+
+  it('does not create a revision and broadcasts {kind:"takes", sourceId, groupId}', async () => {
+    const before = (await getJson(BASE, '/api/state')).body.revision;
+    const ws = await openWs(BASE);
+    try {
+      const waiting = nextWsMessage(ws, (m) => m.type === 'show');
+      const { status, body } = await postJson(BASE, '/api/show', { kind: 'takes', sourceId: 's1', groupId });
+      expect(status).toBe(200);
+      expect(body.directive).toEqual({ kind: 'takes', sourceId: 's1', groupId });
+      const msg = await waiting;
+      expect(msg).toEqual({ type: 'show', directive: { kind: 'takes', sourceId: 's1', groupId } });
+    } finally {
+      ws.close();
+    }
+    const after = (await getJson(BASE, '/api/state')).body.revision;
+    expect(after).toBe(before);
+  });
+
+  it('rejects an unknown groupId', async () => {
+    const { status, body } = await postJson(BASE, '/api/show', { kind: 'takes', sourceId: 's1', groupId: 'nope' });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/unknown take group/);
+  });
+
+  it('rejects an unknown sourceId', async () => {
+    const { status, body } = await postJson(BASE, '/api/show', { kind: 'takes', sourceId: 'nope', groupId });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/unknown source/);
+  });
+
+  it('rejects a missing groupId', async () => {
+    const { status, body } = await postJson(BASE, '/api/show', { kind: 'takes', sourceId: 's1' });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/groupId is required/);
+  });
+});
