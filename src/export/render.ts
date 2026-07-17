@@ -719,7 +719,14 @@ export function buildCompositionFilterGraph(
       const geo = spriteGeometry(asset, sp.position, sp.scale, output, { flip: sp.flip });
       const plan = spriteMotionPlan(sp.motion, geo, r.tlStart, r.tlEnd);
       const idx = addImageInput(asset.absPath);
-      const chain = [`scale=${Math.max(1, Math.round(geo.width))}:${Math.max(1, Math.round(geo.height))}`];
+      // breathe is scale-only: its pulse lives in eval=frame w/h expressions
+      // (plan.breathe), which a static `scale=W:H` would silently discard —
+      // the preset must animate in the render exactly like the web preview.
+      const chain = [
+        plan.breathe
+          ? `scale=eval=frame:w='${plan.breathe.widthExpr}':h='${plan.breathe.heightExpr}'`
+          : `scale=${Math.max(1, Math.round(geo.width))}:${Math.max(1, Math.round(geo.height))}`,
+      ];
       if (sp.flip) chain.push('hflip');
       chain.push('format=rgba');
       if (sp.opacity < 0.999) chain.push(`colorchannelmixer=aa=${sp.opacity}`);
@@ -737,11 +744,19 @@ export function buildCompositionFilterGraph(
         const emoteAsset = opts.kitAssets!.get(w.assetId);
         if (!emoteAsset) return; // unresolved emote asset — skip this window (warning already surfaced upstream by resolveKitAssets)
         const eGeo = spriteGeometry(emoteAsset, sp.position, sp.scale, output, { flip: sp.flip });
+        // Emote layers get their OWN plan from their own geometry (an emote
+        // PNG may have different bounds/aspect) — the formulas are pure in t
+        // and share tlStart, so base and emote stay phase-locked anyway.
+        const ePlan = spriteMotionPlan(sp.motion, eGeo, r.tlStart, r.tlEnd);
         const eIdx = addImageInput(emoteAsset.absPath);
         const absT0 = r.tlStart + w.t0;
         const absT1 = r.tlStart + w.t1;
         const fd = Math.min(SPRITE_EMOTE_CROSSFADE_SECONDS, (w.t1 - w.t0) / 2);
-        const eChain = [`scale=${Math.max(1, Math.round(eGeo.width))}:${Math.max(1, Math.round(eGeo.height))}`];
+        const eChain = [
+          ePlan.breathe
+            ? `scale=eval=frame:w='${ePlan.breathe.widthExpr}':h='${ePlan.breathe.heightExpr}'`
+            : `scale=${Math.max(1, Math.round(eGeo.width))}:${Math.max(1, Math.round(eGeo.height))}`,
+        ];
         if (sp.flip) eChain.push('hflip');
         eChain.push('format=rgba');
         if (sp.opacity < 0.999) eChain.push(`colorchannelmixer=aa=${sp.opacity}`);
@@ -749,10 +764,8 @@ export function buildCompositionFilterGraph(
         const evLabel = `[spe${n}_${wi}]`;
         parts.push(`[${eIdx}:v]${eChain.join(',')}${evLabel}`);
         const eComposited = `[spec${n}_${wi}]`;
-        // Emote layers reuse the SAME motion x/y expression as the base
-        // (phase-locked to r.tlStart), so the expression swap never visibly jumps.
         parts.push(
-          `${videoLabel}${evLabel}overlay=x='${plan.xExpr}':y='${plan.yExpr}':enable='between(t,${absT0},${absT1})'${eComposited}`,
+          `${videoLabel}${evLabel}overlay=x='${ePlan.xExpr}':y='${ePlan.yExpr}':enable='between(t,${absT0},${absT1})'${eComposited}`,
         );
         videoLabel = eComposited;
       });
