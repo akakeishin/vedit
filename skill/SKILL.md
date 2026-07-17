@@ -27,19 +27,36 @@ vedit doctor        # 依存チェック(ffmpeg / whisper / モデル)
 vedit doctor --download-model ggml-large-v3-turbo
 ```
 
+ingest 自体(プロキシ+波形+シーン検出)は whisper モデル不要。モデルが
+要るのは `vedit transcribe`(または `vedit ingest --transcribe`)を
+実際に使うときだけ。
+
 `vedit` が PATH に無ければ `node /Users/ht/dev/video-edit-skill/dist/cli.js` を使う。
 
-## 基本フロー
+## 基本フロー(scenes-first)
 
 ```bash
 vedit create <dir> --name <名前>
-vedit ingest <file> --language ja         # 単発素材はこちら。4K素材で約26秒/分
+vedit ingest <file>                       # 既定: プロキシ+波形+シーン検出まで(文字起こしはしない)
 vedit ingest-batch <dir> --plan           # 複数本(撮影カード等)は事前確認してから ingest エージェントに委譲
 vedit open                                # プレビューURLを必ずユーザーに伝える
 vedit status                              # revision / duration / sources(全コマンドの起点)
-vedit transcript                          # packed transcript(編集判断の主材料)
-vedit detect                              # 無音(波形+単語ギャップ)・フィラー候補
+vedit scenes                              # packed scene list — まずここで構造を把握する(hasSpeech/energy)
+vedit scenes sheet                        # シーンごとのサムネ格子(視覚で把握)
 ```
+
+**主用途は「映像が主役」の素材**(歩き vlog 等)。whisper の文字起こしは
+ingest 時間の大半を占めがちな割に、映像が主役の素材では必須ではない —
+ingest の既定は**シーン検出まで**で止まり、文字起こしはしない。
+
+- 発話が内容の中心と分かったら(トーク系vlog・インタビュー等)、
+  `vedit transcribe <sourceId|all> --language ja` を実行して初めて
+  文字起こしが走る(非同期の裏ジョブ。次章)
+- 「字幕つけて」「この発言をカットして」等トーク系の指示を受けたら、
+  ディレクターは**まず `vedit transcribe` を裏で起動してから**分析や
+  他の作業を続ける(完了を待たずに指示を受け付けてよい)
+- ingest 時点で発話中心と分かっている場合は `vedit ingest --transcribe`
+  で旧来どおり即時に文字起こしまで済ませてよい
 
 `ingest-batch` は撮影カード/フォルダの一括取り込み用: SHA-256 で重複を検出して
 スキップ、`--copy <destDir>` でプロジェクト外の素材保管先へコピー後に検証
@@ -95,10 +112,12 @@ vedit view --domain source --source <id>   # カット前のソースを見る
 
 各コマにソースタイムコード焼き込み。カット適用後は必ず view で境界を確認する。
 
-しゃべりのない素材(B-roll・風景)は `vedit scenes detect` → `vedit scenes sheet` で
-シーンごとのサムネ格子を作り、それを Read して各シーンに一言注釈
-(`vedit scenes note s0003 "..." --by model`)を付けると、単語 id と同じ感覚で
-`--scene s0003` を clip-add / remove-range / view に渡せる。
+シーンは ingest 時点で自動検出済み(`--no-scenes` で無効化可。再検出したい
+ときだけ `vedit scenes detect --sensitivity ..`)。しゃべりのない素材
+(B-roll・風景)は `vedit scenes sheet` でシーンごとのサムネ格子を作り、
+それを Read して各シーンに一言注釈(`vedit scenes note s0003 "..." --by model`)
+を付けると、単語 id と同じ感覚で `--scene s0003` を clip-add / remove-range /
+view に渡せる。
 
 ## クリップ構成(取捨選択・並べ替え)
 
@@ -113,9 +132,9 @@ vedit clip-move <clipId> --before <clipId|end> --base <rev>
 多数クリップの取捨選択は: 全部 `--no-add` で ingest → 分析エージェントに
 transcript+view で「使う/使わない」推薦を作らせる → ユーザー承認 → clip-add。
 
-しゃべりのない素材の大量選別は3状態カリング(未確認/keep/reject)を使う:
-`vedit scenes detect` → 分析エージェントが `scenes sheet` を見て keep/reject を推薦
-→ ユーザー確認 → `vedit review <sceneId...> keep|reject --base <rev>`
+しゃべりのない素材の大量選別は3状態カリング(未確認/keep/reject)を使う
+(シーンは ingest 時点で検出済み): 分析エージェントが `scenes sheet` を見て
+keep/reject を推薦 → ユーザー確認 → `vedit review <sceneId...> keep|reject --base <rev>`
 → `vedit selects --confirm --base <rev>` で keep シーンだけの仮タイムラインに置換
 (`--confirm` 無しはプレビューのみ。既存タイムラインは丸ごと置き換わるので
 undo で戻せることを伝える)。進捗確認は `vedit review-status`。

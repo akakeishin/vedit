@@ -5,8 +5,15 @@
 
 ## 段取り(必ずこの順)
 
-1. **分析**: transcript 分析エージェント(references/delegation.md テンプレート2)
-   に素材の構造化を依頼。chapters / highlights / cutCandidates / pauses / risks。
+1. **構造把握 → 分析**: まず `vedit scenes`(packed scene list)と
+   `vedit scenes sheet` + `vedit view` で素材全体の構造を把握する
+   (シーンは ingest 時点で検出済み)。**「映像が主役」の素材はここまでで
+   方針宣言に足りることが多い** — その場合は transcript 分析を省略してよい。
+   発話が内容の中心と分かったら(トーク系vlog・インタビュー等)、
+   `vedit transcribe <sourceId|all> --language ja` を裏で起動し、完了を
+   待ってから transcript 分析エージェント(references/delegation.md
+   テンプレート2)に素材の構造化を依頼する。chapters / highlights /
+   cutCandidates / pauses / risks。
 2. **方針宣言**: 分析結果から編集方針を 2〜3 行でユーザーに見せる。必ず含める:
    - **約束**: この動画は視聴者に何を約束するか(冒頭で提示されるもの)
    - **見せ場**: どこがペイオフか(削ってはいけない山)
@@ -45,7 +52,8 @@
 1. **字幕の無効化を提案する**(`vedit captions --enabled false`)—
    出典ルール上、誤認識テキストを字幕として焼くことはできない
 2. 分析・編集の主軸を **scenes ワークフローに切り替える**
-   (`vedit scenes detect` → `scenes sheet` → 視覚単位で構成判断)
+   (`vedit scenes sheet` → 視覚単位で構成判断。シーン検出は ingest 時点で
+   済んでいる)
 3. カットリストの「引用」は view / scenes sheet の**セル参照**で代替する
    (例: 「cell9-12 の並木道ネオン区間」)
 
@@ -86,9 +94,9 @@
    冒頭に最強の一言をフックとして配置、字幕は大きめスタイル
 4. `vedit reframe 9:16` + 縦向き export render
 
-しゃべりのないB-roll区間を差し込みたい場合は `vedit scenes detect` +
-`vedit scenes sheet` で視覚版の「packed transcript」を作り、注釈付きの
-シーンを `clip-add --scene s0003` で直接指定する(タイムコード手計算不要)。
+しゃべりのないB-roll区間を差し込みたい場合は `vedit scenes sheet`
+(シーン検出は ingest 時点で済んでいる)で視覚版の「packed transcript」を作り、
+注釈付きのシーンを `clip-add --scene s0003` で直接指定する(タイムコード手計算不要)。
 
 ## 公開パックの起草手順
 

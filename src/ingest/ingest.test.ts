@@ -8,14 +8,24 @@ import type { Word } from '../core/types.js';
 // makeProxy/probe/transcribe shell out via run(); stub it so these tests only
 // assert on the constructed argv (and, for probe/transcribe, fake ffprobe's
 // JSON / whisper-cli's output file), without needing ffmpeg/ffprobe/whisper
-// installed.
-const { runMock, hasFilterMock } = vi.hoisted(() => ({
+// installed. runCapture is ALSO stubbed (W-LAZY: ingestFile now runs
+// detectScenesForSource by default, which shells out via runCapture for the
+// ffmpeg scene-change filter — see core/scenes.ts) so a plain ingestFile()
+// call without scenes:false doesn't fail on an unmocked import; it defaults
+// to "no scene-change boundaries found" (a single whole-clip scene) unless a
+// test overrides it. runBinary defaults to an empty buffer (makePeaks parses
+// it into a zero-length peaks array) rather than being left unconfigured,
+// since ingestFile now always at least probes+proxies+scene-detects even a
+// hasAudio:true source without any test explicitly opting into transcribe.
+const { runMock, runCaptureMock, hasFilterMock } = vi.hoisted(() => ({
   runMock: vi.fn().mockResolvedValue(''),
+  runCaptureMock: vi.fn().mockResolvedValue({ stdout: '', stderr: '' }),
   hasFilterMock: vi.fn(() => true),
 }));
 vi.mock('./run.js', () => ({
   run: (...args: unknown[]) => runMock(...args),
-  runBinary: vi.fn(),
+  runBinary: vi.fn().mockResolvedValue(Buffer.alloc(0)),
+  runCapture: (...args: unknown[]) => runCaptureMock(...args),
   ffmpegHasFilter: (...args: unknown[]) => hasFilterMock(...args),
 }));
 
@@ -319,8 +329,12 @@ describe('ingestFile concurrency', () => {
     await fs.writeFile(fileB, 'b');
 
     const [ra, rb] = await Promise.all([
-      ingestFile(project, fileA, { transcribe: false }),
-      ingestFile(project, fileB, { transcribe: false }),
+      // scenes: false — this test is specifically about the commit-retry
+      // race, not scene detection (which now defaults on; see the
+      // "ingestFile defaults (W-LAZY)" suite below) — keeping it off here
+      // keeps the assertions below focused on revision/commit outcomes.
+      ingestFile(project, fileA, { transcribe: false, scenes: false }),
+      ingestFile(project, fileB, { transcribe: false, scenes: false }),
     ]);
 
     expect(ra.source.id).not.toBe(rb.source.id);
@@ -328,5 +342,121 @@ describe('ingestFile concurrency', () => {
     expect(m.sources.map((s) => s.id).sort()).toEqual([ra.source.id, rb.source.id].sort());
     expect(m.timeline.video).toHaveLength(2);
     expect(m.revision).toBe(2); // two accepted commits, no lost update
+  });
+});
+
+describe('ingestFile defaults (W-LAZY: transcribe off, scenes on)', () => {
+  function fakeFfprobe(hasAudioStream: boolean, duration = '6') {
+    return JSON.stringify({
+      format: { duration },
+      streams: [
+        { codec_type: 'video', avg_frame_rate: '30/1', width: 640, height: 360, duration },
+        ...(hasAudioStream ? [{ codec_type: 'audio' }] : []),
+      ],
+    });
+  }
+  function fakeWhisperOutput(args: string[], text = 'hi', toMs = 300): Promise<void> {
+    const outBase = args[args.indexOf('-of') + 1];
+    return fs.writeFile(
+      `${outBase}.json`,
+      JSON.stringify({
+        transcription: [{ tokens: [{ text, offsets: { from: 0, to: toMs }, p: 0.9 }] }],
+        result: { language: 'ja' },
+      }),
+    );
+  }
+
+  it('does not transcribe by default even when the source has audio', async () => {
+    runMock.mockReset();
+    runCaptureMock.mockReset().mockResolvedValue({ stdout: '', stderr: '' });
+    runMock.mockImplementation(async (cmd: string) => (cmd === 'ffprobe' ? fakeFfprobe(true) : ''));
+
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-ingest-lazy-'));
+    const project = await Project.create(path.join(root, 'proj'), 'lazy');
+    const file = path.join(root, 'clip.mp4');
+    await fs.writeFile(file, 'x');
+
+    const { source } = await ingestFile(project, file);
+    expect(source.transcribed).toBe(false);
+    expect(runMock.mock.calls.some(([cmd]) => cmd === 'whisper-cli')).toBe(false);
+    await expect(project.transcript(source.id)).rejects.toThrow(); // no transcript-<id>.json was ever written
+  });
+
+  it('runs scene detection by default, without needing --transcribe first', async () => {
+    runMock.mockReset();
+    runCaptureMock.mockReset().mockResolvedValue({ stdout: '', stderr: '' }); // no scene-change boundaries -> one whole-clip scene
+    runMock.mockImplementation(async (cmd: string) => (cmd === 'ffprobe' ? fakeFfprobe(false) : ''));
+
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-ingest-scenes-'));
+    const project = await Project.create(path.join(root, 'proj'), 'scenes-default');
+    const file = path.join(root, 'clip.mp4');
+    await fs.writeFile(file, 'x');
+
+    const { source } = await ingestFile(project, file);
+    const scenes = await project.scenes(source.id);
+    expect(scenes.scenes.length).toBeGreaterThan(0);
+    expect(runCaptureMock).toHaveBeenCalled();
+  });
+
+  it('skips scene detection when scenes:false is passed (--no-scenes)', async () => {
+    runMock.mockReset();
+    runCaptureMock.mockReset().mockResolvedValue({ stdout: '', stderr: '' });
+    runMock.mockImplementation(async (cmd: string) => (cmd === 'ffprobe' ? fakeFfprobe(false) : ''));
+
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-ingest-noscenes-'));
+    const project = await Project.create(path.join(root, 'proj'), 'no-scenes');
+    const file = path.join(root, 'clip.mp4');
+    await fs.writeFile(file, 'x');
+
+    const { source } = await ingestFile(project, file, { scenes: false });
+    const scenes = await project.scenes(source.id);
+    expect(scenes.scenes).toEqual([]); // Project.scenes() falls back to an empty SceneFile when none was ever written
+    expect(runCaptureMock).not.toHaveBeenCalled();
+  });
+
+  it('still transcribes when opts.transcribe is explicitly true (old "transcribe at ingest" behavior)', async () => {
+    runMock.mockReset();
+    runCaptureMock.mockReset().mockResolvedValue({ stdout: '', stderr: '' });
+    runMock.mockImplementation(async (cmd: string, args: string[]) => {
+      if (cmd === 'ffprobe') return fakeFfprobe(true);
+      if (cmd === 'whisper-cli') await fakeWhisperOutput(args);
+      return '';
+    });
+
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-ingest-explicit-'));
+    const project = await Project.create(path.join(root, 'proj'), 'explicit');
+    const file = path.join(root, 'clip.mp4');
+    await fs.writeFile(file, 'x');
+
+    const { source } = await ingestFile(project, file, { transcribe: true, scenes: false });
+    expect(source.transcribed).toBe(true);
+    const t = await project.transcript(source.id);
+    expect(t.words[0].text).toBe('hi');
+  });
+
+  it('scenes detected alongside an explicit transcribe:true reflect hasSpeech from that same transcript', async () => {
+    // Regression coverage for ordering: detectScenesForSource is handed a
+    // manifest built via ingestFile's own buildNext (source + its
+    // full-range timeline clip), NOT the on-disk pre-commit manifest —
+    // otherwise keptWords() sees no segment for this brand-new source yet
+    // and every scene would come back hasSpeech:false regardless of the
+    // transcript (see the comment above buildNext in ingest.ts).
+    runMock.mockReset();
+    runCaptureMock.mockReset().mockResolvedValue({ stdout: '', stderr: '' }); // one whole-clip scene
+    runMock.mockImplementation(async (cmd: string, args: string[]) => {
+      if (cmd === 'ffprobe') return fakeFfprobe(true);
+      if (cmd === 'whisper-cli') await fakeWhisperOutput(args);
+      return '';
+    });
+
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-ingest-hasspeech-'));
+    const project = await Project.create(path.join(root, 'proj'), 'hasspeech');
+    const file = path.join(root, 'clip.mp4');
+    await fs.writeFile(file, 'x');
+
+    const { source } = await ingestFile(project, file, { transcribe: true });
+    const scenes = await project.scenes(source.id);
+    expect(scenes.scenes.length).toBeGreaterThan(0);
+    expect(scenes.scenes.every((s) => s.hasSpeech)).toBe(true);
   });
 });

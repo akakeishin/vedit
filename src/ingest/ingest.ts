@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { freshId } from '../core/ops.js';
 import type { Project } from '../core/project.js';
+import { detectScenesForSource } from '../core/scenes.js';
 import type { Manifest, Source, Transcript, Word } from '../core/types.js';
 import { buildColorChain } from '../export/color.js';
 import { run, runBinary } from './run.js';
@@ -434,7 +435,28 @@ export async function ingestFile(
   file: string,
   opts: {
     language?: string;
+    /**
+     * Whether to run whisper transcription as part of this ingest. Default
+     * FALSE (W-LAZY): transcription used to be the ingest-time gate, but
+     * for "the footage is the point" material (walk vlogs, B-roll-heavy
+     * shoots) whisper's wall-clock cost dominates ingest for no payoff most
+     * of the time. Explicit `vedit transcribe <sourceId|all>` (async job,
+     * see POST /api/transcribe in server/daemon.ts) runs it later, in the
+     * background, only when actually needed — set true here (or pass
+     * `--transcribe` to `vedit ingest`) to keep the old "transcribe at
+     * ingest" flow for material that's known to be talk-centric upfront.
+     */
     transcribe?: boolean;
+    /**
+     * Whether to run scene-change detection (core/scenes.ts's
+     * detectScenesForSource) as part of this ingest. Default TRUE
+     * (W-LAZY): scenes are now the ingest-time structural signal in place
+     * of the transcript, so `vedit scenes` / `scenes sheet` are usable
+     * immediately after ingest even for an untranscribed source. Pass
+     * `--no-scenes` to skip it (e.g. a quick pool-only ingest that will be
+     * scene-detected later, or when ffmpeg's scene filter isn't wanted).
+     */
+    scenes?: boolean;
     addToTimeline?: boolean;
     onProgress?: IngestProgress;
     /**
@@ -486,14 +508,16 @@ export async function ingestFile(
     color: p.color,
     sha256: opts.sha256,
   };
-  if (p.hasAudio && opts.transcribe !== false) {
-    notify('transcribing (whisper)');
-    const t = await timed('transcribeMs', () => transcribe(abs, id, { language: opts.language, sourceDuration: p.duration }));
-    await project.writeTranscript(t);
-    source.transcribed = true;
-  }
   const addToTimeline = opts.addToTimeline ?? true;
   const summary = `ingested ${path.basename(abs)} (${p.duration.toFixed(1)}s)${addToTimeline ? '' : ', pool only'}`;
+  // Defined before the transcribe/scenes steps below (rather than only right
+  // before the commit loop, as before W-LAZY) so detectScenesForSource can
+  // be handed a manifest whose timeline already includes this source's own
+  // clip — without that, keptWords() (which hasSpeech is derived from) sees
+  // no segment for `id` at all yet and every scene would come back
+  // hasSpeech:false regardless of the transcript. `buildNext` reads `source`
+  // from the enclosing closure at CALL time, so mutating source.transcribed
+  // below (before the scenes step) is still reflected here.
   const buildNext = (m: Manifest): Manifest => {
     const first = m.sources.length === 0;
     return {
@@ -513,6 +537,16 @@ export async function ingestFile(
         : m.timeline,
     };
   };
+  if (p.hasAudio && opts.transcribe === true) {
+    notify('transcribing (whisper)');
+    const t = await timed('transcribeMs', () => transcribe(abs, id, { language: opts.language, sourceDuration: p.duration }));
+    await project.writeTranscript(t);
+    source.transcribed = true;
+  }
+  if (opts.scenes !== false) {
+    notify('detecting scenes');
+    await timed('scenesMs', async () => detectScenesForSource(project, buildNext(await project.manifest()), id));
+  }
   // `ingest-batch` runs up to two ingests concurrently (bounded parallelism
   // for the slow proxy/transcribe work — see batch.ts) but Project.commit
   // is optimistic-concurrency-checked: reading `cur.revision` here and then

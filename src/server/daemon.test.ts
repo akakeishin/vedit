@@ -19,7 +19,13 @@ import type { CutCandidate, KitFile, Word } from '../core/types.js';
 // color-transform shells out to makeProxy() (real proxy regen would need
 // real ffmpeg + real media files neither of which exist in these tests) —
 // stub it too, same rationale as probeAudio below.
-const { probeAudioMock, makeProxyMock } = vi.hoisted(() => ({
+// POST /api/transcribe (W-LAZY) shells out to whisper via transcribe(); stub
+// it so the "daemon: transcribe job" suite below is fast/deterministic
+// without needing whisper-cli/a real model installed. Default resolves
+// immediately with a tiny fabricated transcript; individual tests override
+// it (mockImplementationOnce / mockReset+mockImplementation) to control
+// timing (double-start guard) or simulate failure (transcribe-error).
+const { probeAudioMock, makeProxyMock, transcribeMock } = vi.hoisted(() => ({
   probeAudioMock: vi.fn(async (file: string) => {
     if (file.includes('missing')) throw new Error('ffprobe failed: no such file');
     if (file.includes('novoice')) return { duration: 30, hasAudio: false };
@@ -27,10 +33,15 @@ const { probeAudioMock, makeProxyMock } = vi.hoisted(() => ({
     return { duration: 300, hasAudio: true };
   }),
   makeProxyMock: vi.fn(async () => undefined),
+  transcribeMock: vi.fn(async (_file: string, sourceId: string, opts?: { language?: string }) => ({
+    sourceId,
+    language: opts?.language ?? 'ja',
+    words: [{ id: 'w0000', text: 'hello', t0: 0, t1: 1, p: 0.9 }],
+  })),
 }));
 vi.mock('../ingest/ingest.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../ingest/ingest.js')>();
-  return { ...actual, probeAudio: probeAudioMock, makeProxy: makeProxyMock };
+  return { ...actual, probeAudio: probeAudioMock, makeProxy: makeProxyMock, transcribe: transcribeMock };
 });
 
 // POST /api/locate-media shells out to `mdfind` (macOS-only, and depends on
@@ -2654,5 +2665,220 @@ describe('daemon: GET /api/fonts with a linked kit', () => {
     expect(body.kit).toEqual([{ name: 'MyFont-Bold', path: 'fonts/MyFont-Bold.ttf' }]);
     expect(body.system).toEqual([{ family: 'Hiragino Sans' }, { family: 'Noto Sans JP' }]);
     expect(scanKitFontsMock).toHaveBeenCalledWith(kitDir);
+  });
+});
+
+// ---- W-LAZY: POST /api/transcribe (async job) ----
+describe('daemon: transcribe job (W-LAZY)', () => {
+  const PORT = 18230;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-transcribe-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'transcribe');
+    const src = (id: string, overrides: Partial<{ hasAudio: boolean; transcribed: boolean }> = {}) => ({
+      id, path: `/media/${id}.mp4`, duration: 20, fps: 30, width: 1920, height: 1080,
+      hasAudio: true, transcribed: false, ...overrides,
+    });
+    await project.commit(0, 'system', 'setup', {}, 'seed sources', (m) => ({
+      ...m,
+      fps: 30,
+      sources: [
+        src('s1'), src('s2'), src('s3', { transcribed: true }), src('s4', { hasAudio: false }), src('s5'), src('s6'),
+      ],
+      timeline: { video: [], motion: [] },
+    }));
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('rejects when sourceId is missing', async () => {
+    const { status, body } = await postJson(BASE, '/api/transcribe', {});
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/sourceId is required/);
+  });
+
+  it('rejects an unknown sourceId', async () => {
+    const { status, body } = await postJson(BASE, '/api/transcribe', { sourceId: 'nope' });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/unknown source: nope/);
+  });
+
+  it('rejects a sourceId with no audio instead of starting a doomed job', async () => {
+    const { status, body } = await postJson(BASE, '/api/transcribe', { sourceId: 's4' });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/no audio/);
+    expect(transcribeMock).not.toHaveBeenCalledWith(expect.anything(), 's4', expect.anything());
+  });
+
+  it('responds immediately with {started:[sourceId]} without waiting for the job to finish', async () => {
+    const ws = await openWs(BASE);
+    try {
+      let releaseJob!: (t: unknown) => void;
+      transcribeMock.mockImplementationOnce(() => new Promise((resolve) => { releaseJob = resolve; }));
+      const done = nextWsMessage(ws, (m) => m.type === 'transcribe-done' && m.sourceId === 's1');
+
+      const { status, body } = await postJson(BASE, '/api/transcribe', { sourceId: 's1' });
+      expect(status).toBe(200);
+      expect(body.started).toEqual(['s1']);
+      expect(body.skipped).toEqual([]);
+
+      // still running: /api/state reflects it via the per-source `transcribing` flag
+      const mid = (await getJson(BASE, '/api/state')).body;
+      expect(mid.sources.find((s: any) => s.id === 's1').transcribing).toBe(true);
+      expect(mid.sources.find((s: any) => s.id === 's1').transcribed).toBe(false);
+
+      releaseJob({ sourceId: 's1', language: 'ja', words: [{ id: 'w0000', text: 'hi', t0: 0, t1: 1, p: 0.9 }] });
+      await done;
+    } finally {
+      ws.close();
+    }
+  });
+
+  it('rejects a second transcribe for the same source while the first job is still running (double-start guard)', async () => {
+    const ws = await openWs(BASE);
+    try {
+      let releaseJob!: (t: unknown) => void;
+      transcribeMock.mockImplementationOnce(() => new Promise((resolve) => { releaseJob = resolve; }));
+
+      const first = await postJson(BASE, '/api/transcribe', { sourceId: 's2' });
+      expect(first.status).toBe(200);
+      expect(first.body.started).toEqual(['s2']);
+
+      const second = await postJson(BASE, '/api/transcribe', { sourceId: 's2' });
+      expect(second.status).toBe(400);
+      expect(second.body.error).toMatch(/already transcribing/);
+
+      const done = nextWsMessage(ws, (m) => m.type === 'transcribe-done' && m.sourceId === 's2');
+      releaseJob({ sourceId: 's2', language: 'ja', words: [] });
+      await done;
+
+      // the job cleared out of the registry, so a follow-up request for the
+      // same source is accepted again (not permanently stuck as "running").
+      // s2 is already transcribed by now, so this exercises the explicit
+      // re-transcribe path rather than double-start.
+      const third = await postJson(BASE, '/api/transcribe', { sourceId: 's2' });
+      expect(third.status).toBe(200);
+      expect(third.body.started).toEqual(['s2']);
+      await nextWsMessage(ws, (m) => m.type === 'transcribe-done' && m.sourceId === 's2');
+    } finally {
+      ws.close();
+    }
+  });
+
+  it('broadcasts transcribe-progress then transcribe-done, and commits Source.transcribed=true as actor "system"', async () => {
+    const ws = await openWs(BASE);
+    try {
+      const progress = nextWsMessage(ws, (m) => m.type === 'transcribe-progress' && m.sourceId === 's5');
+      const done = nextWsMessage(ws, (m) => m.type === 'transcribe-done' && m.sourceId === 's5');
+      const updated = nextWsMessage(ws, (m) => m.type === 'update' && m.op === 'transcribe');
+
+      const { status, body } = await postJson(BASE, '/api/transcribe', { sourceId: 's5', language: 'en' });
+      expect(status).toBe(200);
+      expect(body.started).toEqual(['s5']);
+
+      const progressMsg = await progress;
+      expect(progressMsg.step).toMatch(/transcrib/i);
+      await done;
+      await updated;
+
+      expect(transcribeMock).toHaveBeenCalledWith('/media/s5.mp4', 's5', expect.objectContaining({ language: 'en' }));
+
+      const state = (await getJson(BASE, '/api/state')).body;
+      const s5 = state.sources.find((s: any) => s.id === 's5');
+      expect(s5.transcribed).toBe(true);
+      expect(s5.transcribing).toBe(false);
+
+      const revs = await getJson(BASE, '/api/revisions');
+      const last = revs.body[revs.body.length - 1];
+      expect(last.actor).toBe('system');
+      expect(last.op).toBe('transcribe');
+    } finally {
+      ws.close();
+    }
+  });
+
+  it('"all" starts every untranscribed hasAudio source, skipping already-transcribed and no-audio ones', async () => {
+    // By this point in the suite s1/s2 have already been transcribed above;
+    // s3 was seeded already-transcribed and s4 has no audio — s6 is the only
+    // source left that should qualify.
+    const ws = await openWs(BASE);
+    try {
+      const done = nextWsMessage(ws, (m) => m.type === 'transcribe-done' && m.sourceId === 's6');
+      const { status, body } = await postJson(BASE, '/api/transcribe', { sourceId: 'all' });
+      expect(status).toBe(200);
+      expect(body.started).toEqual(['s6']);
+      await done;
+      const state = (await getJson(BASE, '/api/state')).body;
+      expect(state.sources.find((s: any) => s.id === 's6').transcribed).toBe(true);
+    } finally {
+      ws.close();
+    }
+  });
+
+  it('"all" is a no-op (200, started:[]) when nothing is eligible', async () => {
+    // every source is now transcribed or has no audio (see the test above).
+    const { status, body } = await postJson(BASE, '/api/transcribe', { sourceId: 'all' });
+    expect(status).toBe(200);
+    expect(body.started).toEqual([]);
+  });
+});
+
+// ---- W-LAZY: POST /api/transcribe job failure ----
+describe('daemon: transcribe job failure (W-LAZY)', () => {
+  const PORT = 18231;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-transcribe-fail-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'transcribe-fail');
+    await project.commit(0, 'system', 'setup', {}, 'seed source', (m) => ({
+      ...m,
+      fps: 30,
+      sources: [{ id: 's1', path: '/media/s1.mp4', duration: 20, fps: 30, width: 1920, height: 1080, hasAudio: true, transcribed: false }],
+      timeline: { video: [], motion: [] },
+    }));
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('broadcasts transcribe-error, does not commit, and clears the job so it can be retried', async () => {
+    const ws = await openWs(BASE);
+    try {
+      transcribeMock.mockRejectedValueOnce(new Error('whisper-cli exploded'));
+      const err = nextWsMessage(ws, (m) => m.type === 'transcribe-error' && m.sourceId === 's1');
+
+      const { status, body } = await postJson(BASE, '/api/transcribe', { sourceId: 's1' });
+      expect(status).toBe(200);
+      expect(body.started).toEqual(['s1']);
+
+      const errMsg = await err;
+      expect(errMsg.error).toMatch(/whisper-cli exploded/);
+
+      const state = (await getJson(BASE, '/api/state')).body;
+      const s1 = state.sources.find((s: any) => s.id === 's1');
+      expect(s1.transcribed).toBe(false); // no commit happened
+      expect(s1.transcribing).toBe(false); // job cleared out of the registry
+
+      const revs = await getJson(BASE, '/api/revisions');
+      expect(revs.body.some((r: any) => r.op === 'transcribe')).toBe(false);
+
+      // retry succeeds now that the failed job cleared the registry
+      transcribeMock.mockResolvedValueOnce({ sourceId: 's1', language: 'ja', words: [] });
+      const done = nextWsMessage(ws, (m) => m.type === 'transcribe-done' && m.sourceId === 's1');
+      const retry = await postJson(BASE, '/api/transcribe', { sourceId: 's1' });
+      expect(retry.status).toBe(200);
+      await done;
+    } finally {
+      ws.close();
+    }
   });
 });

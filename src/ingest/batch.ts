@@ -319,10 +319,11 @@ export async function copyAndVerify(src: string, destDir: string, expectedHash: 
 
 /**
  * Run `worker` over `items` with at most `concurrency` in flight at once.
- * Used to cap proxy-generation + transcription (the expensive part of each
- * /api/ingest call) at 2 concurrent files, per the ingest-batch spec —
- * unbounded parallelism here would spawn N whisper-cli/ffmpeg processes at
- * once for a big camera-card dump.
+ * Used to cap proxy-generation + scene detection (+ transcription when
+ * --transcribe is given — see ingestFile's default in src/ingest/ingest.ts)
+ * at 2 concurrent files, per the ingest-batch spec — unbounded parallelism
+ * here would spawn N whisper-cli/ffmpeg processes at once for a big
+ * camera-card dump.
  */
 export async function runPool<T>(items: T[], concurrency: number, worker: (item: T, index: number) => Promise<void>): Promise<void> {
   let next = 0;

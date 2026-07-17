@@ -49,7 +49,7 @@ import { detectFillers, detectSilences, detectSilencesFromPeaks } from '../core/
 import type { Peaks } from '../core/detect.js';
 import { packTranscript } from '../core/pack.js';
 import { detectScenesForSource, packScenes } from '../core/scenes.js';
-import { ingestFile, makeProxy, probeAudio } from '../ingest/ingest.js';
+import { ingestFile, makeProxy, probeAudio, transcribe } from '../ingest/ingest.js';
 import { run } from '../ingest/run.js';
 import type { CaptionSettings, CutCandidate, Manifest, MotionItem, RevisionEntry, SceneFile, Transcript } from '../core/types.js';
 import { freshId } from '../core/ops.js';
@@ -62,6 +62,15 @@ const WEB_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '.
 interface Ctx {
   project: Project | null;
   clients: Set<WebSocket>;
+  /**
+   * sourceIds with an in-flight `vedit transcribe` background job (W-LAZY:
+   * POST /api/transcribe). A plain in-process Set is enough — the daemon is
+   * the sole writer/process, same rationale as Project's own `withLock`.
+   * Used both to reject a duplicate transcribe request for the same source
+   * (see POST /api/transcribe below) and to surface a "processing" state
+   * per source from /api/state (see stateSummary's `transcribing` field).
+   */
+  transcribeJobs: Set<string>;
 }
 
 async function allTranscripts(p: Project): Promise<Transcript[]> {
@@ -331,8 +340,16 @@ function withReview(f: SceneFile, m: Manifest): { sourceId: string; scenes: (Sce
   return { ...f, scenes: f.scenes.map((s) => (rv[s.id] ? { ...s, review: rv[s.id] } : s)) };
 }
 
-/** Snapshot the state Claude/UI needs after every mutation. */
-async function stateSummary(p: Project) {
+/**
+ * Snapshot the state Claude/UI needs after every mutation. `transcribingIds`
+ * (W-LAZY), when given, is `ctx.transcribeJobs` — the set of sourceIds with
+ * an in-flight background transcribe job — so each source's `transcribing`
+ * field reflects live job state rather than only the durable
+ * `transcribed` manifest flag. Defaults to an empty set so any caller that
+ * doesn't have a `Ctx` handy (there are none today, but this keeps the
+ * function usable standalone) still gets a well-formed response.
+ */
+async function stateSummary(p: Project, transcribingIds: Set<string> = new Set()) {
   const m = await p.manifest();
   const cands = await p.candidates();
   const pending = cands.filter((c) => c.status === 'proposed').length;
@@ -354,6 +371,10 @@ async function stateSummary(p: Project) {
       path: s.path,
       duration: s.duration,
       transcribed: !!s.transcribed,
+      // W-LAZY: true while `vedit transcribe` has a background job running
+      // for this source; false once it lands (transcribe-done) or fails
+      // (transcribe-error) — see runTranscribeJob below.
+      transcribing: transcribingIds.has(s.id),
       ...(needsColorTransform(s.color) ? { colorWarning: COLOR_WARNING_MESSAGE } : {}),
     })),
     pendingCandidates: pending,
@@ -371,7 +392,7 @@ async function stateSummary(p: Project) {
 
 export async function startDaemon(opts: { port?: number; projectDir?: string } = {}) {
   const port = opts.port ?? Number(process.env.VEDIT_PORT ?? 7799);
-  const ctx: Ctx = { project: null, clients: new Set() };
+  const ctx: Ctx = { project: null, clients: new Set(), transcribeJobs: new Set() };
   if (opts.projectDir) {
     const { project } = await openOrCreateProject(opts.projectDir, path.basename(opts.projectDir));
     ctx.project = project;
@@ -414,6 +435,52 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
     return m;
   }
 
+  /**
+   * Background job body for `vedit transcribe` (W-LAZY: POST /api/transcribe
+   * below). Runs whisper on the ORIGINAL file (never the proxy — same as
+   * ingestFile's own transcribe step in src/ingest/ingest.ts), writes the
+   * transcript, then commits Source.transcribed=true as actor 'system'
+   * against whatever the current revision is AT COMMIT TIME — not the
+   * revision read when the job started — via the same
+   * read-cur/commit/retry-on-STALE_REVISION loop ingestFile's own commit
+   * uses (see its doc comment), so this rides Project's mutex instead of
+   * racing a concurrent claude/ui edit. `sourceId` is always removed from
+   * `ctx.transcribeJobs` on the way out (success or failure), so a failed
+   * job can be retried and /api/state's `transcribing` flag never gets
+   * stuck true.
+   */
+  async function runTranscribeJob(p: Project, sourceId: string, language?: string) {
+    try {
+      broadcast(ctx, { type: 'transcribe-progress', sourceId, step: 'transcribing (whisper)' });
+      const m0 = await p.manifest();
+      const src = m0.sources.find((s) => s.id === sourceId);
+      if (!src) throw new Error(`unknown source: ${sourceId}`); // shouldn't happen: caller resolved this against a manifest read moments earlier
+      const t = await transcribe(src.path, sourceId, { language, sourceDuration: src.duration });
+      await p.writeTranscript(t);
+      const MAX_STALE_RETRIES = 20;
+      for (let attempt = 0; ; attempt++) {
+        const cur = await p.manifest();
+        try {
+          await p.commit(
+            cur.revision, 'system', 'transcribe', { sourceId, language },
+            `transcribed ${path.basename(src.path)}`,
+            (m) => ({ ...m, sources: m.sources.map((s) => (s.id === sourceId ? { ...s, transcribed: true } : s)) }),
+          );
+          break;
+        } catch (e: any) {
+          if (e?.code === 'STALE_REVISION' && attempt < MAX_STALE_RETRIES) continue;
+          throw e;
+        }
+      }
+      broadcast(ctx, { type: 'transcribe-done', sourceId });
+      broadcast(ctx, { type: 'update', revision: (await p.manifest()).revision, op: 'transcribe', summary: `transcribed ${path.basename(src.path)}` });
+    } catch (e: any) {
+      broadcast(ctx, { type: 'transcribe-error', sourceId, error: e?.message ?? String(e) });
+    } finally {
+      ctx.transcribeJobs.delete(sourceId);
+    }
+  }
+
   async function route(ctx: Ctx, req: http.IncomingMessage, res: http.ServerResponse, url: URL) {
     const { pathname } = url;
     const method = req.method ?? 'GET';
@@ -426,7 +493,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       ctx.project = project;
       if (!created) await upsertProject(dir, (await project.manifest()).name); // Project.create() upserts on its own path
       broadcast(ctx, { type: 'project', dir });
-      return json(res, 200, { ok: true, dir, state: await stateSummary(ctx.project) });
+      return json(res, 200, { ok: true, dir, state: await stateSummary(ctx.project, ctx.transcribeJobs) });
     }
     if (pathname === '/api/ping') return json(res, 200, { ok: true, project: ctx.project?.dir ?? null });
 
@@ -443,15 +510,19 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
     if (!p) return json(res, 400, { error: 'no project open' });
 
     // ---- reads ----
-    if (pathname === '/api/state') return json(res, 200, await stateSummary(p));
+    if (pathname === '/api/state') return json(res, 200, await stateSummary(p, ctx.transcribeJobs));
     if (pathname === '/api/project') {
       const m = await p.manifest();
       // `overlays`/`sprites` carry every item's resolved tlStart (null =
       // orphan) so the web UI never has to reimplement sourceTimeToTimeline
-      // itself.
+      // itself. `transcribing` (W-LAZY) is ctx.transcribeJobs verbatim — live
+      // job state, not part of the manifest — so the web UI can render the
+      // right "文字起こし: なし/処理中/済" state even for a browser tab that
+      // (re)loads mid-job, before the next transcribe-progress WS message.
       return json(res, 200, {
         manifest: m, segments: segments(m), duration: timelineDuration(m),
         overlays: resolveOverlays(m), sprites: resolveSprites(m),
+        transcribing: [...ctx.transcribeJobs],
       });
     }
     if (pathname === '/api/kit') {
@@ -609,6 +680,10 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       const { source: src, timings } = await ingestFile(p, b.file, {
         language: b.language,
         transcribe: b.transcribe,
+        // W-LAZY: undefined (the common case — neither `vedit ingest` nor
+        // `ingest-batch` sends this unless `--no-scenes` was given) falls
+        // through to ingestFile's own default (true).
+        scenes: b.scenes,
         addToTimeline: b.addToTimeline,
         // Set only by `ingest-batch` (see src/ingest/batch.ts), which
         // computes the hash itself during its verification pass; a plain
@@ -618,7 +693,50 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         onProgress: (step) => broadcast(ctx, { type: 'ingest-progress', step }),
       });
       broadcast(ctx, { type: 'update', revision: (await p.manifest()).revision, op: 'ingest', summary: `ingested ${b.file}` });
-      return json(res, 200, { source: src, timings, state: await stateSummary(p) });
+      return json(res, 200, { source: src, timings, state: await stateSummary(p, ctx.transcribeJobs) });
+    }
+
+    // ---- W-LAZY: explicit, async transcribe job (decoupled from ingest —
+    // see ingestFile's `transcribe` default of false). Responds immediately
+    // (the "202-equivalent" contract) with which sourceIds actually started;
+    // progress/completion arrive over the websocket as transcribe-progress /
+    // transcribe-done / transcribe-error (see runTranscribeJob above), and
+    // /api/state's per-source `transcribing`/`transcribed` reflect it too. ----
+    if (pathname === '/api/transcribe' && method === 'POST') {
+      const b = await readBody(req);
+      const requested = typeof b.sourceId === 'string' && b.sourceId ? b.sourceId : undefined;
+      if (!requested) return json(res, 400, { error: 'transcribe: sourceId is required ("all" or a specific source id)' });
+      const m = await p.manifest();
+      let targets: string[];
+      if (requested === 'all') {
+        targets = m.sources.filter((s) => s.hasAudio && !s.transcribed).map((s) => s.id);
+      } else {
+        const src = m.sources.find((s) => s.id === requested);
+        if (!src) return json(res, 400, { error: `unknown source: ${requested}` });
+        // Same gate ingestFile itself applies (transcribe only ever runs for
+        // p.hasAudio) — failing fast here is clearer than letting the
+        // background job start whisper against a file with no audio stream
+        // and surface the ffmpeg "-map a:0" failure later as
+        // transcribe-error.
+        if (!src.hasAudio) return json(res, 400, { error: `source has no audio: ${requested}` });
+        targets = [requested];
+      }
+      const alreadyRunning = targets.filter((id) => ctx.transcribeJobs.has(id));
+      // A specific sourceId that's already mid-job is a real double-start —
+      // reject it outright (the daemon-side "同一ソースの二重起動は拒否"
+      // guard). "all" instead just skips whichever of its targets are
+      // already running and starts the rest — an "all" call while every
+      // eligible source happens to already be running isn't an error, just
+      // nothing new to start.
+      if (requested !== 'all' && alreadyRunning.length > 0) {
+        return json(res, 400, { error: `already transcribing: ${requested}` });
+      }
+      const toStart = targets.filter((id) => !ctx.transcribeJobs.has(id));
+      for (const id of toStart) {
+        ctx.transcribeJobs.add(id);
+        void runTranscribeJob(p, id, b.language);
+      }
+      return json(res, 200, { started: toStart, skipped: alreadyRunning });
     }
 
     // ---- drag-and-drop ingest (W-UI §4): locate the dropped file's real
@@ -795,7 +913,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         await mutate(p, actor, baseRev, 'remove-words', b, `removed ${removed} words (${removedSeconds.toFixed(1)}s): "${text.slice(0, 40)}"`, (m) =>
           removeSourceRange(m, sourceId!, r.t0, r.t1),
         );
-        return json(res, 200, { removedSeconds, state: await stateSummary(p) });
+        return json(res, 200, { removedSeconds, state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'remove-range') {
         let sourceId = b.sourceId as string | undefined;
@@ -816,13 +934,13 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         await mutate(p, actor, baseRev, 'remove-range', b, `removed ${removedSeconds.toFixed(1)}s of source ${sourceId}`, (m) =>
           removeSourceRange(m, sourceId!, b.t0, b.t1),
         );
-        return json(res, 200, { removedSeconds, state: await stateSummary(p) });
+        return json(res, 200, { removedSeconds, state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'trim') {
         await mutate(p, actor, baseRev, 'trim', b, `trim ${b.clipId} ${b.edge} ${b.frames}f`, (m) =>
           trimClip(m, b.clipId, b.edge, b.frames),
         );
-        return json(res, 200, { state: await stateSummary(p) });
+        return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'captions') {
         // maxCps is a recognized, validated patch field (CLI integration
@@ -863,7 +981,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
           }
           return { ...m, captions };
         });
-        return json(res, 200, { state: await stateSummary(p) });
+        return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'caption-text') {
         // W-CAP: text corrections keyed by the cue's leading word id
@@ -900,7 +1018,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
           else next[key] = text;
           return { ...m, captionTextOverrides: next };
         });
-        return json(res, 200, { state: await stateSummary(p) });
+        return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'motion-add') {
         const specId = freshId('mo');
@@ -914,7 +1032,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
           (m) => ({ ...m, timeline: { ...m.timeline, motion: [...m.timeline.motion, item] } }),
           { [specId]: specContent },
         );
-        return json(res, 200, { id: specId, state: await stateSummary(p) });
+        return json(res, 200, { id: specId, state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'motion-update') {
         // Only an id that's actually on the timeline may be touched — this
@@ -950,7 +1068,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
           }),
           motionSpecUpdates,
         );
-        return json(res, 200, { state: await stateSummary(p) });
+        return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'motion-remove') {
         if (!m0.timeline.motion.some((x) => x.id === b.id)) {
@@ -960,7 +1078,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
           ...m,
           timeline: { ...m.timeline, motion: m.timeline.motion.filter((x) => x.id !== b.id) },
         }));
-        return json(res, 200, { state: await stateSummary(p) });
+        return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'music-add') {
         if (typeof b.path !== 'string' || !b.path) {
@@ -998,7 +1116,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
           `music-add ${path.basename(filePath)} at ${tlStart}s (+${duration.toFixed(1)}s)`,
           (m) => addMusic(m, filePath, { id, tlStart, srcIn, duration, gain: b.gain, fadeIn: b.fadeIn, fadeOut: b.fadeOut, duck: b.duck }),
         );
-        return json(res, 200, { id, state: await stateSummary(p) });
+        return json(res, 200, { id, state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'music-update') {
         if (!(m0.timeline.music ?? []).some((x) => x.id === b.id)) {
@@ -1010,14 +1128,14 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
             gain: b.gain, fadeIn: b.fadeIn, fadeOut: b.fadeOut, duck: b.duck,
           }),
         );
-        return json(res, 200, { state: await stateSummary(p) });
+        return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'music-remove') {
         if (!(m0.timeline.music ?? []).some((x) => x.id === b.id)) {
           return json(res, 400, { error: `unknown music item: ${b.id}` });
         }
         await mutate(p, actor, baseRev, 'music-remove', b, `music-remove ${b.id}`, (m) => removeMusic(m, b.id));
-        return json(res, 200, { state: await stateSummary(p) });
+        return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'broll-add') {
         if (!b.anchor || typeof b.anchor.sourceId !== 'string' || typeof b.anchor.srcTime !== 'number') {
@@ -1029,7 +1147,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
           `broll-add ${b.sourceId} [${b.in}-${b.out}] anchor ${b.anchor.sourceId}@${Number(b.anchor.srcTime).toFixed(2)}`,
           (m) => addOverlay(m, b.sourceId, { srcIn: b.in, srcOut: b.out, anchor: b.anchor, audioMode: b.audioMode, gainDb: b.gainDb, id }),
         );
-        return json(res, 200, { id, state: await stateSummary(p) });
+        return json(res, 200, { id, state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'broll-update') {
         if (!(m0.timeline.overlays ?? []).some((x) => x.id === b.id)) {
@@ -1041,14 +1159,14 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         await mutate(p, actor, baseRev, 'broll-update', b, `broll-update ${b.id}`, (m) =>
           updateOverlay(m, b.id, { srcIn: b.in, srcOut: b.out, anchor: b.anchor, audioMode: b.audioMode, gainDb: b.gainDb }),
         );
-        return json(res, 200, { state: await stateSummary(p) });
+        return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'broll-remove') {
         if (!(m0.timeline.overlays ?? []).some((x) => x.id === b.id)) {
           return json(res, 400, { error: `unknown overlay: ${b.id}` });
         }
         await mutate(p, actor, baseRev, 'broll-remove', b, `broll-remove ${b.id}`, (m) => removeOverlay(m, b.id));
-        return json(res, 200, { state: await stateSummary(p) });
+        return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'sprite-add') {
         if (!m0.kit) return json(res, 400, { error: 'sprite-add: no kit linked; run `vedit kit-link <dir>` first' });
@@ -1072,7 +1190,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
             anchor: b.anchor, duration: b.duration, position: b.position, scale: b.scale, opacity: b.opacity, flip: b.flip, id,
           }),
         );
-        return json(res, 200, { id, state: await stateSummary(p) });
+        return json(res, 200, { id, state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'sprite-update') {
         if (!(m0.timeline.sprites ?? []).some((x) => x.id === b.id)) {
@@ -1086,14 +1204,14 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
             anchor: b.anchor, duration: b.duration, position: b.position, scale: b.scale, opacity: b.opacity, flip: b.flip,
           }),
         );
-        return json(res, 200, { state: await stateSummary(p) });
+        return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'sprite-remove') {
         if (!(m0.timeline.sprites ?? []).some((x) => x.id === b.id)) {
           return json(res, 400, { error: `unknown sprite: ${b.id}` });
         }
         await mutate(p, actor, baseRev, 'sprite-remove', b, `sprite-remove ${b.id}`, (m) => removeSprite(m, b.id));
-        return json(res, 200, { state: await stateSummary(p) });
+        return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'audio-mix') {
         await mutate(
@@ -1101,7 +1219,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
           `audio-mix target=${b.targetLufs ?? -14} duck=${b.duckAmount ?? -10} xfade=${b.crossfadeMs ?? 12}`,
           (m) => setAudioMix(m, { targetLufs: b.targetLufs, duckAmount: b.duckAmount, crossfadeMs: b.crossfadeMs }),
         );
-        return json(res, 200, { state: await stateSummary(p) });
+        return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'audio-repair') {
         await mutate(
@@ -1109,7 +1227,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
           `audio-repair preset=${b.preset}${b.deess ? ' deess' : ''}`,
           (m) => setAudioRepair(m, { preset: b.preset, deess: b.deess }),
         );
-        return json(res, 200, { state: await stateSummary(p) });
+        return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'color-transform') {
         const sourceId = b.sourceId as string | undefined;
@@ -1157,7 +1275,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
           );
           proxyRegenerated = true;
         }
-        return json(res, 200, { proxyRegenerated, state: await stateSummary(p) });
+        return json(res, 200, { proxyRegenerated, state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'color-adjust') {
         const sourceId = b.sourceId as string | undefined;
@@ -1170,24 +1288,24 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
           `color-adjust ${sourceId} exposure=${b.exposure ?? '-'} wb=${b.wb ?? '-'} sat=${b.sat ?? '-'}`,
           (m) => setColorAdjust(m, sourceId, { exposure: b.exposure, wb: b.wb, sat: b.sat }),
         );
-        return json(res, 200, { state: await stateSummary(p) });
+        return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'clip-add') {
         const clipId = freshId('c');
         await mutate(p, actor, baseRev, 'clip-add', b, `clip-add ${b.sourceId} [${b.in ?? 0}-${b.out ?? '*'}]`, (m) =>
           addClip(m, b.sourceId, { in: b.in, out: b.out, at: b.at, id: clipId }),
         );
-        return json(res, 200, { clipId, state: await stateSummary(p) });
+        return json(res, 200, { clipId, state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'clip-remove') {
         await mutate(p, actor, baseRev, 'clip-remove', b, `clip-remove ${b.clipId}`, (m) => removeClip(m, b.clipId));
-        return json(res, 200, { state: await stateSummary(p) });
+        return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'clip-move') {
         await mutate(p, actor, baseRev, 'clip-move', b, `clip-move ${b.clipId} before ${b.before}`, (m) =>
           moveClip(m, b.clipId, b.before),
         );
-        return json(res, 200, { state: await stateSummary(p) });
+        return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'reframe') {
         const output = parseReframeSpec(b.spec);
@@ -1195,13 +1313,13 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         await mutate(p, actor, baseRev, 'reframe', b, `reframe ${output.width}x${output.height} focus=${b.focus ?? 'center'}`, (m) =>
           applyReframe(m, output, focus),
         );
-        return json(res, 200, { output, state: await stateSummary(p) });
+        return json(res, 200, { output, state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'clip-crop') {
         await mutate(p, actor, baseRev, 'clip-crop', b, `clip-crop ${b.clipId} x=${b.x ?? '-'} y=${b.y ?? '-'}`, (m) =>
           setClipCrop(m, b.clipId, { x: b.x, y: b.y }),
         );
-        return json(res, 200, { state: await stateSummary(p) });
+        return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'scene-review') {
         const sourceId = b.sourceId as string | undefined;
@@ -1230,7 +1348,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
             return cur;
           },
         );
-        return json(res, 200, { state: await stateSummary(p) });
+        return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'selects') {
         const sceneFiles = await sceneFilesFor(p, m0);
@@ -1244,7 +1362,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
           `selects: replaced ${previousClips} clip(s) with ${newVideo.length} keep-scene clip(s)`,
           (m) => ({ ...m, timeline: { ...m.timeline, video: newVideo } }),
         );
-        return json(res, 200, { previousClips, newClips: newVideo.length, state: await stateSummary(p) });
+        return json(res, 200, { previousClips, newClips: newVideo.length, state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'kit-link') {
         const dir = typeof b.path === 'string' ? path.resolve(b.path) : undefined;
@@ -1263,14 +1381,14 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
           applied = a;
           return manifest;
         });
-        return json(res, 200, { path: dir, recognizedSections: sections, appliedDefaults: applied, state: await stateSummary(p) });
+        return json(res, 200, { path: dir, recognizedSections: sections, appliedDefaults: applied, state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'kit-unlink') {
         await mutate(p, actor, baseRev, 'kit-unlink', b, 'kit-unlink', (m) => {
           const { kit: _kit, ...rest } = m;
           return rest as Manifest;
         });
-        return json(res, 200, { state: await stateSummary(p) });
+        return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'restore') {
         // `baseRev` here is the same value every other /api/edit op uses
@@ -1279,7 +1397,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         // requires it explicitly instead of always racing onto "latest".
         const m = await p.restore(b.rev, actor, baseRev);
         broadcast(ctx, { type: 'update', revision: m.revision, op: 'restore', summary: `restored r${b.rev}` });
-        return json(res, 200, { state: await stateSummary(p) });
+        return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
       }
       return json(res, 400, { error: `unknown op: ${b.op}` });
     }
@@ -1389,7 +1507,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         });
       }
       broadcast(ctx, { type: 'candidates', pending: result.all.filter((c) => c.status === 'proposed').length });
-      return json(res, 200, { decided: result.target.length, state: await stateSummary(p) });
+      return json(res, 200, { decided: result.target.length, state: await stateSummary(p, ctx.transcribeJobs) });
     }
 
     // ---- scene index (non-destructive: no baseRev, like candidates.json) ----

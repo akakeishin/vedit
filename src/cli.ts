@@ -50,7 +50,7 @@ const BASE = `http://localhost:${PORT}`;
 // `--no-transcribe clip.mp4` would eat `clip.mp4` as the flag's value and
 // leave the positional argument list empty.
 const BOOLEAN_FLAGS = new Set([
-  'no-transcribe', 'no-add', 'no-fillers', 'no-silence',
+  'transcribe', 'no-transcribe', 'no-scenes', 'no-add', 'no-fillers', 'no-silence',
   'latest', 'full', 'all', 'burn-captions', 'no-duck',
   'no-repair', 'fast-loudnorm', 'deess', 'confirm',
   'plan', 'link', 'no-verify', 'force', 'flip', 'no-flip',
@@ -283,9 +283,12 @@ const HELP = `vedit — conversational local NLE
 usage: vedit <command> [args] [--project <dir>]
 
 project:   create <dir> [--name n] | status | resume | revisions | undo [--rev N] | open | projects
-ingest:    ingest <file...> [--language ja] [--no-transcribe] [--no-add]
+ingest:    ingest <file...> [--language ja] [--transcribe] [--no-scenes] [--no-add]
+             # 既定: プロキシ+波形+シーン検出まで(文字起こしはしない)。旧挙動(即時transcribe)は --transcribe
            ingest-batch <dir|files...> [--plan] [--copy destDir | --link] [--no-verify]
-             [--language ja] [--no-transcribe] [--no-add]   # 撮影カード一括取込、検証付き・再開可能
+             [--language ja] [--transcribe] [--no-scenes] [--no-add]   # 撮影カード一括取込、検証付き・再開可能
+transcribe: transcribe <sourceId|all> [--language ja]
+             # 文字起こしを裏で非同期実行(即座に返る; WSで transcribe-progress/-done/-error を配信)
 read:      transcript [--full] [--source id] | candidates [--all] | sources
 detect:    detect [--min-gap 0.7] [--threshold 0.06] [--no-fillers] [--no-silence]
 cut:       remove-words <w1 w5..w9 ...> [--source id] [--pad 0.08] | remove-range <t0> <t1> [--source id]
@@ -394,7 +397,16 @@ async function main() {
           kit = await readKitFile(m.kit.path);
         } catch { /* kit unreadable — resume() surfaces no kitProfile rather than failing the whole command */ }
       }
-      return out(buildResume(m, dir, revs, cands, kit));
+      // W-LAZY: feeds buildResume's "talk-likely but untranscribed" nextSteps
+      // hint (see core/resume.ts) — every source's scenes file, skipping
+      // ones with none detected yet (same pattern as sceneFilesFor in
+      // server/daemon.ts).
+      const sceneFiles = [];
+      for (const s of m.sources) {
+        const f = await p.scenes(s.id);
+        if (f.scenes.length) sceneFiles.push(f);
+      }
+      return out(buildResume(m, dir, revs, cands, kit, sceneFiles));
     }
 
     case 'projects': {
@@ -415,17 +427,23 @@ async function main() {
     }
 
     case 'ingest': {
+      if (flags.transcribe && flags['no-transcribe']) fail('--transcribe and --no-transcribe are mutually exclusive');
       const dir = projectDir();
       await ensureDaemon(dir);
-      if (pos.length === 0) fail('usage: vedit ingest <file...>');
+      if (pos.length === 0) fail('usage: vedit ingest <file...> [--language ja] [--transcribe] [--no-scenes] [--no-add]');
+      // W-LAZY: transcription defaults OFF (scene detection is the ingest-time
+      // structural signal instead) — pass --transcribe to keep the old
+      // "transcribe at ingest" behavior for material known upfront to be
+      // talk-centric; otherwise run `vedit transcribe <sourceId|all>` later.
       for (const f of pos) {
-        console.error(`ingesting ${f} (proxy + waveform + transcription; this can take a while)...`);
+        console.error(`ingesting ${f} (proxy + waveform${flags['no-scenes'] ? '' : ' + scene detection'}${flags.transcribe ? ' + transcription' : ''}; this can take a while)...`);
         const res = await api('/api/ingest', {
           method: 'POST',
           body: JSON.stringify({
             file: path.resolve(f),
             language: flags.language,
-            transcribe: flags['no-transcribe'] ? false : undefined,
+            transcribe: flags.transcribe ? true : flags['no-transcribe'] ? false : undefined,
+            scenes: flags['no-scenes'] ? false : undefined,
             addToTimeline: flags['no-add'] ? false : undefined,
           }),
         });
@@ -435,9 +453,10 @@ async function main() {
     }
 
     case 'ingest-batch': {
-      const USAGE = 'usage: vedit ingest-batch <dir|files...> [--plan] [--copy destDir | --link] [--no-verify] [--language ja] [--no-transcribe] [--no-add]';
+      const USAGE = 'usage: vedit ingest-batch <dir|files...> [--plan] [--copy destDir | --link] [--no-verify] [--language ja] [--transcribe] [--no-scenes] [--no-add]';
       if (pos.length === 0) fail(USAGE);
       if (flags.copy && flags.link) fail('--copy and --link are mutually exclusive');
+      if (flags.transcribe && flags['no-transcribe']) fail('--transcribe and --no-transcribe are mutually exclusive');
       const dir = projectDir();
 
       const files = await listVideoFiles(pos);
@@ -533,9 +552,10 @@ async function main() {
       await ensureDaemon(dir);
 
       const results: { file: string; ok: boolean; error?: string }[] = [];
-      // Bounded to 2 concurrent files: proxy generation + transcription are
-      // the expensive part of each /api/ingest call (see runPool in
-      // batch.ts). Copy-then-verify happens inside the same worker so it's
+      // Bounded to 2 concurrent files: proxy generation + scene detection
+      // (+ transcription when --transcribe is given) are the expensive part
+      // of each /api/ingest call (see runPool in batch.ts). Copy-then-verify
+      // happens inside the same worker so it's
       // bounded by the same concurrency limit.
       await runPool(targets, 2, async (entry) => {
         const hash = fileHashes.get(entry.file);
@@ -560,7 +580,8 @@ async function main() {
             file: ingestPath,
             sha256: hash,
             language: flags.language,
-            transcribe: flags['no-transcribe'] ? false : undefined,
+            transcribe: flags.transcribe ? true : flags['no-transcribe'] ? false : undefined,
+            scenes: flags['no-scenes'] ? false : undefined,
             addToTimeline: flags['no-add'] ? false : undefined,
           }),
         });
@@ -580,6 +601,29 @@ async function main() {
         skippedAlreadyIngested: resumeSkipped,
         journal: journalPath(dir),
         hint: results.some((r) => !r.ok) ? '失敗したファイルは同じコマンドを再実行すれば再試行される(ジャーナルで完了済みはスキップ)' : undefined,
+      });
+    }
+
+    case 'transcribe': {
+      // W-LAZY: explicit, asynchronous transcription — decoupled from
+      // ingest (see ingestFile's `transcribe` default of false). The daemon
+      // starts a background job and returns immediately; progress/
+      // completion arrive over the websocket (transcribe-progress /
+      // transcribe-done / transcribe-error) and via `vedit status`'s
+      // per-source transcribing/transcribed fields — this command does not
+      // block until the job finishes.
+      const target = pos[0] ?? fail('usage: vedit transcribe <sourceId|all> [--language ja]');
+      const dir = projectDir();
+      await ensureDaemon(dir);
+      const res = await api('/api/transcribe', {
+        method: 'POST',
+        body: JSON.stringify({ sourceId: target, language: flags.language }),
+      });
+      return out({
+        ...res,
+        hint: res.started?.length
+          ? '裏で実行中。完了は `vedit status` の sources[].transcribed、または web の存在感ストリップで確認できる'
+          : '対象なし(既に文字起こし済み、または全て実行中)',
       });
     }
 

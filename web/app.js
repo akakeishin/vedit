@@ -74,6 +74,7 @@ const S = {
   expandedMedia: new Set(), // W-UI §3: sourceIds whose row detail (badges/usage bar/scene button) is expanded
   showWordKeys: new Set(), // "sourceId:wordId" — W-UI §0 "show words" highlight, separate from selWords (no delete side effect)
   activeTask: null, // W-UI §1 claudeStrip: { label } | null — current long-running background task, from WS progress events
+  transcribing: new Set(), // W-LAZY: sourceIds with an in-flight `vedit transcribe` background job (seeded from /api/project's `transcribing`, kept live via transcribe-progress/-done/-error WS messages)
   timelineDrag: null, // in-progress timeline drag/trim (see startClipReorderDrag/startTrimDrag/startBlockDrag)
   fontsList: null, // W-CAP: /api/fonts response ({kit:[{name,family?,path}], system:[{family}]}), refreshed every reload()
 };
@@ -103,6 +104,7 @@ async function reload() {
     S.duration = pr.duration;
     S.overlays = pr.overlays ?? [];
     S.sprites = pr.sprites ?? [];
+    S.transcribing = new Set(pr.transcribing ?? []); // W-LAZY: live job state (see /api/project in daemon.ts), not part of the manifest
     S.kit = await api('/api/kit').catch(() => ({ path: null, kit: null }));
     // W-CAP: fetched once per reload (daemon-side memory+disk cached, see
     // GET /api/fonts in daemon.ts) rather than only on popover-open, so
@@ -1119,8 +1121,18 @@ function mediaRow(src) {
     // (flag material that will preview/render flat) no longer applies once
     // `vedit color` has actually set a transform.
     const colorConverted = src.colorTransform && src.colorTransform.type && src.colorTransform.type !== 'none';
+    // W-LAZY: transcription is no longer an ingest-time default, so this is
+    // a 3-state badge (なし/処理中/済) always shown, not just an "ok" flag
+    // that appears once done — S.transcribing is populated from
+    // /api/project's `transcribing` field plus live transcribe-progress/
+    // -done/-error WS messages (see connectWs below).
+    const transcribeBadge = src.transcribed
+      ? '<span class="badge ok">文字起こし: 済</span>'
+      : S.transcribing.has(src.id)
+        ? '<span class="badge warn">文字起こし: 処理中</span>'
+        : '<span class="badge">文字起こし: なし</span>';
     badges.innerHTML = [
-      src.transcribed ? '<span class="badge ok">文字起こし済み</span>' : '',
+      transcribeBadge,
       !src.hasAudio ? '<span class="badge warn">音声なし</span>' : '',
       !src.proxy ? '<span class="badge warn">プロキシ未生成</span>' : '',
       colorConverted
@@ -1858,9 +1870,36 @@ function rejectedWordMap() {
   return m;
 }
 
+/**
+ * W-LAZY empty state: transcription is no longer an ingest-time default, so
+ * "no source has a transcript yet" is now a normal, expected state (not just
+ * a brief moment right after ingest) — tell the user how to get one instead
+ * of silently rendering nothing. Distinguishes "a transcribe job is already
+ * running" (S.transcribing, live WS/reload state) from "nothing started
+ * yet" so the message doesn't tell someone to kick off a job that's already
+ * in flight.
+ */
+function renderTranscriptEmptyState(el) {
+  const msg = document.createElement('div');
+  msg.className = 'hintText';
+  msg.style.padding = '8px';
+  if (S.transcribing.size > 0) {
+    const names = [...S.transcribing]
+      .map((id) => basename(S.manifest.sources.find((s) => s.id === id)?.path ?? id))
+      .join(', ');
+    msg.textContent = `文字起こし中: ${names} …`;
+  } else {
+    msg.textContent = '文字起こしがまだです — 「字幕つけて」と言うか `vedit transcribe <sourceId|all>`';
+  }
+  el.appendChild(msg);
+}
 function renderTranscript() {
   const el = $('words');
   el.innerHTML = '';
+  if (!S.manifest.sources.some((src) => S.transcripts.has(src.id))) {
+    renderTranscriptEmptyState(el);
+    return;
+  }
   const ignored = rejectedWordMap();
   // If the roving-tabindex stop points at a word that no longer exists
   // (e.g. it was just deleted), fall back to the first available word so the
@@ -2704,6 +2743,30 @@ function connectWs() {
       else setClaudeTask(`取り込み中(アップロード): ${msg.name} — ${formatBytes(msg.bytes ?? 0)}`);
     }
     if (msg.type === 'color-transform-progress') setClaudeTask(`色変換中: ${msg.sourceId} — ${msg.step}`);
+    // W-LAZY: `vedit transcribe` background job progress (POST
+    // /api/transcribe in daemon.ts). transcribe-done is always followed by a
+    // separate 'update' broadcast (the source.transcribed=true commit),
+    // which the generic handler below already reloads+clears the strip for
+    // — S.transcribing is updated here too just so the media-pool badge and
+    // Transcript-tab empty state flip instantly instead of waiting on that
+    // second message. transcribe-error has no accompanying commit/'update',
+    // so it clears the strip and surfaces the failure itself.
+    if (msg.type === 'transcribe-progress') {
+      S.transcribing.add(msg.sourceId);
+      const src = S.manifest?.sources.find((s) => s.id === msg.sourceId);
+      setClaudeTask(`文字起こし中: ${basename(src ? src.path : msg.sourceId)} …`);
+      if (S.manifest) { renderMediaPanel(); renderTranscript(); }
+    }
+    if (msg.type === 'transcribe-done') {
+      S.transcribing.delete(msg.sourceId);
+      if (S.manifest) renderMediaPanel();
+    }
+    if (msg.type === 'transcribe-error') {
+      S.transcribing.delete(msg.sourceId);
+      setClaudeTask(null);
+      if (S.manifest) { renderMediaPanel(); renderTranscript(); }
+      toast(`文字起こしに失敗しました (${msg.sourceId}): ${msg.error}`, { type: 'error' });
+    }
     if (msg.type === 'update' || msg.type === 'candidates' || msg.type === 'project') {
       $('ingestOverlay').hidden = true;
       $('stage').removeAttribute('aria-busy');

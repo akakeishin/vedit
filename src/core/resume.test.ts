@@ -195,3 +195,87 @@ describe('buildResume', () => {
     expect(r.kitProfile).toBeNull();
   });
 });
+
+// ---- W-LAZY: "talk-likely but untranscribed" nextSteps hint ----
+
+function sceneFile(sourceId: string, energies: number[]): { sourceId: string; scenes: { t0: number; t1: number; energy: number }[] } {
+  return { sourceId, scenes: energies.map((energy, i) => ({ t0: i * 2, t1: i * 2 + 2, energy })) };
+}
+
+describe('buildResume: talk-likely untranscribed nextSteps hint (W-LAZY)', () => {
+  it('suggests transcribe for an untranscribed, hasAudio source with high mean scene energy', () => {
+    const m = manifest({
+      sources: [{ id: 's1', path: '/media/loud.mp4', duration: 10, fps: 30, width: 1920, height: 1080, hasAudio: true, transcribed: false }],
+    });
+    const r = buildResume(m, '/d', [], [], null, [sceneFile('s1', [0.2, 0.25])]);
+    const hint = r.nextSteps.find((s) => s.includes('未転写'));
+    expect(hint).toBeDefined();
+    expect(hint).toContain('vedit transcribe s1');
+  });
+
+  it('does not suggest it once the source is already transcribed', () => {
+    const m = manifest({
+      sources: [{ id: 's1', path: '/media/loud.mp4', duration: 10, fps: 30, width: 1920, height: 1080, hasAudio: true, transcribed: true }],
+    });
+    const r = buildResume(m, '/d', [], [], null, [sceneFile('s1', [0.2, 0.25])]);
+    expect(r.nextSteps.some((s) => s.includes('未転写'))).toBe(false);
+  });
+
+  it('does not suggest it for a source with no audio, however loud its scenes read', () => {
+    const m = manifest({
+      sources: [{ id: 's1', path: '/media/silent.mp4', duration: 10, fps: 30, width: 1920, height: 1080, hasAudio: false, transcribed: false }],
+    });
+    const r = buildResume(m, '/d', [], [], null, [sceneFile('s1', [0.9, 0.9])]);
+    expect(r.nextSteps.some((s) => s.includes('未転写'))).toBe(false);
+  });
+
+  it('does not suggest it when mean scene energy is low (quiet B-roll)', () => {
+    const m = manifest({
+      sources: [{ id: 's1', path: '/media/quiet.mp4', duration: 10, fps: 30, width: 1920, height: 1080, hasAudio: true, transcribed: false }],
+    });
+    const r = buildResume(m, '/d', [], [], null, [sceneFile('s1', [0.01, 0.02])]);
+    expect(r.nextSteps.some((s) => s.includes('未転写'))).toBe(false);
+  });
+
+  it('does not suggest it when no sceneFiles are passed at all (defaults to [])', () => {
+    const m = manifest({
+      sources: [{ id: 's1', path: '/media/loud.mp4', duration: 10, fps: 30, width: 1920, height: 1080, hasAudio: true, transcribed: false }],
+    });
+    const r = buildResume(m, '/d', [], []); // no sceneFiles argument at all
+    expect(r.nextSteps.some((s) => s.includes('未転写'))).toBe(false);
+  });
+
+  it('does not suggest it for a source with no detected scenes yet', () => {
+    const m = manifest({
+      sources: [{ id: 's1', path: '/media/loud.mp4', duration: 10, fps: 30, width: 1920, height: 1080, hasAudio: true, transcribed: false }],
+    });
+    const r = buildResume(m, '/d', [], [], null, []); // sceneFiles passed but empty
+    expect(r.nextSteps.some((s) => s.includes('未転写'))).toBe(false);
+  });
+
+  it('lists every qualifying sourceId and suggests "vedit transcribe all" for more than one', () => {
+    const m = manifest({
+      sources: [
+        { id: 's1', path: '/media/a.mp4', duration: 10, fps: 30, width: 1920, height: 1080, hasAudio: true, transcribed: false },
+        { id: 's2', path: '/media/b.mp4', duration: 10, fps: 30, width: 1920, height: 1080, hasAudio: true, transcribed: false },
+      ],
+    });
+    const r = buildResume(m, '/d', [], [], null, [sceneFile('s1', [0.3]), sceneFile('s2', [0.3])]);
+    const hint = r.nextSteps.find((s) => s.includes('未転写'));
+    expect(hint).toBeDefined();
+    expect(hint).toContain('s1, s2');
+    expect(hint).toContain('vedit transcribe all');
+  });
+
+  it('is subject to the same 3-item nextSteps cap as every other hint', () => {
+    const m = manifest({
+      captions: { enabled: false, style: 'clean', maxChars: 24 },
+      sources: [
+        { id: 's1', path: '/media/hlg.mp4', duration: 10, fps: 30, width: 1920, height: 1080, hasAudio: true, transcribed: false, color: { transfer: 'smpte2084' } },
+      ],
+    });
+    const cands = [candidate({ id: 'c1', kind: 'silence', status: 'proposed' })];
+    const r = buildResume(m, '/d', [], cands, null, [sceneFile('s1', [0.3])]);
+    expect(r.nextSteps.length).toBeLessThanOrEqual(3);
+  });
+});
