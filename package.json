@@ -9,7 +9,8 @@
   "scripts": {
     "test": "vitest",
     "build": "tsc -p .",
-    "smoke:export": "node scripts/smoke-export.mjs"
+    "smoke:export": "node scripts/smoke-export.mjs",
+    "smoke:compose": "npm run build && node scripts/smoke-compose.mjs"
   },
   "keywords": [],
   "author": "",
