@@ -56,7 +56,17 @@ const S = {
   // we never have to re-derive it from a possibly-stale DOM query.
   focusKey: null, // "sourceId:wordId" — roving-tabindex focus stop in #words
   activeWordKey: null, // "sourceId:wordId" currently playback-highlighted
-  selectedClip: null,
+  // W-UI IA v2 波2 §1: unified timeline-object selection — { kind: 'clip'|
+  // 'broll'|'motion'|'sprite'|'dialogue'|'music', id } | null. Selecting
+  // anything switches the aside from #tabsView to #inspectorView (see
+  // selectItem/renderInspector). Caption cues are NOT tracked here — they
+  // open the existing captionStyleDialog directly (see buildCueEl).
+  selection: null,
+  // W-UI IA v2 波2 §9/追補#3: revision a mutate() response's `warning` field
+  // was already surfaced for, via toast — connectWs()'s generic "変更 #N"
+  // confirmation skips that SAME revision once so it doesn't immediately
+  // clobber the warning with a bland confirmation.
+  lastWarningRevision: null,
   detectMinGap: 0.7,
   // W-UI IA v2 §5(c): best-effort "which of the 4 zero-candidate empty
   // states are we in" signal — see renderCandidatesGroup's doc for why this
@@ -235,7 +245,7 @@ function loadSeg(i, { play = false, offset = 0 } = {}) {
   const target = s.srcStart + offset;
   const apply = () => {
     video.currentTime = target;
-    if (play) video.play().catch(() => {});
+    if (play) tryPlay(video);
   };
   if (!video.src.endsWith(url)) {
     video.src = url;
@@ -266,6 +276,30 @@ function updateFraming() {
 }
 function isComposition() {
   return Boolean(S.manifest?.composition);
+}
+// W-UI IA v2 波2 §6 "color-adjust のプレビュー近似": exposure/saturation get
+// a CSS filter() approximation on the current segment's source; white
+// balance has no CSS equivalent (a hue/warmth shift, not a linear
+// brightness/saturation transform) and is intentionally left out — the clip
+// inspector shows its raw number plus an explicit "書き出しで確認" note
+// instead of faking it (見た目の嘘をつかない、という賭けの一部). 2^exposure
+// is the standard photographic-EV-to-linear-brightness mapping; sat already
+// shares CSS saturate()'s 0..2 (1=neutral) scale 1:1 with
+// colorAdjust.sat's own range (see setColorAdjust's validation).
+let lastColorFilter = '';
+function colorAdjustFilterFor(sourceId) {
+  const c = S.manifest?.colorAdjust?.[sourceId];
+  if (!c) return '';
+  const parts = [];
+  if (c.exposure) parts.push(`brightness(${Math.pow(2, c.exposure).toFixed(3)})`);
+  if (c.sat != null && c.sat !== 1) parts.push(`saturate(${c.sat})`);
+  return parts.join(' ');
+}
+function applyColorAdjustPreview(sourceId) {
+  const filter = colorAdjustFilterFor(sourceId);
+  if (filter === lastColorFilter) return;
+  lastColorFilter = filter;
+  video.style.filter = filter;
 }
 function seekTl(tl, { play } = {}) {
   // Any timeline seek/scrub ("playhead operation") returns from source
@@ -393,7 +427,7 @@ function tick() {
           S.playing = false;
           setPlayBtnState(false);
         } else {
-          video.play().catch(() => {});
+          tryPlay(video);
         }
       }
     } else {
@@ -406,6 +440,15 @@ function tick() {
     renderCaption(tl);
     renderMotion(tl);
     renderSprites(tl);
+    // W-UI IA v2 波2 §5 (spec's wave-2 list, "セリフの通常プロジェクト・
+    // プレビュー描画"): dialogue bubbles were only ever driven from
+    // tickComposition() — a normal (source-driven) project with dialogue
+    // items rendered silent/invisible in the web preview despite the
+    // renderer always burning them in (see render.ts's doc on this). Same
+    // call tickComposition already makes, just also reachable outside
+    // composition mode.
+    renderDialogueBubbles(tl);
+    applyColorAdjustPreview(s.sourceId);
     highlightWord(tl);
     syncMusicPlayback(tl);
     syncOverlayVideo(tl);
@@ -451,14 +494,49 @@ function stopPlayback() {
   S.rateIdx = 0;
   setPlaybackRate(1);
 }
+// W-UI IA v2 波2 §7 "再生ボタンの嘘を直す": whether there is anything at all
+// to play right now — a composition project needs a positive duration, a
+// normal project needs at least one timeline segment. startPlayback() and
+// the J-shuttle shortcut both gate on this so S.playing never flips to true
+// (pause-icon "lie") when nothing actually starts moving; renderPlayability
+// mirrors it onto #playBtn's disabled/title so the lie is prevented at the
+// UI level too, not just patched after the fact.
+function canPlayTimeline() {
+  return isComposition() ? S.duration > 0 : S.segments.length > 0;
+}
+function renderPlayability() {
+  const btn = $('playBtn');
+  const playable = canPlayTimeline();
+  btn.disabled = !playable;
+  btn.title = playable ? '' : 'タイムラインに何もありません — 素材を追加すると再生できます';
+}
+// Shared video.play() wrapper (W-UI IA v2 波2 追補#4): a rejected play()
+// promise (autoplay policy, interrupted load, etc.) used to be silently
+// swallowed with no state sync, leaving S.playing/the pause-icon claiming
+// playback that never actually started. For the MAIN <video> element this
+// now folds back into the same stopped state the boundary-stall retry logic
+// (see tick()'s stalledSince) already produces; other elements (background
+// music/B-roll overlay <video>s) don't drive the play button at all, so
+// their rejection stays a silent no-op — same as before, just via one named
+// helper instead of an unexplained empty arrow at every call site.
+function tryPlay(el) {
+  const p = el.play();
+  if (p && typeof p.catch === 'function') {
+    p.catch(() => {
+      if (el === video) { S.playing = false; setPlayBtnState(false); }
+    });
+  }
+  return p;
+}
 function startPlayback() {
+  if (!canPlayTimeline()) return;
   if (isComposition()) {
     if (S.compTl >= S.duration - 1e-3) S.compTl = 0; // replay from the top once fully played out
     S.compClockAnchor = performance.now();
   } else if (S.currentSeg < 0) {
     seekTl(0, { play: true });
   } else {
-    video.play().catch(() => {});
+    tryPlay(video);
   }
   S.playing = true;
   setPlayBtnState(true);
@@ -467,6 +545,23 @@ function startPlayback() {
 $('playBtn').onclick = () => {
   if (S.playing) stopPlayback();
   else startPlayback();
+};
+
+// ---------- 波2 追補#2: 出力比率の変更入口(reframe) ----------
+// The header's #stat readout has always SHOWN the output aspect (when
+// manifest.output is set) with no way to change it — reframe existed on the
+// API/CLI side only. focus stays 'center' (the op's own default); a crop
+// window per-clip can still be nudged afterward via each clip's own crop
+// display in the inspector (read-only for now — see buildClipInspector).
+$('reframeSelect').onchange = async (e) => {
+  const spec = e.target.value;
+  e.target.value = ''; // this control is a one-shot action, not a persistent state readout
+  if (!spec) return;
+  if (!confirm(`出力比率を ${spec} に変更します。クロップ位置は後から調整できます。よろしいですか？`)) return;
+  await mutate(
+    { op: 'reframe', spec, focus: 'center' },
+    { conflictMessage: '比率の変更は反映されませんでした。最新状態を確認してもう一度実行してください' },
+  );
 };
 
 // Global 1-key shortcuts are disabled while focus is inside a button/select/
@@ -493,6 +588,7 @@ document.addEventListener('keydown', (e) => {
   }
   if (key === 'j') {
     e.preventDefault();
+    if (!canPlayTimeline()) return; // 波2 §7: don't lie about playback starting when the timeline is empty
     S.rateIdx = 0;
     setPlaybackRate(1);
     seekTl(tlNow() - 2, { play: true });
@@ -519,7 +615,12 @@ video.addEventListener('ended', () => {
 });
 
 // ---------- timeline strip ----------
-const tlEl = $('timeline');
+// W-UI IA v2 波2 §2: tlEl points at the TRACK CONTENT container, not the
+// outer #timeline (which now also hosts the ruler + gutter — see
+// index.html). Every existing row's left/top/width/height % math is
+// unchanged; only the containing block moved one level deeper, so this is
+// the one place that needs to know that.
+const tlEl = $('timelineTracks');
 tlEl.addEventListener('pointerdown', (e) => {
   const move = (ev) => {
     const r = tlEl.getBoundingClientRect();
@@ -626,7 +727,7 @@ $('shortcutsDialog').addEventListener('close', () => {
 const EDGE_PX = 6;
 
 function timelineRect() {
-  return $('timeline').getBoundingClientRect();
+  return tlEl.getBoundingClientRect();
 }
 function dropIndicatorX(rects, idx) {
   if (rects.length === 0) return 0;
@@ -777,7 +878,13 @@ function startBlockDrag(e, kind, id, originalTlStart, blockEl) {
     window.removeEventListener('pointermove', onMove);
     window.removeEventListener('pointerup', onUp);
     S.timelineDrag = null;
-    if (!moved) return;
+    if (!moved) {
+      // W-UI IA v2 波2 §1: a plain click (no drag) selects this block —
+      // same "click selects, drag moves" split as the clip row's own
+      // startClipReorderDrag.
+      selectItem(kind, id);
+      return;
+    }
     const newTl = originalTlStart + (ev.clientX - startX) / pxPerSecond;
     const op = kind === 'motion' || kind === 'music'
       ? blockMoveOp(kind, id, newTl, originalTlStart)
@@ -836,7 +943,7 @@ function renderTimeline() {
     const d = document.createElement('div');
     // Alternate shade per clip (even within the same source) so adjacent clip
     // boundaries stay visible; the boundary itself gets a thin divider line.
-    d.className = 'clip' + (idx % 2 ? ' alt' : '') + (S.selectedClip === s.clipId ? ' sel' : '');
+    d.className = 'clip' + (idx % 2 ? ' alt' : '') + (isSelected('clip', s.clipId) ? ' sel' : '');
     d.style.left = `${(s.tlStart / S.duration) * 100}%`;
     d.style.width = `${((s.tlEnd - s.tlStart) / S.duration) * 100}%`;
     d.title = `${clipDisplayLabel(s.clipId)} — ドラッグで並べ替え、端(6px)をドラッグでトリム`;
@@ -864,15 +971,29 @@ function renderTimeline() {
   mrow.innerHTML = '';
   for (const mo of S.manifest.timeline.motion) {
     const d = document.createElement('div');
-    d.className = 'moBlock';
-    d.style.left = `${(mo.tlStart / S.duration) * 100}%`;
-    d.style.width = `${(mo.duration / S.duration) * 100}%`;
     // W-UI redesign §6: label by motion type, not the internal spec id (mo.id
     // stays available via the title tooltip) — MOTION_TYPE_LABEL is defined
     // with humanizeRevision below but this only runs after full module load.
     const moType = S.motionSpecs?.[mo.id]?.type;
+    d.className = 'moBlock' + (isSelected('motion', mo.id) ? ' sel' : '');
+    d.style.left = `${(mo.tlStart / S.duration) * 100}%`;
+    d.style.width = `${(mo.duration / S.duration) * 100}%`;
     d.textContent = moType ? (MOTION_TYPE_LABEL[moType] ?? moType) : 'モーション';
-    d.title = `${mo.id} (${fmt(mo.duration)}) — ドラッグで移動`;
+    let titleText = `${mo.id} (${fmt(mo.duration)}) — ドラッグで移動`;
+    // 波2 追補#1: custom-html is preview-only — never burned into the export
+    // (see export/motion.ts's doc) — a silent, easy-to-miss data loss if the
+    // user never notices until after exporting. A permanent badge (not the
+    // tally/warning color — this isn't wrong, just scoped) beats a one-shot
+    // toast nobody's watching for.
+    if (moType === 'custom-html') {
+      const badge = document.createElement('span');
+      badge.className = 'exportSkipBadge';
+      badge.textContent = '書き出し対象外';
+      d.appendChild(document.createTextNode(' '));
+      d.appendChild(badge);
+      titleText += ' — custom-html は書き出しでは焼き込まれません(プレビューのみ)';
+    }
+    d.title = titleText;
     d.onpointerdown = (e) => startBlockDrag(e, 'motion', mo.id, mo.tlStart, d);
     mrow.appendChild(d);
   }
@@ -880,7 +1001,7 @@ function renderTimeline() {
   murow.innerHTML = '';
   for (const mu of S.manifest.timeline.music ?? []) {
     const d = document.createElement('div');
-    d.className = 'muBlock';
+    d.className = 'muBlock' + (isSelected('music', mu.id) ? ' sel' : '');
     d.style.left = `${(mu.tlStart / S.duration) * 100}%`;
     d.style.width = `${(mu.duration / S.duration) * 100}%`;
     d.title = `${mu.id} ${basename(mu.path)} (${mu.gain}dB${mu.duck ? ', duck' : ''}) — ドラッグで移動`;
@@ -893,7 +1014,10 @@ function renderTimeline() {
   renderIntentZoneRow();
   renderBgRow();
   renderDialogueRow();
+  renderCaptionRow();
   drawWave();
+  renderRuler();
+  renderTrackGutter();
 }
 
 // W-ANIME: background-cut row ("紙芝居") — one block per backgroundIntervals()
@@ -933,12 +1057,14 @@ function renderDialogueRow() {
   if (!S.duration) return;
   for (const d of S.dialogue ?? []) {
     const el = document.createElement('div');
-    el.className = 'dlBlock';
+    el.className = 'dlBlock' + (isSelected('dialogue', d.id) ? ' sel' : '');
     el.style.left = `${(d.tlStart / S.duration) * 100}%`;
     el.style.width = `${Math.max(0, d.duration / S.duration) * 100}%`;
     el.title = `${d.id}: ${d.text}`;
     el.textContent = d.text;
-    el.onclick = () => seekTl(d.tlStart);
+    // W-UI IA v2 波2 §1: click selects (→ inspector) AND seeks — same
+    // "selecting always moves the playhead there too" feel as clicking a clip.
+    el.onclick = () => { selectItem('dialogue', d.id); seekTl(d.tlStart); };
     row.appendChild(el);
   }
 }
@@ -980,8 +1106,43 @@ function renderIntentZoneRow() {
     d.className = `intentZoneBlock ${zone.kind}`;
     d.style.left = `${(r.tlStart / S.duration) * 100}%`;
     d.style.width = `${Math.max(0, (r.tlEnd - r.tlStart) / S.duration) * 100}%`;
-    d.title = `${zone.label}(${zone.kind === 'quiet' ? '静寂' : '保持'})`;
+    // W-UI IA v2 波2 §7 "細部の嘘の修正": this bar used to have no click
+    // handler at all despite `cursor` implying interactivity — clicking now
+    // seeks there, and the title says outright that Claude is the one
+    // protecting it (removal is structural — see #intentZonesInfo's
+    // "Claude に頼む" chip in the 確認 tab instead of a UI control here).
+    d.title = zone.kind === 'quiet'
+      ? `Claude が守っている無音: ${zone.label} — クリックでシーク`
+      : `Claude が保持している区間: ${zone.label} — クリックでシーク`;
+    d.tabIndex = 0;
+    d.setAttribute('role', 'button');
+    d.onclick = () => seekTl(r.tlStart, { play: false });
+    d.onkeydown = (e) => { if (e.key === 'Enter' || e.code === 'Space') { e.preventDefault(); d.onclick(); } };
     row.appendChild(d);
+  }
+}
+
+// W-UI IA v2 波2 追補#5: intent zones (保護区間) are a structural edit
+// (intent-remove) with no UI control by design — this is where the "Claude
+// に頼む" chip for them lives (the timeline bar itself only seeks + explains
+// via its title, see renderIntentZoneRow above). Not a warning (nothing is
+// wrong), so it's a plain info list, not part of 対応が必要.
+function renderIntentZonesInfo() {
+  const el = $('intentZonesInfo');
+  if (!el) return;
+  el.innerHTML = '';
+  const zones = S.manifest?.intentZones ?? [];
+  if (zones.length === 0 || isProjectEmpty()) { el.hidden = true; return; }
+  el.hidden = false;
+  for (const zone of zones) {
+    const row = document.createElement('div');
+    row.className = 'intentZoneInfoRow';
+    const label = document.createElement('span');
+    const kindLabel = zone.kind === 'quiet' ? '静寂' : '保持';
+    label.textContent = `保護区間(${kindLabel}): ${zone.label}`;
+    row.appendChild(label);
+    row.appendChild(askClaudeChip(`保護区間(${zone.label})を解除して`));
+    el.appendChild(row);
   }
 }
 
@@ -999,22 +1160,19 @@ function renderOverlayRow() {
     const ov = r.overlay;
     const d = document.createElement('div');
     if (r.tlStart == null) {
-      d.className = 'ovBlock orphan';
+      d.className = 'ovBlock orphan' + (isSelected('broll', ov.id) ? ' sel' : '');
       d.style.left = `${orphanIdx * 14}px`;
       d.textContent = '!';
-      d.title = `配置先を見失っています: ${ov.id} — クリックで理由を表示`;
-      d.onclick = (e) => {
-        e.stopPropagation();
-        toast(
-          `B-roll ${ov.id} は配置先を見失っています — 元の位置(${ov.anchor.sourceId}@${ov.anchor.srcTime.toFixed(2)}s)がカットで失われました。Claude に伝えて配置し直してください`,
-          { type: 'error' },
-        );
-      };
+      d.title = `配置先を見失っています: ${ov.id} — クリックで詳しく見る`;
+      // W-UI IA v2 波2 §1/§8: opens the inspector (persistent, with a "Claude
+      // に頼む" copy chip) instead of a one-shot toast that's gone the moment
+      // the user looks away.
+      d.onclick = (e) => { e.stopPropagation(); selectItem('broll', ov.id); };
       orphanIdx++;
     } else {
       const dur = ov.srcOut - ov.srcIn;
       const ovSrc = S.manifest.sources.find((s) => s.id === ov.sourceId);
-      d.className = 'ovBlock';
+      d.className = 'ovBlock' + (isSelected('broll', ov.id) ? ' sel' : '');
       d.style.left = `${(r.tlStart / S.duration) * 100}%`;
       d.style.width = `${(dur / S.duration) * 100}%`;
       // W-UI polish: raw filename lives in the title (hover) alongside the
@@ -1042,20 +1200,14 @@ function renderSpriteRow() {
     const sp = r.sprite;
     const d = document.createElement('div');
     if (r.tlStart == null) {
-      d.className = 'spBlock orphan';
+      d.className = 'spBlock orphan' + (isSelected('sprite', sp.id) ? ' sel' : '');
       d.style.left = `${orphanIdx * 14}px`;
       d.textContent = '!';
-      d.title = `配置先を見失っています: ${sp.id} — クリックで理由を表示`;
-      d.onclick = (e) => {
-        e.stopPropagation();
-        toast(
-          `キャラクター ${sp.id} は配置先を見失っています — 元の位置(${sp.anchor.sourceId}@${sp.anchor.srcTime.toFixed(2)}s)がカットで失われました。Claude に伝えて配置し直してください`,
-          { type: 'error' },
-        );
-      };
+      d.title = `配置先を見失っています: ${sp.id} — クリックで詳しく見る`;
+      d.onclick = (e) => { e.stopPropagation(); selectItem('sprite', sp.id); };
       orphanIdx++;
     } else {
-      d.className = 'spBlock';
+      d.className = 'spBlock' + (isSelected('sprite', sp.id) ? ' sel' : '');
       d.style.left = `${(r.tlStart / S.duration) * 100}%`;
       d.style.width = `${(sp.duration / S.duration) * 100}%`;
       d.title = `${sp.id} (${sp.assetId}, ${sp.duration.toFixed(1)}s) — ドラッグで移動`;
@@ -1087,6 +1239,103 @@ function renderSceneMarks() {
       el.appendChild(d);
     }
   }
+}
+
+// ---------- W-UI IA v2 波2 §5: T1 テロップ行 ----------
+// A permanent click entry point into the caption style dialog — present
+// even when there are zero cues (captions.enabled=false, or an enabled
+// project with nothing transcribed yet), which is the exact deadlock the
+// spec calls out: turning captions off used to remove every path back to
+// turning them on. openCaptionStylePopover's `cue` argument is only ever
+// read by the per-cue drag/text-edit code (see buildCueEl) — it's fine to
+// pass null here (see also the T1 row's own click handler below).
+function renderCaptionRow() {
+  const row = $('captionRow');
+  if (!row) return;
+  row.innerHTML = '';
+  if (!S.duration || isComposition()) return;
+  const openDialog = (e) => { e?.stopPropagation?.(); openCaptionStylePopover(null); };
+  const asButton = (el) => {
+    el.tabIndex = 0;
+    el.setAttribute('role', 'button');
+    el.onclick = openDialog;
+    el.onkeydown = (ev) => { if (ev.key === 'Enter' || ev.code === 'Space') { ev.preventDefault(); openDialog(); } };
+  };
+  if (!S.manifest.captions.enabled) {
+    const d = document.createElement('div');
+    d.className = 'capRowBlock capRowOff';
+    d.textContent = '字幕: オフ — クリックでオンにする';
+    d.title = 'クリックで字幕のオン/オフやデザインを設定できます';
+    asButton(d);
+    row.appendChild(d);
+    return;
+  }
+  if (S.cues.length === 0) {
+    const d = document.createElement('div');
+    d.className = 'capRowBlock capRowEmpty';
+    d.textContent = '字幕: 表示できるcueがありません — クリックでデザインを設定';
+    d.title = '文字起こしが無い、または全て無音として除去されています。クリックで字幕のデザインを設定できます';
+    asButton(d);
+    row.appendChild(d);
+    return;
+  }
+  for (const c of S.cues) {
+    const d = document.createElement('div');
+    d.className = 'capRowBlock';
+    d.style.left = `${(c.tlStart / S.duration) * 100}%`;
+    d.style.width = `${Math.max(0.3, ((c.tlEnd - c.tlStart) / S.duration) * 100)}%`;
+    d.title = c.text;
+    asButton(d);
+    d.onclick = (e) => { e.stopPropagation(); openCaptionStylePopover(c); };
+    row.appendChild(d);
+  }
+}
+
+// ---------- W-UI IA v2 波2 §2: 時間目盛り + トラックラベルガター ----------
+const RULER_NICE_STEPS = [0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900];
+function renderRuler() {
+  const el = $('timeRuler');
+  if (!el) return;
+  el.innerHTML = '';
+  if (!S.duration) return;
+  const width = tlEl.getBoundingClientRect().width || el.getBoundingClientRect().width;
+  if (!width) return;
+  const targetPx = 70; // aim for a tick roughly every 70px, never crowded
+  const rawStep = S.duration / Math.max(1, width / targetPx);
+  const step = RULER_NICE_STEPS.find((s) => s >= rawStep) ?? RULER_NICE_STEPS[RULER_NICE_STEPS.length - 1];
+  for (let t = 0; t <= S.duration + 1e-6; t += step) {
+    const tick = document.createElement('div');
+    tick.className = 'rulerTick';
+    tick.style.left = `${Math.min(100, (t / S.duration) * 100)}%`;
+    tick.textContent = fmt(t);
+    el.appendChild(tick);
+  }
+}
+// Gutter labels use the EXACT same top/height (or bottom/height) values as
+// their corresponding row's own CSS rule (style.css) — percent-based rows
+// stay pixel-aligned automatically as the timeline resizes; px-based rows
+// (T1/A2, anchored to the bottom of the now-104px-tall #timelineTracks) are
+// copied 1:1 from #captionRow/#musicRow's own bottom/height. Only rendered
+// when the underlying row actually has something in it (存在する行のみ).
+function renderTrackGutter() {
+  const el = $('trackGutter');
+  if (!el) return;
+  el.innerHTML = '';
+  const composition = isComposition();
+  const addLabel = (text, style) => {
+    const d = document.createElement('div');
+    d.className = 'gutterLabel';
+    d.textContent = text;
+    Object.assign(d.style, style);
+    el.appendChild(d);
+  };
+  if (S.overlays.length > 0) addLabel('V2 B-roll', { top: '0%', height: '12%' });
+  if (!composition) {
+    addLabel('V1 本編', { top: '12%', height: '25%' });
+    addLabel('A1 音声', { top: '37%', height: '25%' });
+  }
+  if (!composition) addLabel('T1 テロップ', { bottom: '0px', height: '12px' });
+  if ((S.manifest?.timeline.music ?? []).length > 0) addLabel('A2 BGM', { bottom: '30px', height: '12px' });
 }
 
 function drawWave() {
@@ -1168,7 +1417,7 @@ function syncMusicPlayback(tl) {
     }
     const localT = tl - mu.tlStart + mu.srcIn;
     if (Math.abs(el.currentTime - localT) > 0.3) el.currentTime = localT;
-    if (S.playing && el.paused) el.play().catch(() => {});
+    if (S.playing && el.paused) tryPlay(el);
     if (!S.playing && !el.paused) el.pause();
     const fadeIn = mu.fadeIn > 0 ? Math.max(0, Math.min(1, (tl - mu.tlStart) / mu.fadeIn)) : 1;
     const fadeOut = mu.fadeOut > 0 ? Math.max(0, Math.min(1, (mu.tlStart + mu.duration - tl) / mu.fadeOut)) : 1;
@@ -1209,7 +1458,7 @@ function syncOverlayVideo(tl) {
     videoOverlay.currentTime = target;
   }
   videoOverlay.hidden = false;
-  if (S.playing && videoOverlay.paused) videoOverlay.play().catch(() => {});
+  if (S.playing && videoOverlay.paused) tryPlay(videoOverlay);
   if (!S.playing && !videoOverlay.paused) videoOverlay.pause();
   // audioMode=mute: main video's audio continues untouched, second video
   // stays muted. mix/replace: approximated by unmuting the second video at
@@ -1259,7 +1508,7 @@ function enterSourcePreview(sourceId, { at = 0 } = {}) {
   if (!videoOverlay.hidden) { videoOverlay.hidden = true; videoOverlay.pause(); } // B-roll V2 preview doesn't apply to raw source preview
 
   const url = proxyUrl(sourceId);
-  const apply = () => { video.currentTime = at; video.play().catch(() => {}); };
+  const apply = () => { video.currentTime = at; tryPlay(video); };
   if (!video.src.endsWith(url)) { video.src = url; video.addEventListener('loadedmetadata', apply, { once: true }); }
   else apply();
   S.playing = true;
@@ -1515,7 +1764,144 @@ function mediaRow(src) {
   });
   return row;
 }
+// ---------- W-UI IA v2 波2 §7: キットのリンク状態(素材タブ先頭) ----------
+// Linked: "キット: 名前 · スタイルN・素材N" info line. Not linked: per
+// 追補#5 (Codex レビュー), a "Claude に頼む" chip instead of hiding the area
+// outright — kit-link is structural (a filesystem path Claude has to
+// resolve), so this is a dead end the same way an orphaned B-roll is.
+function renderKitStatus() {
+  const el = $('kitStatus');
+  if (!el) return;
+  const kit = S.kit?.kit;
+  if (kit) {
+    el.hidden = false;
+    el.innerHTML = '';
+    const name = kit.name || basename(S.kit.path ?? '') || 'キット';
+    const text = document.createElement('span');
+    text.textContent = `キット: ${name} · スタイル${(kit.styles ?? []).length}・素材${(kit.assets ?? []).length}`;
+    text.title = S.kit.path ?? '';
+    el.appendChild(text);
+    return;
+  }
+  if (S.kit?.path) {
+    // path is set but the kit.json couldn't be read (see S.kit.error) —
+    // that's a broken link, not "no kit"; still worth a chip, different wording.
+    el.hidden = false;
+    el.innerHTML = '';
+    const text = document.createElement('span');
+    text.textContent = `キット未読み込み: ${basename(S.kit.path)}`;
+    el.appendChild(text);
+    el.appendChild(askClaudeChip('キットの連携を確認して(kit.jsonが読み込めません)'));
+    return;
+  }
+  el.hidden = false;
+  el.innerHTML = '';
+  const text = document.createElement('span');
+  text.textContent = 'キット: 未連携';
+  el.appendChild(text);
+  el.appendChild(askClaudeChip('このプロジェクトにキットを連携して'));
+}
+
+// ---------- W-UI IA v2 波2 §4: 音声パネル(プロジェクト全体設定) ----------
+function renderAudioPanel() {
+  const preset = S.manifest.audioRepair?.preset ?? 'off';
+  const presetSel = $('audioRepairPreset');
+  if (presetSel && document.activeElement !== presetSel) presetSel.value = preset;
+  const deessCb = $('audioRepairDeess');
+  if (deessCb && document.activeElement !== deessCb) deessCb.checked = Boolean(S.manifest.audioRepair?.deess);
+
+  const duckAmount = S.manifest.audioMix?.duckAmount ?? -10;
+  const duckInput = $('audioMixDuck');
+  if (duckInput && document.activeElement !== duckInput) duckInput.value = String(duckAmount);
+  $('audioMixDuckVal').textContent = `${duckAmount}dB`;
+
+  const targetLufs = S.manifest.audioMix?.targetLufs ?? -14;
+  const lufsInput = $('audioMixLufs');
+  if (lufsInput && document.activeElement !== lufsInput) lufsInput.value = String(targetLufs);
+  $('audioMixLufsVal').textContent = `${targetLufs}LUFS`;
+}
+$('audioRepairPreset').onchange = async (e) => {
+  await mutate(
+    { op: 'audio-repair', preset: e.target.value, deess: $('audioRepairDeess').checked },
+    { conflictMessage: '会話リペアの設定は反映されませんでした。最新状態を確認してもう一度実行してください' },
+  );
+};
+$('audioRepairDeess').onchange = async (e) => {
+  const preset = S.manifest.audioRepair?.preset ?? 'off';
+  await mutate(
+    { op: 'audio-repair', preset, deess: e.target.checked },
+    { conflictMessage: 'デエッサーの設定は反映されませんでした。最新状態を確認してもう一度実行してください' },
+  );
+};
+$('audioMixDuck').onchange = async (e) => {
+  await mutate(
+    { op: 'audio-mix', duckAmount: Number(e.target.value) },
+    { conflictMessage: 'ダッキング量の変更は反映されませんでした。最新状態を確認してもう一度実行してください' },
+  );
+};
+$('audioMixLufs').onchange = async (e) => {
+  await mutate(
+    { op: 'audio-mix', targetLufs: Number(e.target.value) },
+    { conflictMessage: '目標ラウドネスの変更は反映されませんでした。最新状態を確認してもう一度実行してください' },
+  );
+};
+// Live readout while dragging, before the change commits.
+$('audioMixDuck').oninput = (e) => { $('audioMixDuckVal').textContent = `${e.target.value}dB`; };
+$('audioMixLufs').oninput = (e) => { $('audioMixLufsVal').textContent = `${e.target.value}LUFS`; };
+
+// ---- BGM追加 (music-add) ----
+$('musicAddBtn').onclick = () => {
+  const form = $('musicAddForm');
+  form.hidden = !form.hidden;
+  if (!form.hidden) $('musicAddPath').focus();
+};
+$('musicAddCancel').onclick = () => {
+  $('musicAddForm').hidden = true;
+  $('musicAddPath').value = '';
+  $('musicAddSfx').checked = false;
+};
+async function submitMusicAdd(fileOrPath) {
+  let filePath = fileOrPath;
+  if (fileOrPath instanceof File) {
+    try {
+      filePath = (await api(`/api/upload?${new URLSearchParams({ name: fileOrPath.name })}`, { method: 'POST', body: fileOrPath })).path;
+    } catch (e) {
+      toast(`音声ファイルの取り込みに失敗しました: ${e.message}`, { type: 'error' });
+      return;
+    }
+  }
+  filePath = (filePath ?? '').trim();
+  if (!filePath) { toast('ファイルのパスを入力してください', { type: 'error' }); return; }
+  const sfx = $('musicAddSfx').checked;
+  const body = { op: 'music-add', path: filePath, tlStart: tlNow() };
+  if (sfx) Object.assign(body, { duck: false, fadeIn: 0.03, fadeOut: 0.03, role: 'sfx' });
+  const { ok } = await mutate(body, { conflictMessage: 'BGM/SEの追加は反映されませんでした。最新状態を確認してもう一度実行してください' });
+  if (ok) { $('musicAddForm').hidden = true; $('musicAddPath').value = ''; $('musicAddSfx').checked = false; }
+}
+$('musicAddSubmit').onclick = () => submitMusicAdd($('musicAddPath').value);
+$('musicAddForm').addEventListener('dragover', (e) => { e.preventDefault(); });
+$('musicAddForm').addEventListener('drop', (e) => {
+  e.preventDefault();
+  const file = e.dataTransfer?.files?.[0];
+  if (file) submitMusicAdd(file);
+});
+
+// ---- 「言い直しを確認」(W-UI IA v2 波2 §7): GET /api/takes をユーザー起点
+// で開く — これまで Claude の show directive 経由のみ到達可能だった。
+$('takesCheckBtn').onclick = async () => {
+  const transcribedSrcs = S.manifest.sources.filter((s) => s.transcribed);
+  if (transcribedSrcs.length === 0) { toast('文字起こしがまだありません', { type: 'error' }); return; }
+  for (const src of transcribedSrcs) {
+    let groups;
+    try { groups = await fetchTakesForSource(src.id); } catch { continue; }
+    if (groups.length > 0) { renderTakesCard(src.id, groups[0]); return; }
+  }
+  toast('言い直し候補は見つかりませんでした');
+};
+
 function renderMediaPanel() {
+  renderKitStatus();
+  renderAudioPanel();
   const el = $('mediaList');
   el.innerHTML = '';
   const sources = S.manifest.sources;
@@ -1611,32 +1997,320 @@ $('buildSelectsBtn').onclick = async () => {
   if (applied) toast(`採用 ${keepCount} シーンで仮タイムラインを作成しました`);
 };
 
-// ---------- clip inspector (±frame trim) ----------
-function selectClip(clipId) {
-  S.selectedClip = clipId;
-  $('clipInspector').hidden = !clipId;
-  if (clipId) {
-    const label = $('clipLabel');
-    label.textContent = clipDisplayLabel(clipId);
-    label.title = clipId; // internal id kept as a tooltip only — see clipDisplayLabel's doc
+// ---------- W-UI IA v2 波2 §1: selection inspector ----------
+// Clicking a clip/B-roll/motion/sprite/dialogue/BGM block on the timeline
+// switches the aside from #tabsView to #inspectorView (temporarily — "←
+// 確認に戻る" returns). Caption cues are the one exception in the spec's
+// object list: they keep opening the existing captionStyleDialog directly
+// (see buildCueEl/openCaptionStylePopover) rather than duplicating that
+// dialog's font/palette/position controls into the narrow aside.
+function selectItem(kind, id) {
+  S.selection = id ? { kind, id } : null;
+  renderTimeline(); // updates .sel highlight classes on the timeline blocks
+  renderInspector();
+}
+function deselect() { selectItem(null, null); }
+function isSelected(kind, id) {
+  return S.selection?.kind === kind && S.selection?.id === id;
+}
+// Back-compat name: clip selection is reached from several timeline drag
+// handlers under this name (startClipReorderDrag/startTrimDrag) — kept as a
+// thin wrapper onto the generalized path rather than touching every call site.
+function selectClip(clipId) { selectItem('clip', clipId); }
+
+$('inspectorBack').onclick = deselect;
+
+function inspField(labelText, valueText) {
+  const wrap = document.createElement('div');
+  wrap.className = 'inspField';
+  const l = document.createElement('label');
+  l.textContent = labelText;
+  wrap.appendChild(l);
+  if (valueText != null) {
+    const v = document.createElement('div');
+    v.className = 'inspMeta';
+    v.textContent = valueText;
+    wrap.appendChild(v);
   }
-  renderTimeline();
+  return wrap;
 }
-$('clipClose').onclick = () => selectClip(null);
-for (const b of document.querySelectorAll('[data-trim]')) {
-  b.onclick = async () => {
-    if (!S.selectedClip) return;
-    const [edge, f] = b.dataset.trim.split(':');
-    await mutate({ op: 'trim', clipId: S.selectedClip, edge, frames: Number(f) });
+function inspDivider(body) {
+  const d = document.createElement('div');
+  d.className = 'inspDivider';
+  body.appendChild(d);
+}
+/** A labeled <input type=range> with a live-updating value readout, committing via `onCommit` only on release (change), not every drag tick — same "preview locally, commit on release" shape as the caption-style popover's sliders. Shared by the clip inspector's color-adjust fields and the BGM inspector's gain/fade fields. */
+function inspSlider(labelText, { min, max, step, value, format = String, onCommit }) {
+  const wrap = document.createElement('div');
+  wrap.className = 'inspField';
+  const l = document.createElement('label');
+  const valSpan = document.createElement('span');
+  valSpan.className = 'mono';
+  valSpan.textContent = format(value);
+  l.append(`${labelText} `, valSpan);
+  const input = document.createElement('input');
+  input.type = 'range';
+  input.min = String(min);
+  input.max = String(max);
+  input.step = String(step);
+  input.value = String(value);
+  input.oninput = () => { valSpan.textContent = format(Number(input.value)); };
+  input.onchange = async () => { await onCommit(Number(input.value)); };
+  wrap.append(l, input);
+  return wrap;
+}
+function inspRemoveButton(labelText, confirmText, onConfirm) {
+  const btn = document.createElement('button');
+  btn.className = 'btn-reject';
+  btn.textContent = labelText;
+  btn.onclick = async () => {
+    if (!confirm(confirmText)) return;
+    deselect();
+    await onConfirm();
   };
+  return btn;
 }
-$('clipRemoveBtn').onclick = async () => {
-  if (!S.selectedClip) return;
-  if (!confirm('このクリップをタイムラインから外しますか？(素材は残ります)')) return;
-  const clipId = S.selectedClip;
-  selectClip(null);
-  await mutate({ op: 'clip-remove', clipId });
+
+function buildClipInspector(body, clipId) {
+  const segs = S.segments.filter((s) => s.clipId === clipId);
+  if (segs.length === 0) { deselect(); return; }
+  const clip = S.manifest.timeline.video.find((c) => c.id === clipId);
+  const label = document.createElement('div');
+  label.className = 'inspLabel';
+  label.textContent = clipDisplayLabel(clipId);
+  label.title = clipId; // internal id kept as a tooltip only — see clipDisplayLabel's doc
+  body.appendChild(label);
+
+  body.appendChild(inspField('タイムライン位置', segs.map((s) => `${fmt(s.tlStart)}–${fmt(s.tlEnd)}`).join(', ')));
+  if (clip) {
+    body.appendChild(inspField('使用範囲(素材内)', `${fmt(clip.srcIn)}–${fmt(clip.srcOut)}`));
+    const cropText = S.manifest.output
+      ? `X ${Math.round((clip.crop?.x ?? 0.5) * 100)}% / Y ${Math.round((clip.crop?.y ?? 0.5) * 100)}%`
+      : '出力比率が既定のため未使用';
+    body.appendChild(inspField('クロップ位置', cropText));
+  }
+  inspDivider(body);
+
+  const trimRow = (rowLabel, edge) => {
+    const row = document.createElement('div');
+    row.className = 'inspTrimRow';
+    const l = document.createElement('span');
+    l.textContent = rowLabel;
+    l.className = 'inspMeta';
+    row.appendChild(l);
+    for (const [df, txt] of [[-1, '−1f'], [1, '+1f']]) {
+      const b = document.createElement('button');
+      b.textContent = txt;
+      b.setAttribute('aria-label', `${rowLabel}を${df > 0 ? '1フレーム進める' : '1フレーム戻す'}`);
+      b.onclick = async () => { await mutate({ op: 'trim', clipId, edge, frames: df }); };
+      row.appendChild(b);
+    }
+    return row;
+  };
+  body.appendChild(trimRow('開始点(IN)', 'in'));
+  body.appendChild(trimRow('終了点(OUT)', 'out'));
+
+  // W-UI IA v2 波2 §6: color-adjust lives on the clip inspector (the source
+  // this clip plays from), rather than adding a 7th selection kind —
+  // exposure/saturation get a CSS approximation live in the preview (see
+  // colorAdjustFilterFor/tick()); white balance has no CSS equivalent, so it
+  // stays a plain number + an explicit "書き出しで確認" note (no dishonest
+  // approximation).
+  if (clip) {
+    inspDivider(body);
+    const colorHeading = document.createElement('div');
+    colorHeading.className = 'inspLabel';
+    colorHeading.textContent = '色調整(この素材全体)';
+    body.appendChild(colorHeading);
+    const sourceId = clip.sourceId;
+    const cur = S.manifest.colorAdjust?.[sourceId] ?? {};
+    body.appendChild(inspSlider('露出', {
+      min: -2, max: 2, step: 0.1, value: cur.exposure ?? 0,
+      format: (v) => `${v > 0 ? '+' : ''}${v.toFixed(1)}EV`,
+      onCommit: async (v) => { await mutate({ op: 'color-adjust', sourceId, exposure: v }); },
+    }));
+    body.appendChild(inspSlider('彩度', {
+      min: 0, max: 2, step: 0.05, value: cur.sat ?? 1,
+      format: (v) => `${Math.round(v * 100)}%`,
+      onCommit: async (v) => { await mutate({ op: 'color-adjust', sourceId, sat: v }); },
+    }));
+    const wbWrap = inspSlider('色温度', {
+      min: -100, max: 100, step: 5, value: cur.wb ?? 0,
+      format: (v) => String(v),
+      onCommit: async (v) => { await mutate({ op: 'color-adjust', sourceId, wb: v }); },
+    });
+    const wbBadge = document.createElement('span');
+    wbBadge.className = 'exportOnlyBadge';
+    wbBadge.title = '色温度の変化はプレビューでは近似できません。実際の色味は書き出しで確認してください';
+    wbBadge.textContent = '色温度は書き出しで確認';
+    wbWrap.appendChild(wbBadge);
+    body.appendChild(wbWrap);
+  }
+
+  inspDivider(body);
+  body.appendChild(inspRemoveButton(
+    'タイムラインから外す', 'このクリップをタイムラインから外しますか？(素材は残ります)',
+    async () => { await mutate({ op: 'clip-remove', clipId }); },
+  ));
+}
+
+function buildBrollInspector(body, id) {
+  const r = S.overlays.find((x) => x.overlay.id === id);
+  if (!r) { deselect(); return; }
+  const ov = r.overlay;
+  const src = S.manifest.sources.find((s) => s.id === ov.sourceId);
+  const label = document.createElement('div');
+  label.className = 'inspLabel';
+  label.textContent = `B-roll: ${sourceLabel(src)}`;
+  label.title = src ? basename(src.path) : ov.sourceId;
+  body.appendChild(label);
+  if (r.tlStart != null) {
+    const dur = ov.srcOut - ov.srcIn;
+    body.appendChild(inspField('タイムライン位置', `${fmt(r.tlStart)}–${fmt(r.tlStart + dur)}`));
+    body.appendChild(inspField('使用範囲(素材内)', `${fmt(ov.srcIn)}–${fmt(ov.srcOut)}`));
+    body.appendChild(inspField('音声モード', ov.audioMode));
+  } else {
+    const anchorSrc = S.manifest.sources.find((s) => s.id === ov.anchor.sourceId);
+    const warn = document.createElement('div');
+    warn.className = 'inboxWarn';
+    warn.textContent = `配置先を見失っています — 元の位置(${sourceLabel(anchorSrc)} の ${fmt(ov.anchor.srcTime)} 付近)がカットで失われました`;
+    body.appendChild(warn);
+    body.appendChild(askClaudeChip(`B-roll(${sourceLabel(anchorSrc)} の ${fmt(ov.anchor.srcTime)} 付近)を置き直して`));
+  }
+  inspDivider(body);
+  body.appendChild(inspRemoveButton(
+    'タイムラインから外す', 'このB-rollをタイムラインから外しますか？',
+    async () => { await mutate({ op: 'broll-remove', id }); },
+  ));
+}
+
+function buildMotionInspector(body, id) {
+  const mo = S.manifest.timeline.motion.find((m) => m.id === id);
+  if (!mo) { deselect(); return; }
+  const spec = S.motionSpecs?.[id];
+  const label = document.createElement('div');
+  label.className = 'inspLabel';
+  label.textContent = spec?.type ? (MOTION_TYPE_LABEL[spec.type] ?? spec.type) : 'モーション演出';
+  body.appendChild(label);
+  body.appendChild(inspField('タイムライン位置', `${fmt(mo.tlStart)}–${fmt(mo.tlStart + mo.duration)}`));
+  if (spec?.type === 'custom-html') {
+    const badge = document.createElement('span');
+    badge.className = 'exportOnlyBadge';
+    badge.title = 'custom-html のモーションは書き出し時に焼き込まれません(警告付きでスキップされます)';
+    badge.textContent = '書き出し対象外(プレビューのみ)';
+    body.appendChild(badge);
+  }
+  inspDivider(body);
+  body.appendChild(inspRemoveButton(
+    'タイムラインから外す', 'このモーション演出をタイムラインから外しますか？',
+    async () => { await mutate({ op: 'motion-remove', id }); },
+  ));
+}
+
+function buildSpriteInspector(body, id) {
+  const r = S.sprites.find((x) => x.sprite.id === id);
+  if (!r) { deselect(); return; }
+  const sp = r.sprite;
+  const label = document.createElement('div');
+  label.className = 'inspLabel';
+  label.textContent = `キャラクター: ${sp.assetId}`;
+  body.appendChild(label);
+  if (r.tlStart != null) {
+    body.appendChild(inspField('タイムライン位置', `${fmt(r.tlStart)}–${fmt(r.tlStart + sp.duration)}`));
+  } else {
+    const anchorSrc = S.manifest.sources.find((s) => s.id === sp.anchor.sourceId);
+    const warn = document.createElement('div');
+    warn.className = 'inboxWarn';
+    warn.textContent = `配置先を見失っています — 元の位置(${sourceLabel(anchorSrc)} の ${fmt(sp.anchor.srcTime)} 付近)がカットで失われました`;
+    body.appendChild(warn);
+    body.appendChild(askClaudeChip(`キャラクター(${sp.assetId} · ${sourceLabel(anchorSrc)} の ${fmt(sp.anchor.srcTime)} 付近)を置き直して`));
+  }
+  inspDivider(body);
+  body.appendChild(inspRemoveButton(
+    'タイムラインから外す', 'このキャラクターをタイムラインから外しますか？',
+    async () => { await mutate({ op: 'sprite-remove', id }); },
+  ));
+}
+
+function buildDialogueInspector(body, id) {
+  const d = (S.dialogue ?? []).find((x) => x.id === id);
+  if (!d) { deselect(); return; }
+  const label = document.createElement('div');
+  label.className = 'inspLabel';
+  label.textContent = `セリフ: "${d.text}"`;
+  body.appendChild(label);
+  body.appendChild(inspField('タイムライン位置', `${fmt(d.tlStart)}–${fmt(d.tlStart + d.duration)}`));
+  inspDivider(body);
+  body.appendChild(inspRemoveButton(
+    'タイムラインから外す', 'このセリフをタイムラインから外しますか？',
+    async () => { await mutate({ op: 'dialogue-remove', id }); },
+  ));
+}
+
+function buildMusicInspector(body, id) {
+  const mu = (S.manifest.timeline.music ?? []).find((m) => m.id === id);
+  if (!mu) { deselect(); return; }
+  const label = document.createElement('div');
+  label.className = 'inspLabel';
+  label.textContent = `${mu.role === 'sfx' ? 'SE' : 'BGM'}: ${basename(mu.path)}`;
+  label.title = mu.path;
+  body.appendChild(label);
+  body.appendChild(inspField('タイムライン位置', `${fmt(mu.tlStart)}–${fmt(mu.tlStart + mu.duration)}`));
+  inspDivider(body);
+  body.appendChild(inspSlider('音量(gain)', {
+    min: -40, max: 12, step: 1, value: mu.gain,
+    format: (v) => `${v > 0 ? '+' : ''}${v}dB`,
+    onCommit: async (v) => { await mutate({ op: 'music-update', id, gain: v }); },
+  }));
+  body.appendChild(inspSlider('フェードイン', {
+    min: 0, max: 10, step: 0.5, value: mu.fadeIn,
+    format: (v) => `${v.toFixed(1)}s`,
+    onCommit: async (v) => { await mutate({ op: 'music-update', id, fadeIn: v }); },
+  }));
+  body.appendChild(inspSlider('フェードアウト', {
+    min: 0, max: 10, step: 0.5, value: mu.fadeOut,
+    format: (v) => `${v.toFixed(1)}s`,
+    onCommit: async (v) => { await mutate({ op: 'music-update', id, fadeOut: v }); },
+  }));
+  const duckRow = document.createElement('label');
+  duckRow.className = 'audioCheck';
+  const duckCb = document.createElement('input');
+  duckCb.type = 'checkbox';
+  duckCb.checked = mu.duck;
+  duckCb.onchange = async () => { await mutate({ op: 'music-update', id, duck: duckCb.checked }); };
+  duckRow.append(duckCb, ' 発話でダッキング(自動的に音量を下げる)');
+  body.appendChild(duckRow);
+  inspDivider(body);
+  body.appendChild(inspRemoveButton('削除', 'このBGM/SEを削除しますか？', async () => { await mutate({ op: 'music-remove', id }); }));
+}
+
+const INSPECTOR_BUILDERS = {
+  clip: buildClipInspector,
+  broll: buildBrollInspector,
+  motion: buildMotionInspector,
+  sprite: buildSpriteInspector,
+  dialogue: buildDialogueInspector,
+  music: buildMusicInspector,
 };
+const INSPECTOR_TITLE = { clip: 'クリップ', broll: 'B-roll', motion: 'モーション', sprite: 'キャラクター', dialogue: 'セリフ', music: 'BGM/SE' };
+
+function renderInspector() {
+  const view = $('inspectorView');
+  const tabsView = $('tabsView');
+  if (!S.selection) {
+    view.hidden = true;
+    tabsView.hidden = false;
+    return;
+  }
+  tabsView.hidden = true;
+  view.hidden = false;
+  $('inspectorTitle').textContent = INSPECTOR_TITLE[S.selection.kind] ?? S.selection.kind;
+  const body = $('inspectorBody');
+  body.innerHTML = '';
+  const builder = INSPECTOR_BUILDERS[S.selection.kind];
+  if (builder) builder(body, S.selection.id);
+  else deselect();
+}
 
 // ---------- W8 kit: caption style palette/font + sprite stage rendering ----------
 
@@ -1965,6 +2639,41 @@ async function loadFontOptions(selectEl, currentValue) {
   }
 }
 
+// W-UI IA v2 波2 §5: 4 built-in presets (see export/render.ts's
+// ASS_STYLE_PRESETS — clean/bold/outline/boxed always exist there) plus any
+// linked kit's own styles, which are equally valid captions.style ids (see
+// kitStyleFor in renderCaption).
+const CAPTION_STYLE_PRESETS = [['clean', 'クリーン'], ['bold', 'ボールド'], ['outline', 'アウトライン'], ['boxed', 'ボックス']];
+function populateCaptionStylePresetSelect(selectEl, current) {
+  selectEl.innerHTML = '';
+  for (const [id, label] of CAPTION_STYLE_PRESETS) {
+    const opt = document.createElement('option');
+    opt.value = id;
+    opt.textContent = label;
+    selectEl.appendChild(opt);
+  }
+  const kitStyles = S.kit?.kit?.styles ?? [];
+  if (kitStyles.length) {
+    const g = document.createElement('optgroup');
+    g.label = 'キット';
+    for (const s of kitStyles) {
+      const opt = document.createElement('option');
+      opt.value = s.id;
+      opt.textContent = s.label || s.id;
+      g.appendChild(opt);
+    }
+    selectEl.appendChild(g);
+  }
+  selectEl.value = current || 'clean';
+  if (selectEl.value !== current && current) {
+    const opt = document.createElement('option');
+    opt.value = current;
+    opt.textContent = `${current}(未検出)`;
+    selectEl.appendChild(opt);
+    selectEl.value = current;
+  }
+}
+
 function cloneCaptionOverrides(o) {
   if (!o) return {};
   const clone = { ...o };
@@ -1985,6 +2694,14 @@ function previewCaptionOverrides() {
 }
 
 function syncCaptionPopoverControls() {
+  // W-UI IA v2 波2 §5: enabled/style/maxChars are plain project settings
+  // (captions.enabled/.style/.maxChars), not part of the overrides draft —
+  // they always reflect S.manifest.captions directly and commit immediately
+  // on change (see the 3 onchange handlers below), independent of this
+  // dialog's 適用/キャンセル flow for the overrides fields.
+  $('capEnabledToggle').checked = Boolean(S.manifest.captions.enabled);
+  populateCaptionStylePresetSelect($('capStylePreset'), S.manifest.captions.style);
+  $('capMaxChars').value = String(S.manifest.captions.maxChars ?? 24);
   const d = captionOverridesDraft;
   loadFontOptions($('capFont'), d.font);
   $('capTextColor').value = d.palette?.text || '#ffffff';
@@ -2032,6 +2749,30 @@ function wireCapColorInput(id, field) {
 wireCapColorInput('capTextColor', 'text');
 wireCapColorInput('capOutlineColor', 'outline');
 wireCapColorInput('capBoxColor', 'box');
+// W-UI IA v2 波2 §5: enabled/style/maxChars commit immediately (project
+// settings, not part of the overrides draft/適用/キャンセル flow) — the
+// dialog stays open so the effect (cue reappearing, style/width changing)
+// is visible right away, same live-update pattern the rest of the app uses.
+$('capEnabledToggle').onchange = async (e) => {
+  await mutate(
+    { op: 'captions', patch: { enabled: e.target.checked } },
+    { conflictMessage: '字幕の表示切り替えは反映されませんでした。最新状態を確認してもう一度実行してください' },
+  );
+};
+$('capStylePreset').onchange = async (e) => {
+  await mutate(
+    { op: 'captions', patch: { style: e.target.value } },
+    { conflictMessage: '字幕プリセットの変更は反映されませんでした。最新状態を確認してもう一度実行してください' },
+  );
+};
+$('capMaxChars').onchange = async (e) => {
+  const v = Number(e.target.value);
+  if (!Number.isFinite(v) || v < 1) { syncCaptionPopoverControls(); return; }
+  await mutate(
+    { op: 'captions', patch: { maxChars: Math.round(v) } },
+    { conflictMessage: '1行の最大文字数の変更は反映されませんでした。最新状態を確認してもう一度実行してください' },
+  );
+};
 $('capSizeScale').oninput = (e) => {
   captionResetRequested = false;
   captionOverridesDraft.sizeScale = Number(e.target.value);
@@ -2784,11 +3525,13 @@ function highlightWord(tl) {
 const KIND_LABEL = { silence: '無音', filler: 'フィラー', retake: '言い直し', 'low-energy': '低テンション' };
 const KIND_ORDER = ['silence', 'filler', 'retake', 'low-energy'];
 
-// W9: QC categories (see export/qc.js's QcCategory) surfaced in the いま
+// W9: QC categories (see export/qc.js's QcCategory) surfaced in the 確認
 // inbox — every OTHER category (candidates/scene-review/overlay-orphan/
 // sprite-orphan/color) already has its own dedicated inbox surface, so
 // merging those too would double-count the same issue (see renderInbox).
-const QC_INBOX_CATEGORIES = new Set(['captions', 'source-missing', 'kit-duration']);
+// W-UI IA v2 波2 §7: kit-asset-missing added — previously invisible through
+// every path (not one of the pre-existing dedicated surfaces either).
+const QC_INBOX_CATEGORIES = new Set(['captions', 'source-missing', 'kit-duration', 'kit-asset-missing']);
 
 // Map a candidate's (padded) source-time point to a timeline seconds value,
 // clamped to the segment that currently contains its source range — used by
@@ -2906,7 +3649,17 @@ function colorWarningSources() {
 function inboxWarningRow(text, opts = {}) {
   const d = document.createElement('div');
   d.className = 'inboxWarn';
-  d.textContent = text;
+  // W-UI IA v2 波2 §8: an optional "Claude に頼む" chip alongside the
+  // warning text (structural fixes — a color correction, a re-placement —
+  // are conversation, not a UI control here).
+  if (opts.askPrompt) {
+    const line = document.createElement('div');
+    line.textContent = text;
+    d.appendChild(line);
+    d.appendChild(askClaudeChip(opts.askPrompt));
+  } else {
+    d.textContent = text;
+  }
   if (opts.title) d.title = opts.title; // internal id/detail, kept out of the visible text — see the anchor-orphan warnings below
   if (opts.onClick) {
     d.tabIndex = 0;
@@ -3022,9 +3775,10 @@ function renderWarningsGroup(el) {
   // color warnings
   for (const src of colorWarningSources()) {
     count++; kindCounts.color++;
-    el.appendChild(inboxWarningRow(`⚠ 要色変換: ${sourceLabel(src)} — Log/HLG/PQ 素材のため浅い色で見えています。Claude に「色を直して」と伝えてください`, {
+    el.appendChild(inboxWarningRow(`⚠ 要色変換: ${sourceLabel(src)} — Log/HLG/PQ 素材のため浅い色で見えています。`, {
       title: basename(src.path),
       onClick: () => { activateTab($('tab-mediaPanel'), { focus: false }); setMediaFocus(src.id, { focus: false }); },
+      askPrompt: `${sourceLabel(src)}の色を直して`,
     }));
   }
 
@@ -3419,12 +4173,21 @@ function renderActivityFeed() {
 // preserve (e.g. keep the transcript selection alive) when a 409 happens.
 async function mutate(body, opts = {}) {
   try {
-    await api('/api/edit', {
+    const res = await api('/api/edit', {
       method: 'POST',
       body: JSON.stringify({ baseRev: S.manifest.revision, actor: 'ui', ...body }),
     });
     await reload();
-    return { ok: true, conflict: false };
+    // W-UI IA v2 波2 追補#3: some ops (music-add/-update's duckWarningFor)
+    // return a non-fatal `warning` alongside a 200 — previously dropped on
+    // the floor entirely. Surface it, and remember which revision it was
+    // for so the WS "変更 #N" confirmation toast (connectWs below) doesn't
+    // immediately clobber it with a bland one for the very same commit.
+    if (res && typeof res.warning === 'string' && res.warning) {
+      toast(res.warning, { type: 'warn' });
+      S.lastWarningRevision = res.state?.revision ?? S.manifest.revision;
+    }
+    return { ok: true, conflict: false, result: res };
   } catch (e) {
     const conflict = e.status === 409;
     const msg = conflict ? (opts.conflictMessage ?? '他の編集と競合しました。最新状態を再読み込みしました') : e.message;
@@ -3435,14 +4198,20 @@ async function mutate(body, opts = {}) {
 }
 
 let toastTimer;
+// W-UI IA v2 波2 §9/追補#3: a third `warn` variant, alongside the existing
+// plain/error ones — for a successful mutation that still comes with a
+// caveat (e.g. music-add/-update's duckWarningFor, surfaced from the /api
+// /edit response body — see mutate()). Amber like the inbox's warning rows,
+// closable + longer-lived than a plain confirmation since it's meant to
+// actually be read, but never role="alert" (nothing failed).
 function toast(msg, opts = {}) {
   const t = $('toast');
-  const isError = opts.type === 'error';
+  const variant = opts.type === 'error' ? 'error' : opts.type === 'warn' ? 'warn' : 'plain';
   t.innerHTML = '';
   const span = document.createElement('span');
   span.textContent = msg;
   t.appendChild(span);
-  if (isError) {
+  if (variant !== 'plain') {
     const closeBtn = document.createElement('button');
     closeBtn.className = 'toastClose';
     closeBtn.textContent = '×';
@@ -3450,12 +4219,39 @@ function toast(msg, opts = {}) {
     closeBtn.onclick = () => { t.hidden = true; };
     t.appendChild(closeBtn);
   }
-  t.setAttribute('role', isError ? 'alert' : 'status');
+  t.setAttribute('role', variant === 'error' ? 'alert' : 'status');
+  if (variant === 'plain') t.removeAttribute('data-variant'); else t.setAttribute('data-variant', variant);
   t.hidden = false;
   clearTimeout(toastTimer);
-  if (!isError) {
+  if (variant === 'plain') {
     toastTimer = setTimeout(() => (t.hidden = true), 3500);
+  } else if (variant === 'warn') {
+    toastTimer = setTimeout(() => (t.hidden = true), 7000);
   }
+}
+
+// ---------- W-UI IA v2 波2 §8: 「Claude に頼む」チップ ----------
+// Structural dead ends (orphaned B-roll/sprites, an unlinked kit, a
+// protected zone with no removal UI, custom-html-only motion, …) get a
+// precise, ready-to-send request copied to the clipboard instead of a UI
+// control — see docs/product-bet-sensory-vs-structural.md: 構造は会話.
+async function copyToClipboard(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast('コピーしました');
+    return true;
+  } catch {
+    toast('コピーに失敗しました。手動でコピーしてください', { type: 'error' });
+    return false;
+  }
+}
+function askClaudeChip(promptText) {
+  const btn = document.createElement('button');
+  btn.className = 'askChip';
+  btn.textContent = `「${promptText}」をコピー`;
+  btn.title = 'クリックでこの依頼文をクリップボードにコピーします。Claude に伝えてください';
+  btn.onclick = (e) => { e.stopPropagation(); copyToClipboard(promptText); };
+  return btn;
 }
 
 // ---------- tabs (WAI-ARIA Tabs pattern: automatic activation) ----------
@@ -3706,6 +4502,38 @@ function setClaudeTask(label) {
   const strip = $('claudeStrip');
   strip.hidden = !label;
   if (label) $('claudeStripText').textContent = label;
+  renderClaudeStatus();
+}
+
+// ---------- W-UI IA v2 波2 §3: Claude 状態の常設表示(ヘッダー) ----------
+// Promotes the いま/確認 タブ内 claudeStrip's "is Claude doing something
+// right now" signal to a permanent header readout with 3 states, derived
+// from data the daemon already exposes (no new API): WS activity (S.
+// activeTask, same signal claudeStrip already used) means 編集中; otherwise
+// the 確認 タブ's own pending-count badge (candidates + 対応が必要) means
+// あなたの確認待ち; otherwise 待機中. Reads the badge AFTER renderInbox() has
+// run (see renderAll) rather than recomputing the same anchor/color/
+// low-confidence/QC scan a second time here.
+function renderClaudeStatus() {
+  const el = $('claudeStatus');
+  if (!el) return;
+  if (S.activeTask) {
+    el.textContent = 'Claude: 編集中';
+    el.className = 'claudeStatus busy';
+    el.title = S.activeTask.label;
+    return;
+  }
+  const badge = $('inboxCount');
+  const pending = badge && !badge.hidden ? Number(badge.textContent || '0') : 0;
+  if (pending > 0) {
+    el.textContent = 'Claude: あなたの確認待ち';
+    el.className = 'claudeStatus waiting';
+    el.title = `${pending}件の確認待ち — 確認タブを開いてください`;
+  } else {
+    el.textContent = 'Claude: 待機中';
+    el.className = 'claudeStatus idle';
+    el.title = '';
+  }
 }
 
 // ---------- websocket live updates ----------
@@ -3781,7 +4609,26 @@ function connectWs() {
       } catch (e) {
         toast(e.message, { type: 'error' });
       }
-      if (msg.summary) toast(`変更 #${msg.revision ?? ''}: ${msg.summary}`);
+      // W-UI IA v2 波2 §9: every successful mutation (from ANY actor, since
+      // this browser's own websocket also receives its own broadcast —
+      // src/server/daemon.ts's broadcast() has no sender-exclusion) lands
+      // here, so this is the "控えめな確認" for direct UI edits too — no
+      // separate success-toast plumbing needed at each call site. Previously
+      // this echoed the daemon's raw internal summary (op names/ids/English)
+      // verbatim, straight past the "CLI構文をUI文言に出さない" rule; look
+      // the same revision back up in the just-reloaded S.revisions and run
+      // it through humanizeRevision() instead. Skipped once if mutate()
+      // already surfaced a `warning` toast for this exact revision, so the
+      // warning isn't immediately overwritten by a bland confirmation.
+      if (msg.type === 'update' && msg.summary) {
+        if (msg.revision === S.lastWarningRevision) {
+          S.lastWarningRevision = null;
+        } else {
+          const entry = S.revisions.find((r) => r.rev === msg.revision);
+          const text = entry ? humanizeRevision(entry) : msg.summary;
+          toast(`変更 #${msg.revision ?? ''}: ${text}`);
+        }
+      }
     }
   };
 }
@@ -4023,7 +4870,8 @@ async function renderAll() {
   $('projName').textContent = m.name;
   renderStat();
   // W-UI IA v2 用語表: 「変更 #7」→「現在の版 7」(ヘッダー右端の弱表示)。
-  $('revLabel').textContent = `現在の版 ${m.revision}`;
+  // 波2 §7: 「自動保存」を明示 — 「保存」という語が UI に一度も出ない状態の解消。
+  $('revLabel').textContent = `現在の版 ${m.revision} · 自動保存`;
   applyCompositionMode();
   await loadMotionSpecs();
   syncMusicElements();
@@ -4035,9 +4883,13 @@ async function renderAll() {
   renderRange();
   updateFraming();
   renderStageState();
+  renderInspector();
+  renderPlayability();
+  renderClaudeStatus(); // after renderInbox() — reads its badge, see the doc above
+  renderIntentZonesInfo();
 }
 
-window.addEventListener('resize', drawWave);
+window.addEventListener('resize', () => { drawWave(); renderRuler(); });
 // Connect the socket and start the frame loop unconditionally — tick() is a
 // no-op until a segment is loaded — so that if the initial /api/project call
 // fails (e.g. "no project open"), the UI still hears about a project being
@@ -4059,6 +4911,7 @@ reload().then(() => {
   const apply = (w) => {
     document.documentElement.style.setProperty('--aside-w', `${clampW(w)}px`);
     drawWave(); // timeline canvas depends on stage width
+    renderRuler(); // same — tick spacing depends on the same width
   };
   const saved = Number(localStorage.getItem(KEY));
   if (saved) apply(saved);

@@ -115,6 +115,20 @@ dialog#shortcutsDialog td:first-child {
 /* W-UI IA v2 §1: 「現在の版 N」— ヘッダー右端の弱表示(旧#transport内から
    移設。#revLabel 自体の mono/tabular-nums は上のセレクタリストで既に付与)。 */
 .hdrRevLabel { color: var(--text-faint); font-size: var(--fs-xs); white-space: nowrap; }
+/* W-UI IA v2 波2 §3: Claude 状態の常設表示(renderClaudeStatus in app.js)。
+   --link=待機中・確認待ち共通の落ち着いた色、busy のときだけ動きを付ける
+   (prefers-reduced-motion では静止のまま — 上の @media ルールで除外)。 */
+.claudeStatus { font-size: var(--fs-xs); font-weight: 600; white-space: nowrap; padding: 2px 8px; border-radius: 999px; }
+.claudeStatus.idle { color: var(--text-faint); background: transparent; }
+.claudeStatus.waiting { color: var(--tally); background: rgba(232, 160, 60, 0.14); }
+.claudeStatus.busy { color: var(--link); background: rgba(143, 168, 201, 0.14); }
+.claudeStatus.busy::before { content: '● '; animation: claudeBusyPulse 1.2s ease-in-out infinite; }
+@keyframes claudeBusyPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+@media (prefers-reduced-motion: reduce) { .claudeStatus.busy::before { animation: none; } }
+/* 波2 追補#2: 出力比率変更セレクト — ヘッダーの弱い操作系として revLabel と
+   同じ弱色トーン。 */
+.reframeCtl { display: flex; align-items: center; gap: 4px; color: var(--text-faint); font-size: var(--fs-xs); white-space: nowrap; }
+.reframeCtl select { font-size: var(--fs-xs); padding: 1px 4px; }
 .spacer { flex: 1; }
 /* W-UI redesign §1: connection state is a small dot + title tooltip, not a
    text label — the color alone (+ title/aria-label for a11y) carries it. */
@@ -324,11 +338,40 @@ main { flex: 1; display: flex; min-height: 0; }
   padding: 1px 6px; border-radius: 999px;
 }
 
+/* W-UI IA v2 波2 §2: トラックラベルガター + 時間目盛り。#timeline 自体は
+   もはやトラック行の直接の position:absolute 基準ではなく、外枠(ルーラー+
+   ガター+トラック本体を並べる器)になる — トラック行は #timelineTracks の
+   中にそのまま移設済みで、その内部の left/top/width/height の% 計算は
+   一切変更していない(#timelineTracks が新しい絶対配置の基準になるだけ)。
+   高さは元の 92px のトラック本体 + 18px のルーラー + T1 テロップ行ぶんの
+   12px を足した 122px(#timelineTracks 自体は 104px)。 */
 #timeline {
-  position: relative; height: 92px; background: var(--stage-surface);
+  position: relative; height: 122px; background: var(--stage-surface);
   border: 1px solid var(--stage-border); border-radius: var(--radius); overflow: hidden; cursor: crosshair;
   flex: none;
 }
+#timeRuler {
+  position: absolute; left: 56px; right: 0; top: 0; height: 18px;
+  border-bottom: 1px solid var(--stage-border); pointer-events: none;
+}
+.rulerTick {
+  position: absolute; top: 0; height: 100%; padding-left: 3px;
+  border-left: 1px solid var(--zone-border); color: var(--text-faint);
+  font-size: 9px; font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+  white-space: nowrap; line-height: 18px;
+}
+/* トラックラベルガター: 各ラベルは対応する行と同じ top/height(または
+   bottom/height)を使うので、行が増減しても常にピクセル単位で揃う(renderTrackGutter in app.js)。 */
+#trackGutter {
+  position: absolute; left: 0; top: 18px; bottom: 0; width: 56px;
+  border-right: 1px solid var(--stage-border); background: var(--zone-surface);
+}
+.gutterLabel {
+  position: absolute; left: 0; right: 0; display: flex; align-items: center;
+  padding: 0 6px; font-size: 9px; color: var(--text-faint); white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+}
+#timelineTracks { position: absolute; left: 56px; right: 0; top: 18px; bottom: 0; }
 #wave { position: absolute; inset: 0; width: 100%; height: 100%; }
 /* B-roll V2 row (W3): thin strip ABOVE the clip row per spec, teal so it
    reads as a distinct layer from the A-roll clips/scene marks below it.
@@ -364,9 +407,10 @@ main { flex: 1; display: flex; min-height: 0; }
 #intentZoneRow { position: absolute; left: 0; right: 0; top: 12%; height: 50%; pointer-events: none; }
 .intentZoneBlock {
   position: absolute; bottom: 0; height: 4px; border-radius: 2px;
-  background: rgba(143, 168, 201, 0.6); pointer-events: auto; cursor: default;
+  background: rgba(143, 168, 201, 0.6); pointer-events: auto; cursor: pointer;
 }
 .intentZoneBlock.hold { background: rgba(122, 92, 208, 0.65); }
+.intentZoneBlock:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
 /* Clip fill: a neutral steel-blue base so the (optional) filmstrip
    thumbnails tiled on top (.clipThumb below) still read as "this is a clip"
    even before/without real frames — e.g. sources with no scene data yet. */
@@ -391,6 +435,11 @@ main { flex: 1; display: flex; min-height: 0; }
 .clip.dragging, .moBlock.dragging, .muBlock.dragging, .ovBlock.dragging, .spBlock.dragging {
   opacity: 0.55; box-shadow: 0 0 0 1px var(--link); cursor: grabbing;
 }
+/* W-UI IA v2 波2 §1: 選択ハイライト — 選んだブロックが光る(selectItem/
+   renderTimeline in app.js が該当ブロックにこのクラスを付ける)。 */
+.moBlock.sel, .muBlock.sel, .ovBlock.sel, .spBlock.sel, .dlBlock.sel {
+  outline: 2px solid var(--link); outline-offset: 1px; z-index: 2;
+}
 #dropIndicator {
   position: absolute; top: 12%; height: 50%; width: 2px; background: var(--link);
   pointer-events: none; z-index: 3;
@@ -404,13 +453,18 @@ main { flex: 1; display: flex; min-height: 0; }
   position: absolute; top: 0; bottom: 0; background: rgba(232, 160, 60, 0.18);
   border-left: 1px solid var(--tally); border-right: 1px solid var(--tally); pointer-events: none;
 }
-#motionRow { position: absolute; left: 0; right: 0; bottom: 2px; height: 14px; }
+/* W-UI IA v2 波2 §5: bottom offsets +12px vs pre-波2 (2/18/32/46/60) to make
+   room for the new #captionRow lane at bottom:0 — #timelineTracks grew by
+   exactly that 12px (see #timeline/#timelineTracks above), so these 5 rows
+   keep the exact same on-screen appearance/spacing relative to each other,
+   just shifted down as a block to leave the bottom slot free. */
+#motionRow { position: absolute; left: 0; right: 0; bottom: 14px; height: 14px; }
 .moBlock {
   position: absolute; height: 100%; border-radius: 3px; cursor: grab;
   background: rgba(122, 92, 208, 0.85); font-size: 9px; color: #fff;
   overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0 3px;
 }
-#musicRow { position: absolute; left: 0; right: 0; bottom: 18px; height: 12px; }
+#musicRow { position: absolute; left: 0; right: 0; bottom: 30px; height: 12px; }
 .muBlock {
   position: absolute; height: 100%; border-radius: 3px; cursor: grab;
   background: rgba(63, 185, 107, 0.8); font-size: 9px; color: #04101f;
@@ -419,7 +473,7 @@ main { flex: 1; display: flex; min-height: 0; }
 /* W8 kit sprite row: thin strip just above musicRow, pink so it reads as
    distinct from B-roll (teal, #overlayRow) and music (green). Orphan chips
    mirror .ovBlock.orphan (tally — see its doc). */
-#spriteRow { position: absolute; left: 0; right: 0; bottom: 32px; height: 12px; }
+#spriteRow { position: absolute; left: 0; right: 0; bottom: 44px; height: 12px; }
 .spBlock {
   position: absolute; top: 0; height: 100%; border-radius: 3px;
   background: rgba(214, 90, 200, 0.85); font-size: 9px; color: #04101f;
@@ -436,18 +490,32 @@ main { flex: 1; display: flex; min-height: 0; }
    renderDialogueRow in app.js), so `cursor: pointer` rather than `grab`.
    Steel-blue rather than the row palette's original amber — amber is
    reserved for tally (see the design tokens' doc above). */
-#bgRow { position: absolute; left: 0; right: 0; bottom: 46px; height: 12px; }
+#bgRow { position: absolute; left: 0; right: 0; bottom: 58px; height: 12px; }
 .bgBlock {
   position: absolute; top: 0; height: 100%; border-radius: 3px;
   background: rgba(92, 134, 168, 0.85); font-size: 9px; color: #04101f;
   overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0 3px; cursor: pointer;
 }
-#dialogueRow { position: absolute; left: 0; right: 0; bottom: 60px; height: 12px; }
+#dialogueRow { position: absolute; left: 0; right: 0; bottom: 72px; height: 12px; }
 .dlBlock {
   position: absolute; top: 0; height: 100%; border-radius: 3px;
   background: rgba(255, 255, 255, 0.85); font-size: 9px; color: #04101f;
   overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0 3px; cursor: pointer;
 }
+/* W-UI IA v2 波2 §5: T1 テロップ行 — 常設のクリック入口(cue が無くても/
+   字幕オフでも消えない、renderCaptionRow in app.js)。#timelineTracks を
+   92px→104px に広げた分、ちょうど最下段の新しいレーンに収まる。 */
+#captionRow { position: absolute; left: 0; right: 0; bottom: 0; height: 12px; }
+.capRowBlock {
+  position: absolute; top: 0; height: 100%; border-radius: 3px;
+  background: rgba(232, 160, 60, 0.55); font-size: 9px; color: #241a05;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0 3px; cursor: pointer;
+}
+.capRowBlock.capRowOff, .capRowBlock.capRowEmpty {
+  left: 0; width: 100%; background: var(--zone-surface-2); color: var(--text-dim);
+  border: 1px dashed var(--zone-border); text-align: center;
+}
+.capRowBlock:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
 #playhead {
   position: absolute; top: 0; bottom: 0; width: 1px; background: #ff5252; pointer-events: none;
 }
@@ -472,16 +540,39 @@ main { flex: 1; display: flex; min-height: 0; }
   background: var(--stage-surface); border: 1px solid var(--link); border-radius: var(--radius);
 }
 #rangeInfo { color: var(--text); }
-#clipInspector {
-  display: flex; gap: 6px; align-items: center;
-  padding: 6px 10px; background: var(--stage-surface); border: 1px solid var(--stage-border); border-radius: var(--radius);
+
+/* ---- W-UI IA v2 波2 §1: 選択インスペクタ(旧 #clipInspector を右ペインへ昇格) ---- */
+#inspectorView { display: flex; flex-direction: column; min-height: 0; flex: 1; }
+.inspectorHeader {
+  display: flex; align-items: center; gap: 8px; padding: 8px;
+  border-bottom: 1px solid var(--zone-border); position: sticky; top: 0; background: var(--zone-bg); z-index: 2;
 }
-#clipLabel { color: var(--text-dim); margin-right: 6px; }
+#inspectorBack { color: var(--link); border-color: var(--link); font-size: var(--fs-xs); padding: 3px 8px; }
+#inspectorTitle { font-weight: 600; font-size: var(--fs-sm); color: var(--text); }
+#inspectorBody { padding: 10px 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+.inspField { display: flex; flex-direction: column; gap: 4px; }
+.inspField label { font-size: var(--fs-xs); color: var(--text-dim); display: flex; justify-content: space-between; gap: 6px; }
+.inspRow { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.inspTrimRow { display: flex; align-items: center; gap: 6px; }
+.inspTrimRow button { font-size: var(--fs-xs); padding: 2px 8px; }
+.inspLabel { color: var(--text); font-weight: 600; font-size: var(--fs-sm); word-break: break-word; }
+.inspMeta { color: var(--text-dim); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; }
+.inspDivider { border-top: 1px solid var(--zone-border); margin: 2px 0; }
+#inspectorBody .btn-reject { align-self: flex-start; }
+/* 波2 §4/§6: プレビュー未反映を明示するバッジ(嘘をつかない — --wash系、
+   色警告等の tally とは区別)。 */
+.exportOnlyBadge {
+  align-self: flex-start; font-size: 10px; padding: 1px 6px; border-radius: 999px;
+  background: transparent; border: 1px solid var(--wash); color: var(--text-dim); cursor: help;
+}
 
 aside {
   width: var(--aside-w, 340px); min-width: 240px; max-width: 70vw; border-left: 1px solid var(--zone-border); background: var(--zone-bg);
   display: flex; flex-direction: column; min-height: 0;
 }
+/* #inspectorView と #tabsView は排他的に切り替わる、aside の中身そのもの
+   (renderInspector in app.js が hidden を切り替える)。 */
+#tabsView { display: flex; flex-direction: column; min-height: 0; flex: 1; }
 .tabs { display: flex; border-bottom: 1px solid var(--zone-border); }
 .tab {
   flex: 1; border: 0; border-radius: 0; background: none; padding: 8px; color: var(--text-dim); font-size: var(--fs-sm);
@@ -508,6 +599,19 @@ aside {
 /* W-UI IA v2 §5a: プロジェクトが空のときの確認タブ全体の代替表示 — 2群の
    代わりにこの1文だけを大きめ・中央寄りに見せる。 */
 .confirmEmptyProject { padding: 32px 16px; text-align: center; font-size: var(--fs-sm); }
+/* 波2 追補#5: 保護区間(intent zones) — 構造編集(解除)は会話側、という
+   案内。--tally は使わない(警告ではない)。 */
+.intentZonesInfo { padding: 8px 12px 2px; display: flex; flex-direction: column; gap: 6px; }
+.intentZoneInfoRow {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 6px 8px; border-radius: var(--radius); background: var(--zone-surface-2); border: 1px solid var(--zone-border);
+  font-size: var(--fs-xs); color: var(--text-dim);
+}
+/* Same fix as .kitStatus's doc: without this, CJK text with no spaces can
+   get squeezed and wrap one character per line before the row itself wraps
+   onto a new line. flex-shrink:0 forces "wrap as a whole unit or not at
+   all", never "shrink into a sliver first". */
+.intentZoneInfoRow > span { flex-shrink: 0; }
 .inboxGroup + .inboxGroup { border-top: 1px solid var(--zone-border); margin-top: 4px; }
 .inboxHeading {
   display: flex; align-items: center; gap: 8px; padding: 10px 12px 2px;
@@ -664,6 +768,37 @@ aside {
 .btn-wash:hover { border-color: var(--text-dim); background: rgba(255, 255, 255, 0.05); }
 
 /* ---- media pool ("素材") panel ---- */
+/* W-UI IA v2 波2 §7: キットのリンク状態(素材タブ先頭、未リンク時は要素ごと
+   hidden — renderKitStatus in app.js)。 */
+.kitStatus {
+  margin: 8px 8px 0; padding: 6px 10px; border-radius: var(--radius);
+  background: var(--zone-surface-2); border: 1px solid var(--zone-border);
+  color: var(--text-dim); font-size: var(--fs-xs);
+  /* column, not row: a row flex context with no explicit basis on the text
+     span let the flex algorithm squeeze it down to a sliver next to the
+     chip button, and CJK text has no spaces to break on — it wrapped one
+     character per line in that sliver. Stacking avoids the whole class of
+     "flex child got squeezed" wrapping bugs for any future 2nd chip too. */
+  display: flex; flex-direction: column; align-items: flex-start; gap: 6px;
+}
+.kitStatus > span { white-space: normal; }
+/* W-UI IA v2 波2 §4: 音声パネル(プロジェクト全体設定 — BGM 単体の調整は
+   選択インスペクタ側)。既定は閉じた <details>、他の折りたたみ(検出条件)と
+   同じ語彙。 */
+.audioPanel { margin: 8px 8px 0; border: 1px solid var(--zone-border); border-radius: var(--radius); background: var(--zone-surface-2); }
+.audioPanel summary {
+  cursor: pointer; padding: 8px 10px; color: var(--text); font-size: var(--fs-sm); font-weight: 600; list-style: revert;
+}
+.audioPanelBody { padding: 4px 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+.audioField { display: flex; flex-direction: column; gap: 4px; }
+.audioField label { font-size: var(--fs-xs); color: var(--text-dim); display: flex; justify-content: space-between; gap: 6px; }
+.audioField select { align-self: flex-start; min-width: 140px; }
+.audioField input[type="range"] { width: 100%; }
+.audioCheck { display: flex; align-items: center; gap: 6px; font-size: var(--fs-xs); color: var(--text-dim); }
+.musicAddForm { display: flex; flex-direction: column; gap: 6px; padding: 8px; border-radius: var(--radius); background: var(--zone-surface); border: 1px solid var(--zone-border); }
+.musicAddForm label { display: flex; flex-direction: column; gap: 4px; font-size: var(--fs-xs); color: var(--text-dim); }
+.musicAddForm input[type="text"] { padding: 4px 6px; background: var(--zone-surface-2); border: 1px solid var(--zone-border); border-radius: 4px; color: var(--text); }
+.musicAddActions { display: flex; gap: 6px; justify-content: flex-end; }
 #mediaList { padding: 8px; display: flex; flex-direction: column; gap: 6px; overflow-y: auto; }
 .srcRow {
   display: flex; gap: 10px; align-items: center; padding: 6px; cursor: pointer;
@@ -737,9 +872,29 @@ aside {
   display: flex; align-items: center; gap: 10px; max-width: 60vw; font-size: var(--fs-sm);
 }
 #toast[role="alert"] { border-color: var(--reject); }
+/* mutate 応答の warning フィールド(例: BGM のダッキングが保護区間と重なる)
+   — エラーではないが読み流されては困るので amber + 手動close、既存の
+   自動消滅トーストより長め(app.js の toast(msg,{type:'warn'}) 呼び出し)。 */
+#toast[data-variant="warn"] { border-color: var(--tally); }
 .toastClose {
   padding: 0 6px; border-radius: 4px; line-height: 1; flex: none;
   background: none; border: 1px solid var(--stage-border);
+}
+/* ---- W-UI IA v2 波2 §8: 「Claude に頼む」チップ — 行き止まりで精密な
+   依頼文をクリップボードへコピーする(askClaudeChip in app.js)。構造系は
+   会話へ、という製品の賭けの実装(タリー琥珀は使わない — 警告ではなく案内)。 ---- */
+.askChip {
+  display: inline-flex; align-items: center; gap: 4px; font-size: var(--fs-xs);
+  color: var(--text-dim); border-color: var(--wash); padding: 2px 8px; margin-top: 2px;
+}
+.askChip:hover { color: var(--text); border-color: var(--text-dim); }
+.askChip::before { content: '💬'; font-size: 10px; }
+/* 波2 追補#1: custom-html モーションは書き出し時に焼き込まれない(プレビュー
+   だけの演出) — 常時バッジで明示。tally(警告)ではなく --wash(中立の注意
+   書き)。 */
+.moBlock .exportSkipBadge {
+  display: inline-block; margin-left: 3px; padding: 0 3px; border-radius: 2px;
+  background: rgba(0,0,0,0.35); color: #e7e2d8; font-size: 8px; font-weight: 700;
 }
 
 dialog#shortcutsDialog {
@@ -761,6 +916,7 @@ dialog#captionStyleDialog {
 }
 dialog#captionStyleDialog::backdrop { background: rgba(0,0,0,0.6); }
 dialog#captionStyleDialog h2 { font-size: var(--fs-lg); font-weight: 600; margin-bottom: 14px; }
+.capEnabledRow { flex-direction: row !important; align-items: center; gap: 8px; font-size: var(--fs-sm); color: var(--text); }
 .capField { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
 .capField label { font-size: var(--fs-xs); color: var(--text-dim); display: flex; justify-content: space-between; gap: 6px; }
 .capField select, .capField input[type="range"] { width: 100%; }
