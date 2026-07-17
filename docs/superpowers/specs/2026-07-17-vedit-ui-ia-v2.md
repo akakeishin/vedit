@@ -119,9 +119,10 @@ UI は確認・承認・微調整)を壊さずに借りること。
   cue が消えて字幕 UI への入口ごと消滅する現行構造の解消)。
 - **音声パネル拡張**: audio-mix(目標ラウドネス・duckAmount)も対象に
   (duckAmount はプレビューが常時参照しているのに変更手段がない)。
-- **add/remove の対称化**: motion-add(4プリセットのみ)・music-add の
-  追加ボタン、選択インスペクタに削除(motion/music/broll)。
-  sprite/dialogue/compose 系の追加 UI はコンポジション UI 波(波3)へ。
+- **add/remove の対称化**: music-add の追加ボタン、選択インスペクタに
+  削除(motion/music/broll)。**motion-add はボタンを作らない**
+  (Codex 判定を採用: claude-only-with-guidance — 「頼むチップ」で誘導)。
+  sprite/dialogue/compose 系の追加 UI もコンポジション UI 波(波3)へ。
 - **color-adjust のプレビュー近似**: exposure→CSS brightness、
   saturation→saturate で近似反映。WB は「書き出しで確認」の注記を表示
   (嘘の近似はしない)。
