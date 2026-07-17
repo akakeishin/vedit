@@ -70,6 +70,19 @@ export interface Manifest {
    * <dir>`, cleared via `vedit kit-unlink`. See src/core/kit.ts.
    */
   kit?: { path: string };
+  /**
+   * Per-cue text corrections (W-CAP "NLE 内での字幕編集"), keyed by the
+   * cue's leading word id in `"sourceId:wordId"` form (the first element of
+   * CaptionCue.wordIds, prefixed with its source — see captionCueKey in
+   * core/captions.ts, the only place this key format is built/consumed).
+   * An empty string hides that cue entirely; there is no separate "restore
+   * original" value stored here — clearing a correction means deleting its
+   * key (see the daemon's `caption-text` op with `text: null`, or `vedit
+   * caption-text <key> --clear`). Optional for backward compatibility with
+   * existing project.json files; a cue whose key has no entry here is
+   * unaffected (full regression).
+   */
+  captionTextOverrides?: Record<string, string>;
 }
 
 export interface Source {
@@ -262,6 +275,51 @@ export interface CaptionSettings {
    * to 8 when absent.
    */
   maxCps?: number;
+  /**
+   * Per-project caption style overrides (W-CAP "NLE 内での字幕編集"),
+   * layered on TOP of whatever `style` resolves to (a built-in
+   * ASS_STYLE_PRESETS id or a linked kit's style) — every field is
+   * optional ("書いた分だけ効く"). Absent (or an override object with no
+   * fields set) leaves toAss/toSrt/the web preview byte-for-byte the same
+   * as before this feature existed. Set via the web caption style popover
+   * (drag-to-reposition for `position`) or `vedit captions
+   * --font/--text-color/--outline-color/--box-color/--size-scale/
+   * --outline-width/--bg-opacity/--position-v` (same `captions` patch op as
+   * `style`/`maxChars`; the daemon merges a given `overrides` object onto
+   * the existing one field-by-field, and clears it entirely when the patch
+   * sends `overrides: null`). See applyCaptionOverrides in export/render.ts
+   * for exactly how each field maps onto the ASS Style line, and
+   * renderCaption in web/app.js for the CSS-custom-property mirror.
+   */
+  overrides?: {
+    /**
+     * A system font family name (used as-is, resolved by libass/CoreText
+     * at render/preview time), OR a font FILE name under a linked kit's
+     * fonts/ directory, with or without its extension (e.g. "MyFont-Bold"
+     * or "MyFont-Bold.ttf") — resolveKitFontFile in core/fonts.ts decides
+     * which by trying it against the kit's fonts/ dir first. GET
+     * /api/fonts lists both groups for the web font <select>.
+     */
+    font?: string;
+    palette?: { text?: string; outline?: string; box?: string };
+    /** 0.5..2, multiplies the resolved style's font size. */
+    sizeScale?: number;
+    /** ASS Outline width in px; 0 switches BorderStyle to an opaque box (same convention as kitAssStyle's caption.outline_width). */
+    outlineWidth?: number;
+    /** 0..1 background box opacity (0 = fully transparent, 1 = fully opaque). */
+    bgOpacity?: number;
+    position?: {
+      /**
+       * 0..1, vertical position of the caption box's center (0 = top of
+       * frame, 1 = bottom); default ~0.94, matching the pre-W-CAP
+       * hardcoded placement (web: `bottom: 6%`; ASS: MarginV = height*0.06
+       * with Alignment=2/bottom-anchor) byte-for-byte when omitted.
+       */
+      v: number;
+      /** Only 'center' is supported today; reserved for future horizontal placement. */
+      h?: 'center';
+    };
+  };
 }
 
 // ---- transcript ----

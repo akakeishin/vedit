@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { captionCues, sanitizeCaptionText } from './captions.js';
+import { captionCueKey, captionCues, sanitizeCaptionText } from './captions.js';
 import type { Manifest, Transcript, Word } from './types.js';
 
 function manifest(clips: { srcIn: number; srcOut: number }[] = [{ srcIn: 0, srcOut: 20 }]): Manifest {
@@ -115,6 +115,84 @@ describe('captionCues', () => {
       // With maxCps=100 the CPS requirement is trivially satisfied by the
       // existing 0.6s flush floor — no extension needed.
       expect(cues[0].tlEnd - cues[0].tlStart).toBeCloseTo(0.6, 5);
+    });
+  });
+
+  describe('sourceId/key (W-CAP)', () => {
+    it('every cue carries sourceId and a key of `${sourceId}:${wordIds[0]}`', () => {
+      const m = manifest([{ srcIn: 0, srcOut: 20 }]);
+      const words: Word[] = [
+        { id: 'w0', text: 'Hello.', t0: 1.0, t1: 1.5, p: 0.9 },
+        { id: 'w1', text: 'World.', t0: 5.0, t1: 5.5, p: 0.9 },
+      ];
+      const t: Transcript = { sourceId: 's1', language: 'en', words };
+      const cues = captionCues(m, [t]);
+      expect(cues).toHaveLength(2);
+      expect(cues[0].sourceId).toBe('s1');
+      expect(cues[0].key).toBe('s1:w0');
+      expect(cues[0].key).toBe(captionCueKey('s1', 'w0'));
+      expect(cues[1].key).toBe('s1:w1');
+    });
+
+    it('a merged cue (CPS-floor merge) keeps the chronologically-earlier cue\'s key', () => {
+      const m = manifest([{ srcIn: 0, srcOut: 20 }]);
+      // Same fixture as the "regression" CPS-floor test above: too-short
+      // adjacent cues merge into one.
+      const words: Word[] = [
+        { id: 'w0', text: 'では、また次回!', t0: 10, t1: 10.05, p: 0.9 },
+        { id: 'w1', text: 'next.', t0: 10.3, t1: 10.6, p: 0.9 },
+      ];
+      const t: Transcript = { sourceId: 's1', language: 'ja', words };
+      const cues = captionCues(m, [t]);
+      expect(cues).toHaveLength(1);
+      expect(cues[0].key).toBe('s1:w0');
+    });
+  });
+
+  describe('captionTextOverrides (W-CAP)', () => {
+    function words(): Word[] {
+      return [
+        { id: 'w0', text: 'Hello.', t0: 1.0, t1: 1.5, p: 0.9 },
+        { id: 'w1', text: 'World.', t0: 5.0, t1: 5.5, p: 0.9 },
+      ];
+    }
+    function transcript(): Transcript {
+      return { sourceId: 's1', language: 'en', words: words() };
+    }
+
+    it('replaces a cue\'s text and records the original under originalText', () => {
+      const base = manifest([{ srcIn: 0, srcOut: 20 }]);
+      const m: Manifest = { ...base, captionTextOverrides: { 's1:w0': 'Bonjour.' } };
+      const cues = captionCues(m, [transcript()]);
+      expect(cues[0].text).toBe('Bonjour.');
+      expect(cues[0].originalText).toBe('Hello.');
+      // The untouched cue is unaffected — no originalText at all.
+      expect(cues[1].text).toBe('World.');
+      expect(cues[1].originalText).toBeUndefined();
+    });
+
+    it('an empty-string override hides that cue entirely, leaving the others untouched', () => {
+      const base = manifest([{ srcIn: 0, srcOut: 20 }]);
+      const m: Manifest = { ...base, captionTextOverrides: { 's1:w0': '' } };
+      const cues = captionCues(m, [transcript()]);
+      expect(cues).toHaveLength(1);
+      expect(cues[0].key).toBe('s1:w1');
+    });
+
+    it('a key that does not match any cue is silently ignored (no crash, no effect)', () => {
+      const base = manifest([{ srcIn: 0, srcOut: 20 }]);
+      const m: Manifest = { ...base, captionTextOverrides: { 's1:w999': 'nope' } };
+      const cues = captionCues(m, [transcript()]);
+      expect(cues.map((c) => c.text)).toEqual(['Hello.', 'World.']);
+    });
+
+    it('absent captionTextOverrides is a full regression — cues identical to no overrides at all', () => {
+      const base = manifest([{ srcIn: 0, srcOut: 20 }]);
+      const withField = captionCues({ ...base, captionTextOverrides: {} }, [transcript()]);
+      const without = captionCues(base, [transcript()]);
+      expect(withField.map((c) => ({ text: c.text, tlStart: c.tlStart, tlEnd: c.tlEnd }))).toEqual(
+        without.map((c) => ({ text: c.text, tlStart: c.tlStart, tlEnd: c.tlEnd })),
+      );
     });
   });
 });

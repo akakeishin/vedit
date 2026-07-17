@@ -75,6 +75,7 @@ const S = {
   showWordKeys: new Set(), // "sourceId:wordId" — W-UI §0 "show words" highlight, separate from selWords (no delete side effect)
   activeTask: null, // W-UI §1 claudeStrip: { label } | null — current long-running background task, from WS progress events
   timelineDrag: null, // in-progress timeline drag/trim (see startClipReorderDrag/startTrimDrag/startBlockDrag)
+  fontsList: null, // W-CAP: /api/fonts response ({kit:[{name,family?,path}], system:[{family}]}), refreshed every reload()
 };
 const PLAY_RATES = [1, 1.5, 2];
 
@@ -103,6 +104,11 @@ async function reload() {
     S.overlays = pr.overlays ?? [];
     S.sprites = pr.sprites ?? [];
     S.kit = await api('/api/kit').catch(() => ({ path: null, kit: null }));
+    // W-CAP: fetched once per reload (daemon-side memory+disk cached, see
+    // GET /api/fonts in daemon.ts) rather than only on popover-open, so
+    // renderCaption can resolve an ALREADY-set overrides.font's @font-face
+    // (if it's a kit font) even before the user ever opens the popover.
+    S.fontsList = await api('/api/fonts').catch(() => ({ kit: [], system: [] }));
     S.cues = await api('/api/captions');
     S.candidates = await api('/api/candidates');
     S.candidatesAll = await api('/api/candidates?all=1');
@@ -300,7 +306,7 @@ $('playBtn').onclick = () => {
 // letting the document-level handler also fire would double-trigger or
 // hijack keys the control itself needs (see item 15 in the UX/a11y pass).
 function globalShortcutsBlocked(target) {
-  return !!target?.closest?.('button, select, [role="tab"], dialog');
+  return !!target?.closest?.('button, select, [role="tab"], [role="button"], dialog');
 }
 document.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.isContentEditable) return;
@@ -1319,6 +1325,14 @@ function kitStyleFor(styleId) {
 }
 
 // ---------- captions & motion overlays ----------
+//
+// W-CAP "NLE 内での字幕編集": a caption cue in the stage is clickable (opens
+// the style popover: font/palette/size/outline/background), draggable
+// (vertical position — see startCaptionDrag), and double-clickable (inline
+// contenteditable text correction — see startCaptionTextEdit). Every commit
+// goes through the same revision-checked mutate() path as everything else
+// in this file; style-popover edits preview live by temporarily patching
+// S.manifest.captions.overrides in place (no revision) until 適用/キャンセル.
 function renderCaption(tl) {
   const layer = $('captionLayer');
   const styleId = S.manifest?.captions.style ?? 'clean';
@@ -1342,13 +1356,394 @@ function renderCaption(tl) {
   } else {
     layer.className = `style-${styleId}`;
   }
+  const overrides = S.manifest?.captions.overrides;
+  // Default 0.94 mirrors CaptionSettings.overrides.position's documented
+  // default and export/render.ts's toAss MarginV formula exactly — see the
+  // `bottom: calc((1 - var(--cap-position-v, 0.94)) * 100%)` rule in
+  // style.css.
+  layer.style.setProperty('--cap-position-v', String(overrides?.position?.v ?? 0.94));
+
   const cue = S.manifest?.captions.enabled ? S.cues.find((c) => tl >= c.tlStart && tl < c.tlEnd) : null;
   const text = cue ? cue.text : '';
-  if (layer.dataset.cur !== text) {
-    layer.dataset.cur = text;
-    layer.innerHTML = text ? `<span class="cue">${esc(text)}</span>` : '';
+  // Cache key includes the cue's key (not just its text) so a genuinely
+  // different cue that happens to render the same text still gets a freshly
+  // wired DOM element (fresh event handlers bound to the right cue object).
+  const cacheKey = `${cue?.key ?? ''}:${text}`;
+  if (layer.dataset.cur !== cacheKey) {
+    layer.dataset.cur = cacheKey;
+    layer.innerHTML = '';
+    if (cue && text) layer.appendChild(buildCueEl(cue));
+  }
+  // Style overrides can change independently of text/key (live popover
+  // preview, or just a plain style-only patch after undo/redo) — reapply to
+  // whichever cue element currently exists every frame; cheap (a handful of
+  // inline style writes), and skipped entirely while the user is mid text
+  // edit so it never fights the contenteditable caret/selection.
+  const cueEl = layer.querySelector('.cue');
+  if (cueEl && !cueEl.isContentEditable) applyCueOverrideStyles(cueEl, overrides);
+}
+
+/** (Re)fill a cue <span>'s content: its text, plus the "✎修正済み" marker when a caption-text correction is active. Shared by buildCueEl and startCaptionTextEdit's cancel path so both stay in sync. */
+function renderCueContent(span, cue) {
+  span.textContent = cue.text;
+  if (cue.originalText) {
+    const mark = document.createElement('span');
+    mark.className = 'cueEditedMark';
+    mark.textContent = '✎修正済み';
+    mark.title = `元のテキスト: ${cue.originalText}`;
+    span.appendChild(mark);
   }
 }
+
+function buildCueEl(cue) {
+  const span = document.createElement('span');
+  span.className = 'cue';
+  renderCueContent(span, cue);
+  span.dataset.key = cue.key ?? '';
+  span.tabIndex = 0;
+  span.setAttribute('role', 'button');
+  span.setAttribute('aria-label', '字幕: クリックでスタイル編集、ドラッグで縦位置変更、ダブルクリックでテキスト修正');
+  span.addEventListener('pointerdown', (e) => startCaptionDrag(e, cue, span));
+  span.addEventListener('dblclick', (e) => {
+    e.stopPropagation();
+    clearTimeout(cueClickTimer);
+    cueClickTimer = null;
+    startCaptionTextEdit(cue, span);
+  });
+  span.addEventListener('keydown', (e) => {
+    // Guard against text-edit mode: this listener stays attached for the
+    // element's whole lifetime, including while startCaptionTextEdit has
+    // made it contenteditable — without this check, typing a plain space
+    // while correcting a cue's text would ALSO reopen the style popover
+    // (addEventListener doesn't let an earlier listener's stopPropagation
+    // suppress a later listener on the very same element).
+    if (e.target.isContentEditable) return;
+    // Scoped to this element — never reaches the document-level 1-letter
+    // shortcut handler regardless (globalShortcutsBlocked already treats
+    // [role="button"] as blocked), but stopPropagation keeps intent explicit.
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      e.stopPropagation();
+      openCaptionStylePopover(cue);
+    }
+  });
+  return span;
+}
+
+/** Apply CaptionSettings.overrides as inline styles on a cue <span> — a JS mirror of applyCaptionOverrides in export/render.ts (see that function's doc for the field-by-field mapping); only fields actually set on `overrides` touch anything, so an override with just e.g. sizeScale never disturbs the active style's own colors. */
+function applyCueOverrideStyles(cueEl, overrides) {
+  cueEl.style.color = overrides?.palette?.text || '';
+  cueEl.style.fontSize = overrides?.sizeScale != null ? `calc(clamp(14px, 2.6vw, 26px) * ${overrides.sizeScale})` : '';
+  cueEl.style.webkitTextStroke =
+    overrides?.outlineWidth != null || overrides?.palette?.outline
+      ? `${overrides?.outlineWidth ?? 1}px ${overrides?.palette?.outline || 'transparent'}`
+      : '';
+  // Box background: set as an INLINE `background` (not a stylesheet class)
+  // so it reliably wins over #captionLayer.style-kit .cue's own background
+  // rule — an ID-selector rule beats a class-only one on specificity alone,
+  // no matter the source order, so a class toggle here would silently lose
+  // to the kit style's background when both are active at once.
+  const hasBoxOverride = Boolean(overrides?.palette?.box) || overrides?.bgOpacity != null;
+  if (hasBoxOverride) {
+    cueEl.style.setProperty('--cap-box', overrides?.palette?.box || '#000000');
+    cueEl.style.setProperty('--cap-box-opacity', overrides?.bgOpacity != null ? String(overrides.bgOpacity) : '0.55');
+    cueEl.style.background = 'color-mix(in srgb, var(--cap-box) calc(var(--cap-box-opacity) * 100%), transparent)';
+  } else {
+    cueEl.style.removeProperty('--cap-box');
+    cueEl.style.removeProperty('--cap-box-opacity');
+    cueEl.style.background = '';
+  }
+  if (overrides?.font) {
+    // overrides.font is either a kit font FILE name (with or without
+    // extension) or a plain system family name (see CaptionSettings
+    // .overrides.font's doc in types.ts) — match it against S.fontsList.kit
+    // the same way export/render.ts's resolveKitFontFile does (extension-
+    // insensitive) to decide whether it needs a @font-face registration.
+    const base = overrides.font.replace(/\.[^./]+$/, '');
+    const kitMatch = S.fontsList?.kit?.find((f) => f.name === overrides.font || f.name === base);
+    cueEl.style.fontFamily = kitMatch ? `'${ensureKitFontFace(kitMatch.path)}'` : overrides.font;
+  } else {
+    cueEl.style.fontFamily = '';
+  }
+}
+
+// ---- drag-to-reposition (vertical only) ----
+// Mirrors the click-vs-drag threshold pattern used by startClipReorderDrag
+// et al elsewhere in this file: a pointerdown that never moves past 4px is
+// treated as a click (opens the style popover, after a short delay so a
+// dblclick isn't misread as two single clicks — see cueClickTimer).
+let cueClickTimer = null;
+function startCaptionDrag(e, cue, cueEl) {
+  if (cueEl.isContentEditable) return; // mid text-edit: let native caret/selection handle pointer events
+  e.stopPropagation();
+  const startY = e.clientY;
+  const box = $('videoBox').getBoundingClientRect();
+  const guide = $('captionDragGuide');
+  let moved = false;
+
+  const onMove = (ev) => {
+    const dy = ev.clientY - startY;
+    if (!moved && Math.abs(dy) < 4) return;
+    if (!moved) {
+      moved = true;
+      S.timelineDrag = { kind: 'caption-position' };
+      guide.hidden = false;
+    }
+    const v = Math.max(0, Math.min(1, (ev.clientY - box.top) / box.height));
+    $('captionLayer').style.setProperty('--cap-position-v', String(v));
+    guide.style.top = `${v * 100}%`;
+  };
+  const onUp = async (ev) => {
+    window.removeEventListener('pointermove', onMove);
+    window.removeEventListener('pointerup', onUp);
+    S.timelineDrag = null;
+    guide.hidden = true;
+    if (!moved) {
+      clearTimeout(cueClickTimer);
+      cueClickTimer = setTimeout(() => {
+        cueClickTimer = null;
+        openCaptionStylePopover(cue);
+      }, 260); // dblclick threshold — canceled by buildCueEl's dblclick handler
+      return;
+    }
+    const v = Math.max(0, Math.min(1, (ev.clientY - box.top) / box.height));
+    const { ok } = await mutate(
+      { op: 'captions', patch: { overrides: { position: { v: Math.round(v * 100) / 100 } } } },
+      { conflictMessage: '字幕の位置変更は反映されませんでした。最新状態を確認してもう一度実行してください' },
+    );
+    if (!ok) renderCaption(tlNow());
+  };
+  window.addEventListener('pointermove', onMove);
+  window.addEventListener('pointerup', onUp);
+}
+
+// ---- inline text edit (dblclick) ----
+function startCaptionTextEdit(cue, span) {
+  if (!cue.key) {
+    toast('この字幕は編集できません(単語情報がありません)', { type: 'error' });
+    return;
+  }
+  const original = cue.text;
+  span.textContent = original; // drop the "✎修正済み" mark node while editing raw text
+  span.contentEditable = 'true';
+  span.focus();
+  const sel = window.getSelection();
+  if (sel) {
+    const range = document.createRange();
+    range.selectNodeContents(span);
+    sel.removeAllRanges();
+    sel.addRange(range);
+  }
+
+  let finished = false;
+  const cleanup = () => {
+    span.contentEditable = 'false';
+    span.removeEventListener('keydown', onKeydown);
+    span.removeEventListener('blur', onBlur);
+  };
+  const commit = async () => {
+    if (finished) return;
+    finished = true;
+    cleanup();
+    const newText = span.textContent.trim();
+    if (newText === original) {
+      renderCueContent(span, cue); // no-op edit: just restore the ✎ mark, if any
+      return;
+    }
+    await mutate(
+      { op: 'caption-text', key: cue.key, text: newText },
+      { conflictMessage: '字幕テキストの修正は反映されませんでした。最新状態を確認してもう一度実行してください' },
+    );
+  };
+  const cancel = () => {
+    if (finished) return;
+    finished = true;
+    cleanup();
+    renderCueContent(span, cue);
+  };
+  const onKeydown = (e) => {
+    e.stopPropagation(); // never let this reach the document-level 1-letter shortcut handler
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      commit();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      cancel();
+    }
+  };
+  const onBlur = () => commit();
+  span.addEventListener('keydown', onKeydown);
+  span.addEventListener('blur', onBlur);
+}
+
+// ---- style popover (click) ----
+async function loadFontOptions(selectEl, currentValue) {
+  let fonts = S.fontsList;
+  if (!fonts) {
+    fonts = await api('/api/fonts').catch(() => ({ kit: [], system: [] }));
+    S.fontsList = fonts;
+  }
+  selectEl.innerHTML = '';
+  const none = document.createElement('option');
+  none.value = '';
+  none.textContent = '(既定のフォント)';
+  selectEl.appendChild(none);
+  if (fonts.kit?.length) {
+    const g = document.createElement('optgroup');
+    g.label = 'キット';
+    for (const f of fonts.kit) {
+      const opt = document.createElement('option');
+      opt.value = f.name;
+      opt.textContent = f.family && f.family !== f.name ? `${f.name} (${f.family})` : f.name;
+      g.appendChild(opt);
+    }
+    selectEl.appendChild(g);
+  }
+  if (fonts.system?.length) {
+    const g = document.createElement('optgroup');
+    g.label = 'システム';
+    for (const f of fonts.system) {
+      const opt = document.createElement('option');
+      opt.value = f.family;
+      opt.textContent = f.family;
+      g.appendChild(opt);
+    }
+    selectEl.appendChild(g);
+  }
+  selectEl.value = currentValue || '';
+  // currentValue not among the listed options (e.g. set on another machine,
+  // or the font was since removed) — keep it selectable instead of silently
+  // discarding the setting when the popover just happens to open.
+  if (currentValue && selectEl.value !== currentValue) {
+    const opt = document.createElement('option');
+    opt.value = currentValue;
+    opt.textContent = `${currentValue} (未検出)`;
+    selectEl.appendChild(opt);
+    selectEl.value = currentValue;
+  }
+}
+
+function cloneCaptionOverrides(o) {
+  if (!o) return {};
+  const clone = { ...o };
+  if (o.palette) clone.palette = { ...o.palette };
+  if (o.position) clone.position = { ...o.position };
+  return clone;
+}
+
+let captionPopoverInvoker = null;
+let captionOverridesOriginal; // S.manifest.captions.overrides as of dialog-open, restored on cancel
+let captionOverridesDraft = {};
+let captionResetRequested = false;
+let captionApplied = false;
+
+function previewCaptionOverrides() {
+  S.manifest.captions.overrides = captionResetRequested ? undefined : captionOverridesDraft;
+  renderCaption(tlNow());
+}
+
+function syncCaptionPopoverControls() {
+  const d = captionOverridesDraft;
+  loadFontOptions($('capFont'), d.font);
+  $('capTextColor').value = d.palette?.text || '#ffffff';
+  $('capOutlineColor').value = d.palette?.outline || '#000000';
+  $('capBoxColor').value = d.palette?.box || '#000000';
+  const sizeScale = d.sizeScale ?? 1;
+  $('capSizeScale').value = String(sizeScale);
+  $('capSizeScaleVal').textContent = `${sizeScale.toFixed(2)}x`;
+  const outlineWidth = d.outlineWidth ?? 3;
+  $('capOutlineWidth').value = String(outlineWidth);
+  $('capOutlineWidthVal').textContent = `${outlineWidth}px`;
+  const bgOpacity = d.bgOpacity ?? 0.55;
+  $('capBgOpacity').value = String(bgOpacity);
+  $('capBgOpacityVal').textContent = `${Math.round(bgOpacity * 100)}%`;
+}
+
+function openCaptionStylePopover(cue) {
+  const dlg = $('captionStyleDialog');
+  if (dlg.open) return;
+  captionOverridesOriginal = S.manifest.captions.overrides;
+  captionOverridesDraft = cloneCaptionOverrides(captionOverridesOriginal);
+  captionResetRequested = false;
+  captionApplied = false;
+  captionPopoverInvoker = document.activeElement;
+  syncCaptionPopoverControls();
+  dlg.showModal();
+}
+function closeCaptionStylePopover() {
+  const dlg = $('captionStyleDialog');
+  if (dlg.open) dlg.close();
+}
+$('capFont').onchange = (e) => {
+  captionResetRequested = false;
+  if (e.target.value) captionOverridesDraft.font = e.target.value;
+  else delete captionOverridesDraft.font;
+  previewCaptionOverrides();
+};
+function wireCapColorInput(id, field) {
+  $(id).oninput = (e) => {
+    captionResetRequested = false;
+    captionOverridesDraft.palette = { ...captionOverridesDraft.palette, [field]: e.target.value };
+    previewCaptionOverrides();
+  };
+}
+wireCapColorInput('capTextColor', 'text');
+wireCapColorInput('capOutlineColor', 'outline');
+wireCapColorInput('capBoxColor', 'box');
+$('capSizeScale').oninput = (e) => {
+  captionResetRequested = false;
+  captionOverridesDraft.sizeScale = Number(e.target.value);
+  $('capSizeScaleVal').textContent = `${captionOverridesDraft.sizeScale.toFixed(2)}x`;
+  previewCaptionOverrides();
+};
+$('capOutlineWidth').oninput = (e) => {
+  captionResetRequested = false;
+  captionOverridesDraft.outlineWidth = Number(e.target.value);
+  $('capOutlineWidthVal').textContent = `${captionOverridesDraft.outlineWidth}px`;
+  previewCaptionOverrides();
+};
+$('capBgOpacity').oninput = (e) => {
+  captionResetRequested = false;
+  captionOverridesDraft.bgOpacity = Number(e.target.value);
+  $('capBgOpacityVal').textContent = `${Math.round(captionOverridesDraft.bgOpacity * 100)}%`;
+  previewCaptionOverrides();
+};
+$('capResetBtn').onclick = () => {
+  captionResetRequested = true;
+  captionOverridesDraft = {};
+  syncCaptionPopoverControls();
+  previewCaptionOverrides();
+};
+$('capCancelBtn').onclick = () => closeCaptionStylePopover();
+$('capApplyBtn').onclick = async () => {
+  // Nothing actually changed (opened, looked, closed without touching
+  // anything) — skip the round trip / no-op revision entirely.
+  if (!captionResetRequested && Object.keys(captionOverridesDraft).length === 0) {
+    closeCaptionStylePopover();
+    return;
+  }
+  captionApplied = true;
+  const patchOverrides = captionResetRequested ? null : captionOverridesDraft;
+  closeCaptionStylePopover();
+  await mutate(
+    { op: 'captions', patch: { overrides: patchOverrides } },
+    { conflictMessage: '字幕スタイルの変更は反映されませんでした。最新状態を確認してもう一度実行してください' },
+  );
+};
+$('captionStyleDialog').addEventListener('click', (e) => {
+  if (e.target === $('captionStyleDialog')) closeCaptionStylePopover();
+});
+$('captionStyleDialog').addEventListener('close', () => {
+  if (!captionApplied) {
+    // Esc, backdrop click, or キャンセル — revert the live preview back to
+    // whatever was actually saved (mutate() on 適用 already reloads, so this
+    // branch only ever needs to undo a NOT-applied draft).
+    S.manifest.captions.overrides = captionOverridesOriginal;
+    renderCaption(tlNow());
+  }
+  captionPopoverInvoker?.focus?.();
+  captionPopoverInvoker = null;
+});
 
 // Absolute-positioned <img> per resolved (non-orphan) sprite active at `tl`
 // — a JS port of ops.ts's spriteGeometry (pure math kept in sync by hand;

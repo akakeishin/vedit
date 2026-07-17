@@ -51,9 +51,10 @@ import { packTranscript } from '../core/pack.js';
 import { detectScenesForSource, packScenes } from '../core/scenes.js';
 import { ingestFile, makeProxy, probeAudio } from '../ingest/ingest.js';
 import { run } from '../ingest/run.js';
-import type { CutCandidate, Manifest, MotionItem, RevisionEntry, SceneFile, Transcript } from '../core/types.js';
+import type { CaptionSettings, CutCandidate, Manifest, MotionItem, RevisionEntry, SceneFile, Transcript } from '../core/types.js';
 import { freshId } from '../core/ops.js';
 import { applyKitDefaults, readKitFile, recognizedKitSections } from '../core/kit.js';
+import { listSystemFonts, scanKitFonts } from '../core/fonts.js';
 import { locateMedia, type MediaFingerprint } from '../ingest/locate.js';
 
 const WEB_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'web');
@@ -157,6 +158,95 @@ function parseRevRef(v: unknown): number | null {
     return Number.isFinite(n) ? n : null;
   }
   return null;
+}
+
+// ---- W-CAP: captions.overrides patch validation + merge (pure) ----
+
+const HEX_COLOR_RE = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
+
+/**
+ * Validate a `captions` patch's `overrides` field (before it's null, which
+ * the caller handles separately as "clear everything"). Every field is
+ * optional — only fields actually present are checked — matching every
+ * other patch-shaped op in this file (e.g. `maxCps` above). Returns an
+ * error message, or null when the patch is well-formed.
+ */
+function validateCaptionOverridesPatch(patch: unknown): string | null {
+  if (typeof patch !== 'object' || patch === null || Array.isArray(patch)) {
+    return 'captions.overrides must be an object (or null to clear all overrides)';
+  }
+  const o = patch as Record<string, unknown>;
+  if (o.sizeScale !== undefined) {
+    const v = o.sizeScale;
+    if (typeof v !== 'number' || !Number.isFinite(v) || v < 0.5 || v > 2) {
+      return 'captions.overrides.sizeScale must be a number between 0.5 and 2';
+    }
+  }
+  if (o.outlineWidth !== undefined) {
+    const v = o.outlineWidth;
+    if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) {
+      return 'captions.overrides.outlineWidth must be a non-negative number';
+    }
+  }
+  if (o.bgOpacity !== undefined) {
+    const v = o.bgOpacity;
+    if (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > 1) {
+      return 'captions.overrides.bgOpacity must be a number between 0 and 1';
+    }
+  }
+  if (o.font !== undefined && (typeof o.font !== 'string' || !o.font)) {
+    return 'captions.overrides.font must be a non-empty string';
+  }
+  if (o.palette !== undefined) {
+    if (typeof o.palette !== 'object' || o.palette === null || Array.isArray(o.palette)) {
+      return 'captions.overrides.palette must be an object';
+    }
+    for (const [k, v] of Object.entries(o.palette as Record<string, unknown>)) {
+      if (!['text', 'outline', 'box'].includes(k)) return `captions.overrides.palette: unknown field "${k}"`;
+      if (v !== undefined && (typeof v !== 'string' || !HEX_COLOR_RE.test(v))) {
+        return `captions.overrides.palette.${k} must be a hex color like #rrggbb`;
+      }
+    }
+  }
+  if (o.position !== undefined) {
+    if (typeof o.position !== 'object' || o.position === null || Array.isArray(o.position)) {
+      return 'captions.overrides.position must be an object';
+    }
+    const pos = o.position as Record<string, unknown>;
+    if (pos.v !== undefined) {
+      const v = pos.v;
+      if (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > 1) {
+        return 'captions.overrides.position.v must be a number between 0 and 1';
+      }
+    }
+    if (pos.h !== undefined && pos.h !== 'center') {
+      return 'captions.overrides.position.h must be "center" (only supported value today)';
+    }
+  }
+  return null;
+}
+
+/**
+ * Merge a validated `overrides` patch onto the current
+ * `CaptionSettings.overrides` — one level deep for `palette`/`position` too,
+ * so e.g. patching just `{palette:{text:'#fff'}}` never drops a
+ * previously-set `palette.outline`. Mirrors the motion-update sidecar
+ * merge convention elsewhere in this file (old content spread first, patch
+ * fields win). Full clear is a separate path (`overrides: null`), not
+ * expressible through this merge — see the `captions` op handler below.
+ */
+function mergeCaptionOverrides(
+  base: CaptionSettings['overrides'] | undefined,
+  patch: Record<string, unknown>,
+): NonNullable<CaptionSettings['overrides']> {
+  const merged: NonNullable<CaptionSettings['overrides']> = { ...base };
+  if (patch.font !== undefined) merged.font = patch.font as string;
+  if (patch.sizeScale !== undefined) merged.sizeScale = patch.sizeScale as number;
+  if (patch.outlineWidth !== undefined) merged.outlineWidth = patch.outlineWidth as number;
+  if (patch.bgOpacity !== undefined) merged.bgOpacity = patch.bgOpacity as number;
+  if (patch.palette !== undefined) merged.palette = { ...base?.palette, ...(patch.palette as object) };
+  if (patch.position !== undefined) merged.position = { ...base?.position, ...(patch.position as object) } as { v: number; h?: 'center' };
+  return merged;
 }
 
 /**
@@ -424,6 +514,17 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
     if (pathname === '/api/captions') {
       const m = await p.manifest();
       return json(res, 200, captionCues(m, await allTranscripts(p)));
+    }
+    if (pathname === '/api/fonts' && method === 'GET') {
+      // W-CAP: font <select> for the web caption style popover (grouped
+      // kit/system). Kit fonts are re-scanned fresh every call (small
+      // directory, same convention as readKitFile); system fonts are
+      // memory+disk cached (1 day) — see listSystemFonts in core/fonts.ts —
+      // so this route stays cheap after its first, possibly-slow call.
+      const m = await p.manifest();
+      const kitFonts = m.kit ? await scanKitFonts(m.kit.path).catch(() => []) : [];
+      const systemFonts = await listSystemFonts(path.join(p.cacheDir, 'fonts.json'));
+      return json(res, 200, { kit: kitFonts, system: systemFonts });
     }
     if (pathname.startsWith('/api/motion/') && method === 'GET') {
       const id = pathname.split('/')[3];
@@ -735,10 +836,70 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
             return json(res, 400, { error: 'captions.maxCps must be a number between 1 and 30' });
           }
         }
-        await mutate(p, actor, baseRev, 'captions', b, `captions ${JSON.stringify(b.patch)}`, (m) => ({
-          ...m,
-          captions: { ...m.captions, ...b.patch },
-        }));
+        // W-CAP: `overrides` is validated + merged specially (see
+        // validateCaptionOverridesPatch/mergeCaptionOverrides above) rather
+        // than passed through the plain spread below — `null` means "clear
+        // every override", an object means "merge these fields onto
+        // whatever's already set" (never a wholesale replace, so e.g. the
+        // web popover applying just a size change never drops a
+        // previously-set color). Absent from the patch entirely -> captions
+        // .overrides is left completely untouched, same as any other
+        // unmentioned captions field.
+        const hasOverridesPatch = b.patch && Object.prototype.hasOwnProperty.call(b.patch, 'overrides');
+        if (hasOverridesPatch && b.patch.overrides !== null) {
+          const err = validateCaptionOverridesPatch(b.patch.overrides);
+          if (err) return json(res, 400, { error: err });
+        }
+        await mutate(p, actor, baseRev, 'captions', b, `captions ${JSON.stringify(b.patch)}`, (m) => {
+          const { overrides: overridesPatch, ...restPatch } = b.patch ?? {};
+          let captions: CaptionSettings = { ...m.captions, ...restPatch };
+          if (hasOverridesPatch) {
+            if (overridesPatch === null) {
+              const { overrides: _drop, ...rest } = captions;
+              captions = rest;
+            } else {
+              captions = { ...captions, overrides: mergeCaptionOverrides(m.captions.overrides, overridesPatch) };
+            }
+          }
+          return { ...m, captions };
+        });
+        return json(res, 200, { state: await stateSummary(p) });
+      }
+      if (b.op === 'caption-text') {
+        // W-CAP: text corrections keyed by the cue's leading word id
+        // ("sourceId:wordId", see captionCueKey) — b.text === null clears a
+        // previously-set correction, '' hides that cue entirely (see
+        // captionCues in core/captions.ts), any other string replaces it.
+        const key = b.key;
+        if (typeof key !== 'string' || !key || !key.includes(':')) {
+          return json(res, 400, { error: 'caption-text: key is required, in "sourceId:wordId" form' });
+        }
+        const sourceId = key.slice(0, key.indexOf(':'));
+        if (!m0.sources.some((s) => s.id === sourceId)) {
+          return json(res, 400, { error: `caption-text: unknown source in key: ${sourceId}` });
+        }
+        const text = b.text;
+        if (text !== null && typeof text !== 'string') {
+          return json(res, 400, { error: 'caption-text: text must be a string, or null to clear the correction' });
+        }
+        // Look up the pre-correction cue text for a readable revision
+        // summary ("字幕修正 "旧"→"新"") — best-effort: a cue that no longer
+        // exists at this key (captions disabled, or that moment got cut)
+        // still allows the op (the correction is simply dormant until/unless
+        // the cue reappears), just with a less specific summary.
+        const cues = captionCues(m0, await allTranscripts(p));
+        const cue = cues.find((c) => c.key === key);
+        const oldText = (cue ? cue.originalText ?? cue.text : m0.captionTextOverrides?.[key]) ?? '(不明)';
+        const summary =
+          text === null
+            ? `字幕修正解除 "${oldText.slice(0, 30)}"`
+            : `字幕修正 "${oldText.slice(0, 30)}"→"${text.slice(0, 30)}"`;
+        await mutate(p, actor, baseRev, 'caption-text', b, summary, (m) => {
+          const next = { ...(m.captionTextOverrides ?? {}) };
+          if (text === null) delete next[key];
+          else next[key] = text;
+          return { ...m, captionTextOverrides: next };
+        });
         return json(res, 200, { state: await stateSummary(p) });
       }
       if (b.op === 'motion-add') {

@@ -105,3 +105,47 @@ describe('toSrt line wrapping', () => {
     expect(srt).toContain('a b c d e\nf.');
   });
 });
+
+// ---- W-CAP: toSrt only ever reflects captionTextOverrides — style
+// overrides (font/palette/size/...) have no SRT equivalent, so toSrt stays
+// byte-for-byte the same as far as they're concerned (SRT carries no style
+// information at all; toAss is the only place style overrides land). ----
+describe('toSrt and W-CAP overrides', () => {
+  it('reflects a captionTextOverrides correction (same substitution captionCues bakes into every cue consumer)', () => {
+    const m: Manifest = { ...manifest(), captionTextOverrides: { 's1:w0': 'Bonjour.' } };
+    const srt = toSrt(m, [transcript()]);
+    expect(srt).toContain('Bonjour.');
+    expect(srt).not.toContain('Hello.');
+    expect(srt).toContain('World.'); // the untouched cue is unaffected
+  });
+
+  it('an empty-string text override removes that cue from the SRT entirely', () => {
+    const m: Manifest = { ...manifest(), captionTextOverrides: { 's1:w0': '' } };
+    const srt = toSrt(m, [transcript()]);
+    expect(srt).not.toContain('Hello.');
+    expect(srt).toContain('World.');
+  });
+
+  it('style overrides (font/palette/size/outline/bgOpacity/position) never change toSrt output at all — SRT carries no style', () => {
+    const base = manifest();
+    const withoutOverrides = toSrt(base, [transcript()]);
+    const withOverrides = toSrt(
+      {
+        ...base,
+        captions: {
+          ...base.captions,
+          overrides: {
+            font: 'SomeFont',
+            palette: { text: '#ff0000', outline: '#00ff00', box: '#0000ff' },
+            sizeScale: 1.5,
+            outlineWidth: 6,
+            bgOpacity: 0.2,
+            position: { v: 0.3 },
+          },
+        },
+      },
+      [transcript()],
+    );
+    expect(withOverrides).toBe(withoutOverrides);
+  });
+});

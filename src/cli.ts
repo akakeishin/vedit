@@ -54,6 +54,7 @@ const BOOLEAN_FLAGS = new Set([
   'latest', 'full', 'all', 'burn-captions', 'no-duck',
   'no-repair', 'fast-loudnorm', 'deess', 'confirm',
   'plan', 'link', 'no-verify', 'force', 'flip', 'no-flip',
+  'clear',
 ]);
 const argv = process.argv.slice(2);
 const cmd = argv[0];
@@ -302,6 +303,11 @@ culling:   review <sceneId...> keep|reject|clear [--source id] --base <rev>   # 
 reframe:   reframe <9:16|1:1|16:9|WxH> [--focus left|center|right|0..1]
            clip-crop <clipId> [--x 0..1] [--y 0..1]
 captions:  captions [--enabled true|false] [--style clean|bold|<kitStyleId>] [--max-chars 24]
+           captions [--font f] [--text-color #rrggbb] [--outline-color #rrggbb] [--box-color #rrggbb]
+             [--size-scale 0.5..2] [--outline-width px] [--bg-opacity 0..1] [--position-v 0..1]  # 字幕スタイルの微調整(UI のポップオーバーからも変更可)
+           caption-text <sourceId:wordId> "新テキスト" --base <rev>   # 字幕テキストの誤字修正(元の書き起こしは変えない)
+           caption-text <sourceId:wordId> --clear --base <rev>       # 修正を解除
+           fonts   # 利用可能なフォント一覧(キット内 + システム、read-only)
 motion:    motion-add --type chapter-card --text "..." --at 12 --duration 4 [--subtitle ...]
            motion-update <id> [--text ...] [--at ...] [--duration ...] | motion-remove <id>
 music:     music-add <file> [--at 0] [--duration N] [--src-in 0] [--gain -12] [--fade-in 1] [--fade-out 2] [--no-duck]
@@ -854,12 +860,43 @@ async function main() {
       if (flags.enabled !== undefined) patch.enabled = flags.enabled === 'true' || flags.enabled === true;
       if (flags.style) patch.style = flags.style;
       if (flags['max-chars']) patch.maxChars = numFlag('max-chars', flags['max-chars']);
+      // W-CAP: style overrides, layered on top of `style` (see
+      // CaptionSettings.overrides in types.ts) — same `captions` patch op,
+      // merged server-side onto whatever's already set (see
+      // mergeCaptionOverrides in daemon.ts), so e.g. `--size-scale 1.2` on
+      // its own never drops a previously-set `--font`.
+      const overrides: Record<string, unknown> = {};
+      if (flags.font) overrides.font = flags.font;
+      if (flags['size-scale'] !== undefined) overrides.sizeScale = numFlag('size-scale', flags['size-scale']);
+      if (flags['outline-width'] !== undefined) overrides.outlineWidth = numFlag('outline-width', flags['outline-width']);
+      if (flags['bg-opacity'] !== undefined) overrides.bgOpacity = numFlag('bg-opacity', flags['bg-opacity']);
+      const palette: Record<string, unknown> = {};
+      if (flags['text-color']) palette.text = flags['text-color'];
+      if (flags['outline-color']) palette.outline = flags['outline-color'];
+      if (flags['box-color']) palette.box = flags['box-color'];
+      if (Object.keys(palette).length) overrides.palette = palette;
+      if (flags['position-v'] !== undefined) overrides.position = { v: numFlag('position-v', flags['position-v']) };
+      if (Object.keys(overrides).length) patch.overrides = overrides;
       if (Object.keys(patch).length === 0) {
         const dir = projectDir();
         await ensureDaemon(dir);
         return out(await api('/api/captions'));
       }
       return edit({ op: 'captions', patch });
+    }
+
+    case 'caption-text': {
+      const USAGE = 'usage: vedit caption-text <sourceId:wordId> "新テキスト" --base <rev> (or --clear)';
+      const key = pos[0] ?? fail(USAGE);
+      if (flags.clear) return edit({ op: 'caption-text', key, text: null });
+      if (pos.length < 2) fail(USAGE);
+      return edit({ op: 'caption-text', key, text: pos[1] });
+    }
+
+    case 'fonts': {
+      const dir = projectDir();
+      await ensureDaemon(dir);
+      return out(await api('/api/fonts'));
     }
 
     case 'motion-add': {

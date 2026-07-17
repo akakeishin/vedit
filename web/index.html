@@ -24,6 +24,7 @@
         <video id="videoOverlay" hidden muted playsinline aria-hidden="true"></video>
         <div id="spriteLayer" aria-hidden="true"></div>
         <div id="captionLayer"></div>
+        <div id="captionDragGuide" hidden aria-hidden="true"></div>
         <div id="motionLayer"></div>
         <div id="ingestOverlay" hidden><div class="spin"></div><span id="ingestStep" aria-live="polite"></span></div>
         <div id="stageEmpty" hidden>
@@ -166,7 +167,43 @@
   </table>
   <p class="hintText">トランスクリプト欄にフォーカス中: ←/→で移動、Spaceで選択トグル、Shift+←/→で範囲拡張、Enterでシーク、Deleteで削除</p>
   <p class="hintText">タイムライン: クリップ本体をドラッグで並べ替え、端(6px)をドラッグでトリム、B-roll/スプライト/モーション/BGM のブロックをドラッグで移動できます。ファイルやフォルダをウィンドウにドロップすると取り込みます。</p>
+  <p class="hintText">字幕: クリックでスタイル編集、ドラッグで縦位置変更、ダブルクリックでテキスト修正。</p>
   <button id="shortcutsCloseBtn">閉じる</button>
+</dialog>
+
+<!-- W-CAP: caption style popover (font/palette/size/outline/background) —
+     opened by clicking a caption cue in the stage; position is changed by
+     dragging the cue instead (see startCaptionDrag in app.js), and text by
+     double-clicking it (inline contenteditable). -->
+<dialog id="captionStyleDialog" aria-labelledby="captionStyleTitle">
+  <h2 id="captionStyleTitle">字幕スタイル</h2>
+  <div class="capField">
+    <label for="capFont">フォント</label>
+    <select id="capFont"><option value="">(既定のフォント)</option></select>
+  </div>
+  <div class="capColorRow">
+    <div class="capField"><label for="capTextColor">文字色</label><input type="color" id="capTextColor"></div>
+    <div class="capField"><label for="capOutlineColor">縁色</label><input type="color" id="capOutlineColor"></div>
+    <div class="capField"><label for="capBoxColor">背景色</label><input type="color" id="capBoxColor"></div>
+  </div>
+  <div class="capField">
+    <label for="capSizeScale">サイズ <span id="capSizeScaleVal"></span></label>
+    <input type="range" id="capSizeScale" min="0.5" max="2" step="0.05">
+  </div>
+  <div class="capField">
+    <label for="capOutlineWidth">縁の太さ <span id="capOutlineWidthVal"></span></label>
+    <input type="range" id="capOutlineWidth" min="0" max="10" step="0.5">
+  </div>
+  <div class="capField">
+    <label for="capBgOpacity">背景の透過 <span id="capBgOpacityVal"></span></label>
+    <input type="range" id="capBgOpacity" min="0" max="1" step="0.05">
+  </div>
+  <div class="capActions">
+    <button id="capResetBtn" aria-label="このスタイル変更をすべてリセット">リセット</button>
+    <span class="spacer"></span>
+    <button id="capCancelBtn">キャンセル</button>
+    <button id="capApplyBtn">適用</button>
+  </div>
 </dialog>
 <script type="module" src="app.js"></script>
 </body>

@@ -72,14 +72,45 @@ main { flex: 1; display: flex; min-height: 0; }
 .spriteImg { position: absolute; }
 
 #captionLayer {
-  position: absolute; left: 0; right: 0; bottom: 6%; text-align: center; pointer-events: none;
+  position: absolute; left: 0; right: 0; text-align: center; pointer-events: none;
+  /* W-CAP: overrides.position.v (0=top,1=bottom of the box's bottom edge —
+     see startCaptionDrag/renderCaption in app.js and the matching ASS
+     MarginV formula in export/render.ts's toAss). Default 0.94 reproduces
+     the pre-W-CAP hardcoded `bottom: 6%` exactly. */
+  bottom: calc((1 - var(--cap-position-v, 0.94)) * 100%);
 }
 #captionLayer .cue {
   display: inline-block; padding: 0.2em 0.7em; border-radius: 6px;
   background: rgba(0,0,0,0.55); color: #fff; font-weight: 700;
   font-size: clamp(14px, 2.6vw, 26px); text-shadow: 0 1px 3px #000;
+  /* W-CAP: cues are clickable (style popover) / draggable (position) /
+     double-clickable (inline text edit) — see renderCaption in app.js. */
+  pointer-events: auto; cursor: pointer; position: relative;
+}
+#captionLayer .cue:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+#captionLayer .cue[contenteditable="true"] {
+  cursor: text; outline: 2px dashed var(--accent); outline-offset: 2px;
+  -webkit-user-select: text; user-select: text;
 }
 #captionLayer.style-bold .cue { background: #000; color: #ffe45c; }
+/* W-CAP overrides.palette.box / overrides.bgOpacity: applyCueOverrideStyles
+   in app.js sets the `background` (a color-mix() referencing --cap-box/
+   --cap-box-opacity) directly as an INLINE style rather than through a
+   stylesheet class here — an inline style always wins regardless of
+   specificity, which a class-only rule would NOT reliably do against
+   #captionLayer.style-kit .cue's own ID-selector background rule below. */
+/* W-CAP "✎修正済み" marker (caption-text override active on this cue) —
+   hover/focus shows the original transcript text via the native title
+   tooltip (see buildCueEl in app.js). */
+.cueEditedMark {
+  display: inline-block; margin-left: 0.5em; font-size: 0.6em; font-weight: 400;
+  color: #ffbe3c; vertical-align: middle; cursor: help;
+}
+/* W-CAP vertical-drag guideline, shown only while dragging a caption box. */
+#captionDragGuide {
+  position: absolute; left: 0; right: 0; height: 0; border-top: 1px dashed var(--accent);
+  pointer-events: none; z-index: 4;
+}
 /* W8 kit style (captions --style <kitStyleId>): approximation of the ASS
    palette/font toAss's kitAssStyle burns in — see renderCaption in app.js,
    which sets these custom properties from the linked kit's style. */
@@ -460,6 +491,25 @@ dialog#shortcutsDialog td { padding: 4px 8px; font-size: 12px; border-bottom: 1p
 dialog#shortcutsDialog td:first-child { color: var(--accent); font-variant-numeric: tabular-nums; white-space: nowrap; font-weight: 600; }
 dialog#shortcutsDialog td:last-child { color: var(--text); }
 dialog#shortcutsDialog .hintText { display: block; margin-bottom: 14px; }
+
+/* ---- W-CAP: caption style popover ---- */
+dialog#captionStyleDialog {
+  background: var(--panel); color: var(--text); border: 1px solid var(--edge); border-radius: 10px;
+  padding: 18px 22px; min-width: 280px; max-width: 360px; box-shadow: 0 8px 40px rgba(0,0,0,0.6);
+}
+dialog#captionStyleDialog::backdrop { background: rgba(0,0,0,0.6); }
+dialog#captionStyleDialog h2 { font-size: 15px; margin-bottom: 14px; }
+.capField { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+.capField label { font-size: 11px; color: var(--dim); display: flex; justify-content: space-between; gap: 6px; }
+.capField select, .capField input[type="range"] { width: 100%; }
+.capField input[type="color"] {
+  width: 100%; height: 26px; padding: 0; border: 1px solid var(--edge); border-radius: 4px;
+  background: transparent; cursor: pointer;
+}
+.capColorRow { display: flex; gap: 10px; }
+.capColorRow .capField { flex: 1; margin-bottom: 10px; }
+.capActions { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
+#capResetBtn { color: var(--bad); border-color: var(--bad); }
 
 #paneDivider {
   flex: none; width: 6px; cursor: col-resize; background: var(--edge);

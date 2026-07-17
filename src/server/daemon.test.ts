@@ -46,6 +46,20 @@ vi.mock('../ingest/locate.js', async (importOriginal) => {
   return { ...actual, locateMedia: locateMediaMock };
 });
 
+// GET /api/fonts shells out to a real filesystem walk of the system font
+// directories (+ optionally `fc-list`) via listSystemFonts/scanKitFonts —
+// stub both so the "daemon: GET /api/fonts" suite is deterministic and
+// doesn't depend on what happens to be installed on the test host. Real
+// scanning/caching behavior is covered directly by src/core/fonts.test.ts.
+const { listSystemFontsMock, scanKitFontsMock } = vi.hoisted(() => ({
+  listSystemFontsMock: vi.fn(async () => [{ family: 'Hiragino Sans' }, { family: 'Noto Sans JP' }]),
+  scanKitFontsMock: vi.fn(async () => [{ name: 'MyFont-Bold', path: 'fonts/MyFont-Bold.ttf' }]),
+}));
+vi.mock('../core/fonts.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../core/fonts.js')>();
+  return { ...actual, listSystemFonts: listSystemFontsMock, scanKitFonts: scanKitFontsMock };
+});
+
 function wordsFor(prefix: string, count: number, spacing = 1, dur = 0.8): Word[] {
   const out: Word[] = [];
   let t = 0.5;
@@ -2369,5 +2383,276 @@ describe('daemon: upload', () => {
     const body = await res.json();
     expect(res.status).toBe(200);
     expect(path.basename(body.path)).toMatch(/^upload(-\d+)?\.bin$/);
+  });
+});
+
+// ---- W-CAP: caption style overrides + text corrections + font listing ----
+
+describe('daemon: captions.overrides patch validation + merge', () => {
+  const PORT = 18220;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-capoverrides-'));
+    const dir = path.join(root, 'proj');
+    await Project.create(dir, 'capoverrides');
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('rejects an out-of-range sizeScale', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'captions', patch: { overrides: { sizeScale: 3 } },
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/sizeScale must be a number between 0.5 and 2/);
+  });
+
+  it('rejects a non-hex palette color', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'captions', patch: { overrides: { palette: { text: 'red' } } },
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/hex color/);
+  });
+
+  it('rejects an out-of-range position.v', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'captions', patch: { overrides: { position: { v: 1.5 } } },
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/position\.v must be a number between 0 and 1/);
+  });
+
+  it('rejects a negative outlineWidth and an out-of-range bgOpacity', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const bad1 = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'captions', patch: { overrides: { outlineWidth: -1 } },
+    });
+    expect(bad1.status).toBe(400);
+    const bad2 = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'captions', patch: { overrides: { bgOpacity: 2 } },
+    });
+    expect(bad2.status).toBe(400);
+  });
+
+  it('accepts a valid overrides patch and stores it verbatim', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'captions',
+      patch: { overrides: { sizeScale: 1.2, palette: { text: '#ff0000' } } },
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.captions.overrides).toEqual({ sizeScale: 1.2, palette: { text: '#ff0000' } });
+  });
+
+  it('merges a second partial patch onto the first without dropping previously-set fields', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'captions',
+      patch: { overrides: { outlineWidth: 5 } },
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.captions.overrides).toEqual({
+      sizeScale: 1.2, palette: { text: '#ff0000' }, outlineWidth: 5,
+    });
+  });
+
+  it('merges a palette patch onto an existing palette field-by-field (never wholesale-replaces it)', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'captions',
+      patch: { overrides: { palette: { outline: '#000000' } } },
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.captions.overrides.palette).toEqual({ text: '#ff0000', outline: '#000000' });
+  });
+
+  it('overrides: null clears every override at once', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'captions', patch: { overrides: null },
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.captions.overrides).toBeUndefined();
+  });
+
+  it('a captions patch that never mentions overrides leaves it completely untouched', async () => {
+    let state = (await getJson(BASE, '/api/state')).body;
+    await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'captions', patch: { overrides: { bgOpacity: 0.3 } },
+    });
+    state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'captions', patch: { maxChars: 30 },
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.captions.maxChars).toBe(30);
+    expect(project.manifest.captions.overrides).toEqual({ bgOpacity: 0.3 });
+  });
+});
+
+describe('daemon: caption-text op', () => {
+  const PORT = 18221;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-captiontext-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'captiontext');
+    // Each word ends with a sentence-terminating period so captionCues
+    // flushes it as its own cue deterministically (same trick srt.test.ts
+    // uses), independent of the 0.6s pause/maxChars rules.
+    const words: Word[] = [
+      { id: 'w0000', text: 'Hello.', t0: 1.0, t1: 1.5, p: 0.9 },
+      { id: 'w0001', text: 'World.', t0: 5.0, t1: 5.5, p: 0.9 },
+    ];
+    await project.writeTranscript({ sourceId: 's1', language: 'en', words });
+    await project.commit(0, 'system', 'setup', {}, 'seed source', (m) => ({
+      ...m,
+      sources: [{ id: 's1', path: '/media/one.mp4', duration: 8, fps: 30, width: 1920, height: 1080, hasAudio: true, transcribed: true }],
+      timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 8 }], motion: [] },
+    }));
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('rejects a key without a "sourceId:wordId" shape', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'caption-text', key: 'nocolon', text: 'x',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/sourceId:wordId/);
+  });
+
+  it('rejects a key whose source does not exist in the manifest', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'caption-text', key: 'nope:w0000', text: 'x',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/unknown source/);
+  });
+
+  it('rejects a non-string, non-null text', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'caption-text', key: 's1:w0000', text: 42,
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/text must be a string/);
+  });
+
+  it('applies a text correction, reflected in GET /api/captions with the original preserved', async () => {
+    const before = (await getJson(BASE, '/api/captions')).body;
+    expect(before[0].key).toBe('s1:w0000');
+    expect(before[0].text).toBe('Hello.');
+    expect(before[0].originalText).toBeUndefined();
+
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'caption-text', key: 's1:w0000', text: 'こんにちは',
+    });
+    expect(status).toBe(200);
+
+    const after = (await getJson(BASE, '/api/captions')).body;
+    const cue = after.find((c: any) => c.key === 's1:w0000');
+    expect(cue.text).toBe('こんにちは');
+    expect(cue.originalText).toBe('Hello.');
+
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.captionTextOverrides).toEqual({ 's1:w0000': 'こんにちは' });
+  });
+
+  it('an empty-string correction hides that cue entirely', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'caption-text', key: 's1:w0001', text: '',
+    });
+    expect(status).toBe(200);
+    const after = (await getJson(BASE, '/api/captions')).body;
+    expect(after.some((c: any) => c.key === 's1:w0001')).toBe(false);
+  });
+
+  it('text: null clears a previously-set correction, restoring the original text', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'caption-text', key: 's1:w0000', text: null,
+    });
+    expect(status).toBe(200);
+    const after = (await getJson(BASE, '/api/captions')).body;
+    const cue = after.find((c: any) => c.key === 's1:w0000');
+    expect(cue.text).toBe('Hello.');
+    expect(cue.originalText).toBeUndefined();
+
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.captionTextOverrides['s1:w0000']).toBeUndefined();
+  });
+});
+
+describe('daemon: GET /api/fonts', () => {
+  const PORT = 18222;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-fonts-'));
+    const dir = path.join(root, 'proj');
+    await Project.create(dir, 'fonts');
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('returns system fonts and an empty kit list when no kit is linked', async () => {
+    const { status, body } = await getJson(BASE, '/api/fonts');
+    expect(status).toBe(200);
+    expect(body.kit).toEqual([]);
+    expect(body.system).toEqual([{ family: 'Hiragino Sans' }, { family: 'Noto Sans JP' }]);
+  });
+});
+
+describe('daemon: GET /api/fonts with a linked kit', () => {
+  const PORT = 18223;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let kitDir: string;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-fonts-kit-'));
+    kitDir = path.join(root, 'kit');
+    await fsp.mkdir(kitDir, { recursive: true });
+    await writeKitFile(kitDir, { version: 'vedit-kit/v1', name: 'k' });
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'fonts-kit');
+    await project.commit(0, 'system', 'setup', {}, 'link kit', (m) => ({ ...m, kit: { path: kitDir } }));
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('includes the kit fonts alongside system fonts', async () => {
+    const { status, body } = await getJson(BASE, '/api/fonts');
+    expect(status).toBe(200);
+    expect(body.kit).toEqual([{ name: 'MyFont-Bold', path: 'fonts/MyFont-Bold.ttf' }]);
+    expect(body.system).toEqual([{ family: 'Hiragino Sans' }, { family: 'Noto Sans JP' }]);
+    expect(scanKitFontsMock).toHaveBeenCalledWith(kitDir);
   });
 });

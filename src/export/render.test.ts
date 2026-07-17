@@ -22,6 +22,20 @@ vi.mock('../ingest/run.js', () => ({
   ffmpegHasFilter: () => true,
 }));
 
+// renderFinal's W-CAP "font not found" warning shells out to a real
+// filesystem walk of the system font directories via listSystemFonts — stub
+// just that one export (resolveKitFontFile/scanKitFonts stay real, same as
+// every other kit-font test in this file, which writes real files under a
+// tmpdir kit) so the warning tests below are deterministic regardless of
+// what's actually installed on the test host.
+const { listSystemFontsMock } = vi.hoisted(() => ({
+  listSystemFontsMock: vi.fn(async () => [{ family: 'Hiragino Sans' }, { family: 'Noto Sans JP' }]),
+}));
+vi.mock('../core/fonts.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../core/fonts.js')>();
+  return { ...actual, listSystemFonts: listSystemFontsMock };
+});
+
 import { addOverlay, addSprite } from '../core/ops.js';
 import {
   buildFilterGraph,
@@ -142,6 +156,145 @@ describe('toAss', () => {
     const withoutKit = toAss(manifest('clean'), [transcript()]);
     const withUnrelatedKit = toAss(manifest('clean'), [transcript()], kitWithStyle());
     expect(withUnrelatedKit).toBe(withoutKit);
+  });
+
+  // ---- W-CAP: captions.overrides -> ASS Style line ----
+
+  function styleFields(ass: string, name: string): string[] {
+    const line = ass.split('\n').find((l) => l.startsWith(`Style: ${name},`))!;
+    return line.replace(`Style: ${name},`, '').split(',');
+  }
+  // Format after Name: Fontname, Fontsize, PrimaryColour, SecondaryColour,
+  // OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX,
+  // ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment,
+  // MarginL, MarginR, MarginV, Encoding
+  const F = { fontname: 0, fontsize: 1, primary: 2, outline: 4, back: 5, borderStyle: 14, outlineWidth: 15, marginV: 20 };
+  /** Inverse of render.ts's private hexToBgr, for asserting an ASS colour round-trips to the hex the override actually asked for. */
+  function bgrToHex(assColor: string): string {
+    const m = /^&H[0-9A-Fa-f]{2}([0-9A-Fa-f]{6})$/.exec(assColor)!;
+    const [b, g, r] = [m[1].slice(0, 2), m[1].slice(2, 4), m[1].slice(4, 6)];
+    return `#${r}${g}${b}`.toLowerCase();
+  }
+
+  describe('W-CAP: captions.overrides', () => {
+    it('no overrides at all is a full regression — identical to before overrides existed', () => {
+      const withoutField = toAss(manifest('clean'), [transcript()]);
+      const m = manifest('clean');
+      (m as any).captions.overrides = undefined;
+      expect(toAss(m, [transcript()])).toBe(withoutField);
+    });
+
+    it('sizeScale multiplies the active style\'s fontsize only, leaving other styles\' fontsize untouched', () => {
+      const m = manifest('clean');
+      (m as any).captions.overrides = { sizeScale: 1.5 };
+      const ass = toAss(m, [transcript()]);
+      const defaultFontSize = Math.round(1080 * 0.045);
+      expect(Number(styleFields(ass, 'clean')[F.fontsize])).toBe(Math.round(defaultFontSize * 1.5));
+      expect(Number(styleFields(ass, 'bold')[F.fontsize])).toBe(defaultFontSize);
+    });
+
+    it('palette.text/outline convert to ASS BGR, only on the active style', () => {
+      const m = manifest('clean');
+      (m as any).captions.overrides = { palette: { text: '#ff00aa', outline: '#00ff88' } };
+      const ass = toAss(m, [transcript()]);
+      const clean = styleFields(ass, 'clean');
+      expect(clean[F.primary]).toBe('&H00AA00FF');
+      expect(clean[F.outline]).toBe('&H0088FF00');
+      // 'bold' style's own colors are completely untouched.
+      expect(styleFields(ass, 'bold')[F.primary]).toBe('&H005CE4FF');
+    });
+
+    it('palette.box alone keeps the active style\'s own alpha; bgOpacity alone keeps its own box colour', () => {
+      const m1 = manifest('clean'); // clean's back is &H80000000 (alpha 80, black)
+      (m1 as any).captions.overrides = { palette: { box: '#ff0000' } };
+      expect(styleFields(toAss(m1, [transcript()]), 'clean')[F.back]).toBe('&H800000FF'); // alpha kept (80), colour -> red BGR
+
+      const m2 = manifest('clean');
+      (m2 as any).captions.overrides = { bgOpacity: 0 }; // fully transparent
+      expect(styleFields(toAss(m2, [transcript()]), 'clean')[F.back]).toBe('&HFF000000'); // colour kept (black), alpha -> FF
+    });
+
+    it('outlineWidth 0 switches BorderStyle to an opaque box (matches kitAssStyle\'s convention); a positive value keeps BorderStyle 1', () => {
+      const m1 = manifest('outline'); // built-in 'outline' style already uses BorderStyle 1
+      (m1 as any).captions.overrides = { outlineWidth: 0 };
+      const f1 = styleFields(toAss(m1, [transcript()]), 'outline');
+      expect(f1[F.borderStyle]).toBe('3');
+      expect(f1[F.outlineWidth]).toBe('0');
+
+      const m2 = manifest('bold'); // built-in 'bold' style uses BorderStyle 3
+      (m2 as any).captions.overrides = { outlineWidth: 4 };
+      const f2 = styleFields(toAss(m2, [transcript()]), 'bold');
+      expect(f2[F.borderStyle]).toBe('1');
+      expect(f2[F.outlineWidth]).toBe('4');
+    });
+
+    it('font sets Fontname to the basename without extension, whether given as a family or a font FILE name', () => {
+      const m1 = manifest('clean');
+      (m1 as any).captions.overrides = { font: 'Noto Sans JP' };
+      expect(styleFields(toAss(m1, [transcript()]), 'clean')[F.fontname]).toBe('Noto Sans JP');
+
+      const m2 = manifest('clean');
+      (m2 as any).captions.overrides = { font: 'MyFont-Bold.ttf' };
+      expect(styleFields(toAss(m2, [transcript()]), 'clean')[F.fontname]).toBe('MyFont-Bold');
+    });
+
+    it('position.v becomes a per-style MarginV override; other styles keep the module default', () => {
+      const m = manifest('clean');
+      (m as any).captions.overrides = { position: { v: 0.5 } };
+      const ass = toAss(m, [transcript()]);
+      expect(Number(styleFields(ass, 'clean')[F.marginV])).toBe(Math.round((1 - 0.5) * 1080));
+      expect(Number(styleFields(ass, 'bold')[F.marginV])).toBe(Math.round(1080 * 0.06));
+    });
+
+    it('position.v the documented default (0.94) reproduces the pre-W-CAP hardcoded MarginV exactly', () => {
+      const m = manifest('clean');
+      (m as any).captions.overrides = { position: { v: 0.94 } };
+      const withOverride = styleFields(toAss(m, [transcript()]), 'clean')[F.marginV];
+      const without = styleFields(toAss(manifest('clean'), [transcript()]), 'clean')[F.marginV];
+      expect(withOverride).toBe(without);
+    });
+
+    it('applies on top of a kit style too, not just the built-in presets', () => {
+      const m = manifest('kitStyle1');
+      (m as any).captions.overrides = { sizeScale: 2 };
+      const ass = toAss(m, [transcript()], kitWithStyle());
+      // kitWithStyle's size_1080p is 60 at the default 1080p output.
+      expect(Number(styleFields(ass, 'kitStyle1')[F.fontsize])).toBe(120);
+    });
+
+    it('a partial override (just outlineWidth) leaves the active style\'s own colors/font untouched', () => {
+      const m = manifest('bold');
+      (m as any).captions.overrides = { outlineWidth: 2 };
+      const ass = toAss(m, [transcript()]);
+      const fields = styleFields(ass, 'bold');
+      expect(fields[F.primary]).toBe('&H005CE4FF'); // bold's own yellow, untouched
+      expect(fields[F.outlineWidth]).toBe('2');
+    });
+
+    // ---- parity: the SAME manifest's raw override values (what a web CSS
+    // layer would apply verbatim — a hex color, a size multiplier) and the
+    // ASS Style line toAss emits represent the same color/size, just encoded
+    // differently (hex RGB vs ASS's &HAABBGGRR; an absolute px size vs a
+    // scale factor) — see the "反映の一貫性" contract in the task brief. ----
+    it('parity: PrimaryColour round-trips to the exact overrides.palette.text hex a web layer would use as-is', () => {
+      const m = manifest('clean');
+      const textHex = '#3a7bd5';
+      (m as any).captions.overrides = { palette: { text: textHex } };
+      const ass = toAss(m, [transcript()]);
+      expect(bgrToHex(styleFields(ass, 'clean')[F.primary])).toBe(textHex);
+    });
+
+    it('parity: the ASS fontsize / base fontsize ratio equals overrides.sizeScale exactly (the same multiplier a web layer would apply to its own base font-size)', () => {
+      const sizeScale = 1.3;
+      const m = manifest('clean');
+      (m as any).captions.overrides = { sizeScale };
+      const ass = toAss(m, [transcript()]);
+      const baseFontSize = Math.round(1080 * 0.045);
+      const assFontSize = Number(styleFields(ass, 'clean')[F.fontsize]);
+      // Rounding to the nearest pixel means this is approximate, not exact
+      // floating-point equality — within a pixel's worth of scale error.
+      expect(assFontSize / baseFontSize).toBeCloseTo(sizeScale, 1);
+    });
   });
 });
 
@@ -932,5 +1085,55 @@ describe('renderFinal: W8 kit (styles + sprites)', () => {
     const args = runMock.mock.calls[0][1] as string[];
     const graph = args[args.indexOf('-filter_complex') + 1];
     expect(graph).toContain(`fontsdir='${path.join(dir, 'fonts')}'`);
+  });
+});
+
+// ---- renderFinal: W-CAP overrides.font resolution + "not found" warning ----
+
+describe('renderFinal: W-CAP overrides.font', () => {
+  it('overrides.font resolving to a kit font file adds fontsdir (kit font file takes priority over treating it as a system family)', async () => {
+    runMock.mockClear();
+    const dir = freshKitDir('override-font-kit');
+    await fsp.mkdir(path.join(dir, 'fonts'), { recursive: true });
+    await fsp.writeFile(path.join(dir, 'fonts', 'MyOverrideFont.ttf'), 'fake-font-bytes');
+    await writeKitFile(dir, { version: 'vedit-kit/v1' });
+
+    const m = manifest('clean');
+    (m as Manifest).kit = { path: dir };
+    (m as Manifest).captions.overrides = { font: 'MyOverrideFont' }; // no extension given — resolveKitFontFile tries each known one
+    const res = await renderFinal(m, [transcript()], outPathIn('/tmp'), { burnCaptions: true });
+
+    const args = runMock.mock.calls[0][1] as string[];
+    const graph = args[args.indexOf('-filter_complex') + 1];
+    expect(graph).toContain(`fontsdir='${path.join(dir, 'fonts')}'`);
+    expect(res.warnings.some((w) => w.includes('not found'))).toBe(false);
+  });
+
+  it('overrides.font matching neither a kit font file nor a known system family produces a "not found" warning', async () => {
+    const m = manifest('clean');
+    (m as Manifest).captions.overrides = { font: 'TotallyMadeUpFontXYZ' };
+    const res = await renderFinal(m, [transcript()], outPathIn('/tmp'), { burnCaptions: true });
+    expect(res.warnings.some((w) => w.includes('TotallyMadeUpFontXYZ') && w.includes('not found'))).toBe(true);
+  });
+
+  it('overrides.font matching a known system family produces no warning and no fontsdir clause', async () => {
+    runMock.mockClear();
+    const m = manifest('clean');
+    (m as Manifest).captions.overrides = { font: 'Noto Sans JP' };
+    const res = await renderFinal(m, [transcript()], outPathIn('/tmp'), { burnCaptions: true });
+    expect(res.warnings.some((w) => w.includes('not found'))).toBe(false);
+    const args = runMock.mock.calls[0][1] as string[];
+    const graph = args[args.indexOf('-filter_complex') + 1];
+    expect(graph).not.toContain('fontsdir=');
+  });
+
+  it('no overrides at all never touches the fontsdir/warning logic (regression)', async () => {
+    runMock.mockClear();
+    const m = manifest('clean');
+    const res = await renderFinal(m, [transcript()], outPathIn('/tmp'), { burnCaptions: true });
+    expect(res.warnings).toEqual([]);
+    const args = runMock.mock.calls[0][1] as string[];
+    const graph = args[args.indexOf('-filter_complex') + 1];
+    expect(graph).not.toContain('fontsdir=');
   });
 });

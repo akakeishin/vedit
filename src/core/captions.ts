@@ -6,6 +6,30 @@ export interface CaptionCue {
   tlEnd: number;
   text: string;
   wordIds: string[];
+  /**
+   * Source id the cue's LEADING word (wordIds[0]) came from. Always set by
+   * captionCues; declared optional only so hand-built test fixtures
+   * elsewhere (e.g. qc.test.ts's `cue()` helper) don't need to supply it.
+   */
+  sourceId?: string;
+  /**
+   * `${sourceId}:${wordIds[0]}` (see captionCueKey) — a stable identity for
+   * this cue, used to address it via Manifest.captionTextOverrides and by
+   * the web UI's inline text-edit / caption style popover. Always set by
+   * captionCues.
+   */
+  key?: string;
+  /**
+   * Present only when `text` was replaced by a Manifest.captionTextOverrides
+   * entry — the original (sanitized) transcript text, shown by the web UI's
+   * "✎修正済み" marker on hover.
+   */
+  originalText?: string;
+}
+
+/** `${sourceId}:${wordId}` — the Manifest.captionTextOverrides key format. */
+export function captionCueKey(sourceId: string, wordId: string): string {
+  return `${sourceId}:${wordId}`;
 }
 
 const isCjk = (s: string) => /[぀-ヿ㐀-䶿一-鿿]/u.test(s);
@@ -48,6 +72,10 @@ function mergeCues(a: CaptionCue, b: CaptionCue): CaptionCue {
     tlEnd: Math.max(a.tlEnd, b.tlEnd),
     text: sanitizeCaptionText(a.text + join + b.text),
     wordIds: [...a.wordIds, ...b.wordIds],
+    // `a` is always the chronologically-earlier cue at every mergeCues call
+    // site below, and wordIds[0] (used to build the merged cue's key) comes
+    // from `a.wordIds` — so the merged cue's identity/source stays `a`'s.
+    sourceId: a.sourceId,
   };
 }
 
@@ -134,6 +162,7 @@ export function captionCues(m: Manifest, transcripts: Transcript[]): CaptionCue[
             tlEnd: Math.max(tlEnd + (last.t1 - last.t0) / 2 + 0.15, tlStart + 0.6),
             text,
             wordIds: buf.map((w) => w.id),
+            sourceId: t.sourceId,
           });
         }
       }
@@ -166,5 +195,22 @@ export function captionCues(m: Manifest, transcripts: Transcript[]): CaptionCue[
   // time or merging with a neighbor.
   enforceMinDisplay(cues, total, m.captions.maxCps ?? DEFAULT_MAX_CPS);
 
-  return cues.filter((c) => c.tlEnd > c.tlStart);
+  // W-CAP: apply per-cue text corrections last, once every cue's final
+  // (post-merge, post-de-overlap) leading word is known — each cue's key is
+  // `${sourceId}:${wordIds[0]}` (captionCueKey). An override of '' hides
+  // the cue entirely (filtered out below, same as the existing
+  // tlEnd>tlStart guard); absent from captionTextOverrides -> unaffected.
+  const textOverrides = m.captionTextOverrides ?? {};
+  const out: CaptionCue[] = [];
+  for (const c of cues) {
+    if (c.tlEnd <= c.tlStart) continue;
+    const key = c.sourceId !== undefined && c.wordIds.length > 0 ? captionCueKey(c.sourceId, c.wordIds[0]) : undefined;
+    const override = key !== undefined && Object.prototype.hasOwnProperty.call(textOverrides, key) ? textOverrides[key] : undefined;
+    if (override === undefined) {
+      out.push({ ...c, key });
+    } else if (override !== '') {
+      out.push({ ...c, key, text: override, originalText: c.text });
+    } // override === '' -> cue hidden entirely
+  }
+  return out;
 }

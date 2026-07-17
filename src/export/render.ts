@@ -10,9 +10,10 @@ import {
   timelineDuration,
 } from '../core/ops.js';
 import { captionCues } from '../core/captions.js';
-import type { KitFile, KitStyle, Manifest, Transcript } from '../core/types.js';
+import type { CaptionSettings, KitFile, KitStyle, Manifest, Transcript } from '../core/types.js';
 import { readKitFile, resolveKitAssets, type ResolvedKitAsset } from '../core/kit.js';
 import { resolveWithinDir } from '../core/project.js';
+import { listSystemFonts, resolveKitFontFile } from '../core/fonts.js';
 import { buildColorChain } from './color.js';
 import { ffmpegHasFilter, run, runCapture } from '../ingest/run.js';
 
@@ -42,6 +43,8 @@ interface AssStylePreset {
   /** Kit styles only: overrides the module-wide Hiragino Sans / height*0.045 defaults below. */
   fontname?: string;
   fontsize?: number;
+  /** W-CAP overrides.position.v only: overrides the module-wide height*0.06 MarginV default below. */
+  marginV?: number;
 }
 
 export const ASS_STYLE_PRESETS: Record<string, AssStylePreset> = {
@@ -100,6 +103,47 @@ function kitAssStyle(style: KitStyle, outputHeight: number): AssStylePreset {
   };
 }
 
+/** Split an ASS `&HAABBGGRR` colour string into its alpha and BGR components (uppercase hex). Malformed input falls back to opaque white. */
+function parseAssColor(ass: string): { alphaHex: string; bgr: string } {
+  const m = /^&H([0-9A-Fa-f]{2})([0-9A-Fa-f]{6})$/.exec(ass);
+  return m ? { alphaHex: m[1].toUpperCase(), bgr: m[2].toUpperCase() } : { alphaHex: '00', bgr: 'FFFFFF' };
+}
+
+/**
+ * Apply CaptionSettings.overrides (W-CAP) on top of an already-resolved
+ * style preset (built-in or kit) — only the fields actually set on
+ * `overrides` are touched; every other field passes through from `preset`
+ * untouched, so e.g. an overrides object with just `sizeScale` never
+ * disturbs the base style's colors/font. Pure — no I/O (resolving a font
+ * FILE reference to a fontsdir is renderFinal's job, same division of
+ * labor as kitAssStyle's own caption.font).
+ */
+function applyCaptionOverrides(
+  preset: AssStylePreset,
+  overrides: NonNullable<CaptionSettings['overrides']>,
+  defaultFontSize: number,
+): AssStylePreset {
+  const out: AssStylePreset = { ...preset };
+  const palette = overrides.palette;
+  if (palette?.text) out.primary = `&H00${hexToBgr(palette.text)}`;
+  if (palette?.outline) out.outline = `&H00${hexToBgr(palette.outline)}`;
+  if (palette?.box || overrides.bgOpacity !== undefined) {
+    const base = parseAssColor(preset.back);
+    const bgr = palette?.box ? hexToBgr(palette.box) : base.bgr;
+    const alphaHex = overrides.bgOpacity !== undefined ? opacityToAlphaHex(overrides.bgOpacity, base.alphaHex) : base.alphaHex;
+    out.back = `&H${alphaHex}${bgr}`;
+  }
+  if (overrides.sizeScale !== undefined) {
+    out.fontsize = Math.round((preset.fontsize ?? defaultFontSize) * overrides.sizeScale);
+  }
+  if (overrides.outlineWidth !== undefined) {
+    out.outlineWidth = overrides.outlineWidth;
+    out.borderStyle = overrides.outlineWidth > 0 ? 1 : 3;
+  }
+  if (overrides.font) out.fontname = path.basename(overrides.font, path.extname(overrides.font));
+  return out;
+}
+
 /**
  * `kit`, when given, is an already-loaded kit.json (see readKitFile in
  * kit.ts) — toAss stays pure/I-O-free by never loading it itself. When
@@ -107,12 +151,20 @@ function kitAssStyle(style: KitStyle, outputHeight: number): AssStylePreset {
  * emitted styles (the four built-in presets are ALWAYS still emitted too,
  * unchanged — full regression for every existing caller, which never passes
  * `kit` at all) and becomes the active style.
+ *
+ * W-CAP: `m.captions.overrides`, when set, is layered on top of the ACTIVE
+ * style only (every other style line — including the active style's own
+ * un-overridden preset that would otherwise apply — stays exactly as it
+ * would without overrides); `overrides.position.v` becomes a per-style
+ * MarginV override rather than touching the shared default. No `overrides`
+ * at all reproduces the exact ASS this function emitted before W-CAP
+ * existed — full regression.
  */
 export function toAss(m: Manifest, transcripts: Transcript[], kit?: KitFile | null): string {
   const cues = captionCues(m, transcripts);
   const { width, height } = m.output ?? { width: m.width, height: m.height };
   const defaultFontSize = Math.round(height * 0.045);
-  const marginV = Math.round(height * 0.06);
+  const defaultMarginV = Math.round(height * 0.06);
 
   const presets: Record<string, AssStylePreset> = { ...ASS_STYLE_PRESETS };
   let activeStyle = presets[m.captions.style] ? m.captions.style : 'clean';
@@ -122,10 +174,25 @@ export function toAss(m: Manifest, transcripts: Transcript[], kit?: KitFile | nu
     activeStyle = kitStyle.id;
   }
 
+  const overrides = m.captions.overrides;
+  if (overrides) {
+    presets[activeStyle] = applyCaptionOverrides(presets[activeStyle], overrides, defaultFontSize);
+    if (overrides.position?.v !== undefined) {
+      // Alignment stays 2 (bottom-center, hardcoded below) — MarginV is the
+      // distance from the frame's BOTTOM edge to the text's anchor, so a
+      // caption box whose center should sit at `v` (0=top,1=bottom) gets its
+      // bottom edge at `v*height`, i.e. a margin of `(1-v)*height` from the
+      // bottom. v=0.94 (the documented default) reproduces the pre-W-CAP
+      // hardcoded `height*0.06` exactly.
+      presets[activeStyle].marginV = Math.round((1 - overrides.position.v) * height);
+    }
+  }
+
   const styleLines = Object.entries(presets)
     .map(([name, s]) => {
       const fontname = s.fontname ?? 'Hiragino Sans';
       const fontsize = s.fontsize ?? defaultFontSize;
+      const marginV = s.marginV ?? defaultMarginV;
       return `Style: ${name},${fontname},${fontsize},${s.primary},&H000000FF,${s.outline},${s.back},${s.bold},0,0,0,100,100,0,0,${s.borderStyle},${s.outlineWidth},${s.shadow},2,60,60,${marginV},1`;
     })
     .join('\n');
@@ -747,12 +814,43 @@ export async function renderFinal(
     // filter clause as before W8.
     let fontsdirPart = '';
     const activeKitStyle = kit?.styles?.find((s) => s.id === effectiveM.captions.style);
-    if (activeKitStyle?.caption?.font && effectiveM.kit) {
-      try {
-        const fontAbs = await resolveWithinDir(effectiveM.kit.path, activeKitStyle.caption.font);
-        fontsdirPart = `:fontsdir='${path.dirname(fontAbs).replace(/'/g, "\\'")}'`;
-      } catch (e: any) {
-        warnings.push(`kit style ${activeKitStyle.id}: font path invalid (${activeKitStyle.caption.font}) — captions burn without the kit font`);
+    // W-CAP: overrides.font may itself be a kit font FILE reference (rather
+    // than a system family name) — it takes priority over the active kit
+    // style's own caption.font when it resolves to one, since it's the more
+    // specific/recent choice. Neither present (or no kit linked) leaves
+    // fontsdirPart '' exactly like before W-CAP existed.
+    const overrideFont = effectiveM.captions.overrides?.font;
+    if (effectiveM.kit) {
+      let fontDir: string | null = null;
+      if (overrideFont) {
+        const resolved = await resolveKitFontFile(effectiveM.kit.path, overrideFont).catch(() => null);
+        if (resolved) fontDir = path.dirname(resolved);
+      }
+      if (!fontDir && activeKitStyle?.caption?.font) {
+        try {
+          const fontAbs = await resolveWithinDir(effectiveM.kit.path, activeKitStyle.caption.font);
+          fontDir = path.dirname(fontAbs);
+        } catch (e: any) {
+          warnings.push(`kit style ${activeKitStyle.id}: font path invalid (${activeKitStyle.caption.font}) — captions burn without the kit font`);
+        }
+      }
+      if (fontDir) fontsdirPart = `:fontsdir='${fontDir.replace(/'/g, "\\'")}'`;
+    }
+    // W-CAP: overrides.font that resolved to neither a kit font file (above)
+    // nor a recognized system font family is very likely a typo — surface it
+    // as a warning rather than silently falling back to libass's default
+    // font. staticChecks (qc.ts) is untouched by this; it's purely a
+    // render-time advisory.
+    if (overrideFont && !fontsdirPart) {
+      const family = path.basename(overrideFont, path.extname(overrideFont));
+      const systemFonts = await listSystemFonts(null).catch(() => []);
+      const known = systemFonts.some(
+        (f) => f.family.toLowerCase() === family.toLowerCase() || f.family.toLowerCase() === overrideFont.toLowerCase(),
+      );
+      if (!known) {
+        warnings.push(
+          `caption font "${overrideFont}" was not found in the linked kit's fonts/ directory or common system font locations — burned captions may fall back to a default font`,
+        );
       }
     }
     graph += `;${built.videoLabel}ass='${assPath.replace(/'/g, "\\'")}'${fontsdirPart}[vout]`;

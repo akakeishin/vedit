@@ -203,6 +203,31 @@ vedit motion-update <id> --text "..." --base <rev> / vedit motion-remove <id> --
   transcript 由来のみ。モデル創作のコピーは提案として見せ、承認後に入れる
 - スタイルの再利用: `vedit preset-save <name>` / `vedit preset-apply <name> --base <rev>`
 
+### 字幕の見た目・テキスト修正(W-CAP)
+
+字幕の見た目(フォント・色・サイズ・縁・背景・縦位置)や個々のテロップの
+誤字修正は、**Web UI から直接いじれる**——プレビュー上の字幕をクリックで
+スタイルのポップオーバー(フォント/文字色/縁色/背景色/サイズ/縁の太さ/
+背景の透過)、ドラッグで縦位置、ダブルクリックでテキストのインライン修正
+(Enterで確定、Escでキャンセル)。修正済みの箇所には小さな「✎修正済み」
+マークが付く(ホバーで元テキストを確認できる)。同じ操作は CLI からも可能:
+
+```bash
+vedit captions --font "Noto Sans JP" --text-color "#ffffff" --outline-color "#000000" \
+  --box-color "#000000" --size-scale 1.2 --outline-width 3 --bg-opacity 0.6 --position-v 0.9 --base <rev>
+vedit caption-text <sourceId:wordId> "正しいテキスト" --base <rev>   # 誤字修正(元の書き起こしは変えない)
+vedit caption-text <sourceId:wordId> --clear --base <rev>           # 修正を解除
+vedit fonts   # キット内 + システムのフォント一覧(read-only)
+```
+
+- **文字起こしの誤り(聞き取りミスの字幕テロップ)を直すのは `caption-text`
+  であって、transcript の再文字起こしではない** — transcript.words は
+  カット判断の材料としてそのまま残し、字幕表示だけをピンポイントで直す。
+  空文字を渡すとそのカットの字幕を非表示にできる
+- スタイルの微調整(色・サイズ等)は `--style <preset|kitStyleId>` の上に
+  重ねがけされる差分(overrides)——キットや既存プリセットの見た目自体は
+  変えない。ASS書き出し・レンダー時の字幕焼き込みにも同じ overrides が反映される
+
 ## BGM と音声仕上げ
 
 ```bash
