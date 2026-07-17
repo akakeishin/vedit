@@ -99,6 +99,11 @@ const S = {
   // fetched only when the 確認 tab is shown + a light 30s poll while it stays
   // active (see fetchExportResults). Holds at most 1 record (the latest).
   exportResults: [],
+  // Codex 統合レビュー P2-6: a failed re-fetch used to silently wipe the card
+  // (S.exportResults = []). Now the last successful result is kept and this
+  // flag drives a small "更新できませんでした" note instead — see
+  // fetchExportResults/renderExportResultCard.
+  exportResultsStale: false,
   takesCache: new Map(), // W-INTENT/W11: sourceId -> TakeGroup[], fetched on demand (GET /api/takes) when a "show takes" directive arrives
   // ---- W-ANIME: composition (source-less "sprite anime" production mode) ----
   backgroundIntervals: [], // [{t0,t1,ref}] from /api/project — the resolved "紙芝居"; empty for a non-composition project
@@ -942,6 +947,19 @@ function sceneThumbTilesFor(sourceId, srcStart, srcEnd) {
   return tiles;
 }
 
+// Codex 統合レビュー P1-2: 字幕行(renderCaptionRow の asButton)で実装済みの
+// tabIndex/role="button"/Enter・Space=クリック相当、というパターンをタイム
+// ラインの他ブロック(クリップ/B-roll/モーション/BGM/スプライト/セリフ)にも
+// 適用する共有ヘルパー。マウスの pointerdown ハンドラは別途そのまま付ける —
+// これは「Tab で到達でき、Enter/Space で選択+シークできる」ことだけを保証する。
+function makeBlockKeyboardActivatable(el, onActivate) {
+  el.tabIndex = 0;
+  el.setAttribute('role', 'button');
+  el.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.code === 'Space') { e.preventDefault(); onActivate(); }
+  });
+}
+
 function renderTimeline() {
   const clips = $('clips');
   clips.innerHTML = '';
@@ -970,6 +988,7 @@ function renderTimeline() {
       d.appendChild(tile);
     }
     attachClipHandlers(d, s);
+    makeBlockKeyboardActivatable(d, () => { selectClip(s.clipId); seekTl(s.tlStart, { play: false }); });
     clips.appendChild(d);
   });
   renderSceneMarks();
@@ -1001,6 +1020,7 @@ function renderTimeline() {
     }
     d.title = titleText;
     d.onpointerdown = (e) => startBlockDrag(e, 'motion', mo.id, mo.tlStart, d);
+    makeBlockKeyboardActivatable(d, () => { selectItem('motion', mo.id); seekTl(mo.tlStart, { play: false }); });
     mrow.appendChild(d);
   }
   const murow = $('musicRow');
@@ -1013,6 +1033,7 @@ function renderTimeline() {
     d.title = `${mu.id} ${basename(mu.path)} (${mu.gain}dB${mu.duck ? ', duck' : ''}) — ドラッグで移動`;
     d.textContent = basename(mu.path);
     d.onpointerdown = (e) => startBlockDrag(e, 'music', mu.id, mu.tlStart, d);
+    makeBlockKeyboardActivatable(d, () => { selectItem('music', mu.id); seekTl(mu.tlStart, { play: false }); });
     murow.appendChild(d);
   }
   renderOverlayRow();
@@ -1070,7 +1091,9 @@ function renderDialogueRow() {
     el.textContent = d.text;
     // W-UI IA v2 波2 §1: click selects (→ inspector) AND seeks — same
     // "selecting always moves the playhead there too" feel as clicking a clip.
-    el.onclick = () => { selectItem('dialogue', d.id); seekTl(d.tlStart); };
+    const activate = () => { selectItem('dialogue', d.id); seekTl(d.tlStart); };
+    el.onclick = activate;
+    makeBlockKeyboardActivatable(el, activate);
     row.appendChild(el);
   }
 }
@@ -1174,6 +1197,7 @@ function renderOverlayRow() {
       // に頼む" copy chip) instead of a one-shot toast that's gone the moment
       // the user looks away.
       d.onclick = (e) => { e.stopPropagation(); selectItem('broll', ov.id); };
+      makeBlockKeyboardActivatable(d, () => selectItem('broll', ov.id));
       orphanIdx++;
     } else {
       const dur = ov.srcOut - ov.srcIn;
@@ -1187,6 +1211,7 @@ function renderOverlayRow() {
       d.title = `${ovSrc ? basename(ovSrc.path) : ov.sourceId} — ${ov.id} (${dur.toFixed(1)}s, ${ov.audioMode}) — ドラッグで移動`;
       d.textContent = sourceLabel(ovSrc); // W-UI redesign §6: display name, not the internal overlay id (full filename in title)
       d.onpointerdown = (e) => startBlockDrag(e, 'broll', ov.id, r.tlStart, d);
+      makeBlockKeyboardActivatable(d, () => { selectItem('broll', ov.id); seekTl(r.tlStart, { play: false }); });
     }
     row.appendChild(d);
   }
@@ -1211,6 +1236,7 @@ function renderSpriteRow() {
       d.textContent = '!';
       d.title = `配置先を見失っています: ${sp.id} — クリックで詳しく見る`;
       d.onclick = (e) => { e.stopPropagation(); selectItem('sprite', sp.id); };
+      makeBlockKeyboardActivatable(d, () => selectItem('sprite', sp.id));
       orphanIdx++;
     } else {
       d.className = 'spBlock' + (isSelected('sprite', sp.id) ? ' sel' : '');
@@ -1219,6 +1245,7 @@ function renderSpriteRow() {
       d.title = `${sp.id} (${sp.assetId}, ${sp.duration.toFixed(1)}s) — ドラッグで移動`;
       d.textContent = sp.assetId;
       d.onpointerdown = (e) => startBlockDrag(e, 'sprite', sp.id, r.tlStart, d);
+      makeBlockKeyboardActivatable(d, () => { selectItem('sprite', sp.id); seekTl(r.tlStart, { play: false }); });
     }
     row.appendChild(d);
   }
@@ -1336,11 +1363,17 @@ function renderTrackGutter() {
     el.appendChild(d);
   };
   if (S.overlays.length > 0) addLabel('V2 B-roll', { top: '0%', height: '12%' });
-  if (!composition) {
+  // Codex 統合レビュー P2-8: 非compositionプロジェクトで V1/A1/T1 を常時
+  // 表示していた(素材ゼロの真新しいプロジェクトでもラベルだけ出る)。他の
+  // 行(V2/A2)と同じ「データがある行だけ出す」ルールに揃える — T1 は
+  // captionRow 自体が字幕オフでも常設の入口として残る(renderCaptionRow の
+  // doc参照)ため、ここではガターの「T1」ラベルだけを字幕有効時に絞る。
+  const hasClips = S.segments.length > 0;
+  if (!composition && hasClips) {
     addLabel('V1 本編', { top: '12%', height: '25%' });
     addLabel('A1 音声', { top: '37%', height: '25%' });
   }
-  if (!composition) addLabel('T1 テロップ', { bottom: '0px', height: '12px' });
+  if (!composition && S.manifest?.captions?.enabled) addLabel('T1 テロップ', { bottom: '0px', height: '12px' });
   if ((S.manifest?.timeline.music ?? []).length > 0) addLabel('A2 BGM', { bottom: '30px', height: '12px' });
 }
 
@@ -1719,10 +1752,6 @@ function mediaRow(src) {
       cullBadge.textContent = `未確認 ${c.unreviewed} / 採用 ${c.keep} / 不採用 ${c.reject}`;
       badges.appendChild(cullBadge);
     }
-    const idBadge = document.createElement('span');
-    idBadge.className = 'badge srcIdBadge';
-    idBadge.textContent = src.id;
-    badges.appendChild(idBadge);
     const used = sourceUsageSeconds(src.id);
     const pct = src.duration > 0 ? Math.min(100, (used / src.duration) * 100) : 0;
     const usage = document.createElement('div');
@@ -1885,9 +1914,14 @@ async function submitMusicAdd(fileOrPath) {
   if (ok) { $('musicAddForm').hidden = true; $('musicAddPath').value = ''; $('musicAddSfx').checked = false; }
 }
 $('musicAddSubmit').onclick = () => submitMusicAdd($('musicAddPath').value);
-$('musicAddForm').addEventListener('dragover', (e) => { e.preventDefault(); });
+// Codex 統合レビュー P2-5: stopPropagation しないと window の動画取り込み
+// dragenter/drop ハンドラにもバブって二重発火し(BGMフォームへ音声ファイルを
+// ドロップすると「動画ファイルが見つかりませんでした」の誤トーストが出る)、
+// このフォームの追加とは無関係な取り込みフローが同時に走ってしまう。
+$('musicAddForm').addEventListener('dragover', (e) => { e.preventDefault(); e.stopPropagation(); });
 $('musicAddForm').addEventListener('drop', (e) => {
   e.preventDefault();
+  e.stopPropagation();
   const file = e.dataTransfer?.files?.[0];
   if (file) submitMusicAdd(file);
 });
@@ -2271,7 +2305,7 @@ function buildMusicInspector(body, id) {
   body.appendChild(label);
   body.appendChild(inspField('タイムライン位置', `${fmt(mu.tlStart)}–${fmt(mu.tlStart + mu.duration)}`));
   inspDivider(body);
-  body.appendChild(inspSlider('音量(gain)', {
+  body.appendChild(inspSlider('音量', {
     min: -40, max: 12, step: 1, value: mu.gain,
     format: (v) => `${v > 0 ? '+' : ''}${v}dB`,
     onCommit: async (v) => { await mutate({ op: 'music-update', id, gain: v }); },
@@ -2292,7 +2326,7 @@ function buildMusicInspector(body, id) {
   duckCb.type = 'checkbox';
   duckCb.checked = mu.duck;
   duckCb.onchange = async () => { await mutate({ op: 'music-update', id, duck: duckCb.checked }, { trigger: duckCb }); };
-  duckRow.append(duckCb, ' 発話でダッキング(自動的に音量を下げる)');
+  duckRow.append(duckCb, ' 会話中は自動で下げる');
   body.appendChild(duckRow);
   inspDivider(body);
   body.appendChild(inspRemoveButton('削除', 'このBGM/SEを削除しますか？', async () => { await mutate({ op: 'music-remove', id }); }));
@@ -3296,7 +3330,7 @@ function renderTranscript() {
       s.tabIndex = key === S.focusKey ? 0 : -1;
       s.title = cand
         ? `「残す」を選択済み: ${humanizeCandidateLabel(cand.label, Math.max(0, cand.t1 - cand.t0))}(再検出で再提案されます)`
-        : `${w.id} ${w.t0.toFixed(2)}–${w.t1.toFixed(2)}s`;
+        : `${w.t0.toFixed(2)}–${w.t1.toFixed(2)}s`;
       el.appendChild(s);
       prev = w;
     }
@@ -3771,9 +3805,11 @@ function renderWarningsGroup(el) {
     if (r.tlStart != null) continue;
     count++; kindCounts.anchor++;
     const ov = r.overlay;
+    // Codex 統合レビュー P2-4: title に生の overlay id / sourceId を出していた
+    // — 表示文にすでに素材別名(sourceDisplayName)が入っているので internal
+    // id の title は不要、丸ごと削除。
     el.appendChild(inboxWarningRow(
       `⚠ 配置先を見失ったB-roll: ${sourceDisplayName(ov.sourceId)} — 元の位置(${sourceDisplayName(ov.anchor.sourceId)} ${ov.anchor.srcTime.toFixed(2)}秒)がカットで失われました。Claude に伝えて配置し直してください`,
-      { title: `overlay id: ${ov.id} / anchor sourceId: ${ov.anchor.sourceId}` },
     ));
   }
   for (const r of S.sprites) {
@@ -3782,7 +3818,6 @@ function renderWarningsGroup(el) {
     const sp = r.sprite;
     el.appendChild(inboxWarningRow(
       `⚠ 配置先を見失ったキャラクター: ${sp.assetId} — 元の位置(${sourceDisplayName(sp.anchor.sourceId)} ${sp.anchor.srcTime.toFixed(2)}秒)がカットで失われました。Claude に伝えて配置し直してください`,
-      { title: `sprite id: ${sp.id} / anchor sourceId: ${sp.anchor.sourceId}` },
     ));
   }
 
@@ -3848,8 +3883,12 @@ const EXPORT_KIND_LABEL = {
 async function fetchExportResults() {
   try {
     S.exportResults = await api('/api/export-results?n=1');
+    S.exportResultsStale = false;
   } catch {
-    S.exportResults = []; // best-effort — a failed fetch just means the card stays as it was/hidden, never a toast
+    // best-effort: keep whatever was last successfully fetched instead of
+    // wiping the card (Codex 統合レビュー P2-6) — renderExportResultCard
+    // appends a small "更新できませんでした" note when this flag is set.
+    S.exportResultsStale = true;
   }
   renderExportResultCard();
 }
@@ -3923,6 +3962,14 @@ function renderExportResultCard() {
       '古い版の書き出しです — 最新の内容で書き出すには Claude に伝えてください',
       { askPrompt: 'MP4を書き出して' },
     ));
+  }
+  // Codex 統合レビュー P2-6: 直近の再取得(30秒ポーリング等)が失敗していても
+  // カードは消さず、保持している最後の結果の下に小さく添えるだけに留める。
+  if (S.exportResultsStale) {
+    const stale = document.createElement('div');
+    stale.className = 'hintText';
+    stale.textContent = '更新できませんでした(表示は最後に取得できた結果です)';
+    el.appendChild(stale);
   }
 }
 function renderInbox() {
@@ -4412,7 +4459,10 @@ async function copyToClipboard(text) {
 function askClaudeChip(promptText) {
   const btn = document.createElement('button');
   btn.className = 'askChip';
-  btn.textContent = `「${promptText}」をコピー`;
+  // Codex 統合レビュー 受け入れ基準残差#3: 「Claude への導線」が title だけに
+  // 頼っていた(可視ラベルは「『依頼文』をコピー」で誰に頼むのか不明瞭) —
+  // 固定プレフィックスで可視化する。
+  btn.textContent = `Claude に頼む: 「${promptText}」をコピー`;
   btn.title = 'クリックでこの依頼文をクリップボードにコピーします。Claude に伝えてください';
   btn.onclick = (e) => { e.stopPropagation(); copyToClipboard(promptText); };
   return btn;
@@ -4459,6 +4509,13 @@ tabList.addEventListener('keydown', (e) => {
 let showHighlightTimer;
 function handleShowDirective(d) {
   if (!d || !d.kind) return;
+  // Codex 統合レビュー P1-1: クリップ等を選択してインスペクタ表示中
+  // (#tabsView が hidden)に show 系 WS メッセージが来ると、対象のタブ側は
+  // 更新されてもインスペクタの裏に隠れたまま不可視だった。Claude の提示は
+  // ユーザーへの割り込みとして最優先 — 選択を解除してインスペクタを閉じ、
+  // #tabsView を表示してから各 kind のハンドラ(activateTab 等)に委ねる。
+  // 選択中だった対象を show 後に再選択する必要はない。
+  if (S.selection) deselect();
   if (d.kind === 'range') return showRangeDirective(d);
   if (d.kind === 'words') return showWordsDirective(d);
   if (d.kind === 'candidate') return showCandidateDirective(d);
@@ -4705,6 +4762,12 @@ function renderClaudeStatus() {
 }
 
 // ---------- websocket live updates ----------
+// Codex 統合レビュー P2-7: 切断中に見逃した transcribe-done/update 等の WS
+// メッセージのせいで、再接続後も activeTask/S.transcribing/取り込み
+// オーバーレイがローカルに残留し続けることがあった。wsEverConnected で
+// 「今回の open が最初の接続か、切断からの再接続か」を区別し、再接続の
+// ときだけローカル状態をクリアして reload() で最新状態に同期し直す。
+let wsEverConnected = false;
 function connectWs() {
   const ws = new WebSocket(`ws://${location.host}/ws`);
   ws.onopen = () => {
@@ -4712,6 +4775,14 @@ function connectWs() {
     el.classList.add('up');
     el.title = '接続済み';
     el.setAttribute('aria-label', '接続状態: 接続済み');
+    if (wsEverConnected) {
+      S.transcribing = new Set();
+      setClaudeTask(null);
+      $('ingestOverlay').hidden = true;
+      $('stage').removeAttribute('aria-busy');
+      if (S.manifest) reload().catch((e) => toast(e.message, { type: 'error' }));
+    }
+    wsEverConnected = true;
   };
   ws.onclose = () => {
     const el = $('conn');

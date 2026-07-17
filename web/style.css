@@ -110,7 +110,7 @@ header {
    doc above) — every numeric readout in the timeline/inbox/media-pool UI
    shares this one rule rather than repeating font-family per component. */
 .mono, #headerTc, #tc, #rangeInfo, #revLabel, #minGapVal,
-.cand .srcTag, .cand .dur, .srcDur, .srcIdBadge, .srcUsageLabel, .btn-sceneSeek,
+.cand .srcTag, .cand .dur, .srcDur, .srcUsageLabel, .btn-sceneSeek,
 dialog#shortcutsDialog td:first-child {
   font-family: var(--font-mono); font-variant-numeric: tabular-nums;
 }
@@ -454,6 +454,13 @@ main { flex: 1; display: flex; min-height: 0; }
    renderTimeline in app.js が該当ブロックにこのクラスを付ける)。 */
 .moBlock.sel, .muBlock.sel, .ovBlock.sel, .spBlock.sel, .dlBlock.sel {
   outline: 2px solid var(--link); outline-offset: 1px; z-index: 2;
+}
+/* Codex 統合レビュー P1-2: クリップ/B-roll/モーション/BGM/スプライト/セリフ
+   ブロックにキーボード到達性(tabIndex/role/keydown, makeBlockKeyboardActivatable
+   in app.js)を追加 — フォーカスリングは既存トークン(--link)そのまま。 */
+.clip:focus-visible, .moBlock:focus-visible, .muBlock:focus-visible,
+.ovBlock:focus-visible, .spBlock:focus-visible, .dlBlock:focus-visible {
+  outline: 2px solid var(--link); outline-offset: 1px;
 }
 #dropIndicator {
   position: absolute; top: 12%; height: 50%; width: 2px; background: var(--link);
@@ -856,8 +863,6 @@ aside {
 }
 .badge.ok { background: rgba(143, 185, 150, 0.18); border-color: transparent; color: var(--keep); }
 .badge.warn { background: rgba(232, 160, 60, 0.18); border-color: transparent; color: var(--tally); }
-/* W-UI §3: raw ids (sourceId etc.) shown only in the expanded row detail, styled a step dimmer than the other badges. */
-.srcIdBadge { background: transparent; border: 1px solid var(--zone-border); color: var(--text-dim); font-variant-numeric: tabular-nums; }
 .srcUsage { display: flex; align-items: center; gap: 8px; }
 .srcUsageBar {
   display: block; flex: 1 1 auto; height: 6px; min-width: 40px; border-radius: 999px;
