@@ -58,6 +58,12 @@ const S = {
   activeWordKey: null, // "sourceId:wordId" currently playback-highlighted
   selectedClip: null,
   detectMinGap: 0.7,
+  // W-UI IA v2 §5(c): best-effort "which of the 4 zero-candidate empty
+  // states are we in" signal — see renderCandidatesGroup's doc for why this
+  // is only an approximation (daemon exposes no "has detection ever run"
+  // flag, so a fresh page load can't distinguish 未検出 from 問題なし).
+  detecting: false, // true only while THIS tab's own redetectBtn click is in flight
+  detectRanEmpty: false, // true once THIS session has seen a completed detect that found nothing
   rateIdx: 0, // index into PLAY_RATES, cycled by repeated L presses
   rangeIn: null, // timeline seconds
   rangeOut: null, // timeline seconds
@@ -168,24 +174,38 @@ async function reload() {
 }
 
 // ---------- stage empty/failure states (persistent, not just a toast) ----------
+// W-UI IA v2 §5(a): a normal (source-driven, see W-ANIME's Manifest.
+// composition doc) project with zero sources is the single "brand new
+// project" state — both the stage's 3-line onboarding message AND the 確認
+// tab's "確認するものはまだありません" short-circuit (see renderInbox) key
+// off this same predicate, so the two panels never disagree about it.
+function isProjectEmpty() {
+  return Boolean(S.manifest) && !S.manifest.composition && (S.manifest.sources?.length ?? 0) === 0;
+}
 function renderStageState() {
   const el = $('stageEmpty');
   const msg = $('stageEmptyMsg');
   const retry = $('stageEmptyRetry');
+  msg.innerHTML = '';
+  const addLine = (text, cls) => {
+    const p = document.createElement('p');
+    if (cls) p.className = cls;
+    p.textContent = text;
+    msg.appendChild(p);
+  };
   if (S.loadState === 'error') {
     el.hidden = false;
-    msg.textContent = '読み込みに失敗しました';
+    addLine('読み込みに失敗しました');
     retry.hidden = false;
   } else if (S.loadState === 'no-project') {
     el.hidden = false;
-    msg.textContent = 'プロジェクト未選択';
+    addLine('プロジェクト未選択');
     retry.hidden = true;
-  } else if (S.manifest && !S.manifest.composition && (S.manifest.sources?.length ?? 0) === 0) {
-    // W-ANIME: a composition project has NO sources by design (see
-    // Manifest.composition's doc) — this "ingest a file" empty state is
-    // only meaningful for a normal (source-driven) project.
+  } else if (isProjectEmpty()) {
     el.hidden = false;
-    msg.textContent = 'まだ素材がありません — ここに動画をドラッグして取り込み';
+    addLine('最初の動画を追加', 'stageEmptyLead');
+    addLine('ここに動画をドロップするか、Claude に「この動画を編集して」と伝えてください');
+    addLine('元動画は変更しません');
     retry.hidden = true;
   } else {
     el.hidden = true;
@@ -514,7 +534,7 @@ function renderRange() {
   sel.style.width = `${Math.max(0, (b - a) / S.duration) * 100}%`;
   if (S.rangeIn != null && S.rangeOut != null) {
     bar.hidden = false;
-    $('rangeInfo').textContent = `IN ${fmt(S.rangeIn)} – OUT ${fmt(S.rangeOut)} (${fmt(S.rangeOut - S.rangeIn)})`;
+    $('rangeInfo').textContent = `開始点(IN) ${fmt(S.rangeIn)} – 終了点(OUT) ${fmt(S.rangeOut)} (${fmt(S.rangeOut - S.rangeIn)})`;
   } else {
     bar.hidden = true;
   }
@@ -948,11 +968,11 @@ function renderOverlayRow() {
       d.className = 'ovBlock orphan';
       d.style.left = `${orphanIdx * 14}px`;
       d.textContent = '!';
-      d.title = `アンカー切れ: ${ov.id} — クリックで理由を表示`;
+      d.title = `配置先を見失っています: ${ov.id} — クリックで理由を表示`;
       d.onclick = (e) => {
         e.stopPropagation();
         toast(
-          `B-roll ${ov.id} はアンカー切れです — アンカー(${ov.anchor.sourceId}@${ov.anchor.srcTime.toFixed(2)}s)がカットで失われました。再アンカーしてください(vedit broll-update)`,
+          `B-roll ${ov.id} は配置先を見失っています — 元の位置(${ov.anchor.sourceId}@${ov.anchor.srcTime.toFixed(2)}s)がカットで失われました。Claude に伝えて配置し直してください`,
           { type: 'error' },
         );
       };
@@ -991,11 +1011,11 @@ function renderSpriteRow() {
       d.className = 'spBlock orphan';
       d.style.left = `${orphanIdx * 14}px`;
       d.textContent = '!';
-      d.title = `アンカー切れ: ${sp.id} — クリックで理由を表示`;
+      d.title = `配置先を見失っています: ${sp.id} — クリックで理由を表示`;
       d.onclick = (e) => {
         e.stopPropagation();
         toast(
-          `スプライト ${sp.id} はアンカー切れです — アンカー(${sp.anchor.sourceId}@${sp.anchor.srcTime.toFixed(2)}s)がカットで失われました。再アンカーしてください(vedit sprite-update)`,
+          `キャラクター ${sp.id} は配置先を見失っています — 元の位置(${sp.anchor.sourceId}@${sp.anchor.srcTime.toFixed(2)}s)がカットで失われました。Claude に伝えて配置し直してください`,
           { type: 'error' },
         );
       };
@@ -1299,13 +1319,13 @@ function sceneGridRow(src, scenes) {
     keepBtn.className = 'btn-sceneKeep';
     keepBtn.textContent = '✓';
     keepBtn.setAttribute('aria-pressed', String(review === 'keep'));
-    keepBtn.setAttribute('aria-label', `${sc.id} を keep にする`);
+    keepBtn.setAttribute('aria-label', `${sc.id} を採用にする`);
     keepBtn.onclick = (e) => { e.stopPropagation(); setSceneReviewUi(src.id, sc.id, review === 'keep' ? 'clear' : 'keep'); };
     const rejectBtn = document.createElement('button');
     rejectBtn.className = 'btn-sceneReject';
     rejectBtn.textContent = '✕';
     rejectBtn.setAttribute('aria-pressed', String(review === 'reject'));
-    rejectBtn.setAttribute('aria-label', `${sc.id} を reject にする`);
+    rejectBtn.setAttribute('aria-label', `${sc.id} を不採用にする`);
     rejectBtn.onclick = (e) => { e.stopPropagation(); setSceneReviewUi(src.id, sc.id, review === 'reject' ? 'clear' : 'reject'); };
     reviewRow.append(keepBtn, rejectBtn);
     item.appendChild(reviewRow);
@@ -1407,7 +1427,7 @@ function mediaRow(src) {
       const c = cullingCounts(src.id);
       const cullBadge = document.createElement('span');
       cullBadge.className = 'badge cullBadge';
-      cullBadge.textContent = `未確認 ${c.unreviewed} / keep ${c.keep} / reject ${c.reject}`;
+      cullBadge.textContent = `未確認 ${c.unreviewed} / 採用 ${c.keep} / 不採用 ${c.reject}`;
       badges.appendChild(cullBadge);
     }
     const idBadge = document.createElement('span');
@@ -1465,6 +1485,10 @@ function renderMediaPanel() {
   const el = $('mediaList');
   el.innerHTML = '';
   const sources = S.manifest.sources;
+  // W-UI IA v2 用語表: 「keepだけで仮タイムライン作成」→「採用シーンで仮編集
+  // を作る」、採用>0 のときだけ表示(0のときは押しても意味のあるものが
+  // 何もない — 空の仮タイムラインを作られても困惑するだけなので隠す)。
+  $('buildSelectsBtn').hidden = totalKeepCount() === 0;
   if (sources.length === 0) {
     el.innerHTML = '<div class="hintText" style="padding:8px">まだ素材がありません — ここに動画をドラッグして取り込み</div>';
     return;
@@ -1525,28 +1549,32 @@ $('mediaList').addEventListener('keydown', (e) => {
   else if (e.key === 'End') { e.preventDefault(); setMediaFocus(sources[sources.length - 1].id); }
   else if (e.key === 'Enter') { e.preventDefault(); toggleMediaDetail(row.dataset.source); }
 });
-$('buildSelectsBtn').onclick = async () => {
-  const sourcesWithScenes = S.manifest.sources.filter((s) => S.scenes.has(s.id));
-  let keepCount = 0;
-  for (const s of sourcesWithScenes) {
+// W-UI IA v2 用語表: keep/reject/未確認 → 採用/不採用/未確認。「採用」に
+// 設定した合計シーン数 — buildSelectsBtn の表示条件(採用>0のときだけ表示)
+// と、クリック時の件数表示の両方で使う共有カウント。
+function totalKeepCount() {
+  let n = 0;
+  for (const s of S.manifest.sources) {
+    if (!S.scenes.has(s.id)) continue;
     for (const sc of S.scenes.get(s.id)) {
-      if (reviewFor(s.id, sc.id) === 'keep') keepCount++;
+      if (reviewFor(s.id, sc.id) === 'keep') n++;
     }
   }
-  if (keepCount === 0) {
-    toast('keep に設定したシーンがありません(シーンをチェックしてから実行してください)', { type: 'error' });
-    return;
-  }
+  return n;
+}
+$('buildSelectsBtn').onclick = async () => {
+  const keepCount = totalKeepCount();
+  if (keepCount === 0) return; // button is hidden whenever this is 0 (see renderMediaPanel) — defensive only
   const currentClips = S.manifest.timeline.video.length;
   const ok = confirm(
-    `現在のタイムライン(クリップ ${currentClips} 本)を、keep にした ${keepCount} シーンだけの仮タイムラインに置き換えます。\n元のタイムラインは undo で戻せます。よろしいですか？`,
+    `現在のタイムライン(クリップ ${currentClips} 本)を、採用にした ${keepCount} シーンだけの仮タイムラインに置き換えます。\n元のタイムラインは undo で戻せます。よろしいですか？`,
   );
   if (!ok) return;
   const { ok: applied } = await mutate(
     { op: 'selects' },
     { conflictMessage: '仮タイムラインの作成は適用されませんでした。最新状態を確認してもう一度実行してください' },
   );
-  if (applied) toast(`keep ${keepCount} シーンで仮タイムラインを作成しました`);
+  if (applied) toast(`採用 ${keepCount} シーンで仮タイムラインを作成しました`);
 };
 
 // ---------- clip inspector (±frame trim) ----------
@@ -2351,27 +2379,83 @@ function rejectedWordMap() {
   return m;
 }
 
+// W-UI IA v2 §5b: 素材ごとの文字起こし状況 — 未実行/処理中/完了の3状態。
+const TRANSCRIBE_STATUS_LABEL = { done: '完了', processing: '処理中', pending: '未実行' };
+function sourceTranscribeStatus(src) {
+  if (src.transcribed) return 'done';
+  if (S.transcribing.has(src.id)) return 'processing';
+  return 'pending';
+}
+/**
+ * Punch-list follow-up: the empty/partial states used to only ever tell the
+ * user to ask Claude — there was no in-UI way to actually start a transcribe
+ * job, so a D&D-ingested source with nobody around to ask Claude would sit
+ * un-transcribed forever. POSTs /api/transcribe (daemon.ts, async job —
+ * progress arrives over the same WS transcribe-progress/-done/-error
+ * messages connectWs already listens for) for this one source. Optimistic
+ * S.transcribing add + re-render so the row flips to "処理中" immediately,
+ * not just whenever the first WS progress message happens to land.
+ */
+async function startTranscribe(sourceId) {
+  try {
+    const r = await api('/api/transcribe', { method: 'POST', body: JSON.stringify({ sourceId }) });
+    if (r.started?.includes(sourceId)) {
+      S.transcribing.add(sourceId);
+      renderTranscript();
+      renderMediaPanel();
+    }
+  } catch (e) {
+    toast(e.message, { type: 'error' });
+  }
+}
+// One source's 未実行/処理中/完了 row — 未実行 sources (with audio) get a
+// button that starts that source's transcribe job directly, so "ask Claude"
+// is a suggestion, not the only path (W-UI IA v2 §5b follow-up).
+function transcribeStatusRow(src) {
+  const status = sourceTranscribeStatus(src);
+  const row = document.createElement('div');
+  row.className = 'transcribeStatusRow';
+  const label = document.createElement('span');
+  label.textContent = `${basename(src.path)}: ${TRANSCRIBE_STATUS_LABEL[status]}`;
+  row.appendChild(label);
+  if (status === 'pending') {
+    if (src.hasAudio) {
+      const btn = document.createElement('button');
+      btn.className = 'btn-transcribeSource';
+      btn.textContent = 'この素材を文字起こし';
+      btn.setAttribute('aria-label', `${basename(src.path)} を文字起こし`);
+      btn.onclick = () => startTranscribe(src.id);
+      row.appendChild(btn);
+    } else {
+      const note = document.createElement('span');
+      note.className = 'hintText';
+      note.textContent = '(音声なし)';
+      row.appendChild(note);
+    }
+  }
+  return row;
+}
 /**
  * W-LAZY empty state: transcription is no longer an ingest-time default, so
  * "no source has a transcript yet" is now a normal, expected state (not just
  * a brief moment right after ingest) — tell the user how to get one instead
- * of silently rendering nothing. Distinguishes "a transcribe job is already
- * running" (S.transcribing, live WS/reload state) from "nothing started
- * yet" so the message doesn't tell someone to kick off a job that's already
- * in flight.
+ * of silently rendering nothing. Lists every source's own 未実行/処理中/完了
+ * status (W-UI IA v2 §5b) rather than one aggregate line, with a per-source
+ * start button, and never surfaces the CLI form (`vedit transcribe ...`) —
+ * asking Claude is offered as an alternative, not the only path (W-UI IA v2
+ * §6).
  */
 function renderTranscriptEmptyState(el) {
+  const list = document.createElement('div');
+  list.className = 'hintText transcribeStatusList';
+  for (const src of S.manifest.sources) list.appendChild(transcribeStatusRow(src));
+  el.appendChild(list);
   const msg = document.createElement('div');
   msg.className = 'hintText';
   msg.style.padding = '8px';
-  if (S.transcribing.size > 0) {
-    const names = [...S.transcribing]
-      .map((id) => basename(S.manifest.sources.find((s) => s.id === id)?.path ?? id))
-      .join(', ');
-    msg.textContent = `文字起こし中: ${names} …`;
-  } else {
-    msg.textContent = '文字起こしがまだです — 「字幕つけて」と言うか `vedit transcribe <sourceId|all>`';
-  }
+  msg.textContent = S.transcribing.size > 0
+    ? '文字起こし中です — 完了までお待ちください'
+    : '文字起こしは任意です(字幕づくりやこのタブでの発言単位の編集に使います)。上のボタンで直接始めるか、Claude に「この素材を文字起こしして」と伝えてください';
   el.appendChild(msg);
 }
 function renderTranscript() {
@@ -2421,11 +2505,27 @@ function renderTranscript() {
       if (!S.focusKey) S.focusKey = key; // default roving-tabindex stop: first word
       s.tabIndex = key === S.focusKey ? 0 : -1;
       s.title = cand
-        ? `却下済み: ${cand.label}(再検出で再提案されます)`
+        ? `「残す」を選択済み: ${humanizeCandidateLabel(cand.label, Math.max(0, cand.t1 - cand.t0))}(再検出で再提案されます)`
         : `${w.id} ${w.t0.toFixed(2)}–${w.t1.toFixed(2)}s`;
       el.appendChild(s);
       prev = w;
     }
+  }
+  // W-UI IA v2 §5b: some (not all) sources transcribed — a compact status
+  // footer (with the same per-source start button as the full-empty state)
+  // for the ones still pending/processing, so a partially-transcribed
+  // project doesn't silently omit the sources it has nothing to show for.
+  const notYet = S.manifest.sources.filter((src) => !S.transcripts.has(src.id));
+  if (notYet.length > 0) {
+    const heading = document.createElement('div');
+    heading.className = 'hintText';
+    heading.style.padding = '8px 8px 0';
+    heading.textContent = '未文字起こし:';
+    el.appendChild(heading);
+    const list = document.createElement('div');
+    list.className = 'hintText transcribeStatusList';
+    for (const src of notYet) list.appendChild(transcribeStatusRow(src));
+    el.appendChild(list);
   }
 }
 
@@ -2665,17 +2765,52 @@ function candidateTl(t, c) {
   return seg.tlStart + (clamped - seg.srcStart);
 }
 
+/**
+ * detect.ts (src/core/detect.ts) emits candidate labels as English template
+ * sentences ("0.6s silence after \"...\"", "filler \"...\"", etc.) — fine
+ * for logs, not for a Japanese UI. This turns each known template into a
+ * Japanese sentence that ALSO states what "cutting this saves" in words
+ * (W-UI IA v2 §4: "-X.Xs の意味を文中に含める"), so the separate compact
+ * duration chip (.dur, still shown for at-a-glance scanning of a long list)
+ * is never the ONLY place that number's meaning is explained. Falls back to
+ * the raw label, suffixed the same way, for any template this hasn't been
+ * taught yet (e.g. a future retake/low-energy format).
+ */
+function humanizeCandidateLabel(label, dur) {
+  const cutNote = `詰めると −${dur.toFixed(1)}秒`;
+  let m;
+  if ((m = /^([\d.]+)s silence after "(.*)"$/.exec(label))) {
+    return `"${m[2]}"の後の無音 ${Number(m[1]).toFixed(1)}秒 — ${cutNote}`;
+  }
+  if ((m = /^([\d.]+)s leading silence$/.exec(label))) {
+    return `冒頭の無音 ${Number(m[1]).toFixed(1)}秒 — ${cutNote}`;
+  }
+  if ((m = /^filler "(.*)"$/.exec(label))) {
+    return `フィラー "${m[1]}" — ${cutNote}`;
+  }
+  if ((m = /^([\d.]+)s silence \(waveform(.*)\)$/.exec(label))) {
+    const conflict = /transcript disagrees/.test(m[2]);
+    return `無音 ${Number(m[1]).toFixed(1)}秒(波形検出)${conflict ? ' — 文字起こしと一致しません、確認してから決めてください' : ''} — ${cutNote}`;
+  }
+  return `${label} — ${cutNote}`;
+}
 function candRow(c) {
   const d = document.createElement('div');
   d.className = 'cand';
   d.tabIndex = 0;
   const dur = Math.max(0, c.t1 - c.t0);
+  const label = humanizeCandidateLabel(c.label, dur);
   const src = S.manifest.sources.find((s) => s.id === c.sourceId);
   const srcName = sourceLabel(src);
   const srcTitle = src ? basename(src.path) : c.sourceId;
   const timeRange = `${fmt(c.t0)}–${fmt(c.t1)}`;
-  d.innerHTML = `<span class="kind ${c.kind}">${esc(KIND_LABEL[c.kind] ?? c.kind)}</span><span class="lbl">${esc(c.label)}</span><span class="srcTag" title="${esc(srcTitle)}">${esc(srcName)} ${timeRange}</span><span class="dur">-${dur.toFixed(1)}s</span>`;
-  d.setAttribute('aria-label', `${KIND_LABEL[c.kind] ?? c.kind}: ${c.label}(${srcName} ${timeRange}, -${dur.toFixed(1)}秒)`);
+  // W-UI IA v2 §4: the humanized label is now a full sentence (kind name +
+  // what/where + the cut-savings meaning of −X.X秒) — long enough that the
+  // compact row's CSS ellipsis (.cand .lbl) can clip it, so a title tooltip
+  // keeps the full sentence one hover away rather than only reachable via
+  // aria-label or the candidate card.
+  d.innerHTML = `<span class="kind ${c.kind}">${esc(KIND_LABEL[c.kind] ?? c.kind)}</span><span class="lbl" title="${esc(label)}">${esc(label)}</span><span class="srcTag" title="${esc(srcTitle)}">${esc(srcName)} ${timeRange}</span><span class="dur">−${dur.toFixed(1)}秒</span>`;
+  d.setAttribute('aria-label', `${KIND_LABEL[c.kind] ?? c.kind}: ${label}(${srcName} ${timeRange})`);
   const seekHere = () => {
     const tl = candidateTl(c.t0, c);
     if (tl != null) seekTl(Math.max(0, Math.min(tl, S.duration - 0.1)), { play: false });
@@ -2688,7 +2823,7 @@ function candRow(c) {
   preview.className = 'btn-preview';
   preview.textContent = '前後を再生';
   preview.title = '候補の1秒前から再生し、終端+1秒で自動停止';
-  preview.setAttribute('aria-label', `${c.label} の前後を再生`);
+  preview.setAttribute('aria-label', `${label} の前後を再生`);
   preview.onclick = (e) => {
     e.stopPropagation();
     const startTl = candidateTl(c.t0 - 1, c);
@@ -2701,13 +2836,13 @@ function candRow(c) {
   };
   const ok = document.createElement('button');
   ok.className = 'btn-approve';
-  ok.textContent = 'カット適用';
-  ok.setAttribute('aria-label', `${c.label} をカット適用`);
+  ok.textContent = 'カットする';
+  ok.setAttribute('aria-label', `${label} をカットする`);
   ok.onclick = async (e) => { e.stopPropagation(); await decide([c.id], 'approve'); };
   const ng = document.createElement('button');
   ng.className = 'btn-reject';
   ng.textContent = '残す';
-  ng.setAttribute('aria-label', `${c.label} を残す(却下)`);
+  ng.setAttribute('aria-label', `${label} を残す`);
   ng.onclick = async (e) => { e.stopPropagation(); await decide([c.id], 'reject'); };
   const actions = document.createElement('div');
   actions.className = 'candActions';
@@ -2716,7 +2851,7 @@ function candRow(c) {
   return d;
 }
 
-// ---------- inbox (W-UI §1: 要確認 — pending candidates + アンカー切れ + 色警告 + 低信頼トランスクリプト警告, merged into the "いま" tab) ----------
+// ---------- inbox (W-UI IA v2 §2/§3: 確認タブ = 「Claude の編集提案」(pending candidates) + 「対応が必要」(アンカー切れ・色警告・聞き取り確認・QC) 2群) ----------
 function lowConfidenceCounts() {
   const out = [];
   for (const src of S.manifest.sources) {
@@ -2746,69 +2881,113 @@ function inboxWarningRow(text, opts = {}) {
   }
   return d;
 }
-function renderInbox() {
-  const el = $('inboxList');
+// KIND_LABEL + "候補" (e.g. "無音候補") — the noun the group-header bulk
+// button's result-explicit label uses (W-UI IA v2 §2: 「無音候補2件をカット
+// (−2.4秒)」replaces the old static「まとめて承認」).
+const KIND_CANDIDATE_NOUN = Object.fromEntries(Object.entries(KIND_LABEL).map(([k, v]) => [k, `${v}候補`]));
+/**
+ * Builds the "Claude の編集提案" group's content: one sub-group per
+ * candidate kind (unchanged structure), OR — when there are zero pending
+ * candidates — one of 4 distinguishable empty messages (W-UI IA v2 §5c).
+ * The 4th state's distinction from the 1st is a best-effort approximation:
+ * the daemon has no "has detection ever run" flag, so a fresh page load
+ * that has never seen a completed /api/detect this session defaults to
+ * "未検出" even if Claude ran `vedit detect` (found nothing) in an earlier
+ * session — see S.detecting/S.detectRanEmpty's doc at the top of the file.
+ */
+function renderCandidatesGroup(el) {
+  el.innerHTML = '';
+  const candCount = S.candidates.length;
+  $('detectSettings').hidden = candCount === 0;
+  if (candCount === 0) {
+    const msg = document.createElement('div');
+    msg.className = 'hintText inboxEmpty';
+    if (S.detecting) {
+      msg.textContent = 'Claude が無音や言い直しを確認しています…';
+    } else if (S.candidatesAll.length > 0) {
+      msg.textContent = '✓ 提案はすべて確認済みです';
+    } else if (S.detectRanEmpty) {
+      msg.textContent = '無音や言い直しなどの編集提案は見つかりませんでした';
+    } else {
+      msg.textContent = '編集提案はまだ作られていません — Claude に「動画を編集して」のように伝えてください';
+    }
+    el.appendChild(msg);
+    $('candidatesCount').textContent = '';
+    return;
+  }
+  const byKind = new Map();
+  for (const c of S.candidates) {
+    if (!byKind.has(c.kind)) byKind.set(c.kind, []);
+    byKind.get(c.kind).push(c);
+  }
+  const kinds = [...byKind.keys()].sort((a, b) => {
+    const ia = KIND_ORDER.indexOf(a), ib = KIND_ORDER.indexOf(b);
+    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+  });
+  for (const kind of kinds) {
+    const list = byKind.get(kind);
+    const totalDur = list.reduce((sum, c) => sum + Math.max(0, c.t1 - c.t0), 0);
+    const group = document.createElement('div');
+    group.className = 'candGroup';
+    const header = document.createElement('div');
+    header.className = 'candGroupHeader';
+    header.innerHTML = `<span class="kind ${kind}">${KIND_LABEL[kind] ?? kind}</span><span class="spacer"></span>`;
+    // W-UI IA v2 §2: the group's ONE bulk action is a result-explicit label
+    // ("無音候補2件をカット(−2.4秒)") instead of a plain "まとめて承認" —
+    // what it does and what it's worth are both readable without a click.
+    const approveBtn = document.createElement('button');
+    approveBtn.className = 'btn-approve';
+    approveBtn.textContent = `${KIND_CANDIDATE_NOUN[kind] ?? `${KIND_LABEL[kind] ?? kind}候補`}${list.length}件をカット(−${totalDur.toFixed(1)}秒)`;
+    approveBtn.onclick = () => decide(list.map((c) => c.id), 'approve');
+    const rejectBtn = document.createElement('button');
+    rejectBtn.className = 'btn-reject';
+    rejectBtn.textContent = 'まとめて残す';
+    rejectBtn.onclick = () => decide(list.map((c) => c.id), 'reject');
+    header.append(approveBtn, rejectBtn);
+    group.appendChild(header);
+    for (const c of list) group.appendChild(candRow(c));
+    el.appendChild(group);
+  }
+  const parts = kinds.map((k) => `${KIND_LABEL[k] ?? k}${byKind.get(k).length}`);
+  $('candidatesCount').textContent = `${candCount}件(${parts.join('・')})`;
+}
+/**
+ * Builds the "対応が必要" group: anchor-lost B-roll/sprites, color warnings,
+ * low-confidence-transcript warnings, and the 3 QC categories not already
+ * surfaced elsewhere (see QC_INBOX_CATEGORIES's doc). Returns the item count
+ * so the caller can compute the tab badge total (candidates + this).
+ */
+function renderWarningsGroup(el) {
   el.innerHTML = '';
   let count = 0;
+  const kindCounts = { anchor: 0, color: 0, transcript: 0, qc: 0 };
 
-  if (S.candidates.length > 0) {
-    count += S.candidates.length;
-    const byKind = new Map();
-    for (const c of S.candidates) {
-      if (!byKind.has(c.kind)) byKind.set(c.kind, []);
-      byKind.get(c.kind).push(c);
-    }
-    const kinds = [...byKind.keys()].sort((a, b) => {
-      const ia = KIND_ORDER.indexOf(a), ib = KIND_ORDER.indexOf(b);
-      return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
-    });
-    for (const kind of kinds) {
-      const list = byKind.get(kind);
-      const totalDur = list.reduce((sum, c) => sum + Math.max(0, c.t1 - c.t0), 0);
-      const group = document.createElement('div');
-      group.className = 'candGroup';
-      const header = document.createElement('div');
-      header.className = 'candGroupHeader';
-      header.innerHTML = `<span class="kind ${kind}">${KIND_LABEL[kind] ?? kind}</span><span class="hintText">${list.length}件 / 計-${totalDur.toFixed(1)}s</span><span class="spacer"></span>`;
-      const approveBtn = document.createElement('button');
-      approveBtn.className = 'btn-approve';
-      approveBtn.textContent = 'まとめて承認';
-      approveBtn.onclick = () => decide(list.map((c) => c.id), 'approve');
-      const rejectBtn = document.createElement('button');
-      rejectBtn.className = 'btn-reject';
-      rejectBtn.textContent = 'まとめて却下';
-      rejectBtn.onclick = () => decide(list.map((c) => c.id), 'reject');
-      header.append(approveBtn, rejectBtn);
-      group.appendChild(header);
-      for (const c of list) group.appendChild(candRow(c));
-      el.appendChild(group);
-    }
-  }
-
-  // orphaned B-roll / sprites — "アンカー切れ" (W-UI §3 terminology; "orphan" stays in the CLI/API vocabulary, this is display-only)
+  // orphaned B-roll / sprites — display term "配置先を見失った" (W-UI IA v2
+  // 用語表: アンカー切れ → 配置先を見失った B-roll/画像); "orphan"/anchor
+  // stays in the CLI/API vocabulary only, never surfaced to the user.
   for (const r of S.overlays) {
     if (r.tlStart != null) continue;
-    count++;
+    count++; kindCounts.anchor++;
     const ov = r.overlay;
     el.appendChild(inboxWarningRow(
-      `⚠ アンカー切れ(B-roll: ${sourceDisplayName(ov.sourceId)}): アンカー先(${sourceDisplayName(ov.anchor.sourceId)} ${ov.anchor.srcTime.toFixed(2)}s)がカットで失われました。タイムラインで再アンカーしてください`,
-      { title: `overlay id: ${ov.id} / anchor sourceId: ${ov.anchor.sourceId} (vedit broll-update)` },
+      `⚠ 配置先を見失ったB-roll: ${sourceDisplayName(ov.sourceId)} — 元の位置(${sourceDisplayName(ov.anchor.sourceId)} ${ov.anchor.srcTime.toFixed(2)}秒)がカットで失われました。Claude に伝えて配置し直してください`,
+      { title: `overlay id: ${ov.id} / anchor sourceId: ${ov.anchor.sourceId}` },
     ));
   }
   for (const r of S.sprites) {
     if (r.tlStart != null) continue;
-    count++;
+    count++; kindCounts.anchor++;
     const sp = r.sprite;
     el.appendChild(inboxWarningRow(
-      `⚠ アンカー切れ(スプライト: ${sp.assetId}): アンカー先(${sourceDisplayName(sp.anchor.sourceId)} ${sp.anchor.srcTime.toFixed(2)}s)がカットで失われました。タイムラインで再アンカーしてください`,
-      { title: `sprite id: ${sp.id} / anchor sourceId: ${sp.anchor.sourceId} (vedit sprite-update)` },
+      `⚠ 配置先を見失ったキャラクター: ${sp.assetId} — 元の位置(${sourceDisplayName(sp.anchor.sourceId)} ${sp.anchor.srcTime.toFixed(2)}秒)がカットで失われました。Claude に伝えて配置し直してください`,
+      { title: `sprite id: ${sp.id} / anchor sourceId: ${sp.anchor.sourceId}` },
     ));
   }
 
   // color warnings
   for (const src of colorWarningSources()) {
-    count++;
-    el.appendChild(inboxWarningRow(`⚠ 要色変換: ${sourceLabel(src)} — Log/HLG/PQ 素材のため浅い色で見えています(vedit color)`, {
+    count++; kindCounts.color++;
+    el.appendChild(inboxWarningRow(`⚠ 要色変換: ${sourceLabel(src)} — Log/HLG/PQ 素材のため浅い色で見えています。Claude に「色を直して」と伝えてください`, {
       title: basename(src.path),
       onClick: () => { activateTab($('tab-mediaPanel'), { focus: false }); setMediaFocus(src.id, { focus: false }); },
     }));
@@ -2816,10 +2995,10 @@ function renderInbox() {
 
   // low-confidence transcript warnings
   for (const lc of lowConfidenceCounts()) {
-    count++;
+    count++; kindCounts.transcript++;
     const src = S.manifest.sources.find((s) => s.id === lc.sourceId);
     const name = sourceLabel(src);
-    el.appendChild(inboxWarningRow(`⚠ 低信頼のトランスクリプト: ${name} に${lc.count}語(Transcript タブの"?"付きを確認)`, {
+    el.appendChild(inboxWarningRow(`⚠ 聞き取りを確認したい箇所: ${name} に${lc.count}語(文字起こしタブの"?"付きを確認)`, {
       title: src ? basename(src.path) : lc.sourceId,
       onClick: () => activateTab($('tab-transcriptPanel'), { focus: false }),
     }));
@@ -2829,24 +3008,38 @@ function renderInbox() {
   // QC_INBOX_CATEGORIES's doc above for why only these three categories.
   for (const issue of S.qc?.issues ?? []) {
     if (!QC_INBOX_CATEGORIES.has(issue.category)) continue;
-    count++;
+    count++; kindCounts.qc++;
     el.appendChild(inboxWarningRow(`⚠ ${issue.message}`, {
       onClick: issue.category === 'captions' ? () => activateTab($('tab-transcriptPanel'), { focus: false }) : undefined,
     }));
   }
 
-  const badge = $('inboxCount');
-  if (count > 0) { badge.hidden = false; badge.textContent = String(count); } else { badge.hidden = true; }
-  $('inboxEmpty').hidden = count > 0;
+  const parts = [];
+  if (kindCounts.anchor) parts.push(`配置切れ${kindCounts.anchor}`);
+  if (kindCounts.color) parts.push(`要色変換${kindCounts.color}`);
+  if (kindCounts.transcript) parts.push(`聞き取り確認${kindCounts.transcript}`);
+  if (kindCounts.qc) parts.push(`QC${kindCounts.qc}`);
+  $('warningsCount').textContent = count > 0 ? `${count}件(${parts.join('・')})` : '';
+  $('warningsEmpty').hidden = count > 0;
   el.hidden = count === 0;
+  return count;
 }
-$('approveAllBtn').onclick = () => {
-  const n = S.candidates.length;
-  if (n === 0) return;
-  const totalDur = S.candidates.reduce((sum, c) => sum + Math.max(0, c.t1 - c.t0), 0);
-  if (!confirm(`${n}件・合計−${totalDur.toFixed(1)}s を適用します`)) return;
-  decide('all', 'approve');
-};
+function renderInbox() {
+  // W-UI IA v2 §5a: a brand-new (zero-source) project has nothing to review
+  // yet — the whole 確認 tab collapses to one sentence instead of showing
+  // two empty groups + detection controls that don't apply yet.
+  const projectEmpty = isProjectEmpty();
+  $('confirmEmptyProject').hidden = !projectEmpty;
+  $('candidatesSection').hidden = projectEmpty;
+  $('warningsSection').hidden = projectEmpty;
+  const badge = $('inboxCount');
+  if (projectEmpty) { badge.hidden = true; return; }
+
+  renderCandidatesGroup($('inboxList'));
+  const warnCount = renderWarningsGroup($('warningsList'));
+  const total = S.candidates.length + warnCount;
+  if (total > 0) { badge.hidden = false; badge.textContent = String(total); } else { badge.hidden = true; }
+}
 
 // ---------- detection threshold ----------
 $('minGapRange').oninput = (e) => {
@@ -2854,13 +3047,21 @@ $('minGapRange').oninput = (e) => {
   $('minGapVal').textContent = `${S.detectMinGap.toFixed(1)}s`;
 };
 $('redetectBtn').onclick = async () => {
+  S.detecting = true;
+  renderInbox();
   try {
     await api('/api/detect', { method: 'POST', body: JSON.stringify({ minGap: S.detectMinGap }) });
-    toast(`しきい値 ${S.detectMinGap.toFixed(1)}s で再検出しました`);
+    toast(`最短時間 ${S.detectMinGap.toFixed(1)}秒でこの条件の候補を作り直しました`);
   } catch (e) {
     toast(e.message, { type: 'error' });
   }
+  S.detecting = false;
   await reload().catch(() => {});
+  // reload() re-fetches S.candidates — a completed run that still landed on
+  // zero pending (and nothing in candidatesAll either) is the "問題なし" empty
+  // state; see renderCandidatesGroup's doc for why this is session-local only.
+  if (S.candidates.length === 0 && S.candidatesAll.length === 0) S.detectRanEmpty = true;
+  renderInbox();
 };
 
 // Moves focus to the "next" candidate row after a decide()/reload() re-render
@@ -2889,7 +3090,7 @@ async function decide(ids, decision) {
   hideCandidateCard();
 }
 
-// ---------- activity feed / undo (W-UI §1: 履歴タブを吸収 — "rev" は表示上「変更 #」と呼ぶ。CLI/API の語彙(rev/r12)はそのまま) ----------
+// ---------- activity feed / undo (W-UI IA v2 §1: 独立した「履歴」タブの中身 — 各エントリは "rev" を表示上「変更 #」と呼ぶ。CLI/API の語彙(rev/r12)はそのまま) ----------
 const ACTOR_LABEL = { claude: 'Claude', ui: 'あなた', system: 'システム' };
 
 // ---------- op -> human-readable Japanese summary (W-UI redesign §4) ----------
@@ -2963,8 +3164,10 @@ function humanizeRevision(entry) {
       const kinds = new Set(ids.map((id) => S.candidatesAll.find((c) => c.id === id)?.kind).filter(Boolean));
       const label = kinds.size === 1 ? (KIND_LABEL[[...kinds][0]] ?? '') : '';
       const secs = summary.match(/-([\d.]+)s\)/)?.[1];
-      const bits = [ids.length > 0 ? `${ids.length}件` : '', secs ? `-${secs}s` : ''].filter(Boolean).join(', ');
-      return `${label}カットを承認${bits ? `(${bits})` : ''}`;
+      // W-UI IA v2 用語表: 承認/却下 → カットする/残す — 履歴の表示も「承認」
+      // を使わない言い回しに揃える。
+      const bits = [ids.length > 0 ? `${ids.length}件` : '', secs ? `−${secs}秒` : ''].filter(Boolean).join(', ');
+      return `${label}候補をカット${bits ? `(${bits})` : ''}`;
     }
     case 'remove-words': {
       const secs = summary.match(/\(([\d.]+)s\)/)?.[1];
@@ -3023,6 +3226,17 @@ function humanizeRevision(entry) {
       return `背景を切り替え${typeof p.t === 'number' ? `(${fmt(p.t)}〜)` : ''}`;
     case 'bg-remove':
       return '背景の切り替えを削除';
+    case 'shift': {
+      // W-ANIME composition-only op (src/core/ops.ts's shiftComposition) —
+      // params are the raw request body: from/by seconds, optional
+      // keepDuration. Punch-list follow-up: this case was missing, so
+      // 'shift' fell through to the raw internal summary in the 履歴 feed.
+      const fmtSec = (n) => { const s = n.toFixed(1); return s.endsWith('.0') ? s.slice(0, -2) : s; };
+      const from = typeof p.from === 'number' ? `${fmtSec(p.from)}秒地点から` : '';
+      const by = typeof p.by === 'number' ? `${p.by > 0 ? '+' : ''}${fmtSec(p.by)}秒` : '';
+      const bits = [from, by].filter(Boolean).join(' ');
+      return `タイムラインを一括シフト${bits ? `(${bits})` : ''}`;
+    }
     case 'dialogue-add':
       return `セリフを追加${typeof p.text === 'string' && p.text ? `("${p.text.slice(0, 16)}")` : ''}`;
     case 'dialogue-update':
@@ -3043,7 +3257,7 @@ function humanizeRevision(entry) {
     case 'clip-add':
       return `クリップを追加${p.sourceId ? `(${sourceDisplayName(p.sourceId)})` : ''}`;
     case 'clip-remove':
-      return 'クリップを外す';
+      return 'タイムラインから外す';
     case 'clip-move':
       return 'クリップを並べ替え';
     case 'reframe':
@@ -3052,11 +3266,11 @@ function humanizeRevision(entry) {
       return 'クリップの位置を調整';
     case 'scene-review': {
       const n = Array.isArray(p.sceneIds) ? p.sceneIds.length : (p.sceneId ? 1 : null);
-      const label = p.review === 'keep' ? 'keep' : p.review === 'reject' ? 'reject' : p.review === 'clear' ? '未確認' : '';
+      const label = p.review === 'keep' ? '採用' : p.review === 'reject' ? '不採用' : p.review === 'clear' ? '未確認' : '';
       return `シーンを${label ? `${label}に設定` : '見直し'}${n != null ? `(${n}件)` : ''}`;
     }
     case 'selects':
-      return 'keepシーンだけで仮タイムラインを作成';
+      return '採用シーンだけで仮タイムラインを作成';
     case 'kit-link':
       return 'キットを連携';
     case 'kit-unlink':
@@ -3076,7 +3290,8 @@ function humanizeRevision(entry) {
 
 function focusAfterHistoryAction() {
   const rows = [...document.querySelectorAll('#activityFeed .restoreBtn')];
-  if (rows.length === 0) { $('nowPanel').focus(); return; }
+  // W-UI IA v2 §1: 編集履歴 now lives in its own 履歴 tab, not #nowPanel(確認).
+  if (rows.length === 0) { $('historyPanel').focus(); return; }
   rows[0].focus();
 }
 async function restoreToRevision(rev) {
@@ -3153,9 +3368,9 @@ function renderActivityFeed() {
     if (r.rev >= 2) {
       const btn = document.createElement('button');
       btn.className = 'restoreBtn';
-      btn.textContent = '⟲この直前に戻す';
+      btn.textContent = '⟲この編集より前に戻す';
       btn.onclick = async () => {
-        if (!confirm(`変更 #${r.rev}「${r.summary}」の直前の状態に戻しますか？(これ以降の変更も一緒に戻ります)`)) return;
+        if (!confirm(`変更 #${r.rev}「${r.summary}」より前の状態に戻しますか？(これ以降の変更も一緒に戻ります)`)) return;
         await restoreToRevision(r.rev - 1);
       };
       actions.appendChild(btn);
@@ -3299,12 +3514,13 @@ function showWordsDirective(d) {
 function renderCandidateCard(c) {
   const body = $('candidateCardBody');
   const dur = Math.max(0, c.t1 - c.t0);
+  const label = humanizeCandidateLabel(c.label, dur);
   const src = S.manifest.sources.find((s) => s.id === c.sourceId);
   const srcName = sourceLabel(src);
   const srcTitle = src ? basename(src.path) : c.sourceId;
   body.innerHTML = `<div><span class="kind ${c.kind}">${esc(KIND_LABEL[c.kind] ?? c.kind)}</span></div>` +
-    `<div class="showCardLbl">${esc(c.label)}</div>` +
-    `<div class="hintText" title="${esc(srcTitle)}">${esc(srcName)} ${fmt(c.t0)}–${fmt(c.t1)}(-${dur.toFixed(1)}s)</div>`;
+    `<div class="showCardLbl">${esc(label)}</div>` +
+    `<div class="hintText" title="${esc(srcTitle)}">${esc(srcName)} ${fmt(c.t0)}–${fmt(c.t1)}</div>`;
   const actions = document.createElement('div');
   actions.className = 'candActions';
   const preview = document.createElement('button');
@@ -3321,10 +3537,10 @@ function renderCandidateCard(c) {
   };
   const ok = document.createElement('button');
   ok.className = 'btn-approve';
-  ok.textContent = 'カット適用';
+  ok.textContent = 'カットする';
   ok.onclick = async () => { await decide([c.id], 'approve'); };
   const ng = document.createElement('button');
-  ng.className = 'btn-wash'; // 候補カード: 残すは状態色ではなくニュートラル(--wash) — 「カット適用」は現状の --keep のまま
+  ng.className = 'btn-wash'; // 候補カード: 残すは状態色ではなくニュートラル(--wash) — 「カットする」は現状の --keep のまま
   ng.textContent = '残す';
   ng.onclick = async () => { await decide([c.id], 'reject'); };
   actions.append(preview, ok, ng);
@@ -3669,7 +3885,7 @@ async function startSingleFileIngestFlow(file) {
       },
       {
         label: 'Claude に場所を伝える',
-        onClick: () => { hideIngestFlowCard(); toast('チャットで元ファイルの場所を伝えてください(Claude が `vedit ingest <path>` で取り込みます)'); },
+        onClick: () => { hideIngestFlowCard(); toast('チャットで元ファイルの場所を伝えてください — Claude が取り込みます'); },
       },
       { label: 'キャンセル', onClick: hideIngestFlowCard },
     ]);
@@ -3771,7 +3987,8 @@ async function renderAll() {
   const m = S.manifest;
   $('projName').textContent = m.name;
   renderStat();
-  $('revLabel').textContent = `変更 #${m.revision}`;
+  // W-UI IA v2 用語表: 「変更 #7」→「現在の版 7」(ヘッダー右端の弱表示)。
+  $('revLabel').textContent = `現在の版 ${m.revision}`;
   applyCompositionMode();
   await loadMotionSpecs();
   syncMusicElements();

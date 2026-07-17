@@ -14,6 +14,8 @@
   </div>
   <span id="stat" class="hdrSecondary"></span>
   <span class="spacer"></span>
+  <!-- W-UI IA v2 §1: 「現在の版 N」— ヘッダー右端の弱表示(旧#transport内から移設)。 -->
+  <span id="revLabel" class="hdrRevLabel"></span>
   <button id="shortcutsBtn" title="ショートカット一覧 (?)" aria-label="ショートカット一覧を開く">?</button>
   <span id="conn" class="connDot" title="接続待ち" aria-label="接続状態: 接続待ち">●</span>
 </header>
@@ -36,12 +38,12 @@
         <div id="dialogueLayer" aria-hidden="true"></div>
         <div id="ingestOverlay" hidden><div class="spin"></div><span id="ingestStep" aria-live="polite"></span></div>
         <div id="stageEmpty" hidden>
-          <p id="stageEmptyMsg"></p>
+          <div id="stageEmptyMsg"></div>
           <button id="stageEmptyRetry" hidden>再読み込み</button>
         </div>
       </div>
       <!-- W-UI §0: candidate/compare "show" cards float over the stage,
-           front-and-center, independent of the いま tab's inbox list. -->
+           front-and-center, independent of the 確認 tab's inbox list. -->
       <div id="candidateCard" class="showCard" hidden role="dialog" aria-label="候補カード">
         <button class="cardClose" id="candidateCardClose" aria-label="閉じる">×</button>
         <div id="candidateCardBody"></div>
@@ -61,7 +63,6 @@
       <span id="tc">0:00.0 (f0) / 0:00.0 (f0)</span>
       <span id="rateLabel" hidden></span>
       <span class="spacer"></span>
-      <span id="revLabel"></span>
     </div>
     <div id="timeline">
       <canvas id="wave"></canvas>
@@ -92,11 +93,11 @@
     </div>
     <div id="clipInspector" hidden>
       <span id="clipLabel"></span>
-      <span>IN</span>
-      <button data-trim="in:-1" aria-label="IN点を1フレーム戻す">−1f</button><button data-trim="in:1" aria-label="IN点を1フレーム進める">+1f</button>
-      <span>OUT</span>
-      <button data-trim="out:-1" aria-label="OUT点を1フレーム戻す">−1f</button><button data-trim="out:1" aria-label="OUT点を1フレーム進める">+1f</button>
-      <button id="clipRemoveBtn">クリップを外す</button>
+      <span>開始点(IN)</span>
+      <button data-trim="in:-1" aria-label="開始点を1フレーム戻す">−1f</button><button data-trim="in:1" aria-label="開始点を1フレーム進める">+1f</button>
+      <span>終了点(OUT)</span>
+      <button data-trim="out:-1" aria-label="終了点を1フレーム戻す">−1f</button><button data-trim="out:1" aria-label="終了点を1フレーム進める">+1f</button>
+      <button id="clipRemoveBtn">タイムラインから外す</button>
       <button id="clipClose" aria-label="クリップ詳細を閉じる">×</button>
     </div>
   </section>
@@ -107,53 +108,70 @@
 
   <aside>
     <div class="tabs" role="tablist" aria-label="パネル切替">
-      <button class="tab active" id="tab-nowPanel" role="tab" aria-selected="true" aria-controls="nowPanel" data-panel="nowPanel" tabindex="0">いま</button>
-      <button class="tab" id="tab-transcriptPanel" role="tab" aria-selected="false" aria-controls="transcriptPanel" data-panel="transcriptPanel" tabindex="-1">Transcript</button>
+      <button class="tab active" id="tab-nowPanel" role="tab" aria-selected="true" aria-controls="nowPanel" data-panel="nowPanel" tabindex="0">確認<span id="inboxCount" class="badge cullBadge tallyPulse" hidden></span></button>
+      <button class="tab" id="tab-transcriptPanel" role="tab" aria-selected="false" aria-controls="transcriptPanel" data-panel="transcriptPanel" tabindex="-1">文字起こし</button>
       <button class="tab" id="tab-mediaPanel" role="tab" aria-selected="false" aria-controls="mediaPanel" data-panel="mediaPanel" tabindex="-1">素材</button>
+      <button class="tab" id="tab-historyPanel" role="tab" aria-selected="false" aria-controls="historyPanel" data-panel="historyPanel" tabindex="-1">履歴</button>
     </div>
 
+    <!-- W-UI IA v2 §2: 確認タブ = 「Claude の編集提案」(candidates) + 「対応が必要」
+         (アンカー切れ・色警告・聞き取り確認・QC) の2群。旧「すべて承認」は廃止
+         — 一括操作はグループヘッダの結果明示ボタン1箇所だけ(renderInbox/
+         renderCandidatesGroup/renderWarningsGroup in app.js)。 -->
     <div id="nowPanel" class="panel active" role="tabpanel" aria-labelledby="tab-nowPanel" tabindex="0">
       <div id="claudeStrip" class="claudeStrip" hidden aria-live="polite">
         <div class="spin"></div><span id="claudeStripText"></span>
       </div>
 
-      <div id="inboxSection">
+      <!-- W-UI IA v2 §5a: プロジェクトが空(素材ゼロ)のときだけ表示し、
+           下の2群は隠す(renderInbox の isProjectEmpty() 分岐)。 -->
+      <div id="confirmEmptyProject" class="hintText confirmEmptyProject" hidden>確認するものはまだありません</div>
+
+      <div id="candidatesSection" class="inboxGroup">
         <div class="inboxHeading">
-          <span>要確認</span><span id="inboxCount" class="badge cullBadge tallyPulse" hidden></span>
+          <span>Claude の編集提案</span><span id="candidatesCount" class="hintText"></span>
         </div>
-        <div class="panelbar inboxBar">
-          <button id="approveAllBtn">すべて承認</button>
-          <span class="spacer"></span>
-          <label class="thresholdCtl">無音のしきい値
-            <input type="range" id="minGapRange" min="0.3" max="2.0" step="0.1" value="0.7">
-            <span id="minGapVal">0.7s</span>
-          </label>
-          <button id="redetectBtn">再検出</button>
-        </div>
-        <div id="inboxEmpty" class="hintText inboxEmpty" hidden>✓ 確認待ちなし</div>
+        <details id="detectSettings" class="detectSettings" hidden>
+          <summary>検出条件</summary>
+          <div class="panelbar detectSettingsBar">
+            <label class="thresholdCtl">無音として候補にする最短時間
+              <input type="range" id="minGapRange" min="0.3" max="2.0" step="0.1" value="0.7">
+              <span id="minGapVal">0.7s</span>
+            </label>
+            <button id="redetectBtn">この条件で候補を作り直す</button>
+          </div>
+        </details>
         <div id="inboxList"></div>
       </div>
 
-      <div id="activitySection">
-        <div class="inboxHeading"><span>変更履歴</span></div>
-        <div id="activityFeed"></div>
+      <div id="warningsSection" class="inboxGroup">
+        <div class="inboxHeading">
+          <span>対応が必要</span><span id="warningsCount" class="hintText"></span>
+        </div>
+        <div id="warningsEmpty" class="hintText inboxEmpty" hidden>✓ 対応が必要な項目はありません</div>
+        <div id="warningsList"></div>
       </div>
     </div>
 
     <div id="transcriptPanel" class="panel" role="tabpanel" aria-labelledby="tab-transcriptPanel" tabindex="0">
       <div class="panelbar">
         <button id="removeSelBtn" disabled>選択を削除</button>
-        <span class="hintText">ドラッグ or クリック→Shift+クリックで単語選択 / クリックでシーク / 矢印+Space+Delete も使用可</span>
         <span id="selStatus" role="status" class="sr-only"></span>
       </div>
-      <div id="words" role="listbox" aria-label="トランスクリプト" aria-multiselectable="true"></div>
+      <div id="words" role="listbox" aria-label="文字起こし" aria-multiselectable="true"></div>
     </div>
     <div id="mediaPanel" class="panel" role="tabpanel" aria-labelledby="tab-mediaPanel" tabindex="0">
       <div class="panelbar">
-        <button id="buildSelectsBtn">keep だけで仮タイムライン作成</button>
-        <span class="hintText">クリックで詳細表示 / サムネイルで再生 / ↑↓で移動 / シーン格子内は←→移動・K=keep・X=reject・U=解除</span>
+        <button id="buildSelectsBtn" hidden>採用シーンで仮編集を作る(戻せます)</button>
       </div>
       <div id="mediaList" role="listbox" aria-label="素材"></div>
+    </div>
+    <!-- W-UI IA v2 §1: 独立した「履歴」タブ — 旧「いま」タブの変更履歴セクションを
+         丸ごと移設(#activityFeed の中身/humanizeRevision は流用、見出しのみ
+         「変更履歴」→「編集履歴」)。 -->
+    <div id="historyPanel" class="panel" role="tabpanel" aria-labelledby="tab-historyPanel" tabindex="0">
+      <div class="inboxHeading"><span>編集履歴</span></div>
+      <div id="activityFeed"></div>
     </div>
   </aside>
 </main>
@@ -178,13 +196,14 @@
     <tr><td>← / →</td><td>±1秒</td></tr>
     <tr><td>Shift+← / Shift+→</td><td>±1フレーム</td></tr>
     <tr><td>, / .</td><td>±1フレーム</td></tr>
-    <tr><td>I / O</td><td>選択レンジのイン/アウト点を設定</td></tr>
+    <tr><td>I / O</td><td>選択レンジの開始点(IN) / 終了点(OUT)を設定</td></tr>
     <tr><td>Esc</td><td>レンジ選択を解除</td></tr>
     <tr><td>?</td><td>このヘルプの表示/非表示</td></tr>
   </table>
-  <p class="hintText">トランスクリプト欄にフォーカス中: ←/→で移動、Spaceで選択トグル、Shift+←/→で範囲拡張、Enterでシーク、Deleteで削除</p>
+  <p class="hintText">文字起こし欄: ドラッグ、またはクリック→Shift+クリックで単語選択。クリックでシーク。フォーカス中は←/→で移動、Spaceで選択トグル、Shift+←/→で範囲拡張、Enterでシーク、Deleteで削除。</p>
   <p class="hintText">タイムライン: クリップ本体をドラッグで並べ替え、端(6px)をドラッグでトリム、B-roll/スプライト/モーション/BGM のブロックをドラッグで移動できます。ファイルやフォルダをウィンドウにドロップすると取り込みます。</p>
   <p class="hintText">字幕: クリックでスタイル編集、ドラッグで縦位置変更、ダブルクリックでテキスト修正。</p>
+  <p class="hintText">素材: クリックで詳細表示、サムネイルで再生、↑↓で移動。シーン格子内: ←→で移動、K=採用、X=不採用、U=解除。</p>
   <button id="shortcutsCloseBtn">閉じる</button>
 </dialog>
 

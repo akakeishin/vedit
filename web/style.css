@@ -112,6 +112,9 @@ dialog#shortcutsDialog td:first-child {
   color: var(--text-faint); font-size: var(--fs-xs);
   min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+/* W-UI IA v2 §1: 「現在の版 N」— ヘッダー右端の弱表示(旧#transport内から
+   移設。#revLabel 自体の mono/tabular-nums は上のセレクタリストで既に付与)。 */
+.hdrRevLabel { color: var(--text-faint); font-size: var(--fs-xs); white-space: nowrap; }
 .spacer { flex: 1; }
 /* W-UI redesign §1: connection state is a small dot + title tooltip, not a
    text label — the color alone (+ title/aria-label for a11y) carries it. */
@@ -304,11 +307,18 @@ main { flex: 1; display: flex; min-height: 0; }
   align-items: center; justify-content: center; text-align: center; padding: 24px;
   background: rgba(10,12,16,0.94); color: var(--text-dim);
 }
-#stageEmpty p { max-width: 320px; font-size: var(--fs-sm); line-height: 1.6; white-space: pre-wrap; }
+/* W-UI IA v2 §5a: #stageEmptyMsg holds up to 3 stacked <p> lines (see
+   renderStageState in app.js) — the empty-project state's 3-line onboarding
+   message. .stageEmptyLead (the first line, "最初の動画を追加") reads as the
+   actual call-to-action; the rest stay the plain dim supporting-text size. */
+#stageEmptyMsg {
+  display: flex; flex-direction: column; gap: 8px;
+  max-width: 360px; font-size: var(--fs-sm); line-height: 1.6; white-space: pre-wrap;
+}
+#stageEmptyMsg .stageEmptyLead { font-size: var(--fs-lg); font-weight: 600; color: var(--text); }
 
 #transport { display: flex; align-items: center; gap: 10px; }
 #tc { color: var(--text-dim); font-size: var(--fs-sm); }
-#revLabel { color: var(--text-dim); font-size: var(--fs-xs); }
 #rateLabel {
   font-size: var(--fs-xs); font-weight: 700; color: #04101f; background: var(--link);
   padding: 1px 6px; border-radius: 999px;
@@ -473,7 +483,10 @@ aside {
   display: flex; flex-direction: column; min-height: 0;
 }
 .tabs { display: flex; border-bottom: 1px solid var(--zone-border); }
-.tab { flex: 1; border: 0; border-radius: 0; background: none; padding: 8px; color: var(--text-dim); font-size: var(--fs-sm); }
+.tab {
+  flex: 1; border: 0; border-radius: 0; background: none; padding: 8px; color: var(--text-dim); font-size: var(--fs-sm);
+  display: flex; align-items: center; justify-content: center; gap: 6px;
+}
 .tab.active { color: var(--text); box-shadow: inset 0 -2px var(--link); }
 .tab:focus-visible { outline: 2px solid var(--link); outline-offset: -2px; }
 .panel { display: none; flex: 1; min-height: 0; overflow: auto; flex-direction: column; }
@@ -484,24 +497,33 @@ aside {
 }
 .hintText { color: var(--text-dim); font-size: var(--fs-xs); }
 
-/* ---- W-UI §1: "いま" tab (Claude presence strip + 要確認インボックス + 変更履歴) ---- */
+/* ---- W-UI IA v2 §2/§3: "確認" タブ = Claude presence strip + 「Claude の
+   編集提案」+「対応が必要」の2群。「履歴」タブは別(下の方の #historyPanel
+   まわりのルールを参照)。 ---- */
 .claudeStrip {
   display: flex; align-items: center; gap: 8px; padding: 8px 12px;
   background: rgba(143, 168, 201, 0.12); border-bottom: 1px solid var(--zone-border);
   color: var(--link); font-size: var(--fs-sm);
 }
+/* W-UI IA v2 §5a: プロジェクトが空のときの確認タブ全体の代替表示 — 2群の
+   代わりにこの1文だけを大きめ・中央寄りに見せる。 */
+.confirmEmptyProject { padding: 32px 16px; text-align: center; font-size: var(--fs-sm); }
+.inboxGroup + .inboxGroup { border-top: 1px solid var(--zone-border); margin-top: 4px; }
 .inboxHeading {
   display: flex; align-items: center; gap: 8px; padding: 10px 12px 2px;
   font-size: var(--fs-sm); font-weight: 600; color: var(--text);
 }
-/* W-UI polish: 要確認 count badge — a "tally lamp" that only lights up while
-   there's something pending (renderInbox in app.js only un-hides it when
-   count > 0). The `[hidden]` -> visible transition is a display:none ->
-   flex change, which browsers already treat as a fresh animation start, so
-   the short pulse below replays each time the inbox goes from empty to
-   non-empty with no extra JS bookkeeping needed. Reduced-motion users still
-   get the amber fill/text (that's state, not motion) — only the pulse
-   itself is suppressed, via the existing `.badge.tallyPulse` rule up top. */
+.inboxHeading .hintText { font-weight: 400; }
+/* W-UI polish: tab の件数バッジ — a "tally lamp" that only lights up while
+   there's something pending across BOTH groups (renderInbox in app.js only
+   un-hides it when count > 0). Lives on the tab button itself now (W-UI IA
+   v2 §2: タブバッジ=2群合計), not inside a panel heading. The `[hidden]` ->
+   visible transition is a display:none -> flex change, which browsers
+   already treat as a fresh animation start, so the short pulse below
+   replays each time the inbox goes from empty to non-empty with no extra JS
+   bookkeeping needed. Reduced-motion users still get the amber fill/text
+   (that's state, not motion) — only the pulse itself is suppressed, via the
+   existing `.badge.tallyPulse` rule up top. */
 #inboxCount.badge {
   background: rgba(232, 160, 60, 0.18); border-color: transparent; color: var(--tally); font-weight: 700;
 }
@@ -510,11 +532,21 @@ aside {
   from { box-shadow: 0 0 0 0 rgba(232, 160, 60, 0.55); }
   to { box-shadow: 0 0 0 5px rgba(232, 160, 60, 0); }
 }
-.inboxBar { flex-wrap: wrap; position: static; }
+/* W-UI IA v2 §3: 検出条件 — 候補グループ内の折りたたみ(しきい値+再検出)。
+   デフォルトは閉じた <details>、候補ゼロのときは要素ごと hidden(renderInbox
+   in app.js)。 */
+.detectSettings { margin: 2px 8px 4px; }
+.detectSettings summary {
+  cursor: pointer; padding: 4px 4px; color: var(--text-dim); font-size: var(--fs-xs);
+  list-style: revert;
+}
+.detectSettings summary:hover { color: var(--text); }
+.detectSettings[open] summary { color: var(--text); margin-bottom: 2px; }
+.detectSettingsBar { flex-wrap: wrap; position: static; border-bottom: 0; padding: 6px 4px; }
 .inboxEmpty { padding: 4px 12px 12px; }
 #inboxList { padding: 4px 8px 10px; display: flex; flex-direction: column; gap: 6px; }
 /* The one place amber is a background/border fill rather than a small dot —
-   this whole row IS the "要確認" content, so it earns it (see the design
+   this whole row IS the "対応が必要" content, so it earns it (see the design
    tokens' doc above). */
 .inboxWarn {
   padding: 6px 8px; border-radius: var(--radius); background: rgba(232, 160, 60, 0.1);
@@ -523,8 +555,9 @@ aside {
 .inboxWarn[role="button"] { cursor: pointer; }
 .inboxWarn[role="button"]:hover { background: rgba(232, 160, 60, 0.18); }
 .inboxWarn:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
+#warningsList { padding: 4px 8px 10px; display: flex; flex-direction: column; gap: 6px; }
 
-#activitySection { border-top: 1px solid var(--zone-border); }
+/* ---- W-UI IA v2 §1: 「履歴」タブ(旧「いま」タブの変更履歴セクションを移設) ---- */
 #activityFeed { padding: 6px 8px 12px; display: flex; flex-direction: column; gap: 6px; }
 .activityCard {
   padding: 6px 8px; border-radius: var(--radius); border-left: 2px solid var(--zone-border);
@@ -563,6 +596,11 @@ aside {
 .ingestFlowCard { position: fixed; z-index: 20; }
 
 #words { padding: 10px 12px; user-select: none; overflow-y: auto; }
+/* W-UI IA v2 §5b: 文字起こし未実行(または一部未実行)のときの素材別ステータス
+   一覧 — renderTranscriptEmptyState/renderTranscript in app.js. */
+.transcribeStatusList { padding: 8px 8px 0; display: flex; flex-direction: column; gap: 4px; }
+.transcribeStatusRow { display: flex; align-items: center; justify-content: space-between; gap: 8px; line-height: 1.6; }
+.btn-transcribeSource { font-size: var(--fs-xs); padding: 2px 8px; flex: none; }
 .srcHeading {
   color: var(--text); font-size: var(--fs-xs); font-weight: 600; letter-spacing: 0.02em;
   padding: 10px 0 4px; margin-top: 4px; border-bottom: 1px solid var(--zone-border);
@@ -587,10 +625,10 @@ aside {
 
 .candGroup { display: flex; flex-direction: column; gap: 6px; margin-bottom: 4px; }
 .candGroupHeader {
-  /* self-critique pass: kind badge + hint text + 2 action buttons don't fit
-     one row at the default aside width once buttons refuse to shrink (see
-     the base `button` rule's doc) — wrap the row instead of squeezing text,
-     same pattern .inboxBar already uses below. */
+  /* self-critique pass: kind badge + 2 action buttons don't fit one row at
+     the default aside width once buttons refuse to shrink (see the base
+     `button` rule's doc) — wrap the row instead of squeezing text, same
+     pattern .detectSettingsBar uses above. */
   display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; padding: 4px 2px;
   border-bottom: 1px solid var(--zone-border);
 }
