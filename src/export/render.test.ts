@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, promises as fsp } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import type { KitFile, Manifest, MusicItem, Transcript } from '../core/types.js';
+import type { KitFile, Manifest, MotionItem, MotionSpec, MusicItem, Transcript } from '../core/types.js';
 
 // renderFinal shells out to ffmpeg via run()/runCapture(); stub both (and
 // ffmpegHasFilter/ffmpegBin) so the 2-pass-loudnorm orchestration tests below
@@ -45,6 +45,7 @@ import {
   overlayAudioClause,
   overlayVideoClause,
   planExportPreset,
+  renderComposition,
   renderFinal,
   resolveRenderParams,
   spriteVideoClause,
@@ -1339,5 +1340,167 @@ describe('renderFinal: W-CAP overrides.font', () => {
     const args = runMock.mock.calls[0][1] as string[];
     const graph = args[args.indexOf('-filter_complex') + 1];
     expect(graph).not.toContain('fontsdir=');
+  });
+});
+
+// ---- W7: motion burn-in (renderFinal + renderComposition) ----
+
+function motionItemT(partial: Partial<MotionItem> & { id: string; tlStart: number; duration: number }): MotionItem {
+  return { spec: `motion/${partial.id}.json`, ...partial };
+}
+function motionSpecT(type: MotionSpec['type'], params: Record<string, unknown> = {}): MotionSpec {
+  return { id: 'sp', type, params };
+}
+
+describe('renderFinal: W7 motion burn-in', () => {
+  it('regression: omitting opts.motionSpecs entirely never touches the graph, even with motion items on the timeline', async () => {
+    runMock.mockClear();
+    const withoutMotionOpt = baseManifest();
+    await renderFinal(withoutMotionOpt, [], outPathIn('/tmp'));
+    const graphNoItems = (runMock.mock.calls[0][1] as string[])[(runMock.mock.calls[0][1] as string[]).indexOf('-filter_complex') + 1];
+
+    runMock.mockClear();
+    const withMotionItemsButNoOpt = { ...baseManifest(), timeline: { ...baseManifest().timeline, motion: [motionItemT({ id: 'm1', tlStart: 0, duration: 2 })] } };
+    await renderFinal(withMotionItemsButNoOpt, [], outPathIn('/tmp'));
+    const graphWithItems = (runMock.mock.calls[0][1] as string[])[(runMock.mock.calls[0][1] as string[]).indexOf('-filter_complex') + 1];
+
+    expect(graphWithItems).toBe(graphNoItems);
+    expect(graphWithItems).not.toMatch(/ass=/);
+  });
+
+  it('a burnable motion item adds a second ass filter chained on top of vc (no captions burned in this case)', async () => {
+    runMock.mockClear();
+    const m = { ...baseManifest(), timeline: { ...baseManifest().timeline, motion: [motionItemT({ id: 'm1', tlStart: 1, duration: 2 })] } };
+    const res = await renderFinal(m, [], outPathIn('/tmp'), { motionSpecs: { m1: motionSpecT('cta', { text: 'Subscribe' }) } });
+    expect(res.warnings).toEqual([]);
+    const args = runMock.mock.calls[0][1] as string[];
+    const graph = args[args.indexOf('-filter_complex') + 1];
+    expect(graph).toMatch(/\[vc\]ass='.*\.vedit-motion\.ass'\[voutMotion\]/);
+    expect(args[args.indexOf('-map') + 1]).toBe('[voutMotion]');
+  });
+
+  it('motion burns ON TOP OF captions (second ass filter chains onto [vout], not [vc]) when both are active', async () => {
+    runMock.mockClear();
+    const m = { ...manifest('clean'), timeline: { ...manifest('clean').timeline, motion: [motionItemT({ id: 'm1', tlStart: 1, duration: 2 })] } };
+    await renderFinal(m, [transcript()], outPathIn('/tmp'), {
+      burnCaptions: true,
+      motionSpecs: { m1: motionSpecT('cta', { text: 'Subscribe' }) },
+    });
+    const args = runMock.mock.calls[0][1] as string[];
+    const graph = args[args.indexOf('-filter_complex') + 1];
+    expect(graph).toMatch(/ass='.*\.vedit-captions\.ass'\[vout\]/);
+    expect(graph).toMatch(/\[vout\]ass='.*\.vedit-motion\.ass'\[voutMotion\]/);
+    expect(args[args.indexOf('-map') + 1]).toBe('[voutMotion]');
+  });
+
+  it('a custom-html-only motion timeline burns nothing but produces the "焼き込み対象外" warning with the right count', async () => {
+    runMock.mockClear();
+    const m = {
+      ...baseManifest(),
+      timeline: {
+        ...baseManifest().timeline,
+        motion: [motionItemT({ id: 'm1', tlStart: 0, duration: 2 }), motionItemT({ id: 'm2', tlStart: 3, duration: 2 })],
+      },
+    };
+    const res = await renderFinal(m, [], outPathIn('/tmp'), {
+      motionSpecs: { m1: motionSpecT('custom-html', {}), m2: motionSpecT('custom-html', {}) },
+    });
+    expect(res.warnings).toContain('custom-html は焼き込み対象外(2件)');
+    const args = runMock.mock.calls[0][1] as string[];
+    const graph = args[args.indexOf('-filter_complex') + 1];
+    expect(graph).not.toMatch(/ass=/);
+  });
+
+  it('a mix of burnable + custom-html burns the burnable one and still warns about the custom-html one', async () => {
+    runMock.mockClear();
+    const m = {
+      ...baseManifest(),
+      timeline: {
+        ...baseManifest().timeline,
+        motion: [motionItemT({ id: 'm1', tlStart: 0, duration: 2 }), motionItemT({ id: 'm2', tlStart: 3, duration: 2 })],
+      },
+    };
+    const res = await renderFinal(m, [], outPathIn('/tmp'), {
+      motionSpecs: { m1: motionSpecT('chapter-card', { text: 'Ch1' }), m2: motionSpecT('custom-html', {}) },
+    });
+    expect(res.warnings).toContain('custom-html は焼き込み対象外(1件)');
+    const args = runMock.mock.calls[0][1] as string[];
+    const graph = args[args.indexOf('-filter_complex') + 1];
+    expect(graph).toMatch(/ass='.*\.vedit-motion\.ass'/);
+  });
+
+  it("a kit-linked project's motion burn uses the kit style's palette.accent as the default accent", async () => {
+    runMock.mockClear();
+    const dir = freshKitDir('motion-accent');
+    const kit: KitFile = { version: 'vedit-kit/v1', styles: [{ id: 'clean', palette: { accent: '#00ff00' } }] };
+    await writeKitFile(dir, kit);
+    const m = {
+      ...baseManifest(),
+      kit: { path: dir },
+      timeline: { ...baseManifest().timeline, motion: [motionItemT({ id: 'm1', tlStart: 0, duration: 2 })] },
+    };
+    // The generated ASS *content* (where the accent colour actually lands)
+    // is written to a temp file and removed again before renderFinal
+    // returns, so intercept the write itself rather than reading the file
+    // back or inspecting the ffmpeg argv (which only carries the file path).
+    const writeSpy = vi.spyOn(fsp, 'writeFile');
+    await renderFinal(m, [], outPathIn('/tmp'), { motionSpecs: { m1: motionSpecT('cta', { text: 'Go' }) } });
+    const motionWrite = writeSpy.mock.calls.find(([p]) => String(p).endsWith('.vedit-motion.ass'));
+    expect(motionWrite).toBeDefined();
+    expect(String(motionWrite![1])).toContain('\\3c&H00FF00&'); // BGR of the kit's #00ff00 accent
+    writeSpy.mockRestore();
+  });
+
+  it('the temp motion .ass file is removed after the render (same cleanup as .vedit-captions.ass)', async () => {
+    runMock.mockClear();
+    const outDir = mkdtempSync(path.join(tmpdir(), 'vedit-render-motion-cleanup-'));
+    const m = { ...baseManifest(), timeline: { ...baseManifest().timeline, motion: [motionItemT({ id: 'm1', tlStart: 0, duration: 2 })] } };
+    await renderFinal(m, [], outPathIn(outDir), { motionSpecs: { m1: motionSpecT('cta', { text: 'Go' }) } });
+    const remaining = await fsp.readdir(outDir);
+    expect(remaining.some((f) => f.includes('.vedit-motion.ass'))).toBe(false);
+  });
+});
+
+describe('renderComposition: W7 motion burn-in', () => {
+  it('regression: omitting opts.motionSpecs entirely never touches the graph, even with motion items on the timeline', async () => {
+    runMock.mockClear();
+    const m = { ...compManifest(), timeline: { ...compManifest().timeline, motion: [motionItemT({ id: 'm1', tlStart: 0, duration: 2 })] } };
+    await renderComposition(m, outPathIn('/tmp'));
+    const args = runMock.mock.calls[0][1] as string[];
+    const graph = args[args.indexOf('-filter_complex') + 1];
+    expect(graph).not.toMatch(/ass=/);
+  });
+
+  it('a burnable motion item adds a second ass filter chained on top of the background graph', async () => {
+    runMock.mockClear();
+    const m = { ...compManifest(), timeline: { ...compManifest().timeline, motion: [motionItemT({ id: 'm1', tlStart: 1, duration: 2 })] } };
+    const res = await renderComposition(m, outPathIn('/tmp'), { motionSpecs: { m1: motionSpecT('cta', { text: 'Go' }) } });
+    expect(res.warnings).toEqual([]);
+    const args = runMock.mock.calls[0][1] as string[];
+    const graph = args[args.indexOf('-filter_complex') + 1];
+    expect(graph).toMatch(/\[bgAll\]ass='.*\.vedit-motion\.ass'\[voutMotion\]/);
+    expect(args[args.indexOf('-map') + 1]).toBe('[voutMotion]');
+  });
+
+  it('motion burns UNDER dialogue (motion ass chains first, dialogue ass chains onto its output) when both are active', async () => {
+    runMock.mockClear();
+    let m = compManifest({ dialogue: [{ id: 'dl1', text: 'hi', tlStart: 0, duration: 2 }] });
+    m = { ...m, timeline: { ...m.timeline, motion: [motionItemT({ id: 'm1', tlStart: 0, duration: 2 })] } };
+    await renderComposition(m, outPathIn('/tmp'), { motionSpecs: { m1: motionSpecT('cta', { text: 'Go' }) } });
+    const args = runMock.mock.calls[0][1] as string[];
+    const graph = args[args.indexOf('-filter_complex') + 1];
+    expect(graph).toMatch(/\[bgAll\]ass='.*\.vedit-motion\.ass'\[voutMotion\]/);
+    expect(graph).toMatch(/\[voutMotion\]ass='.*\.vedit-dialogue\.ass'\[vout\]/);
+    expect(args[args.indexOf('-map') + 1]).toBe('[vout]');
+  });
+
+  it('a custom-html-only motion timeline burns nothing but warns with the right count', async () => {
+    runMock.mockClear();
+    const m = { ...compManifest(), timeline: { ...compManifest().timeline, motion: [motionItemT({ id: 'm1', tlStart: 0, duration: 2 })] } };
+    const res = await renderComposition(m, outPathIn('/tmp'), { motionSpecs: { m1: motionSpecT('custom-html', {}) } });
+    expect(res.warnings).toContain('custom-html は焼き込み対象外(1件)');
+    const args = runMock.mock.calls[0][1] as string[];
+    const graph = args[args.indexOf('-filter_complex') + 1];
+    expect(graph).not.toMatch(/ass=/);
   });
 });

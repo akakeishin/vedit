@@ -14,7 +14,7 @@ import {
   timelineDuration,
 } from '../core/ops.js';
 import { captionCues } from '../core/captions.js';
-import type { CaptionSettings, KitFile, KitStyle, Manifest, MusicItem, Transcript } from '../core/types.js';
+import type { CaptionSettings, KitFile, KitStyle, Manifest, MotionSpec, MusicItem, Transcript } from '../core/types.js';
 import {
   AMBIENT_LAYER_OPACITY,
   deriveSpeechBubbleStyle,
@@ -24,9 +24,10 @@ import {
   type ResolvedKitAsset,
   type SpeechBubbleStyle,
 } from '../core/kit.js';
-import { resolveWithinDir } from '../core/project.js';
+import { resolveWithinDir, type Project } from '../core/project.js';
 import { listSystemFonts, resolveKitFontFile } from '../core/fonts.js';
 import { buildColorChain } from './color.js';
+import { buildMotionAss } from './motion.js';
 import { ffmpegHasFilter, run, runCapture } from '../ingest/run.js';
 
 function assTime(t: number): string {
@@ -1031,6 +1032,30 @@ function ffmpegInputArgs(inputPaths: string[], loopIndices?: number[], streamLoo
 }
 
 /**
+ * W7: convenience I/O loader for renderFinal/renderComposition's
+ * `opts.motionSpecs` — resolves every `m.timeline.motion` item's sidecar via
+ * `Project.readMotionSpec` (motion/<id>.json), skipping (not throwing on) a
+ * missing or corrupt sidecar, same "best effort, ignore on failure" contract
+ * as web/app.js's own loadMotionSpecs. Not called by renderFinal/
+ * renderComposition themselves — render.ts stays I/O-free for
+ * project-relative files it has no directory reference for (see
+ * buildMotionAss's doc in motion.ts) — this exists purely so a caller that
+ * DOES have a `Project` (e.g. the CLI) can build the map in one line:
+ * `renderFinal(m, transcripts, dest, { motionSpecs: await loadMotionSpecs(p, m) })`.
+ */
+export async function loadMotionSpecs(p: Project, m: Manifest): Promise<Record<string, MotionSpec>> {
+  const out: Record<string, MotionSpec> = {};
+  for (const item of m.timeline.motion) {
+    try {
+      out[item.id] = (await p.readMotionSpec(item.id)) as MotionSpec;
+    } catch {
+      /* missing/corrupt sidecar — skip, matching web's loadMotionSpecs ignore-on-error */
+    }
+  }
+  return out;
+}
+
+/**
  * Run a measurement-only ffmpeg pass (`-f null -`) for a `print_format=json`
  * loudnorm filter and parse the JSON stats block it prints to stderr —
  * pass 1 of 2-pass loudnorm normalization. Only audio needs to be mapped;
@@ -1077,21 +1102,33 @@ async function measureLoudnorm(
  * optional music mix/duck, optional conversational-audio repair chain
  * (manifest.audioRepair), final-stage loudness normalization (2-pass by
  * default — measure then apply; `--fast-loudnorm`/`fastLoudnorm` falls back
- * to the old 1-pass application), optional ASS caption burn, optional
- * publish preset (encode params + forced loudnorm target + resize). Motion
- * overlays are not baked yet (preview-only for now; on NLE export they
- * travel as markers + spec sidecars).
+ * to the old 1-pass application), optional ASS caption burn, W7 motion burn
+ * (see below), optional publish preset (encode params + forced loudnorm
+ * target + resize).
+ *
+ * W7 motion burn: when `opts.motionSpecs` is supplied (caller-resolved
+ * MotionItem sidecar content, keyed by id — see loadMotionSpecs below), the
+ * 4 built-in presets (chapter-card/lower-third/callout/cta) are burned in via
+ * a SECOND `ass` filter chained on top of the caption burn (matching
+ * #motionLayer sitting above #captionLayer in the web preview's DOM — see
+ * web/index.html); custom-html items are never burned and instead produce a
+ * `custom-html は焼き込み対象外(N件)` warning. Omitting `motionSpecs`
+ * entirely (the pre-W7 default — no existing caller passes it) skips this
+ * block completely, so a caller that never opts in gets the exact same
+ * filtergraph as before W7 existed regardless of what's on
+ * `m.timeline.motion` — see src/export/motion.ts's buildMotionAss doc for
+ * why render.ts can't resolve the sidecars itself.
  *
  * Regression contract: with no `--preset`, no `manifest.audioRepair` (or an
- * explicit `preset: 'off'`), and no music, this produces the exact same
- * ffmpeg filtergraph as before loudnorm/repair existed — no loudnorm filter
- * at all, audio chain unchanged.
+ * explicit `preset: 'off'`), no music, and no `opts.motionSpecs`, this
+ * produces the exact same ffmpeg filtergraph as before loudnorm/repair/W7
+ * existed — no loudnorm filter at all, audio chain unchanged.
  */
 export async function renderFinal(
   m: Manifest,
   transcripts: Transcript[],
   outPath: string,
-  opts: { burnCaptions?: boolean; fastLoudnorm?: boolean; noRepair?: boolean } & RenderParamOverrides = {},
+  opts: { burnCaptions?: boolean; fastLoudnorm?: boolean; noRepair?: boolean; motionSpecs?: Record<string, MotionSpec> } & RenderParamOverrides = {},
 ): Promise<{ file: string; warnings: string[] }> {
   // --no-repair (dry-audio A/B): disable the repair chain for this render
   // only, without touching the manifest's saved setting.
@@ -1213,6 +1250,32 @@ export async function renderFinal(
     vLabel = '[vout]';
   }
 
+  // W7: motion burn-in — a SECOND, independent `ass` filter chained on top
+  // of (not merged into) the caption burn above, applied to whatever `vLabel`
+  // currently is (so it draws OVER captions, matching #motionLayer sitting
+  // above #captionLayer in the web preview — see web/index.html). Only runs
+  // when the caller supplied `opts.motionSpecs`; see this function's doc for
+  // why that's an opt-in rather than something render.ts resolves itself.
+  let motionAssPath: string | null = null;
+  if (opts.motionSpecs) {
+    const output = effectiveM.output ?? { width: effectiveM.width, height: effectiveM.height };
+    const motionDoc = buildMotionAss(effectiveM, opts.motionSpecs, kit, output);
+    if (motionDoc.customHtmlSkipped > 0) {
+      warnings.push(`custom-html は焼き込み対象外(${motionDoc.customHtmlSkipped}件)`);
+    }
+    if (motionDoc.ass) {
+      if (!ffmpegHasFilter('ass')) {
+        throw new Error(
+          'this ffmpeg build lacks the `ass` filter (motion burn). Install `brew install ffmpeg-full` or set VEDIT_FFMPEG, or render without motionSpecs.',
+        );
+      }
+      motionAssPath = path.join(path.dirname(outPath), '.vedit-motion.ass');
+      await fs.writeFile(motionAssPath, motionDoc.ass);
+      graph += `;${vLabel}ass='${motionAssPath.replace(/'/g, "\\'")}'[voutMotion]`;
+      vLabel = '[voutMotion]';
+    }
+  }
+
   // Musicless loudnorm (preset-forced and/or repair-triggered) is applied
   // here, after the base graph — the music-present case already baked its
   // loudnorm into `built` above via buildFilterGraph's own loudnorm opts.
@@ -1240,6 +1303,7 @@ export async function renderFinal(
     outPath,
   ]);
   if (assPath) await fs.rm(assPath, { force: true });
+  if (motionAssPath) await fs.rm(motionAssPath, { force: true });
   return { file: outPath, warnings };
 }
 
@@ -1253,11 +1317,17 @@ export async function renderFinal(
  * does not run a 2-pass loudnorm measurement pass — a single-pass loudnorm
  * target is applied directly (see the W-ANIME implementation report for
  * why this was judged an acceptable simplification for a first cut).
+ *
+ * W7 motion burn: same `opts.motionSpecs`-gated behavior as renderFinal (see
+ * its doc), but chained BEFORE the dialogue burn below rather than after —
+ * #motionLayer sits below #dialogueLayer in the web preview's DOM (see
+ * web/index.html), so motion draws under speech bubbles here, unlike
+ * renderFinal where it draws over captions.
  */
 export async function renderComposition(
   m: Manifest,
   outPath: string,
-  opts: RenderParamOverrides = {},
+  opts: RenderParamOverrides & { motionSpecs?: Record<string, MotionSpec> } = {},
 ): Promise<{ file: string; warnings: string[] }> {
   if (!m.composition) throw new Error('renderComposition: manifest has no composition');
   const params = resolveRenderParams(m, opts);
@@ -1298,6 +1368,30 @@ export async function renderComposition(
   const inputs = ffmpegInputArgs(built.inputPaths, built.loopInputIndices, built.streamLoopInputIndices);
 
   let vLabel = built.videoLabel;
+
+  // W7: motion burn-in, applied BEFORE the dialogue burn below so motion
+  // sits under speech bubbles (matches #motionLayer < #dialogueLayer in the
+  // web DOM). Opt-in via opts.motionSpecs — see renderFinal's doc for why.
+  let motionAssPath: string | null = null;
+  if (opts.motionSpecs) {
+    const output = m.output ?? { width: m.width, height: m.height };
+    const motionDoc = buildMotionAss(m, opts.motionSpecs, kit, output);
+    if (motionDoc.customHtmlSkipped > 0) {
+      warnings.push(`custom-html は焼き込み対象外(${motionDoc.customHtmlSkipped}件)`);
+    }
+    if (motionDoc.ass) {
+      if (!ffmpegHasFilter('ass')) {
+        throw new Error(
+          'this ffmpeg build lacks the `ass` filter (motion burn). Install `brew install ffmpeg-full` or set VEDIT_FFMPEG, or render without motionSpecs.',
+        );
+      }
+      motionAssPath = path.join(path.dirname(outPath), '.vedit-motion.ass');
+      await fs.writeFile(motionAssPath, motionDoc.ass);
+      graph += `;${vLabel}ass='${motionAssPath.replace(/'/g, "\\'")}'[voutMotion]`;
+      vLabel = '[voutMotion]';
+    }
+  }
+
   let assPath: string | null = null;
   const hasDialogue = (m.timeline.dialogue ?? []).length > 0;
   if (hasDialogue) {
@@ -1318,7 +1412,11 @@ export async function renderComposition(
         warnings.push(`kit style ${activeKitStyle.id}: font path invalid (${activeKitStyle.caption.font}) — dialogue burns without the kit font`);
       }
     }
-    graph += `;${built.videoLabel}ass='${assPath.replace(/'/g, "\\'")}'${fontsdirPart}[vout]`;
+    // Chains onto `vLabel` (not `built.videoLabel`) so this lands on top of
+    // the W7 motion burn above when one happened — with no motion burn
+    // (the common/pre-W7 case), vLabel === built.videoLabel here still, so
+    // this is byte-for-byte the same clause as before W7 existed.
+    graph += `;${vLabel}ass='${assPath.replace(/'/g, "\\'")}'${fontsdirPart}[vout]`;
     vLabel = '[vout]';
   }
 
@@ -1340,5 +1438,6 @@ export async function renderComposition(
     outPath,
   ]);
   if (assPath) await fs.rm(assPath, { force: true });
+  if (motionAssPath) await fs.rm(motionAssPath, { force: true });
   return { file: outPath, warnings };
 }
