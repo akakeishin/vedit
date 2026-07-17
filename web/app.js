@@ -330,12 +330,31 @@ function seekTl(tl, { play } = {}) {
       S.playing = play;
       setPlayBtnState(play);
     }
+    // F-s3-3/F-s3-4 root cause: headerTc/tcNow/captions/motion/etc. were only
+    // ever pushed to the DOM from inside tick()'s requestAnimationFrame loop
+    // — seekTl/loadSeg themselves only touched internal state (video.
+    // currentTime, S.currentSeg/S.compTl), leaving the seek's own result
+    // invisible until "whenever the next rAF callback happens to land". That
+    // gap is normally imperceptible (rAF fires ~60/s), but any delay to the
+    // loop (a backgrounded/occluded window, or simply a paused video with no
+    // other rAF consumer) left the display frozen at the pre-seek position
+    // even though the seek itself had already succeeded — exactly the
+    // "video.currentTime moved but headerTc/tcNow stayed at 0:00.0" report.
+    // Pushing one synchronous render right here closes that gap for good,
+    // independent of the rAF loop's timing.
+    renderCompositionFrame(tl);
     return;
   }
   let i = segAt(tl);
   if (i < 0) i = S.segments.length - 1;
   if (i < 0) return; // no segments at all
   loadSeg(i, { play: play ?? S.playing, offset: tl - S.segments[i].tlStart });
+  // Same reasoning as the composition branch above. Use the just-computed
+  // target `tl` directly rather than tlNow() — tlNow() reads video.
+  // currentTime, which for a cross-source loadSeg() hasn't been set yet
+  // (it's applied async once 'loadedmetadata' fires), so re-deriving it here
+  // would render the OLD position for a moment instead of the new one.
+  renderPlaybackFrame(tl);
 }
 
 // ---------- W-ANIME: composition virtual clock (no <video>/segments to drive playback) ----------
@@ -366,14 +385,12 @@ function applyCompositionMode() {
     S.compClockAnchor = null;
   }
 }
-function tickComposition() {
-  const tl = compTlNow();
-  if (S.playing && tl >= S.duration - 1e-3) {
-    S.compTl = S.duration;
-    S.compClockAnchor = null;
-    S.playing = false;
-    setPlayBtnState(false);
-  }
+// Every tl-driven display element for composition mode ("紙芝居" background
+// + motion/sprites/dialogue/BGM, no <video> at all) — shared by tickComposition
+// (every rAF frame) and seekTl (once, synchronously, right when a seek
+// happens) so a seek's result shows up immediately instead of waiting on the
+// next animation frame (see seekTl's comment on F-s3-3/F-s3-4).
+function renderCompositionFrame(tl) {
   $('playhead').style.left = `${(tl / Math.max(1e-6, S.duration)) * 100}%`;
   renderTimecode(tl, S.duration);
   $('headerTc').textContent = fmt(tl);
@@ -382,6 +399,16 @@ function tickComposition() {
   renderSprites(tl);
   renderDialogueBubbles(tl);
   syncMusicPlayback(tl);
+}
+function tickComposition() {
+  const tl = compTlNow();
+  if (S.playing && tl >= S.duration - 1e-3) {
+    S.compTl = S.duration;
+    S.compClockAnchor = null;
+    S.playing = false;
+    setPlayBtnState(false);
+  }
+  renderCompositionFrame(tl);
   if (S.previewStopAt != null && S.playing && tl >= S.previewStopAt) {
     S.previewStopAt = null;
     stopPlayback();
@@ -449,30 +476,41 @@ function tick() {
       stalledSince = null;
     }
     const tl = tlNow();
-    $('playhead').style.left = `${(tl / S.duration) * 100}%`;
-    renderTimecode(tl, S.duration);
-    $('headerTc').textContent = fmt(tl);
-    renderCaption(tl);
-    renderMotion(tl);
-    renderSprites(tl);
-    // W-UI IA v2 波2 §5 (spec's wave-2 list, "セリフの通常プロジェクト・
-    // プレビュー描画"): dialogue bubbles were only ever driven from
-    // tickComposition() — a normal (source-driven) project with dialogue
-    // items rendered silent/invisible in the web preview despite the
-    // renderer always burning them in (see render.ts's doc on this). Same
-    // call tickComposition already makes, just also reachable outside
-    // composition mode.
-    renderDialogueBubbles(tl);
-    applyColorAdjustPreview(s.sourceId);
-    highlightWord(tl);
-    syncMusicPlayback(tl);
-    syncOverlayVideo(tl);
+    renderPlaybackFrame(tl);
     if (S.previewStopAt != null && S.playing && tl >= S.previewStopAt) {
       S.previewStopAt = null;
       stopPlayback();
     }
   }
   requestAnimationFrame(tick);
+}
+// Every tl-driven display element for a normal (source-driven) project —
+// shared by tick() (every rAF frame) and seekTl (once, synchronously, right
+// when a seek happens) so a seek's result shows up immediately instead of
+// waiting on the next animation frame (see seekTl's comment on
+// F-s3-3/F-s3-4: previously nothing pushed a display update outside tick()'s
+// loop, so any delay to that loop left headerTc/tcNow/captions frozen at the
+// pre-seek position even though the seek itself had already succeeded).
+function renderPlaybackFrame(tl) {
+  const s = S.segments[S.currentSeg];
+  $('playhead').style.left = `${(tl / S.duration) * 100}%`;
+  renderTimecode(tl, S.duration);
+  $('headerTc').textContent = fmt(tl);
+  renderCaption(tl);
+  renderMotion(tl);
+  renderSprites(tl);
+  // W-UI IA v2 波2 §5 (spec's wave-2 list, "セリフの通常プロジェクト・
+  // プレビュー描画"): dialogue bubbles were only ever driven from
+  // tickComposition() — a normal (source-driven) project with dialogue
+  // items rendered silent/invisible in the web preview despite the
+  // renderer always burning them in (see render.ts's doc on this). Same
+  // call tickComposition already makes, just also reachable outside
+  // composition mode.
+  renderDialogueBubbles(tl);
+  if (s) applyColorAdjustPreview(s.sourceId);
+  highlightWord(tl);
+  syncMusicPlayback(tl);
+  syncOverlayVideo(tl);
 }
 function fmt(t) {
   const m = Math.floor(t / 60);
@@ -1055,11 +1093,15 @@ function renderTimeline() {
     // stays available via the title tooltip) — MOTION_TYPE_LABEL is defined
     // with humanizeRevision below but this only runs after full module load.
     const moType = S.motionSpecs?.[mo.id]?.type;
+    const moLabel = moType ? (MOTION_TYPE_LABEL[moType] ?? moType) : 'モーション';
     d.className = 'moBlock' + (isSelected('motion', mo.id) ? ' sel' : '');
     d.style.left = `${(mo.tlStart / S.duration) * 100}%`;
     d.style.width = `${(mo.duration / S.duration) * 100}%`;
-    d.textContent = moType ? (MOTION_TYPE_LABEL[moType] ?? moType) : 'モーション';
-    let titleText = `${mo.id} (${fmt(mo.duration)}) — ドラッグで移動`;
+    d.textContent = moLabel;
+    // F-s3-1: the drag title used to lead with the internal spec id
+    // (momrnl3geu7) — meaningless to anyone but the person who wrote the
+    // manifest. Lead with the same human label the block itself shows.
+    let titleText = `${moLabel} (${fmt(mo.duration)}) — ドラッグで移動`;
     // 波2 追補#1: custom-html is preview-only — never burned into the export
     // (see export/motion.ts's doc) — a silent, easy-to-miss data loss if the
     // user never notices until after exporting. A permanent badge (not the
@@ -1263,10 +1305,13 @@ function renderOverlayRow() {
       d.className = 'ovBlock' + (isSelected('broll', ov.id) ? ' sel' : '');
       d.style.left = `${(r.tlStart / S.duration) * 100}%`;
       d.style.width = `${(dur / S.duration) * 100}%`;
-      // W-UI polish: raw filename lives in the title (hover) alongside the
-      // existing id/dur/audioMode debug info; the block's own text stays
-      // the short "素材N · HH:MM" alias — see sourceLabel's doc.
-      d.title = `${ovSrc ? basename(ovSrc.path) : ov.sourceId} — ${ov.id} (${dur.toFixed(1)}s, ${ov.audioMode}) — ドラッグで移動`;
+      // F-s3-1: the title used to lead with the raw source filename plus the
+      // internal overlay id (ovmro24wjr1) — noise to anyone but the person
+      // who wrote the manifest, and the exact kind of detail W-UI redesign §6
+      // deliberately kept out of the block's own on-canvas text. Use the
+      // same "素材N · HH:MM" alias there too, with duration/audio spelled
+      // out in Japanese instead of raw seconds+enum.
+      d.title = `B-roll: ${sourceLabel(ovSrc)}(${dur.toFixed(1)}秒・${AUDIO_MODE_LABEL[ov.audioMode] ?? ov.audioMode}) — ドラッグで移動`;
       d.textContent = sourceLabel(ovSrc); // W-UI redesign §6: display name, not the internal overlay id (full filename in title)
       d.onpointerdown = (e) => startBlockDrag(e, 'broll', ov.id, r.tlStart, d);
       makeBlockKeyboardActivatable(d, () => { selectItem('broll', ov.id); seekTl(r.tlStart, { play: false }); });
@@ -2757,10 +2802,17 @@ async function loadFontOptions(selectEl, currentValue) {
     }
     selectEl.appendChild(g);
   }
-  if (fonts.system?.length) {
+  // F-s3-5: macOS reports a batch of dot-prefixed "internal use" families
+  // (.Al Bayan PUA, .Keyboard, .LastResort, ...) alongside real ones — these
+  // are UI/fallback fonts the OS itself hides from any font picker, never
+  // meant to be user-selectable. Filter them out here rather than in the
+  // daemon's /api/fonts (kept out of scope for this fix) so the list only
+  // ever shows fonts a caption actually looks different with.
+  const systemFonts = (fonts.system ?? []).filter((f) => !f.family.startsWith('.'));
+  if (systemFonts.length) {
     const g = document.createElement('optgroup');
     g.label = 'システム';
-    for (const f of fonts.system) {
+    for (const f of systemFonts) {
       const opt = document.createElement('option');
       opt.value = f.family;
       opt.textContent = f.family;
@@ -3593,15 +3645,19 @@ window.addEventListener('pointerup', (e) => {
   if (!dragging) return;
   dragging = false;
   if (S.selWords.size === 1) {
-    // treat as click: seek to word if it's on the timeline
+    // F-s3-2: a plain click (pointerdown+up with no drag in between) both
+    // seeks to the word's timeline position AND keeps it selected — restores
+    // the old "click to jump to this word" behavior. Previously this called
+    // seekToWord and then immediately cleared the selection, which made a
+    // click look like "select only" (the seek's own visual feedback —
+    // playhead/timecode/caption — is easy to miss, but the selection
+    // disappearing right away is not). Range selection (drag / Shift+click,
+    // handled above in pointerdown/pointerover) is unaffected — this branch
+    // only ever runs for a single, undragged word.
     const key = [...S.selWords][0];
     const [srcId, id] = key.split(':');
     const w = (S.transcripts.get(srcId) ?? []).find((x) => x.id === id);
     if (w) seekToWord(srcId, w);
-    S.selWords.clear();
-    S.selSourceId = null;
-    renderTranscript();
-    focusWordEl(srcId, id);
   }
   updateSelBtn();
 });
@@ -4351,6 +4407,9 @@ function sourceDisplayName(sourceId) {
 const MOTION_TYPE_LABEL = {
   'chapter-card': 'チャプターカード', 'lower-third': 'ローワーサード', callout: 'コールアウト', cta: 'CTA',
 };
+// F-s3-1: human labels for B-roll overlay audioMode ('mute'|'mix'|'replace',
+// see core/types.ts) — used in the drag title instead of the raw enum value.
+const AUDIO_MODE_LABEL = { mute: '音声なし', mix: '音声ミックス', replace: '音声置換' };
 const COLOR_TYPE_LABEL = { hlg: 'HLG', pq: 'PQ', lut: 'LUT', none: '素材そのまま' };
 function humanizeRevision(entry) {
   const op = entry.op;
