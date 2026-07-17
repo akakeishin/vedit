@@ -1416,6 +1416,27 @@ describe('daemon: music ops', () => {
     const project = (await getJson(BASE, '/api/project')).body;
     expect(project.manifest.timeline.music).toHaveLength(0);
   });
+
+  it('music-add passes b.role through to addMusic (persisted on the item)', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'music-add', path: '/tmp/bgm.mp3', tlStart: 0, duration: 5, role: 'sfx',
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    const mu = project.manifest.timeline.music.find((x: any) => x.id === body.id);
+    expect(mu.role).toBe('sfx');
+    await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: project.manifest.revision, op: 'music-remove', id: body.id });
+  });
+
+  it('music-add rejects an invalid role — addMusic\'s runtime guard throws, converted to 400 by the generic route() catch', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'music-add', path: '/tmp/bgm.mp3', tlStart: 0, duration: 5, role: 'nope',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/role/);
+  });
 });
 
 // ---- Suite 13: audio-repair op (W1) + color warning in stateSummary ----
@@ -3516,5 +3537,161 @@ describe('daemon: compose on an already-ingested project is refused', () => {
     });
     expect(status).toBe(400);
     expect(body.error).toMatch(/already has ingested/);
+  });
+});
+
+// ---- Suite: shift op (composition-only "間" gap adjust) ----
+describe('daemon: shift op (composition gap adjust)', () => {
+  const PORT = 18252;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let dir: string;
+  let kitDir: string;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-shift-'));
+    dir = path.join(root, 'proj');
+    kitDir = path.join(root, 'kit');
+    await fsp.mkdir(kitDir, { recursive: true });
+    const kit: KitFile = {
+      version: 'vedit-kit/v1',
+      assets: [{ id: 'char1', path: 'assets/characters/char1.png', type: 'sprite' }],
+    };
+    await writeKitFile(kitDir, kit);
+    await Project.create(dir, 'shift');
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('shift moves sprites/dialogue/music/bg-cuts at/after --from, grows duration by --by, and reports a per-kind summary', async () => {
+    // Build up a composition with one item of every kind shiftComposition
+    // touches, all sitting at t=5 (>= the from we'll shift with below).
+    let state = (await getJson(BASE, '/api/state')).body;
+    await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'compose', duration: 20, width: 1080, height: 1920,
+    });
+    state = (await getJson(BASE, '/api/state')).body;
+    await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'kit-link', path: kitDir });
+    state = (await getJson(BASE, '/api/state')).body;
+    const sprite = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'sprite-add', assetId: 'char1',
+      anchor: { sourceId: '__comp__', srcTime: 5 }, duration: 3,
+    });
+    expect(sprite.status).toBe(200);
+    state = (await getJson(BASE, '/api/state')).body;
+    const dialogue = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'dialogue-add', text: 'hi', tlStart: 5,
+    });
+    expect(dialogue.status).toBe(200);
+    state = (await getJson(BASE, '/api/state')).body;
+    const music = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'music-add', path: '/tmp/bgm.mp3', tlStart: 5, duration: 3,
+    });
+    expect(music.status).toBe(200);
+    state = (await getJson(BASE, '/api/state')).body;
+    const bg = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'bg-set', t: 8, to: '#ff0000',
+    });
+    expect(bg.status).toBe(200);
+
+    state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'shift', from: 5, by: 2,
+    });
+    expect(status).toBe(200);
+    expect(body.summary).toEqual({ sprites: 1, dialogue: 1, music: 1, bgCuts: 1, duration: 22 });
+
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.composition.duration).toBe(22);
+    expect(project.sprites.find((r: any) => r.sprite.id === sprite.body.id).tlStart).toBeCloseTo(7);
+    expect(project.dialogue.find((d: any) => d.id === dialogue.body.id).tlStart).toBe(7);
+    expect(project.manifest.timeline.music.find((x: any) => x.id === music.body.id).tlStart).toBe(7);
+    expect(project.manifest.composition.backgroundTrack.some((e: any) => e.t === 10)).toBe(true);
+
+    const revs = (await getJson(BASE, '/api/revisions')).body;
+    const last = revs[revs.length - 1];
+    expect(last.op).toBe('shift');
+    expect(last.summary).toBe('shift from=5s by=2s');
+  });
+
+  it('shift is refused (400) on a normal (source-driven) project — composition-only op', async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-shift-refuse-'));
+    const realDir = path.join(root, 'proj');
+    const project = await Project.create(realDir, 'shift-refuse');
+    await project.commit(0, 'system', 'setup', {}, 'seed source', (m) => ({
+      ...m,
+      sources: [{ id: 's1', path: '/media/one.mp4', duration: 10, fps: 30, width: 1920, height: 1080, hasAudio: true }],
+      timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 10 }], motion: [] },
+    }));
+    const PORT2 = 18253;
+    const started = await startDaemon({ port: PORT2, projectDir: realDir });
+    try {
+      const state = (await getJson(`http://localhost:${PORT2}`, '/api/state')).body;
+      const { status, body } = await postJson(`http://localhost:${PORT2}`, '/api/edit', {
+        actor: 'claude', baseRev: state.revision, op: 'shift', from: 0, by: 1,
+      });
+      expect(status).toBe(400);
+      expect(body.error).toMatch(/コンポジション専用|実写プロジェクト/);
+    } finally {
+      started.server.close();
+    }
+  });
+});
+
+// ---- Suite: selects raw wiring (daemon 'selects' op passes b.raw through to buildSelectsTimeline) ----
+describe('daemon: selects raw wiring', () => {
+  const PORT = 18254;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-selects-raw-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'selects-raw');
+    await project.commit(0, 'system', 'setup', {}, 'seed source + micro-edit + keep verdict', (m) => ({
+      ...m,
+      fps: 30,
+      sources: [{ id: 's1', path: '/media/one.mp4', duration: 20, fps: 30, width: 1920, height: 1080, hasAudio: false }],
+      // Narrower than the scene's full [0,10) range below — simulates a
+      // prior remove-words/remove-range micro-edit inside the kept scene.
+      timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 2, srcOut: 8 }], motion: [] },
+      culling: { s1: { sc1: 'keep' } },
+    }));
+    await project.writeScenes({
+      sourceId: 's1',
+      scenes: [{ id: 'sc1', t0: 0, t1: 10, thumb: 'cache/sc-s1-sc1.jpg', hasSpeech: false, energy: 0.1 }],
+    });
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('selects (default) preserves the existing micro-edit inside the kept scene', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'selects',
+    });
+    expect(status).toBe(200);
+    expect(body.newClips).toBe(1);
+    const project = (await getJson(BASE, '/api/project')).body;
+    const video = project.manifest.timeline.video;
+    expect(video).toHaveLength(1);
+    expect(video[0]).toMatchObject({ sourceId: 's1', srcIn: 2, srcOut: 8 }); // micro-edit preserved
+  });
+
+  it('selects raw:true restores the old behavior (full scene bounds, discarding the micro-edit)', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'selects', raw: true,
+    });
+    expect(status).toBe(200);
+    expect(body.newClips).toBe(1);
+    const project = (await getJson(BASE, '/api/project')).body;
+    const video = project.manifest.timeline.video;
+    expect(video).toHaveLength(1);
+    expect(video[0]).toMatchObject({ sourceId: 's1', srcIn: 0, srcOut: 10 }); // raw: full scene range, micro-edit discarded
   });
 });

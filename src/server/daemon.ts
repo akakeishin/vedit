@@ -46,6 +46,7 @@ import {
   setColorTransform,
   setComposition,
   setSceneReview,
+  shiftComposition,
   sourceRangeToTimeline,
   timelineDuration,
   trimClip,
@@ -55,12 +56,13 @@ import {
   updateSprite,
   wordRange,
 } from '../core/ops.js';
+import type { ShiftSummary } from '../core/ops.js';
 import { upsertProject } from '../core/registry.js';
 import { captionCues } from '../core/captions.js';
 import { detectFillers, detectSilences, detectSilencesFromPeaks } from '../core/detect.js';
 import type { Peaks } from '../core/detect.js';
 import { packTranscript } from '../core/pack.js';
-import { detectScenesForSource, packScenes } from '../core/scenes.js';
+import { detectScenesForSource, packScenes, sceneThumbPath } from '../core/scenes.js';
 import { detectTakes, type TakeGroup } from '../core/takes.js';
 import { staticChecks } from '../export/qc.js';
 import { ingestFile, makeProxy, probeAudio, transcribe } from '../ingest/ingest.js';
@@ -1302,7 +1304,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         const updated = await mutate(
           p, actor, baseRev, 'music-add', b,
           `music-add ${path.basename(filePath)} at ${tlStart}s (+${duration.toFixed(1)}s)`,
-          (m) => addMusic(m, filePath, { id, tlStart, srcIn, duration, gain: b.gain, fadeIn: b.fadeIn, fadeOut: b.fadeOut, duck: b.duck }),
+          (m) => addMusic(m, filePath, { id, tlStart, srcIn, duration, gain: b.gain, fadeIn: b.fadeIn, fadeOut: b.fadeOut, duck: b.duck, role: b.role }),
         );
         const addedItem = (updated.timeline.music ?? []).find((x) => x.id === id)!;
         const warning = duckWarningFor(updated, addedItem);
@@ -1441,6 +1443,25 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         const t = Number(b.t);
         await mutate(p, actor, baseRev, 'bg-remove', b, `bg-remove at ${t}s`, (m) => removeBackgroundAt(m, t));
         return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
+      }
+      if (b.op === 'shift') {
+        const from = Number(b.from);
+        const by = Number(b.by);
+        const keepDuration = b.keepDuration === true;
+        // shiftComposition throws (non-composition project, out-of-range
+        // moves, etc.) — left uncaught here so the generic route() handler
+        // converts it to a 400, same as every other op in this dispatch.
+        let summary: ShiftSummary;
+        await mutate(
+          p, actor, baseRev, 'shift', b,
+          `shift from=${from}s by=${by}s`,
+          (m) => {
+            const result = shiftComposition(m, from, by, { keepDuration });
+            summary = result.summary;
+            return result.manifest;
+          },
+        );
+        return json(res, 200, { summary: summary!, state: await stateSummary(p, ctx.transcribeJobs) });
       }
       // ---- W-ANIME: dialogue (speech bubbles) ----
       if (b.op === 'dialogue-add') {
@@ -1650,7 +1671,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       }
       if (b.op === 'selects') {
         const sceneFiles = await sceneFilesFor(p, m0);
-        const newVideo = buildSelectsTimeline(m0, sceneFiles);
+        const newVideo = buildSelectsTimeline(m0, sceneFiles, { raw: b.raw === true });
         if (newVideo.length === 0) {
           return json(res, 400, { error: 'selects: no scenes are marked "keep" — nothing to build a timeline from' });
         }
@@ -1967,6 +1988,32 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
   async function serveMedia(p: Project, pathname: string, req: http.IncomingMessage, res: http.ServerResponse) {
     // /media/kit/<relPath>: separate containment root (see serveKitMedia doc).
     if (pathname.startsWith('/media/kit/')) return serveKitMedia(p, pathname.slice('/media/kit/'.length), req, res);
+    // /media/scene-thumb/<sourceId>/<sceneId>: the web UI's timeline
+    // filmstrip (W-UI redesign) — serves the per-scene poster frame that
+    // `vedit scenes detect` already wrote to cache/ (see sceneThumbPath in
+    // core/scenes.ts, the SAME path helper the write side uses, so this is
+    // pure containment + a read, never a new ffmpeg invocation). 404 (not a
+    // fresh render) when detection hasn't produced that file yet — the
+    // caller (renderTimeline in app.js) just omits the tile.
+    if (pathname.startsWith('/media/scene-thumb/')) {
+      const [sourceId, sceneId] = pathname.slice('/media/scene-thumb/'.length).split('/');
+      if (!sourceId || !sceneId) return json(res, 400, { error: 'scene-thumb: sourceId and sceneId are required' });
+      const m0 = await p.manifest();
+      if (!m0.sources.some((s) => s.id === sourceId)) return json(res, 404, { error: 'unknown source' });
+      let full: string;
+      try {
+        full = (await sceneThumbPath(p, sourceId, sceneId)).abs;
+      } catch {
+        return json(res, 404, { error: 'invalid scene-thumb path' });
+      }
+      let stat: ReturnType<typeof statSync>;
+      try {
+        stat = statSync(full);
+      } catch {
+        return json(res, 404, { error: 'scene thumbnail not found' });
+      }
+      return serveFileWithRange(req, res, full, stat, 'image/jpeg');
+    }
     // /media/proxy/<sourceId> | /media/peaks/<sourceId> | /media/thumb/<sourceId> | /media/music/<musicId>
     const [, , kind, id] = pathname.split('/');
     const m = await p.manifest();

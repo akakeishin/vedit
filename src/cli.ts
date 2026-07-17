@@ -1124,11 +1124,6 @@ async function main() {
 
     case 'selects': {
       const raw = !!flags.raw;
-      if (raw && flags.confirm) {
-        fail(
-          '--raw --confirm はまだ未対応です(適用は daemon の /api/edit "selects" 経由で行われ、daemon 側に raw の配線が無いため既定の微修正保持動作で適用されてしまいます)。--raw はプレビュー確認のみに使ってください',
-        );
-      }
       const dir = projectDir();
       const p = await Project.open(dir);
       const m = await p.manifest();
@@ -1164,7 +1159,7 @@ async function main() {
       const state = await api('/api/state');
       const res = await api('/api/edit', {
         method: 'POST',
-        body: JSON.stringify({ baseRev: baseRevOf(state), actor: flags.actor ?? 'claude', op: 'selects' }),
+        body: JSON.stringify({ baseRev: baseRevOf(state), actor: flags.actor ?? 'claude', op: 'selects', raw }),
       });
       return out({ ...res, ...preview, applied: true, hint: MUTATE_HINT });
     }
