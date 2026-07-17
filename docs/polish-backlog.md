@@ -1,5 +1,52 @@
 # 磨き込みバックログ & 機能ロードマップ
 
+## 機能ロードマップ v3(2026-07-17 徹底棚卸し3本の統合)
+
+入力: 実写編集棚卸し(6シナリオ机上走行)/アニメ棚卸し(45秒3シーン
+ウォークスルー)/Codex 機能深度コンサル。方針: **本番検証ループの前に
+「検証で確実に踏む」P0/P1 を消化**し、L サイズ提案は S/M の代替設計で痛みを
+先に消す。✅=着地済み。
+
+**Fix 波A — 検証前必須(進行中)**
+- ✅ セリフ吹き出しの ASS 描画(BorderStyle=3 セマンティクス+可視上端アンカー)
+- ✅ breathe がレンダー無動作(scale=eval=frame で式消費、emote も自前プラン)
+- ✅ Selects が keep シーン内の word 編集を巻き戻す(交差保持、--raw で旧動作)
+- ✅ export-guide 実装追随(A2 制限/V2/スプライト/マーカー)
+- ✅ レジストリ汚染(テスト HOME 隔離+並列剪定)
+- ✅ publish-pack がコンポジションでサムネ0枚(bg境界+登場時刻、renderedFile 抽出)
+- ⏳ **P0: compose 再実行が backgroundTrack を消す**(保持スプレッド+範囲外切替点の除去)
+- ⏳ **P1: スプライト z 順の web/render 不一致**(配列順=z順に統一)
+- ⏳ CLI 配線残: publish-pack --render / W7 motionSpecs(loadMotionSpecs)/ selects --raw の daemon 配線
+- ⏳ smoke:compose(実レンダー統合検知 — loudnorm/breathe 級のバグの恒久対策)
+
+**Fix 波B — 検証前に判断(小さく効く)**
+- **`vedit shift --from <t> --by <±秒>`**: t 以降の背景切替点・スプライト・セリフ・
+  music tlStart を一括平行移動(Codex 提案「シーン単位リップル(L)」の S/M 代替。
+  コンポジションの「間」調整の反復を1コマンド化)
+- **SE 糖衣**: `music-add --sfx`(no-duck/no-fade/短フェード既定)— ゆる紙芝居の主演出
+- **dialogue の `--pos` 手動指定+同時刻重なり警告**(8個置くと確実に踏む)
+- **通常プロジェクトのスプライト motion**: レンダー静的描画のまま**警告を出す**
+  (焼き込み対応は composition 経路の実績を見てから判断)
+- 通常プロジェクトのプレビューに dialogue が出ない parity(web、UI 再設計後)
+
+**UI 波 — 再設計「ステージと書斎」着地後に載せる**(実写監査 P1 群)
+- music-add ボタン / 字幕ベースプリセット切替 / reframe・clip-crop の視覚操作
+- Selects 置換ダイアログに「微修正は保持されます」の文言反映(新既定の説明)
+- resume 相当の「先週ここまで」ビュー(いま タブ拡張、notes 表示)
+
+**機能波(検証後、v2 から繰り越し+Codex 採用分)**
+- W6: 横→縦の派生プロジェクト / W10: アーカイブ/再リンク(v2 のまま)
+- music/motion の source アンカー化(B-roll の orphan 規則を横展開)
+- クリップ/ソース単位の gain・mute・repairPreset 上書き
+- B-roll V2 の個別クロップ焦点
+- **範囲指定の下見レンダー**(`export render --range a..b` — 音・色の A/B を数秒で)
+- エピソードテンプレ複製(composition の型を保って中身差し替え)
+- 背景遷移プリセット(crossfade|dip-color、0.2〜0.6s)
+- Resolve handoff mix pack(ステム書き出し、L — 需要を検証ループで確認してから)
+- emoteAt の真クロスフェード(ベース側フェード、シルエット差がある素材で顕在化)
+
+---
+
 ## 機能ロードマップ v2(2026-07-17 Codex コンサル反映)
 
 方針: 派手な機能より「毎週の反復作業」(選別・B-roll・音声修復・派生版・
