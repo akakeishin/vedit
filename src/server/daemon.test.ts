@@ -3,10 +3,11 @@ import { mkdtempSync, promises as fsp } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import http, { type Server } from 'node:http';
+import { WebSocket } from 'ws';
 import { Project } from '../core/project.js';
 import { startDaemon } from './daemon.js';
 import { writeKitFile } from '../core/kit.js';
-import type { KitFile, Word } from '../core/types.js';
+import type { CutCandidate, KitFile, Word } from '../core/types.js';
 
 // music-add shells out to ffprobe via probeAudio(); stub it so the "daemon:
 // music ops" suite below stays fast/deterministic without needing ffmpeg
@@ -30,6 +31,19 @@ const { probeAudioMock, makeProxyMock } = vi.hoisted(() => ({
 vi.mock('../ingest/ingest.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../ingest/ingest.js')>();
   return { ...actual, probeAudio: probeAudioMock, makeProxy: makeProxyMock };
+});
+
+// POST /api/locate-media shells out to `mdfind` (macOS-only, and depends on
+// what happens to be on the test host's disk) via locateMedia(); stub it so
+// the "daemon: locate-media" suite is deterministic and OS-independent. Real
+// locateMedia()/mdfindByName()/fingerprintFile() behavior is covered by
+// src/ingest/locate.test.ts directly.
+const { locateMediaMock } = vi.hoisted(() => ({
+  locateMediaMock: vi.fn(async (name: string) => (name === 'findme.mp4' ? '/Volumes/Cards/findme.mp4' : null)),
+}));
+vi.mock('../ingest/locate.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../ingest/locate.js')>();
+  return { ...actual, locateMedia: locateMediaMock };
 });
 
 function wordsFor(prefix: string, count: number, spacing = 1, dur = 0.8): Word[] {
@@ -2063,5 +2077,297 @@ describe('daemon: /media/kit path containment (security)', () => {
     } finally {
       await new Promise((resolve) => started2.server.close(() => resolve(undefined)));
     }
+  });
+});
+
+// ---- W-UI companion channel: POST /api/show (W-UI §0) ----
+function wsUrlOf(base: string): string {
+  return base.replace(/^http/, 'ws') + '/ws';
+}
+function openWs(base: string): Promise<WebSocket> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(wsUrlOf(base));
+    ws.once('open', () => resolve(ws));
+    ws.once('error', reject);
+  });
+}
+function nextWsMessage(ws: WebSocket, predicate?: (msg: any) => boolean, timeoutMs = 2000): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      ws.off('message', onMessage);
+      reject(new Error('timed out waiting for a ws message'));
+    }, timeoutMs);
+    const onMessage = (data: any) => {
+      const msg = JSON.parse(data.toString());
+      if (!predicate || predicate(msg)) {
+        clearTimeout(timer);
+        ws.off('message', onMessage);
+        resolve(msg);
+      }
+    };
+    ws.on('message', onMessage);
+  });
+}
+
+describe('daemon: show channel (W-UI §0, single transcribed source)', () => {
+  const PORT = 18210;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-show-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'show');
+    await project.writeTranscript({ sourceId: 's1', language: 'en', words: wordsFor('w', 6) });
+    await project.commit(0, 'system', 'setup', {}, 'seed source', (m) => ({
+      ...m,
+      fps: 30,
+      sources: [{ id: 's1', path: '/media/one.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: true, transcribed: true }],
+      timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 30 }], motion: [] },
+    }));
+    const cand: CutCandidate = { id: 'cand1', kind: 'silence', sourceId: 's1', t0: 5, t1: 6, wordIds: [], label: '無音 1.0s', status: 'proposed' };
+    await project.writeCandidates([cand]);
+
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+
+    // Build a small revision history for the "compare" tests below:
+    // r1 (seed, 30s) -> r2 (captions patch, no duration change) -> r3 (trim, -1s).
+    await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: 1, op: 'captions', patch: { style: 'bold' } });
+    await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: 2, op: 'trim', clipId: 'c1', edge: 'out', frames: -30 });
+  });
+
+  afterAll(() => server.close());
+
+  it('does not create a revision (pure UI cue)', async () => {
+    const before = (await getJson(BASE, '/api/state')).body.revision;
+    const { status } = await postJson(BASE, '/api/show', { kind: 'range', tlStart: 1, tlEnd: 2 });
+    expect(status).toBe(200);
+    const after = (await getJson(BASE, '/api/state')).body.revision;
+    expect(after).toBe(before);
+  });
+
+  it('kind=range: normalizes a reversed tlStart/tlEnd and broadcasts it over the websocket', async () => {
+    const ws = await openWs(BASE);
+    try {
+      const waiting = nextWsMessage(ws, (m) => m.type === 'show');
+      const { status, body } = await postJson(BASE, '/api/show', { kind: 'range', tlStart: 7.5, tlEnd: 6.3 });
+      expect(status).toBe(200);
+      expect(body.directive).toEqual({ kind: 'range', tlStart: 6.3, tlEnd: 7.5 });
+      const msg = await waiting;
+      expect(msg).toEqual({ type: 'show', directive: { kind: 'range', tlStart: 6.3, tlEnd: 7.5 } });
+    } finally {
+      ws.close();
+    }
+  });
+
+  it('kind=range: rejects non-finite bounds', async () => {
+    const { status, body } = await postJson(BASE, '/api/show', { kind: 'range', tlStart: 'x', tlEnd: 2 });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/finite numbers/);
+  });
+
+  it('kind=words: defaults sourceId to the single transcribed source and expands a w0000..w0002 range', async () => {
+    const { status, body } = await postJson(BASE, '/api/show', { kind: 'words', ids: ['w0000..w0002'] });
+    expect(status).toBe(200);
+    expect(body.directive).toEqual({ kind: 'words', sourceId: 's1', ids: ['w0000', 'w0001', 'w0002'] });
+  });
+
+  it('kind=words: rejects an unknown sourceId', async () => {
+    const { status, body } = await postJson(BASE, '/api/show', { kind: 'words', sourceId: 'nope', ids: ['w0000'] });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/unknown source/);
+  });
+
+  it('kind=words: rejects an empty ids array', async () => {
+    const { status, body } = await postJson(BASE, '/api/show', { kind: 'words', sourceId: 's1', ids: [] });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/ids is required/);
+  });
+
+  it('kind=candidate: accepts a known candidate id', async () => {
+    const { status, body } = await postJson(BASE, '/api/show', { kind: 'candidate', id: 'cand1' });
+    expect(status).toBe(200);
+    expect(body.directive).toEqual({ kind: 'candidate', id: 'cand1' });
+  });
+
+  it('kind=candidate: rejects an unknown candidate id', async () => {
+    const { status, body } = await postJson(BASE, '/api/show', { kind: 'candidate', id: 'nope' });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/unknown candidate/);
+  });
+
+  it('kind=source: accepts a known sourceId with an optional "at", rejects an unknown one', async () => {
+    const ok = await postJson(BASE, '/api/show', { kind: 'source', sourceId: 's1', at: 3 });
+    expect(ok.status).toBe(200);
+    expect(ok.body.directive).toEqual({ kind: 'source', sourceId: 's1', at: 3 });
+
+    const noAt = await postJson(BASE, '/api/show', { kind: 'source', sourceId: 's1' });
+    expect(noAt.body.directive).toEqual({ kind: 'source', sourceId: 's1' });
+
+    const bad = await postJson(BASE, '/api/show', { kind: 'source', sourceId: 'nope' });
+    expect(bad.status).toBe(400);
+  });
+
+  it('kind=compare: accepts "r"-prefixed revision refs, computes duration delta and the op list between them', async () => {
+    const { status, body } = await postJson(BASE, '/api/show', { kind: 'compare', revA: 'r1', revB: 'r3' });
+    expect(status).toBe(200);
+    expect(body.directive.revA).toBe(1);
+    expect(body.directive.revB).toBe(3);
+    expect(body.directive.durationA).toBe(30);
+    expect(body.directive.durationB).toBe(29);
+    expect(body.directive.deltaSeconds).toBeCloseTo(-1, 5);
+    expect(body.directive.ops.map((o: any) => o.op)).toEqual(['captions', 'trim']);
+  });
+
+  it('kind=compare: rejects an out-of-range revision', async () => {
+    const { status, body } = await postJson(BASE, '/api/show', { kind: 'compare', revA: 1, revB: 999 });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/unknown revision/);
+  });
+
+  it('rejects an unknown kind', async () => {
+    const { status, body } = await postJson(BASE, '/api/show', { kind: 'teleport' });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/unknown show kind/);
+  });
+});
+
+describe('daemon: show words (ambiguous multi-source project)', () => {
+  const PORT = 18211;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-show-ambig-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'show-ambig');
+    await project.writeTranscript({ sourceId: 's1', language: 'en', words: wordsFor('a', 3) });
+    await project.writeTranscript({ sourceId: 's2', language: 'en', words: wordsFor('b', 3) });
+    await project.commit(0, 'system', 'setup', {}, 'seed sources', (m) => ({
+      ...m,
+      fps: 30,
+      sources: [
+        { id: 's1', path: '/media/one.mp4', duration: 10, fps: 30, width: 1920, height: 1080, hasAudio: true, transcribed: true },
+        { id: 's2', path: '/media/two.mp4', duration: 10, fps: 30, width: 1920, height: 1080, hasAudio: true, transcribed: true },
+      ],
+      timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 10 }], motion: [] },
+    }));
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('rejects show words with no sourceId when multiple sources are transcribed', async () => {
+    const { status, body } = await postJson(BASE, '/api/show', { kind: 'words', ids: ['w0000'] });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/multiple transcribed sources/);
+    expect(body.sources).toHaveLength(2);
+  });
+
+  it('an explicit sourceId disambiguates', async () => {
+    const { status, body } = await postJson(BASE, '/api/show', { kind: 'words', sourceId: 's2', ids: ['w0000'] });
+    expect(status).toBe(200);
+    expect(body.directive.sourceId).toBe('s2');
+  });
+});
+
+// ---- drag-and-drop ingest: POST /api/locate-media + POST /api/upload (W-UI §4) ----
+describe('daemon: locate-media', () => {
+  const PORT = 18212;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-locate-'));
+    const dir = path.join(root, 'proj');
+    await Project.create(dir, 'locate');
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('returns found:true with the resolved path when locateMedia finds a match', async () => {
+    const { status, body } = await postJson(BASE, '/api/locate-media', {
+      name: 'findme.mp4', size: 123, headSha256: 'aa', tailSha256: 'bb',
+    });
+    expect(status).toBe(200);
+    expect(body).toEqual({ found: true, path: '/Volumes/Cards/findme.mp4' });
+  });
+
+  it('returns found:false when nothing matches', async () => {
+    const { status, body } = await postJson(BASE, '/api/locate-media', {
+      name: 'nowhere.mp4', size: 123, headSha256: 'aa', tailSha256: 'bb',
+    });
+    expect(status).toBe(200);
+    expect(body).toEqual({ found: false, path: null });
+  });
+
+  it('rejects a request missing required fingerprint fields', async () => {
+    const { status, body } = await postJson(BASE, '/api/locate-media', { name: 'x.mp4', size: 10 });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/name, size, headSha256, tailSha256/);
+  });
+});
+
+describe('daemon: upload', () => {
+  const PORT = 18213;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let projectDir: string;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-upload-'));
+    projectDir = path.join(root, 'proj');
+    await Project.create(projectDir, 'upload');
+    const started = await startDaemon({ port: PORT, projectDir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('streams the request body to project/media/<sanitized name> and reports bytes written', async () => {
+    const content = 'x'.repeat(5000);
+    const res = await fetch(`${BASE}/api/upload?${new URLSearchParams({ name: 'my clip.mp4' })}`, {
+      method: 'POST',
+      body: content,
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.bytes).toBe(content.length);
+    expect(body.path).toBe(path.join(projectDir, 'media', 'my clip.mp4'));
+    const written = await fsp.readFile(body.path, 'utf8');
+    expect(written).toBe(content);
+  });
+
+  it('sanitizes a path-traversal-y filename down to a safe basename inside media/', async () => {
+    const res = await fetch(`${BASE}/api/upload?${new URLSearchParams({ name: '../../etc/evil.mp4' })}`, {
+      method: 'POST',
+      body: 'hi',
+    });
+    const body = await res.json();
+    expect(res.status).toBe(200);
+    expect(body.path.startsWith(path.join(projectDir, 'media'))).toBe(true);
+    expect(body.path).not.toContain('..');
+  });
+
+  it('de-duplicates a second upload of the same filename instead of clobbering the first', async () => {
+    const params = new URLSearchParams({ name: 'dup.mp4' });
+    const first = await fetch(`${BASE}/api/upload?${params}`, { method: 'POST', body: 'first' });
+    const second = await fetch(`${BASE}/api/upload?${params}`, { method: 'POST', body: 'second-longer' });
+    const firstBody = await first.json();
+    const secondBody = await second.json();
+    expect(firstBody.path).not.toBe(secondBody.path);
+    expect(await fsp.readFile(firstBody.path, 'utf8')).toBe('first');
+    expect(await fsp.readFile(secondBody.path, 'utf8')).toBe('second-longer');
+  });
+
+  it('defaults to a safe filename when none is given', async () => {
+    const res = await fetch(`${BASE}/api/upload`, { method: 'POST', body: 'no-name-given' });
+    const body = await res.json();
+    expect(res.status).toBe(200);
+    expect(path.basename(body.path)).toMatch(/^upload(-\d+)?\.bin$/);
   });
 });

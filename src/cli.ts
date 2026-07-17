@@ -322,6 +322,9 @@ kit:       kit-init <dir> [--name n]                  # 雛形生成(kit.json + 
 sprites:   sprite-add <assetId> (--at-word wXXXX [--source aRollSrc] | --at-src aRollSrc t | --at-tl t)
              [--pos x,y] [--scale 0..1] [--opacity 0..1] [--duration s] [--flip] --base <rev>
            sprite-update <id> [同フラグ] --base <rev> | sprite-remove <id> --base <rev>
+show:      show range <t0> <t1> | show words <w1 w5..w9 ...> [--source id] | show candidate <id>
+           show compare <revA> <revB> | show source <id> [--at s]
+             # 隣の画面(web UI)へジャンプ/ハイライトの合図を送るだけ(revision を作らない、--base 不要)
 inspect:   view [--from a] [--to b] [--domain timeline|source] [--source id] [--scene id] (prints PNG path)
 export:    export otio <out.otio> | export render <out.mp4> [--burn-captions] [--preset youtube|shorts|x]
            export render ... [--no-repair] [--fast-loudnorm]   # 乾音A/B比較 / 1-passループドネスに落とす
@@ -1199,6 +1202,48 @@ async function main() {
       await ensureDaemon(dir);
       const revs = await api('/api/revisions');
       return out(revs.map((r: any) => `r${r.rev} [${r.actor}] ${r.op}: ${r.summary}`).join('\n'));
+    }
+
+    case 'show': {
+      const USAGE = 'usage: vedit show range <t0> <t1> | show words <w1 w5..w9 ...> [--source id] | show candidate <id> | show compare <revA> <revB> | show source <id> [--at s]';
+      const sub = pos[0];
+      const dir = projectDir();
+      await ensureDaemon(dir);
+      if (sub === 'range') {
+        if (pos.length < 3) fail(USAGE);
+        return out(await api('/api/show', {
+          method: 'POST',
+          body: JSON.stringify({ kind: 'range', tlStart: numArg('t0', pos[1]), tlEnd: numArg('t1', pos[2]) }),
+        }));
+      }
+      if (sub === 'words') {
+        const ids = pos.slice(1);
+        if (ids.length === 0) fail(USAGE);
+        return out(await api('/api/show', {
+          method: 'POST',
+          body: JSON.stringify({ kind: 'words', ids, sourceId: flags.source }),
+        }));
+      }
+      if (sub === 'candidate') {
+        const id = pos[1] ?? fail(USAGE);
+        return out(await api('/api/show', { method: 'POST', body: JSON.stringify({ kind: 'candidate', id }) }));
+      }
+      if (sub === 'compare') {
+        if (pos.length < 3) fail(USAGE);
+        return out(await api('/api/show', {
+          method: 'POST',
+          body: JSON.stringify({ kind: 'compare', revA: pos[1], revB: pos[2] }),
+        }));
+      }
+      if (sub === 'source') {
+        const id = pos[1] ?? fail(USAGE);
+        return out(await api('/api/show', {
+          method: 'POST',
+          body: JSON.stringify({ kind: 'source', sourceId: id, at: numFlag('at', flags.at) }),
+        }));
+      }
+      fail(USAGE);
+      return;
     }
 
     case 'view': {

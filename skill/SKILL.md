@@ -79,6 +79,11 @@ Web UI には「素材」タブ(ポスター・使用状況バー・ソースプ
    特定 revision へは `vedit undo --rev N`。履歴は `vedit revisions` —
    **actor 列(`[ui]`=ユーザーの手動編集 / `[claude]`)で誰の編集かが分かる**。
 6. 大きく削る前に「何秒→何秒になるか」を言葉で確認する。
+7. **特定の箇所について話すときは、必ず直前に `vedit show` で画面をその場所へ動かす。**
+   ユーザーは隣の Web UI 画面を見ながら会話している——「相棒」の演出チャンネル。
+   `vedit show range <t0> <t1>` / `show words <w1..w9> [--source id]` /
+   `show candidate <id>` / `show compare <rA> <rB>` / `show source <id> [--at s]`。
+   revision は作らず `--base` も不要(いつでも呼んでよい)。
 
 ## 目で確認する
 

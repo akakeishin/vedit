@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { promises as fs, createReadStream, statSync } from 'node:fs';
+import { promises as fs, createReadStream, createWriteStream, statSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -51,9 +51,10 @@ import { packTranscript } from '../core/pack.js';
 import { detectScenesForSource, packScenes } from '../core/scenes.js';
 import { ingestFile, makeProxy, probeAudio } from '../ingest/ingest.js';
 import { run } from '../ingest/run.js';
-import type { CutCandidate, Manifest, MotionItem, SceneFile, Transcript } from '../core/types.js';
+import type { CutCandidate, Manifest, MotionItem, RevisionEntry, SceneFile, Transcript } from '../core/types.js';
 import { freshId } from '../core/ops.js';
 import { applyKitDefaults, readKitFile, recognizedKitSections } from '../core/kit.js';
+import { locateMedia, type MediaFingerprint } from '../ingest/locate.js';
 
 const WEB_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'web');
 
@@ -141,6 +142,83 @@ function broadcast(ctx: Ctx, msg: unknown) {
 function ambiguousSources(m: Manifest): { id: string; path: string }[] | null {
   const transcribed = m.sources.filter((s) => s.transcribed);
   return transcribed.length >= 2 ? transcribed.map((s) => ({ id: s.id, path: path.basename(s.path) })) : null;
+}
+
+/**
+ * Parse a revision reference for `POST /api/show {kind:'compare'}` — accepts
+ * either a bare number or the "r12" display form the activity feed/CLI use
+ * (`vedit show compare r5 r7`). Returns null on anything else so the caller
+ * can 400 with a clear message instead of comparing against NaN.
+ */
+function parseRevRef(v: unknown): number | null {
+  if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+  if (typeof v === 'string') {
+    const n = Number(v.trim().replace(/^r/i, ''));
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+/**
+ * Read-only lookup of the manifest snapshot as of revision `rev`, straight
+ * from revisions.jsonl (via Project's public `revisionsPath` getter) — kept
+ * local to daemon.ts rather than added to core/project.ts, which is off
+ * limits while another agent works in src/core/ for this change (see the
+ * task brief). Used only by /api/show's kind=compare (never commits
+ * anything, unlike Project.restore()). Revision 0 is the pristine
+ * pre-history state (no commits logged yet), which resolves to `null`;
+ * callers that need a duration for it should treat that as 0.
+ */
+async function revisionSnapshot(p: Project, rev: number): Promise<Manifest | null> {
+  if (rev === 0) return null;
+  let raw: string;
+  try {
+    raw = await fs.readFile(p.revisionsPath, 'utf8');
+  } catch {
+    raw = '';
+  }
+  let target: RevisionEntry | undefined;
+  for (const line of raw.split('\n')) {
+    if (!line) continue;
+    let entry: RevisionEntry;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue; // tolerate a partial trailing line (crash mid-append), same as Project's own reconcile()
+    }
+    if (entry.rev === rev) target = entry; // last match wins (revs are unique in practice)
+  }
+  if (!target) throw new Error(`revision ${rev} not found`);
+  return target.snapshot;
+}
+
+/**
+ * Sanitize a browser-supplied filename for `POST /api/upload` (D&D ingest
+ * fallback when a dropped file can't be located on disk — see
+ * src/ingest/locate.ts): strip any directory components (defense in depth;
+ * uniqueDestPath below also always joins under the fixed media/ dir, so a
+ * "../.." here couldn't escape it either way) and replace anything but a
+ * conservative safe-character set.
+ */
+function sanitizeUploadName(name: string): string {
+  const base = path.basename(String(name || '')).replace(/[\x00-\x1f]/g, '');
+  const cleaned = base.replace(/[^A-Za-z0-9._ -]/g, '_').trim();
+  return cleaned || 'upload.bin';
+}
+
+/** Append -1, -2, ... before the extension until `dir/name` doesn't already exist, so a second drop of a same-named file never clobbers the first. */
+async function uniqueDestPath(dir: string, name: string): Promise<string> {
+  const ext = path.extname(name);
+  const stem = name.slice(0, name.length - ext.length) || 'upload';
+  let candidate = path.join(dir, name);
+  for (let i = 1; ; i++) {
+    try {
+      await fs.access(candidate);
+    } catch {
+      return candidate;
+    }
+    candidate = path.join(dir, `${stem}-${i}${ext}`);
+  }
 }
 
 /** Every source's scenes file, skipping sources with no detected scenes (out of culling scope). */
@@ -440,6 +518,141 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       });
       broadcast(ctx, { type: 'update', revision: (await p.manifest()).revision, op: 'ingest', summary: `ingested ${b.file}` });
       return json(res, 200, { source: src, timings, state: await stateSummary(p) });
+    }
+
+    // ---- drag-and-drop ingest (W-UI §4): locate the dropped file's real
+    // path on disk (link, no copy) by name + content fingerprint, or accept
+    // a streamed upload when nothing matches. ----
+    if (pathname === '/api/locate-media' && method === 'POST') {
+      const b = await readBody(req);
+      const name = typeof b.name === 'string' ? b.name : '';
+      const size = Number(b.size);
+      const headSha256 = typeof b.headSha256 === 'string' ? b.headSha256 : '';
+      const tailSha256 = typeof b.tailSha256 === 'string' ? b.tailSha256 : '';
+      if (!name || !Number.isFinite(size) || size < 0 || !headSha256 || !tailSha256) {
+        return json(res, 400, { error: 'locate-media: name, size, headSha256, tailSha256 are required' });
+      }
+      const fingerprint: MediaFingerprint = { size, headSha256, tailSha256 };
+      const found = await locateMedia(name, fingerprint);
+      return json(res, 200, { found: found != null, path: found ?? null });
+    }
+    if (pathname === '/api/upload' && method === 'POST') {
+      // Deliberately bypasses readBody() (10MB JSON-body cap, buffers fully
+      // into memory): an upload is raw binary of arbitrary size, streamed
+      // straight to disk. The client sends the File itself as the request
+      // body (fetch(..., {body: file})) with the name as a query param,
+      // since a filename can't safely ride inside a header.
+      const rawName = url.searchParams.get('name') ?? 'upload.bin';
+      const safeName = sanitizeUploadName(rawName);
+      const mediaDir = path.join(p.dir, 'media');
+      await fs.mkdir(mediaDir, { recursive: true });
+      const destPath = await uniqueDestPath(mediaDir, safeName);
+      broadcast(ctx, { type: 'upload-start', name: safeName });
+      let written = 0;
+      let lastBroadcast = 0;
+      const out = createWriteStream(destPath);
+      try {
+        await new Promise<void>((resolve, reject) => {
+          req.on('data', (chunk: Buffer) => {
+            written += chunk.length;
+            const now = Date.now();
+            if (now - lastBroadcast > 250) {
+              lastBroadcast = now;
+              broadcast(ctx, { type: 'upload-progress', name: safeName, bytes: written, done: false });
+            }
+          });
+          req.on('error', reject);
+          out.on('error', reject);
+          out.on('finish', () => resolve());
+          req.pipe(out);
+        });
+      } catch (e: any) {
+        await fs.rm(destPath, { force: true }).catch(() => {});
+        return json(res, 400, { error: `upload failed: ${e?.message ?? e}` });
+      }
+      broadcast(ctx, { type: 'upload-progress', name: safeName, bytes: written, done: true });
+      return json(res, 200, { path: destPath, bytes: written });
+    }
+
+    // ---- W-UI companion channel (W-UI §0): tell every connected browser to
+    // jump/highlight/show something, without creating a revision or needing
+    // an actor — purely a UI cue so a user watching the browser alongside
+    // the chat sees what's being talked about. ----
+    if (pathname === '/api/show' && method === 'POST') {
+      const b = await readBody(req);
+      const m = await p.manifest();
+      let directive: Record<string, unknown>;
+
+      if (b.kind === 'range') {
+        const tlStart = Number(b.tlStart);
+        const tlEnd = Number(b.tlEnd);
+        if (!Number.isFinite(tlStart) || !Number.isFinite(tlEnd)) {
+          return json(res, 400, { error: 'show range: tlStart/tlEnd must be finite numbers' });
+        }
+        directive = { kind: 'range', tlStart: Math.min(tlStart, tlEnd), tlEnd: Math.max(tlStart, tlEnd) };
+      } else if (b.kind === 'words') {
+        let sourceId = b.sourceId as string | undefined;
+        if (!sourceId) {
+          const amb = ambiguousSources(m);
+          if (amb) return json(res, 400, { error: 'multiple transcribed sources; specify sourceId', sources: amb });
+          sourceId = m.sources.find((s) => s.transcribed)?.id;
+        }
+        if (!sourceId || !m.sources.some((s) => s.id === sourceId)) {
+          return json(res, 400, { error: `unknown source: ${sourceId}` });
+        }
+        if (!Array.isArray(b.ids) || b.ids.length === 0) {
+          return json(res, 400, { error: 'show words: ids is required (non-empty array)' });
+        }
+        let ids: string[];
+        try {
+          const t = await p.transcript(sourceId);
+          ids = expandWordIds(b.ids, t.words);
+        } catch (e: any) {
+          return json(res, 400, { error: `show words: ${e?.message ?? e}` });
+        }
+        directive = { kind: 'words', sourceId, ids };
+      } else if (b.kind === 'candidate') {
+        if (typeof b.id !== 'string' || !b.id) return json(res, 400, { error: 'show candidate: id is required' });
+        const all = await p.candidates();
+        if (!all.some((c) => c.id === b.id)) return json(res, 400, { error: `unknown candidate: ${b.id}` });
+        directive = { kind: 'candidate', id: b.id };
+      } else if (b.kind === 'compare') {
+        const revA = parseRevRef(b.revA);
+        const revB = parseRevRef(b.revB);
+        if (revA == null || revB == null) {
+          return json(res, 400, { error: 'show compare: revA and revB are required revision numbers (or "r5" form)' });
+        }
+        for (const r of [revA, revB]) {
+          if (!Number.isInteger(r) || r < 0 || r > m.revision) {
+            return json(res, 400, { error: `show compare: unknown revision ${r}` });
+          }
+        }
+        const [snapA, snapB, revs] = await Promise.all([revisionSnapshot(p, revA), revisionSnapshot(p, revB), p.revisions()]);
+        const durationA = snapA ? timelineDuration(snapA) : 0;
+        const durationB = snapB ? timelineDuration(snapB) : 0;
+        const lo = Math.min(revA, revB);
+        const hi = Math.max(revA, revB);
+        const ops = revs
+          .filter((r) => r.rev > lo && r.rev <= hi)
+          .map((r) => ({ rev: r.rev, actor: r.actor, op: r.op, summary: r.summary }));
+        directive = { kind: 'compare', revA, revB, durationA, durationB, deltaSeconds: durationB - durationA, ops };
+      } else if (b.kind === 'source') {
+        const sourceId = b.sourceId as string | undefined;
+        if (!sourceId || !m.sources.some((s) => s.id === sourceId)) {
+          return json(res, 400, { error: `unknown source: ${sourceId}` });
+        }
+        let at: number | undefined;
+        if (b.at !== undefined) {
+          at = Number(b.at);
+          if (!Number.isFinite(at)) return json(res, 400, { error: 'show source: at must be a finite number' });
+        }
+        directive = { kind: 'source', sourceId, ...(at !== undefined ? { at } : {}) };
+      } else {
+        return json(res, 400, { error: `unknown show kind: ${JSON.stringify(b.kind)} (use range/words/candidate/compare/source)` });
+      }
+
+      broadcast(ctx, { type: 'show', directive });
+      return json(res, 200, { ok: true, directive });
     }
 
     // ---- edits ----

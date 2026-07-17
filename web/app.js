@@ -1,6 +1,31 @@
 // vedit Web NLE v1 — proxy playback mapped through the timeline, DOM overlays
 // for captions/motion, transcript selection, candidate approve/reject.
 // All mutations go through the same revision-checked API Claude uses.
+//
+// This is the "相棒画面" (partner screen) for a Claude Desktop conversation
+// running alongside it — not a standalone mini-NLE. Two features exist
+// specifically to serve that: the WS 'show' channel (Claude can point at a
+// spot on this screen while talking — see handleShowDirective) and the
+// drag-and-drop ingest flow (see the "drag-and-drop ingest" section).
+//
+// Loaded as an ES module (see index.html's <script type="module">) so pure
+// logic can live in separate, unit-testable files: dragLogic.js (timeline
+// drag -> op conversion) and ingestLogic.js (D&D fingerprint/plan helpers).
+
+import {
+  anchoredBlockMoveOp,
+  blockMoveOp,
+  clipMoveOp,
+  dropIndexForX,
+  trimDragOp,
+} from './dragLogic.js';
+import {
+  bufferToHex,
+  fingerprintRanges,
+  formatBytes,
+  isVideoFileName,
+  planSummary,
+} from './ingestLogic.js';
 
 const $ = (id) => document.getElementById(id);
 const video = $('video');
@@ -46,6 +71,10 @@ const S = {
   expandedScenes: new Set(), // sourceIds whose scene grid is expanded
   sceneFocus: new Map(), // sourceId -> sceneId, roving-tabindex focus stop within one expanded scene grid
   musicEls: new Map(), // musicItemId -> <audio> element driving background-music preview
+  expandedMedia: new Set(), // W-UI §3: sourceIds whose row detail (badges/usage bar/scene button) is expanded
+  showWordKeys: new Set(), // "sourceId:wordId" — W-UI §0 "show words" highlight, separate from selWords (no delete side effect)
+  activeTask: null, // W-UI §1 claudeStrip: { label } | null — current long-running background task, from WS progress events
+  timelineDrag: null, // in-progress timeline drag/trim (see startClipReorderDrag/startTrimDrag/startBlockDrag)
 };
 const PLAY_RATES = [1, 1.5, 2];
 
@@ -412,6 +441,184 @@ $('shortcutsDialog').addEventListener('close', () => {
   shortcutsInvoker = null;
 });
 
+// ---------- timeline direct manipulation (W-UI §2) ----------
+// Clip body drag = reorder (clip-move), clip edge (6px) drag = trim (drag is
+// preview-only; the API call fires once on drop), B-roll/sprite/motion/BGM
+// block drag = time move (B-roll/sprite additionally re-resolve their
+// anchor at the drop position). Every drop commits exactly ONE revision.
+// The pixel<->seconds/index math is pure and lives in dragLogic.js so it's
+// unit-tested there; this section is just the DOM/pointer wiring around it.
+const EDGE_PX = 6;
+
+function timelineRect() {
+  return $('timeline').getBoundingClientRect();
+}
+function dropIndicatorX(rects, idx) {
+  if (rects.length === 0) return 0;
+  if (idx <= 0) return rects[0].left;
+  if (idx >= rects.length) return rects[rects.length - 1].left + rects[rects.length - 1].width;
+  return rects[idx].left;
+}
+function showDropIndicator(rects, idx, containerWidth) {
+  const el = $('dropIndicator');
+  el.style.left = `${(dropIndicatorX(rects, idx) / containerWidth) * 100}%`;
+  el.hidden = false;
+}
+function hideDropIndicator() {
+  $('dropIndicator').hidden = true;
+}
+
+/** Clip-body drag: reorder on drop; a plain click (no movement past the threshold) still selects + seeks, same as before this feature existed. */
+function startClipReorderDrag(e, seg, clipEl) {
+  const startX = e.clientX;
+  const rect = timelineRect();
+  let moved = false;
+  let otherRects = null;
+
+  const onMove = (ev) => {
+    const dx = ev.clientX - startX;
+    if (!moved && Math.abs(dx) < 4) return;
+    if (!moved) {
+      moved = true;
+      S.timelineDrag = { kind: 'clip-move', clipId: seg.clipId };
+      clipEl.classList.add('dragging');
+      otherRects = S.segments
+        .filter((s) => s.clipId !== seg.clipId)
+        .map((s) => ({
+          clipId: s.clipId,
+          left: (s.tlStart / S.duration) * rect.width,
+          width: ((s.tlEnd - s.tlStart) / S.duration) * rect.width,
+        }));
+    }
+    const idx = dropIndexForX(otherRects, ev.clientX - rect.left);
+    showDropIndicator(otherRects, idx, rect.width);
+  };
+  const onUp = async (ev) => {
+    window.removeEventListener('pointermove', onMove);
+    window.removeEventListener('pointerup', onUp);
+    hideDropIndicator();
+    S.timelineDrag = null;
+    if (!moved) {
+      selectClip(seg.clipId);
+      seekTl(((ev.clientX - rect.left) / rect.width) * S.duration, { play: false });
+      return;
+    }
+    clipEl.classList.remove('dragging');
+    const orderedClipIds = [...new Set(S.segments.map((s) => s.clipId))];
+    const idx = dropIndexForX(otherRects, ev.clientX - rect.left);
+    const op = clipMoveOp(orderedClipIds, seg.clipId, idx);
+    if (!op) return; // dropped back at its original slot
+    await mutate(op, { conflictMessage: '並べ替えは反映されませんでした。最新状態を確認してもう一度実行してください' });
+  };
+  window.addEventListener('pointermove', onMove);
+  window.addEventListener('pointerup', onUp);
+}
+
+/** Clip edge (6px) drag: preview-only stretch while dragging, one `trim` call on drop. */
+function startTrimDrag(e, seg, edge, clipEl) {
+  e.stopPropagation(); // never also trigger the strip's own scrub-seek
+  const startX = e.clientX;
+  const rect = timelineRect();
+  const pxPerSecond = rect.width / S.duration;
+  const fps = S.manifest?.fps ?? 30;
+  selectClip(seg.clipId);
+  let moved = false;
+
+  const onMove = (ev) => {
+    const dx = ev.clientX - startX;
+    if (!moved && Math.abs(dx) < 2) return;
+    moved = true;
+    S.timelineDrag = { kind: 'trim', clipId: seg.clipId, edge };
+    const live = document.querySelector(`#clips [data-clip-id="${CSS.escape(seg.clipId)}"]`) ?? clipEl;
+    const deltaPct = (dx / rect.width) * 100;
+    if (edge === 'out') {
+      const w = ((seg.tlEnd - seg.tlStart) / S.duration) * 100 + deltaPct;
+      if (w > 0) live.style.width = `${w}%`;
+    } else {
+      const newLeftPct = (seg.tlStart / S.duration) * 100 + deltaPct;
+      const newWidthPct = ((seg.tlEnd - seg.tlStart) / S.duration) * 100 - deltaPct;
+      if (newWidthPct > 0) {
+        live.style.left = `${newLeftPct}%`;
+        live.style.width = `${newWidthPct}%`;
+      }
+    }
+  };
+  const onUp = async (ev) => {
+    window.removeEventListener('pointermove', onMove);
+    window.removeEventListener('pointerup', onUp);
+    S.timelineDrag = null;
+    if (!moved) return;
+    const deltaSeconds = (ev.clientX - startX) / pxPerSecond;
+    const op = trimDragOp(seg.clipId, edge, deltaSeconds, fps);
+    if (!op) { renderTimeline(); return; } // rounds to 0 frames: snap the preview stretch back
+    const { ok } = await mutate(op, { conflictMessage: 'トリムは反映されませんでした。最新状態を確認してもう一度実行してください' });
+    if (!ok) renderTimeline();
+  };
+  window.addEventListener('pointermove', onMove);
+  window.addEventListener('pointerup', onUp);
+}
+
+function attachClipHandlers(d, seg) {
+  d.dataset.clipId = seg.clipId;
+  d.addEventListener('pointerdown', (e) => {
+    e.stopPropagation(); // clip owns seek-on-click itself (see the !moved branch below); the strip's own scrub handler must not also fire
+    const rect = d.getBoundingClientRect();
+    const offsetX = e.clientX - rect.left;
+    if (offsetX <= EDGE_PX) startTrimDrag(e, seg, 'in', d);
+    else if (rect.width - offsetX <= EDGE_PX) startTrimDrag(e, seg, 'out', d);
+    else startClipReorderDrag(e, seg, d);
+  });
+  d.addEventListener('pointermove', (e) => {
+    if (S.timelineDrag) return;
+    const rect = d.getBoundingClientRect();
+    const off = e.clientX - rect.left;
+    d.style.cursor = off <= EDGE_PX || rect.width - off <= EDGE_PX ? 'ew-resize' : 'grab';
+  });
+}
+
+/**
+ * Motion/BGM block drag: {op:'motion-update'|'music-update', tlStart}.
+ * B-roll/sprite block drag: re-resolves the anchor at the drop position
+ * ({op:'broll-update'|'sprite-update', anchor}) — see anchoredBlockMoveOp.
+ */
+function startBlockDrag(e, kind, id, originalTlStart, blockEl) {
+  e.stopPropagation();
+  const startX = e.clientX;
+  const rect = timelineRect();
+  const pxPerSecond = rect.width / S.duration;
+  const startLeftPct = parseFloat(blockEl.style.left) || 0;
+  let moved = false;
+
+  const onMove = (ev) => {
+    const dx = ev.clientX - startX;
+    if (!moved && Math.abs(dx) < 3) return;
+    moved = true;
+    S.timelineDrag = { kind: 'block-move', blockKind: kind, id };
+    blockEl.classList.add('dragging');
+    const deltaPct = (dx / rect.width) * 100;
+    blockEl.style.left = `${Math.max(0, startLeftPct + deltaPct)}%`;
+  };
+  const onUp = async (ev) => {
+    window.removeEventListener('pointermove', onMove);
+    window.removeEventListener('pointerup', onUp);
+    S.timelineDrag = null;
+    if (!moved) return;
+    const newTl = originalTlStart + (ev.clientX - startX) / pxPerSecond;
+    const op = kind === 'motion' || kind === 'music'
+      ? blockMoveOp(kind, id, newTl, originalTlStart)
+      : anchoredBlockMoveOp(kind, id, S.segments, newTl);
+    if (!op) {
+      if (kind === 'broll' || kind === 'sprite') toast('その位置には移動できません(タイムライン範囲外)', { type: 'error' });
+      renderTimeline();
+      return;
+    }
+    const { ok } = await mutate(op, { conflictMessage: '移動は反映されませんでした。最新状態を確認してもう一度実行してください' });
+    if (!ok) renderTimeline();
+  };
+  window.addEventListener('pointermove', onMove);
+  window.addEventListener('pointerup', onUp);
+}
+
 function renderTimeline() {
   const clips = $('clips');
   clips.innerHTML = '';
@@ -422,10 +629,8 @@ function renderTimeline() {
     d.className = 'clip' + (idx % 2 ? ' alt' : '') + (S.selectedClip === s.clipId ? ' sel' : '');
     d.style.left = `${(s.tlStart / S.duration) * 100}%`;
     d.style.width = `${((s.tlEnd - s.tlStart) / S.duration) * 100}%`;
-    d.title = `${s.clipId} (${fmt(s.tlEnd - s.tlStart)})`;
-    // Select on click but let the event bubble so the strip's scrub handler
-    // still seeks to the pointer position.
-    d.onpointerdown = () => selectClip(s.clipId);
+    d.title = `${s.clipId} (${fmt(s.tlEnd - s.tlStart)}) — ドラッグで並べ替え、端(6px)をドラッグでトリム`;
+    attachClipHandlers(d, s);
     clips.appendChild(d);
   });
   renderSceneMarks();
@@ -437,6 +642,8 @@ function renderTimeline() {
     d.style.left = `${(mo.tlStart / S.duration) * 100}%`;
     d.style.width = `${(mo.duration / S.duration) * 100}%`;
     d.textContent = mo.id;
+    d.title = `${mo.id} — ドラッグで移動`;
+    d.onpointerdown = (e) => startBlockDrag(e, 'motion', mo.id, mo.tlStart, d);
     mrow.appendChild(d);
   }
   const murow = $('musicRow');
@@ -446,8 +653,9 @@ function renderTimeline() {
     d.className = 'muBlock';
     d.style.left = `${(mu.tlStart / S.duration) * 100}%`;
     d.style.width = `${(mu.duration / S.duration) * 100}%`;
-    d.title = `${mu.id} ${basename(mu.path)} (${mu.gain}dB${mu.duck ? ', duck' : ''})`;
+    d.title = `${mu.id} ${basename(mu.path)} (${mu.gain}dB${mu.duck ? ', duck' : ''}) — ドラッグで移動`;
     d.textContent = basename(mu.path);
+    d.onpointerdown = (e) => startBlockDrag(e, 'music', mu.id, mu.tlStart, d);
     murow.appendChild(d);
   }
   renderOverlayRow();
@@ -472,11 +680,11 @@ function renderOverlayRow() {
       d.className = 'ovBlock orphan';
       d.style.left = `${orphanIdx * 14}px`;
       d.textContent = '!';
-      d.title = `orphan: ${ov.id} — クリックで理由を表示`;
+      d.title = `アンカー切れ: ${ov.id} — クリックで理由を表示`;
       d.onclick = (e) => {
         e.stopPropagation();
         toast(
-          `B-roll ${ov.id} は orphan です — アンカー(${ov.anchor.sourceId}@${ov.anchor.srcTime.toFixed(2)}s)がカットで失われました。再アンカーしてください(vedit broll-update)`,
+          `B-roll ${ov.id} はアンカー切れです — アンカー(${ov.anchor.sourceId}@${ov.anchor.srcTime.toFixed(2)}s)がカットで失われました。再アンカーしてください(vedit broll-update)`,
           { type: 'error' },
         );
       };
@@ -486,8 +694,9 @@ function renderOverlayRow() {
       d.className = 'ovBlock';
       d.style.left = `${(r.tlStart / S.duration) * 100}%`;
       d.style.width = `${(dur / S.duration) * 100}%`;
-      d.title = `${ov.id} (${dur.toFixed(1)}s, ${ov.audioMode})`;
+      d.title = `${ov.id} (${dur.toFixed(1)}s, ${ov.audioMode}) — ドラッグで移動`;
       d.textContent = ov.id;
+      d.onpointerdown = (e) => startBlockDrag(e, 'broll', ov.id, r.tlStart, d);
     }
     row.appendChild(d);
   }
@@ -510,11 +719,11 @@ function renderSpriteRow() {
       d.className = 'spBlock orphan';
       d.style.left = `${orphanIdx * 14}px`;
       d.textContent = '!';
-      d.title = `orphan: ${sp.id} — クリックで理由を表示`;
+      d.title = `アンカー切れ: ${sp.id} — クリックで理由を表示`;
       d.onclick = (e) => {
         e.stopPropagation();
         toast(
-          `スプライト ${sp.id} は orphan です — アンカー(${sp.anchor.sourceId}@${sp.anchor.srcTime.toFixed(2)}s)がカットで失われました。再アンカーしてください(vedit sprite-update)`,
+          `スプライト ${sp.id} はアンカー切れです — アンカー(${sp.anchor.sourceId}@${sp.anchor.srcTime.toFixed(2)}s)がカットで失われました。再アンカーしてください(vedit sprite-update)`,
           { type: 'error' },
         );
       };
@@ -523,8 +732,9 @@ function renderSpriteRow() {
       d.className = 'spBlock';
       d.style.left = `${(r.tlStart / S.duration) * 100}%`;
       d.style.width = `${(sp.duration / S.duration) * 100}%`;
-      d.title = `${sp.id} (${sp.assetId}, ${sp.duration.toFixed(1)}s)`;
+      d.title = `${sp.id} (${sp.assetId}, ${sp.duration.toFixed(1)}s) — ドラッグで移動`;
       d.textContent = sp.assetId;
+      d.onpointerdown = (e) => startBlockDrag(e, 'sprite', sp.id, r.tlStart, d);
     }
     row.appendChild(d);
   }
@@ -861,10 +1071,19 @@ function needsColorTransform(color) {
   if ((!transfer || transfer === 'unknown') && color.primaries === 'bt2020') return true;
   return false;
 }
+// W-UI §3: simple list by default (thumbnail + name + duration only); a row
+// click (or the "▸ 詳細" button) expands badges/usage-bar/scene-button —
+// second-order info stays out of the way until asked for. Raw ids
+// (sourceId) are shown only inside the expanded detail.
+function toggleMediaDetail(sourceId) {
+  if (S.expandedMedia.has(sourceId)) S.expandedMedia.delete(sourceId);
+  else S.expandedMedia.add(sourceId);
+  renderMediaPanel();
+  document.querySelector(`.srcRow[data-source="${CSS.escape(sourceId)}"]`)?.focus();
+}
 function mediaRow(src) {
   const name = basename(src.path);
-  const used = sourceUsageSeconds(src.id);
-  const pct = src.duration > 0 ? Math.min(100, (used / src.duration) * 100) : 0;
+  const expanded = S.expandedMedia.has(src.id);
 
   const row = document.createElement('div');
   row.className = 'srcRow' + (S.sourcePreview?.sourceId === src.id ? ' previewing' : '');
@@ -884,47 +1103,69 @@ function mediaRow(src) {
   const nameRow = document.createElement('div');
   nameRow.className = 'srcNameRow';
   nameRow.innerHTML = `<span class="srcName">${esc(name)}</span><span class="srcDur">${fmt(src.duration)}</span>`;
-  const badges = document.createElement('div');
-  badges.className = 'srcBadges';
-  // W5: a source with an applied colorTransform (type !== 'none') shows
-  // "変換済み" instead of the "要色変換" warning — the warning's purpose
-  // (flag material that will preview/render flat) no longer applies once
-  // `vedit color` has actually set a transform.
-  const colorConverted = src.colorTransform && src.colorTransform.type && src.colorTransform.type !== 'none';
-  badges.innerHTML = [
-    src.transcribed ? '<span class="badge ok">文字起こし済み</span>' : '',
-    !src.hasAudio ? '<span class="badge warn">音声なし</span>' : '',
-    !src.proxy ? '<span class="badge warn">プロキシ未生成</span>' : '',
-    colorConverted
-      ? '<span class="badge ok">変換済み</span>'
-      : needsColorTransform(src.color) ? '<span class="badge warn">要色変換</span>' : '',
-  ].join('');
-  if (S.scenes.has(src.id)) {
-    const c = cullingCounts(src.id);
-    const cullBadge = document.createElement('span');
-    cullBadge.className = 'badge cullBadge';
-    cullBadge.textContent = `未確認 ${c.unreviewed} / keep ${c.keep} / reject ${c.reject}`;
-    badges.appendChild(cullBadge);
+  info.appendChild(nameRow);
+
+  if (expanded) {
+    const badges = document.createElement('div');
+    badges.className = 'srcBadges';
+    // W5: a source with an applied colorTransform (type !== 'none') shows
+    // "変換済み" instead of the "要色変換" warning — the warning's purpose
+    // (flag material that will preview/render flat) no longer applies once
+    // `vedit color` has actually set a transform.
+    const colorConverted = src.colorTransform && src.colorTransform.type && src.colorTransform.type !== 'none';
+    badges.innerHTML = [
+      src.transcribed ? '<span class="badge ok">文字起こし済み</span>' : '',
+      !src.hasAudio ? '<span class="badge warn">音声なし</span>' : '',
+      !src.proxy ? '<span class="badge warn">プロキシ未生成</span>' : '',
+      colorConverted
+        ? '<span class="badge ok">変換済み</span>'
+        : needsColorTransform(src.color) ? '<span class="badge warn">要色変換</span>' : '',
+    ].join('');
+    if (S.scenes.has(src.id)) {
+      const c = cullingCounts(src.id);
+      const cullBadge = document.createElement('span');
+      cullBadge.className = 'badge cullBadge';
+      cullBadge.textContent = `未確認 ${c.unreviewed} / keep ${c.keep} / reject ${c.reject}`;
+      badges.appendChild(cullBadge);
+    }
+    const idBadge = document.createElement('span');
+    idBadge.className = 'badge srcIdBadge';
+    idBadge.textContent = src.id;
+    badges.appendChild(idBadge);
+    const used = sourceUsageSeconds(src.id);
+    const pct = src.duration > 0 ? Math.min(100, (used / src.duration) * 100) : 0;
+    const usage = document.createElement('div');
+    usage.className = 'srcUsage';
+    usage.innerHTML = `<span class="srcUsageBar"><span class="srcUsageFill" style="width:${pct}%"></span></span><span class="srcUsageLabel">使用 ${used.toFixed(1)}s / ${src.duration.toFixed(1)}s</span>`;
+    info.append(badges, usage);
   }
-  const usage = document.createElement('div');
-  usage.className = 'srcUsage';
-  usage.innerHTML = `<span class="srcUsageBar"><span class="srcUsageFill" style="width:${pct}%"></span></span><span class="srcUsageLabel">使用 ${used.toFixed(1)}s / ${src.duration.toFixed(1)}s</span>`;
-  info.append(nameRow, badges, usage);
 
   const actions = document.createElement('div');
   actions.className = 'srcActions';
+  const playBtn = document.createElement('button');
+  playBtn.textContent = '▶ 再生';
+  playBtn.setAttribute('aria-label', `${name} を再生`);
+  playBtn.onclick = (e) => { e.stopPropagation(); setMediaFocus(src.id, { focus: false }); enterSourcePreview(src.id); };
+  actions.appendChild(playBtn);
   const addBtn = document.createElement('button');
   addBtn.textContent = 'タイムラインへ追加';
   addBtn.setAttribute('aria-label', `${name} をタイムラインへ追加`);
   addBtn.onclick = (e) => { e.stopPropagation(); addSourceToTimeline(src); };
   actions.appendChild(addBtn);
-  if (S.scenes.has(src.id)) {
-    const expanded = S.expandedScenes.has(src.id);
+  const detailBtn = document.createElement('button');
+  detailBtn.className = 'btn-toggleDetail';
+  detailBtn.textContent = expanded ? '▾ 詳細' : '▸ 詳細';
+  detailBtn.setAttribute('aria-expanded', String(expanded));
+  detailBtn.setAttribute('aria-label', `${name} の詳細を${expanded ? '閉じる' : '表示'}`);
+  detailBtn.onclick = (e) => { e.stopPropagation(); toggleMediaDetail(src.id); };
+  actions.appendChild(detailBtn);
+  if (expanded && S.scenes.has(src.id)) {
+    const scenesExpanded = S.expandedScenes.has(src.id);
     const scenesBtn = document.createElement('button');
     scenesBtn.className = 'btn-viewScenes';
     scenesBtn.textContent = 'シーンを見る';
-    scenesBtn.setAttribute('aria-expanded', String(expanded));
-    scenesBtn.setAttribute('aria-label', `${name} のシーンを${expanded ? '閉じる' : '見る'}`);
+    scenesBtn.setAttribute('aria-expanded', String(scenesExpanded));
+    scenesBtn.setAttribute('aria-label', `${name} のシーンを${scenesExpanded ? '閉じる' : '見る'}`);
     scenesBtn.onclick = (e) => { e.stopPropagation(); toggleScenes(src.id); };
     actions.appendChild(scenesBtn);
   }
@@ -934,7 +1175,7 @@ function mediaRow(src) {
   row.addEventListener('click', (e) => {
     if (e.target.closest('button')) return;
     setMediaFocus(src.id);
-    enterSourcePreview(src.id);
+    toggleMediaDetail(src.id);
   });
   return row;
 }
@@ -1000,7 +1241,7 @@ $('mediaList').addEventListener('keydown', (e) => {
   else if (e.key === 'ArrowUp') { e.preventDefault(); setMediaFocus(sources[Math.max(idx - 1, 0)].id); }
   else if (e.key === 'Home') { e.preventDefault(); setMediaFocus(sources[0].id); }
   else if (e.key === 'End') { e.preventDefault(); setMediaFocus(sources[sources.length - 1].id); }
-  else if (e.key === 'Enter') { e.preventDefault(); enterSourcePreview(row.dataset.source); }
+  else if (e.key === 'Enter') { e.preventDefault(); toggleMediaDetail(row.dataset.source); }
 });
 $('buildSelectsBtn').onclick = async () => {
   const sourcesWithScenes = S.manifest.sources.filter((s) => S.scenes.has(s.id));
@@ -1254,8 +1495,9 @@ function renderTranscript() {
       const key = `${src.id}:${w.id}`;
       const cand = ignored.get(key);
       const selected = S.selWords.has(key);
+      const shown = S.showWordKeys.has(key); // W-UI §0 "show words" highlight — separate from selection
       const s = document.createElement('span');
-      s.className = 'w' + (kept.has(w.id) ? '' : ' cut') + (selected ? ' sel' : '') + (cand ? ' ignored' : '');
+      s.className = 'w' + (kept.has(w.id) ? '' : ' cut') + (selected ? ' sel' : '') + (cand ? ' ignored' : '') + (shown ? ' shown' : '');
       s.textContent = w.text;
       s.dataset.id = w.id;
       s.dataset.src = src.id;
@@ -1293,6 +1535,7 @@ let dragging = false;
 $('words').addEventListener('pointerdown', (e) => {
   const t = e.target.closest('.w');
   if (!t) return;
+  S.showWordKeys.clear(); // a manual selection supersedes any "show words" highlight
   const srcId = t.dataset.src;
   const key = `${srcId}:${t.dataset.id}`;
   if (e.shiftKey && S.selAnchor) {
@@ -1365,6 +1608,7 @@ function toggleWordSelection(srcId, id) {
     toast('ソースをまたぐ選択はできません', { type: 'error' });
     return;
   }
+  S.showWordKeys.clear();
   const key = `${srcId}:${id}`;
   if (S.selWords.has(key)) {
     S.selWords.delete(key);
@@ -1550,42 +1794,114 @@ function candRow(c) {
   return d;
 }
 
-function renderCandidates() {
-  $('candCount').textContent = S.candidates.length ? `(${S.candidates.length})` : '';
-  const el = $('candList');
-  el.innerHTML = '';
-  if (S.candidates.length === 0) { el.innerHTML = '<div class="hintText" style="padding:8px">提案はありません。Claude に「無音とフィラーを検出して」と頼むか、CLI で `vedit detect`。</div>'; return; }
-
-  const byKind = new Map();
-  for (const c of S.candidates) {
-    if (!byKind.has(c.kind)) byKind.set(c.kind, []);
-    byKind.get(c.kind).push(c);
+// ---------- inbox (W-UI §1: 要確認 — pending candidates + アンカー切れ + 色警告 + 低信頼トランスクリプト警告, merged into the "いま" tab) ----------
+function lowConfidenceCounts() {
+  const out = [];
+  for (const src of S.manifest.sources) {
+    const words = S.transcripts.get(src.id);
+    if (!words) continue;
+    const n = words.filter((w) => w.p < 0.4).length;
+    if (n > 0) out.push({ sourceId: src.id, count: n });
   }
-  const kinds = [...byKind.keys()].sort((a, b) => {
-    const ia = KIND_ORDER.indexOf(a), ib = KIND_ORDER.indexOf(b);
-    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+  return out;
+}
+function colorWarningSources() {
+  return S.manifest.sources.filter((src) => {
+    const converted = src.colorTransform && src.colorTransform.type && src.colorTransform.type !== 'none';
+    return !converted && needsColorTransform(src.color);
   });
-  for (const kind of kinds) {
-    const list = byKind.get(kind);
-    const totalDur = list.reduce((sum, c) => sum + Math.max(0, c.t1 - c.t0), 0);
-    const group = document.createElement('div');
-    group.className = 'candGroup';
-    const header = document.createElement('div');
-    header.className = 'candGroupHeader';
-    header.innerHTML = `<span class="kind ${kind}">${KIND_LABEL[kind] ?? kind}</span><span class="hintText">${list.length}件 / 計-${totalDur.toFixed(1)}s</span><span class="spacer"></span>`;
-    const approveBtn = document.createElement('button');
-    approveBtn.className = 'btn-approve';
-    approveBtn.textContent = 'まとめて承認';
-    approveBtn.onclick = () => decide(list.map((c) => c.id), 'approve');
-    const rejectBtn = document.createElement('button');
-    rejectBtn.className = 'btn-reject';
-    rejectBtn.textContent = 'まとめて却下';
-    rejectBtn.onclick = () => decide(list.map((c) => c.id), 'reject');
-    header.append(approveBtn, rejectBtn);
-    group.appendChild(header);
-    for (const c of list) group.appendChild(candRow(c));
-    el.appendChild(group);
+}
+function inboxWarningRow(text, opts = {}) {
+  const d = document.createElement('div');
+  d.className = 'inboxWarn';
+  d.textContent = text;
+  if (opts.onClick) {
+    d.tabIndex = 0;
+    d.setAttribute('role', 'button');
+    d.onclick = opts.onClick;
+    d.onkeydown = (e) => { if (e.key === 'Enter' || e.code === 'Space') { e.preventDefault(); opts.onClick(); } };
   }
+  return d;
+}
+function renderInbox() {
+  const el = $('inboxList');
+  el.innerHTML = '';
+  let count = 0;
+
+  if (S.candidates.length > 0) {
+    count += S.candidates.length;
+    const byKind = new Map();
+    for (const c of S.candidates) {
+      if (!byKind.has(c.kind)) byKind.set(c.kind, []);
+      byKind.get(c.kind).push(c);
+    }
+    const kinds = [...byKind.keys()].sort((a, b) => {
+      const ia = KIND_ORDER.indexOf(a), ib = KIND_ORDER.indexOf(b);
+      return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+    });
+    for (const kind of kinds) {
+      const list = byKind.get(kind);
+      const totalDur = list.reduce((sum, c) => sum + Math.max(0, c.t1 - c.t0), 0);
+      const group = document.createElement('div');
+      group.className = 'candGroup';
+      const header = document.createElement('div');
+      header.className = 'candGroupHeader';
+      header.innerHTML = `<span class="kind ${kind}">${KIND_LABEL[kind] ?? kind}</span><span class="hintText">${list.length}件 / 計-${totalDur.toFixed(1)}s</span><span class="spacer"></span>`;
+      const approveBtn = document.createElement('button');
+      approveBtn.className = 'btn-approve';
+      approveBtn.textContent = 'まとめて承認';
+      approveBtn.onclick = () => decide(list.map((c) => c.id), 'approve');
+      const rejectBtn = document.createElement('button');
+      rejectBtn.className = 'btn-reject';
+      rejectBtn.textContent = 'まとめて却下';
+      rejectBtn.onclick = () => decide(list.map((c) => c.id), 'reject');
+      header.append(approveBtn, rejectBtn);
+      group.appendChild(header);
+      for (const c of list) group.appendChild(candRow(c));
+      el.appendChild(group);
+    }
+  }
+
+  // orphaned B-roll / sprites — "アンカー切れ" (W-UI §3 terminology; "orphan" stays in the CLI/API vocabulary, this is display-only)
+  for (const r of S.overlays) {
+    if (r.tlStart != null) continue;
+    count++;
+    const ov = r.overlay;
+    el.appendChild(inboxWarningRow(
+      `⚠ アンカー切れ(B-roll ${ov.id}): アンカー(${ov.anchor.sourceId}@${ov.anchor.srcTime.toFixed(2)}s)がカットで失われました。再アンカーしてください(vedit broll-update)`,
+    ));
+  }
+  for (const r of S.sprites) {
+    if (r.tlStart != null) continue;
+    count++;
+    const sp = r.sprite;
+    el.appendChild(inboxWarningRow(
+      `⚠ アンカー切れ(スプライト ${sp.id}): アンカー(${sp.anchor.sourceId}@${sp.anchor.srcTime.toFixed(2)}s)がカットで失われました。再アンカーしてください(vedit sprite-update)`,
+    ));
+  }
+
+  // color warnings
+  for (const src of colorWarningSources()) {
+    count++;
+    el.appendChild(inboxWarningRow(`⚠ 要色変換: ${basename(src.path)} — Log/HLG/PQ 素材のため浅い色で見えています(vedit color)`, {
+      onClick: () => { activateTab($('tab-mediaPanel'), { focus: false }); setMediaFocus(src.id, { focus: false }); },
+    }));
+  }
+
+  // low-confidence transcript warnings
+  for (const lc of lowConfidenceCounts()) {
+    count++;
+    const src = S.manifest.sources.find((s) => s.id === lc.sourceId);
+    const name = src ? basename(src.path) : lc.sourceId;
+    el.appendChild(inboxWarningRow(`⚠ 低信頼のトランスクリプト: ${name} に${lc.count}語(Transcript タブの"?"付きを確認)`, {
+      onClick: () => activateTab($('tab-transcriptPanel'), { focus: false }),
+    }));
+  }
+
+  const badge = $('inboxCount');
+  if (count > 0) { badge.hidden = false; badge.textContent = String(count); } else { badge.hidden = true; }
+  $('inboxEmpty').hidden = count > 0;
+  el.hidden = count === 0;
 }
 $('approveAllBtn').onclick = () => {
   const n = S.candidates.length;
@@ -1614,8 +1930,8 @@ $('redetectBtn').onclick = async () => {
 // (the decided rows disappear from the list), or to the panel itself if none
 // remain — so keyboard/screen-reader users never lose their place.
 function focusAfterCandidateDecision(anchorIdx) {
-  const rows = [...document.querySelectorAll('#candList .cand')];
-  if (rows.length === 0) { $('candPanel').focus(); return; }
+  const rows = [...document.querySelectorAll('#inboxList .cand')];
+  if (rows.length === 0) { $('nowPanel').focus(); return; }
   const idx = Math.max(0, Math.min(anchorIdx, rows.length - 1));
   rows[idx].focus();
 }
@@ -1633,42 +1949,99 @@ async function decide(ids, decision) {
   }
   await reload().catch(() => {});
   focusAfterCandidateDecision(anchorIdx);
+  hideCandidateCard();
 }
 
-// ---------- history / undo ----------
+// ---------- activity feed / undo (W-UI §1: 履歴タブを吸収 — "rev" は表示上「変更 #」と呼ぶ。CLI/API の語彙(rev/r12)はそのまま) ----------
+const ACTOR_LABEL = { claude: 'Claude', ui: 'あなた', system: 'システム' };
+
 function focusAfterHistoryAction() {
-  const rows = [...document.querySelectorAll('#histList .restoreBtn')];
-  if (rows.length === 0) { $('histPanel').focus(); return; }
+  const rows = [...document.querySelectorAll('#activityFeed .restoreBtn')];
+  if (rows.length === 0) { $('nowPanel').focus(); return; }
   rows[0].focus();
 }
 async function restoreToRevision(rev) {
   const { ok } = await mutate({ op: 'restore', rev });
-  if (ok) toast(`r${rev} に戻しました。ほかの版を確認するには「履歴」タブを開いてください`);
-  // renderHistory() always rebuilds #histList's DOM on reload, so the
-  // clicked button is stale either way — always re-focus something so focus
-  // never silently drops to <body>, on both success and (post-reload) failure.
+  if (ok) toast(`変更 #${rev} の状態に戻しました`);
+  // renderActivityFeed() always rebuilds #activityFeed's DOM on reload, so
+  // the clicked button is stale either way — always re-focus something so
+  // focus never silently drops to <body>, on both success and (post-reload)
+  // failure.
   focusAfterHistoryAction();
 }
-function renderHistory() {
-  const el = $('histList');
+/**
+ * Best-effort "where did this change happen" -> a timeline range, from a
+ * revision entry's recorded op params — powers each activity-feed card's
+ * "▶この変更を見る" button (an internal call into the same show-range
+ * plumbing `vedit show range` drives, per W-UI §0/§1). Uses CURRENT
+ * segments/timeline state, not a historical reconstruction — a nearby,
+ * present-day anchor is all "show me roughly where that was" needs. Returns
+ * null when nothing usable can be derived (button is omitted then).
+ */
+function revisionShowTarget(entry) {
+  const p = entry.params ?? {};
+  if (typeof p.tlStart === 'number') {
+    const dur = typeof p.duration === 'number' ? p.duration : 2;
+    return { tlStart: p.tlStart, tlEnd: p.tlStart + dur };
+  }
+  if (typeof p.clipId === 'string') {
+    const seg = S.segments.find((s) => s.clipId === p.clipId);
+    if (seg) return { tlStart: seg.tlStart, tlEnd: seg.tlEnd };
+  }
+  if (typeof p.id === 'string') {
+    const mo = S.manifest.timeline.motion.find((m) => m.id === p.id);
+    if (mo) return { tlStart: mo.tlStart, tlEnd: mo.tlStart + mo.duration };
+    const mu = (S.manifest.timeline.music ?? []).find((m) => m.id === p.id);
+    if (mu) return { tlStart: mu.tlStart, tlEnd: mu.tlStart + mu.duration };
+    const ov = S.overlays.find((r) => r.overlay.id === p.id && r.tlStart != null);
+    if (ov) return { tlStart: ov.tlStart, tlEnd: ov.tlStart + (ov.overlay.srcOut - ov.overlay.srcIn) };
+    const sp = S.sprites.find((r) => r.sprite.id === p.id && r.tlStart != null);
+    if (sp) return { tlStart: sp.tlStart, tlEnd: sp.tlStart + sp.sprite.duration };
+  }
+  // Cut ops (remove-words/remove-range/apply-candidates): the cut range
+  // itself no longer exists on the timeline, so land on the join point —
+  // the first remaining segment of that source at/after t0, or its last
+  // segment if the cut was at the very end.
+  if (typeof p.sourceId === 'string' && typeof p.t0 === 'number') {
+    const seg = S.segments.find((s) => s.sourceId === p.sourceId && s.srcStart >= p.t0)
+      ?? [...S.segments].reverse().find((s) => s.sourceId === p.sourceId);
+    if (seg) return { tlStart: seg.tlStart, tlEnd: Math.min(S.duration, seg.tlStart + 2) };
+  }
+  return null;
+}
+function renderActivityFeed() {
+  const el = $('activityFeed');
   el.innerHTML = '';
   for (const r of [...S.revisions].reverse()) {
-    const d = document.createElement('div');
-    d.className = 'hist';
-    const info = document.createElement('span');
-    info.innerHTML = `<b>r${r.rev}</b> [${r.actor}] ${esc(r.summary)}`;
-    d.appendChild(info);
-    if (r.rev !== S.manifest.revision) {
+    const card = document.createElement('div');
+    card.className = 'activityCard';
+    const info = document.createElement('div');
+    info.className = 'activityInfo';
+    info.innerHTML = `<b>変更 #${r.rev}</b> <span class="activityActor">[${esc(ACTOR_LABEL[r.actor] ?? r.actor)}]</span> ${esc(r.summary)}`;
+    card.appendChild(info);
+
+    const actions = document.createElement('div');
+    actions.className = 'activityActions';
+    const target = revisionShowTarget(r);
+    if (target) {
+      const showBtn = document.createElement('button');
+      showBtn.className = 'btn-activityShow';
+      showBtn.textContent = '▶この変更を見る';
+      showBtn.onclick = () => showRangeInternal(target.tlStart, target.tlEnd);
+      actions.appendChild(showBtn);
+    }
+    if (r.rev >= 2) {
       const btn = document.createElement('button');
       btn.className = 'restoreBtn';
-      btn.textContent = 'ここに戻す';
+      btn.textContent = '⟲この直前に戻す';
       btn.onclick = async () => {
-        if (!confirm(`r${r.rev} 「${r.summary}」に戻しますか？`)) return;
-        await restoreToRevision(r.rev);
+        if (!confirm(`変更 #${r.rev}「${r.summary}」の直前の状態に戻しますか？(これ以降の変更も一緒に戻ります)`)) return;
+        await restoreToRevision(r.rev - 1);
       };
-      d.appendChild(btn);
+      actions.appendChild(btn);
     }
-    el.appendChild(d);
+    if (actions.childElementCount) card.appendChild(actions);
+    el.appendChild(card);
   }
 }
 function updateUndoBtn() {
@@ -1677,16 +2050,16 @@ function updateUndoBtn() {
   if (rev <= 1) {
     btn.textContent = '⟲ 戻せません';
     btn.disabled = true;
-    btn.setAttribute('aria-label', '戻せるリビジョンがありません');
+    btn.setAttribute('aria-label', '戻せる変更がありません');
   } else {
-    btn.textContent = `⟲ r${rev - 1}へ戻す`;
+    btn.textContent = `⟲ 変更 #${rev - 1}へ戻す`;
     btn.disabled = false;
-    btn.setAttribute('aria-label', `r${rev - 1}へ戻す`);
+    btn.setAttribute('aria-label', `変更 #${rev - 1}へ戻す`);
   }
 }
 $('undoBtn').onclick = async () => {
   const rev = S.manifest?.revision ?? 0;
-  if (rev <= 1) { toast('戻せるリビジョンがありません', { type: 'error' }); return; }
+  if (rev <= 1) { toast('戻せる変更がありません', { type: 'error' }); return; }
   await restoreToRevision(rev - 1);
 };
 
@@ -1762,6 +2135,145 @@ tabList.addEventListener('keydown', (e) => {
   else if (e.key === 'End') { e.preventDefault(); activateTab(tabs[tabs.length - 1]); }
 });
 
+// ---------- W-UI companion channel (show directives) — W-UI §0 ----------
+// Claude calls `vedit show <kind> ...`, which POSTs /api/show and broadcasts
+// {type:'show', directive} to every connected browser (no revision, no
+// actor — purely a UI cue). This is the core of the "相棒" feel: when Claude
+// talks about a specific spot, this screen jumps/highlights/opens it so a
+// user watching alongside the chat sees exactly what's being discussed.
+let showHighlightTimer;
+function handleShowDirective(d) {
+  if (!d || !d.kind) return;
+  if (d.kind === 'range') return showRangeDirective(d);
+  if (d.kind === 'words') return showWordsDirective(d);
+  if (d.kind === 'candidate') return showCandidateDirective(d);
+  if (d.kind === 'compare') return showCompareDirective(d);
+  if (d.kind === 'source') return showSourceDirective(d);
+}
+// Jump to `tlStart`, highlight [tlStart,tlEnd] on the strip (a dedicated
+// #showHighlight element — deliberately NOT the I/O range-selection UI,
+// which would also surface its "この範囲を削除" action bar), autoplay from
+// 1s before tlStart, auto-stop 1s after tlEnd. Also used directly (not via
+// the WS message) by the activity feed's "▶この変更を見る" button.
+function showRangeInternal(tlStart, tlEnd) {
+  if (!Number.isFinite(tlStart) || !Number.isFinite(tlEnd) || !S.duration) return;
+  const a = Math.max(0, Math.min(tlStart, tlEnd));
+  const b = Math.max(tlStart, tlEnd);
+  const el = $('showHighlight');
+  el.hidden = false;
+  el.style.left = `${(a / S.duration) * 100}%`;
+  el.style.width = `${Math.max(0, (b - a) / S.duration) * 100}%`;
+  clearTimeout(showHighlightTimer);
+  showHighlightTimer = setTimeout(() => { el.hidden = true; }, 6000);
+  const startTl = Math.max(0, a - 1);
+  S.previewStopAt = Math.min(S.duration, b + 1);
+  seekTl(startTl, { play: true });
+  S.playing = true;
+  setPlayBtnState(true);
+}
+function showRangeDirective(d) {
+  showRangeInternal(Number(d.tlStart), Number(d.tlEnd));
+}
+// Switch to Transcript, highlight+scroll to the words (a separate
+// S.showWordKeys set — NOT S.selWords, so "showing" a word never enables the
+// delete-selection button as a side effect), and seek to the first one.
+function showWordsDirective(d) {
+  const sourceId = d.sourceId;
+  const ids = Array.isArray(d.ids) ? d.ids : [];
+  if (!sourceId || ids.length === 0) return;
+  activateTab($('tab-transcriptPanel'), { focus: false });
+  S.showWordKeys = new Set(ids.map((id) => `${sourceId}:${id}`));
+  renderTranscript();
+  const words = S.transcripts.get(sourceId) ?? [];
+  const first = words.find((w) => ids.includes(w.id));
+  if (first) {
+    document.querySelector(`.w[data-src="${CSS.escape(sourceId)}"][data-id="${CSS.escape(first.id)}"]`)?.scrollIntoView({ block: 'center' });
+    seekToWord(sourceId, first);
+  }
+}
+// Candidate card: shown front-and-center over the stage (independent of the
+// いま tab's inbox rows), with prev/next-play + apply/keep — reuses the same
+// candidateTl/decide() plumbing the inbox's candRow uses.
+function renderCandidateCard(c) {
+  const body = $('candidateCardBody');
+  const dur = Math.max(0, c.t1 - c.t0);
+  const src = S.manifest.sources.find((s) => s.id === c.sourceId);
+  const srcName = src ? basename(src.path) : c.sourceId;
+  body.innerHTML = `<div><span class="kind ${c.kind}">${esc(KIND_LABEL[c.kind] ?? c.kind)}</span></div>` +
+    `<div class="showCardLbl">${esc(c.label)}</div>` +
+    `<div class="hintText">${esc(srcName)} ${fmt(c.t0)}–${fmt(c.t1)}(-${dur.toFixed(1)}s)</div>`;
+  const actions = document.createElement('div');
+  actions.className = 'candActions';
+  const preview = document.createElement('button');
+  preview.className = 'btn-preview';
+  preview.textContent = '前後を再生';
+  preview.onclick = () => {
+    const startTl = candidateTl(c.t0 - 1, c);
+    const endTl = candidateTl(c.t1 + 1, c);
+    if (startTl == null) return;
+    S.previewStopAt = endTl;
+    seekTl(startTl, { play: true });
+    S.playing = true;
+    setPlayBtnState(true);
+  };
+  const ok = document.createElement('button');
+  ok.className = 'btn-approve';
+  ok.textContent = 'カット適用';
+  ok.onclick = async () => { await decide([c.id], 'approve'); };
+  const ng = document.createElement('button');
+  ng.className = 'btn-reject';
+  ng.textContent = '残す';
+  ng.onclick = async () => { await decide([c.id], 'reject'); };
+  actions.append(preview, ok, ng);
+  body.appendChild(actions);
+  $('candidateCard').hidden = false;
+}
+function hideCandidateCard() { $('candidateCard').hidden = true; }
+$('candidateCardClose').onclick = hideCandidateCard;
+function showCandidateDirective(d) {
+  const c = S.candidatesAll.find((x) => x.id === d.id);
+  if (!c) { toast(`候補 ${d.id} が見つかりません`, { type: 'error' }); return; }
+  renderCandidateCard(c);
+}
+// Compare card: server precomputes durationA/durationB/deltaSeconds/ops (see
+// daemon.ts's /api/show kind=compare) — this just renders it, no parallel
+// video playback (out of scope per spec; a text diff is enough).
+function renderCompareCard(d) {
+  const body = $('compareCardBody');
+  const deltaLabel = `${d.deltaSeconds >= 0 ? '+' : ''}${d.deltaSeconds.toFixed(1)}s`;
+  const opsHtml = (d.ops ?? [])
+    .map((o) => `<li><b>変更 #${o.rev}</b> [${esc(ACTOR_LABEL[o.actor] ?? o.actor)}] ${esc(o.op)}: ${esc(o.summary)}</li>`)
+    .join('');
+  body.innerHTML =
+    `<div class="showCardLbl">変更 #${d.revA}(${fmt(d.durationA)}) → 変更 #${d.revB}(${fmt(d.durationB)}): ${deltaLabel}</div>` +
+    `<ul class="compareOps">${opsHtml || '<li class="hintText">変更なし</li>'}</ul>`;
+  $('compareCard').hidden = false;
+}
+function hideCompareCard() { $('compareCard').hidden = true; }
+$('compareCardClose').onclick = hideCompareCard;
+function showCompareDirective(d) {
+  renderCompareCard(d);
+}
+// Source preview mode, opened from a "show" directive (Claude directing
+// attention to raw, uncut material).
+function showSourceDirective(d) {
+  if (!d.sourceId) return;
+  activateTab($('tab-mediaPanel'), { focus: false });
+  setMediaFocus(d.sourceId, { focus: false });
+  enterSourcePreview(d.sourceId, { at: d.at ?? 0 });
+}
+
+// ---------- Claude presence strip (W-UI §1) ----------
+// Surfaces ingest/transcribe/upload/color-transform progress at the top of
+// the いま tab's feed, from the same WS progress events the stage's
+// #ingestOverlay spinner already listens to.
+function setClaudeTask(label) {
+  S.activeTask = label ? { label } : null;
+  const strip = $('claudeStrip');
+  strip.hidden = !label;
+  if (label) $('claudeStripText').textContent = label;
+}
+
 // ---------- websocket live updates ----------
 function connectWs() {
   const ws = new WebSocket(`ws://${location.host}/ws`);
@@ -1780,15 +2292,27 @@ function connectWs() {
   };
   ws.onmessage = async (ev) => {
     const msg = JSON.parse(ev.data);
+    if (msg.type === 'show') { handleShowDirective(msg.directive); return; }
     if (msg.type === 'ingest-start') {
       $('ingestOverlay').hidden = false;
       $('ingestStep').textContent = '取り込み中...';
       $('stage').setAttribute('aria-busy', 'true');
+      setClaudeTask(`取り込み中: ${basename(msg.file ?? '')}`);
     }
-    if (msg.type === 'ingest-progress') $('ingestStep').textContent = msg.step;
+    if (msg.type === 'ingest-progress') {
+      $('ingestStep').textContent = msg.step;
+      setClaudeTask(msg.step);
+    }
+    if (msg.type === 'upload-start') setClaudeTask(`取り込み中(アップロード): ${msg.name}`);
+    if (msg.type === 'upload-progress') {
+      if (msg.done) setClaudeTask(null);
+      else setClaudeTask(`取り込み中(アップロード): ${msg.name} — ${formatBytes(msg.bytes ?? 0)}`);
+    }
+    if (msg.type === 'color-transform-progress') setClaudeTask(`色変換中: ${msg.sourceId} — ${msg.step}`);
     if (msg.type === 'update' || msg.type === 'candidates' || msg.type === 'project') {
       $('ingestOverlay').hidden = true;
       $('stage').removeAttribute('aria-busy');
+      setClaudeTask(null);
       // tlNow() assumes #video is playing the timeline mix; during source
       // preview mode it plays an unrelated source proxy, so fall back to the
       // saved pre-preview position instead of deriving a bogus value from it.
@@ -1799,10 +2323,214 @@ function connectWs() {
       } catch (e) {
         toast(e.message, { type: 'error' });
       }
-      if (msg.summary) toast(`r${msg.revision ?? ''}: ${msg.summary}`);
+      if (msg.summary) toast(`変更 #${msg.revision ?? ''}: ${msg.summary}`);
     }
   };
 }
+
+// ---------- drag-and-drop ingest (W-UI §4) ----------
+// Window-wide dropzone: drop a video file or a folder of them anywhere in
+// the window to ingest it. Prefers LINKING the original file on disk (found
+// via /api/locate-media's mdfind + head/tail fingerprint match — see
+// src/ingest/locate.ts) over copying; falls back to a streamed upload
+// (/api/upload) into project/media/ only when nothing on disk matches.
+function readEntryFiles(entry) {
+  return new Promise((resolve) => {
+    if (!entry) return resolve([]);
+    if (entry.isFile) {
+      entry.file((file) => resolve([file]), () => resolve([]));
+      return;
+    }
+    if (entry.isDirectory) {
+      const reader = entry.createReader();
+      const collected = [];
+      const readBatch = () => {
+        reader.readEntries(async (batch) => {
+          if (batch.length === 0) {
+            const nested = await Promise.all(collected.map(readEntryFiles));
+            resolve(nested.flat());
+            return;
+          }
+          collected.push(...batch);
+          readBatch(); // readEntries must be called repeatedly until it returns [] (browsers cap a single call's results)
+        }, () => resolve([]));
+      };
+      readBatch();
+      return;
+    }
+    resolve([]);
+  });
+}
+async function collectDroppedVideoFiles(dataTransfer) {
+  const items = dataTransfer.items ? [...dataTransfer.items] : [];
+  let files = [];
+  if (items.length && items[0].webkitGetAsEntry) {
+    const entries = items.map((it) => it.webkitGetAsEntry()).filter(Boolean);
+    const nested = await Promise.all(entries.map(readEntryFiles));
+    files = nested.flat();
+  }
+  // Fall back to the flat file list whenever the entries API yielded nothing
+  // (folders need it for recursion, but a plain flat drop doesn't — and some
+  // browsers/sources don't back every item with a real filesystem entry).
+  if (files.length === 0) files = [...(dataTransfer.files ?? [])];
+  return files.filter((f) => isVideoFileName(f.name));
+}
+async function computeFileFingerprint(file) {
+  const { headStart, headLen, tailStart, tailLen } = fingerprintRanges(file.size);
+  const headBuf = headLen > 0 ? await file.slice(headStart, headStart + headLen).arrayBuffer() : new ArrayBuffer(0);
+  const tailBuf = tailLen > 0 ? await file.slice(tailStart, tailStart + tailLen).arrayBuffer() : new ArrayBuffer(0);
+  const [headDigest, tailDigest] = await Promise.all([
+    crypto.subtle.digest('SHA-256', headBuf),
+    crypto.subtle.digest('SHA-256', tailBuf),
+  ]);
+  return { size: file.size, headSha256: bufferToHex(headDigest), tailSha256: bufferToHex(tailDigest) };
+}
+
+function renderIngestFlowCard(message, buttons) {
+  const body = $('ingestFlowBody');
+  body.innerHTML = '';
+  const p = document.createElement('div');
+  p.className = 'showCardLbl';
+  p.textContent = message;
+  body.appendChild(p);
+  if (buttons.length) {
+    const actions = document.createElement('div');
+    actions.className = 'candActions';
+    for (const b of buttons) {
+      const btn = document.createElement('button');
+      btn.textContent = b.label;
+      if (b.primary) btn.className = 'btn-approve';
+      btn.onclick = b.onClick;
+      actions.appendChild(btn);
+    }
+    body.appendChild(actions);
+  }
+  $('ingestFlowCard').hidden = false;
+}
+function hideIngestFlowCard() {
+  $('ingestFlowCard').hidden = true;
+}
+$('ingestFlowClose').onclick = hideIngestFlowCard;
+
+async function ingestByLink(path) {
+  await api('/api/ingest', { method: 'POST', body: JSON.stringify({ file: path }) });
+}
+async function ingestByUpload(file) {
+  const uploaded = await api(`/api/upload?${new URLSearchParams({ name: file.name })}`, { method: 'POST', body: file });
+  await api('/api/ingest', { method: 'POST', body: JSON.stringify({ file: uploaded.path }) });
+}
+
+async function startSingleFileIngestFlow(file) {
+  renderIngestFlowCard(`${file.name} を確認しています…`, []);
+  let fp;
+  try {
+    fp = await computeFileFingerprint(file);
+  } catch (e) {
+    hideIngestFlowCard();
+    toast(`${file.name} の読み取りに失敗しました: ${e.message}`, { type: 'error' });
+    return;
+  }
+  let located = { found: false };
+  try {
+    located = await api('/api/locate-media', {
+      method: 'POST',
+      body: JSON.stringify({ name: file.name, size: fp.size, mtime: file.lastModified, headSha256: fp.headSha256, tailSha256: fp.tailSha256 }),
+    });
+  } catch { /* locate is best-effort; fall through to the upload offer */ }
+
+  if (located.found) {
+    renderIngestFlowCard(`${file.name} を見つけました → 取り込む(コピーなし)`, [
+      {
+        label: '取り込む', primary: true,
+        onClick: async () => {
+          hideIngestFlowCard();
+          try { await ingestByLink(located.path); toast(`${file.name} を取り込みました(コピーなし)`); }
+          catch (e) { toast(`${file.name} の取り込みに失敗しました: ${e.message}`, { type: 'error' }); }
+        },
+      },
+      { label: 'キャンセル', onClick: hideIngestFlowCard },
+    ]);
+  } else {
+    renderIngestFlowCard(`${file.name} は手元では見つかりませんでした`, [
+      {
+        label: `コピーして取り込む(${formatBytes(fp.size)} 使用)`, primary: true,
+        onClick: async () => {
+          hideIngestFlowCard();
+          try { await ingestByUpload(file); toast(`${file.name} を取り込みました(コピー)`); }
+          catch (e) { toast(`${file.name} のアップロードに失敗しました: ${e.message}`, { type: 'error' }); }
+        },
+      },
+      {
+        label: 'Claude に場所を伝える',
+        onClick: () => { hideIngestFlowCard(); toast('チャットで元ファイルの場所を伝えてください(Claude が `vedit ingest <path>` で取り込みます)'); },
+      },
+      { label: 'キャンセル', onClick: hideIngestFlowCard },
+    ]);
+  }
+}
+
+async function startMultiFileIngestFlow(files) {
+  const summary = planSummary(files);
+  renderIngestFlowCard(`${summary.count}件・合計 ${summary.totalBytesLabel} を取り込みますか？(手元にある素材はコピーせずリンク、無ければコピー)`, [
+    { label: '取り込む', primary: true, onClick: () => runMultiFileIngest(files) },
+    { label: 'キャンセル', onClick: hideIngestFlowCard },
+  ]);
+}
+async function runMultiFileIngest(files) {
+  let done = 0;
+  const failed = [];
+  for (const file of files) {
+    renderIngestFlowCard(`取り込み中 ${done + 1}/${files.length}: ${file.name}`, []);
+    try {
+      const fp = await computeFileFingerprint(file);
+      let located = { found: false };
+      try {
+        located = await api('/api/locate-media', {
+          method: 'POST',
+          body: JSON.stringify({ name: file.name, size: fp.size, mtime: file.lastModified, headSha256: fp.headSha256, tailSha256: fp.tailSha256 }),
+        });
+      } catch { /* fall back to upload below */ }
+      if (located.found) await ingestByLink(located.path);
+      else await ingestByUpload(file);
+      done++;
+    } catch (e) {
+      failed.push({ name: file.name, error: e?.message ?? String(e) });
+    }
+  }
+  hideIngestFlowCard();
+  if (failed.length) toast(`${done}/${files.length}件を取り込みました(失敗: ${failed.map((f) => f.name).join(', ')})`, { type: 'error' });
+  else toast(`${done}件を取り込みました`);
+}
+
+let dropDragCounter = 0;
+window.addEventListener('dragenter', (e) => {
+  if (!e.dataTransfer?.types?.includes('Files')) return;
+  e.preventDefault();
+  dropDragCounter++;
+  $('dropOverlay').hidden = false;
+});
+window.addEventListener('dragover', (e) => {
+  if (!e.dataTransfer?.types?.includes('Files')) return;
+  e.preventDefault();
+});
+window.addEventListener('dragleave', (e) => {
+  if (!e.dataTransfer?.types?.includes('Files')) return;
+  dropDragCounter = Math.max(0, dropDragCounter - 1);
+  if (dropDragCounter === 0) $('dropOverlay').hidden = true;
+});
+window.addEventListener('drop', async (e) => {
+  if (!e.dataTransfer?.types?.includes('Files')) return;
+  e.preventDefault();
+  dropDragCounter = 0;
+  $('dropOverlay').hidden = true;
+  const files = await collectDroppedVideoFiles(e.dataTransfer);
+  if (files.length === 0) {
+    toast('動画ファイル(.mp4/.mov/.m4v)が見つかりませんでした', { type: 'error' });
+    return;
+  }
+  if (files.length === 1) startSingleFileIngestFlow(files[0]);
+  else startMultiFileIngestFlow(files);
+});
 
 // ---------- render root ----------
 function gcd(a, b) { return b ? gcd(b, a % b) : a; }
@@ -1810,25 +2538,32 @@ function aspectLabel(w, h) {
   const g = gcd(Math.round(w), Math.round(h)) || 1;
   return `${Math.round(w / g)}:${Math.round(h / g)}`;
 }
+// W-UI §1 "ヘッダー薄型情報": current duration, plus "/ 目標 M:SS" when the
+// linked kit declares a duration target (profile.duration_seconds.target).
+function durationTargetLabel() {
+  const target = S.kit?.kit?.profile?.duration_seconds?.target;
+  return typeof target === 'number' ? ` / 目標 ${fmt(target)}` : '';
+}
 function renderStat() {
   const m = S.manifest;
   const out = m.output;
-  $('stat').textContent = out
+  const base = out
     ? `${fmt(S.duration)} / 出力 ${out.width}×${out.height} (${aspectLabel(out.width, out.height)}) · 素材 ${m.width}×${m.height} ${Math.round(m.fps)}fps`
     : `${fmt(S.duration)} / ${m.width}×${m.height} ${Math.round(m.fps)}fps`;
+  $('stat').textContent = base + durationTargetLabel();
 }
 async function renderAll() {
   const m = S.manifest;
   $('projName').textContent = m.name;
   renderStat();
-  $('revLabel').textContent = `rev ${m.revision}`;
+  $('revLabel').textContent = `変更 #${m.revision}`;
   updateUndoBtn();
   await loadMotionSpecs();
   syncMusicElements();
   renderTimeline();
   renderTranscript();
-  renderCandidates();
-  renderHistory();
+  renderInbox();
+  renderActivityFeed();
   renderMediaPanel();
   renderRange();
   updateFraming();
