@@ -94,7 +94,14 @@ html, body { height: 100%; }
 body {
   background: var(--bg); color: var(--text);
   font: var(--fs-base)/1.55 var(--font-jp);
-  display: flex; flex-direction: column; overflow: hidden;
+  display: flex; flex-direction: column;
+  /* Codex 最終ゲート P1: min-width より狭いウィンドウでは overflow:hidden
+     のせいで右端UI(書き出しボタン等)に絶対到達できなかった。縦方向の
+     ページスクロールは従来どおり抑止しつつ(内部パネルが各自 overflow-y:auto
+     を持つ)、横方向だけスクロール可能にする — position:fixed の
+     #toast/#dropOverlay/.ingestFlowCard はビューポート基準のままなので
+     この変更で位置がずれることはない。 */
+  overflow-x: auto; overflow-y: hidden;
   min-width: 1360px;
 }
 

@@ -1125,6 +1125,9 @@ function renderBgRow() {
     d.title = `背景: ${label} — クリックでシーク`;
     d.textContent = label;
     d.onclick = () => seekTl(iv.t0);
+    // Codex 最終ゲート P1: 他のタイムラインブロックと同じく Tab で到達でき
+    // Enter/Space でクリック相当の操作(シーク)ができるようにする。
+    makeBlockKeyboardActivatable(d, () => seekTl(iv.t0));
     row.appendChild(d);
   }
 }
@@ -1324,6 +1327,9 @@ function renderSceneMarks() {
       d.style.left = `${(tl / S.duration) * 100}%`;
       d.title = `${sc.id} ${fmt(sc.t0)}`;
       d.onpointerdown = (e) => { e.stopPropagation(); seekTl(tl, { play: false }); };
+      // Codex 最終ゲート P1: 他のタイムラインブロックと同じく Tab で到達でき
+      // Enter/Space でクリック相当の操作(シーク)ができるようにする。
+      makeBlockKeyboardActivatable(d, () => seekTl(tl, { play: false }));
       el.appendChild(d);
     }
   }
@@ -1981,6 +1987,11 @@ $('musicAddSubmit').onclick = () => submitMusicAdd($('musicAddPath').value);
 // dragenter/drop ハンドラにもバブって二重発火し(BGMフォームへ音声ファイルを
 // ドロップすると「動画ファイルが見つかりませんでした」の誤トーストが出る)、
 // このフォームの追加とは無関係な取り込みフローが同時に走ってしまう。
+// Codex 最終ゲート P2: dragover/drop だけ止めても dragenter が window 側の
+// #dropOverlay(全面オーバーレイ、z-index:30)を表示してしまい、その裏に
+// あるこのフォームへドロップし続けること自体を妨げていた — dragenter も
+// 同様に止める。
+$('musicAddForm').addEventListener('dragenter', (e) => { e.preventDefault(); e.stopPropagation(); });
 $('musicAddForm').addEventListener('dragover', (e) => { e.preventDefault(); e.stopPropagation(); });
 $('musicAddForm').addEventListener('drop', (e) => {
   e.preventDefault();
@@ -2108,6 +2119,14 @@ $('buildSelectsBtn').onclick = async () => {
 // (see buildCueEl/openCaptionStylePopover) rather than duplicating that
 // dialog's font/palette/position controls into the narrow aside.
 function selectItem(kind, id) {
+  // Codex 最終ゲート P1: 字幕スタイルビュー(S.rightMode==='caption')は
+  // ライブプレビューのため S.manifest.captions.overrides に未適用ドラフトを
+  // 直接書いている(previewCaptionOverrides)。ここで S.rightMode を直接
+  // 'clip'/'claude' に上書きすると closeCaptionStylePopover の「キャンセル
+  // 相当の復元」を経由せず、ドラフトが manifest に残留したままクリップ選択
+  // に遷移してしまう(openExportView/handleShowDirective は既にこのガードを
+  // 通している — 同じパターンをここにも揃える)。
+  if (S.rightMode === 'caption') closeCaptionStylePopover();
   S.selection = id ? { kind, id } : null;
   // W-DESIGN: 右パネルの4モード('claude'|'clip'|'caption'|'export')のうち
   // 選択があれば 'clip'、無ければ('caption'/'export' 以外なら)'claude' へ。
