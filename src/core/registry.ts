@@ -40,18 +40,30 @@ export async function upsertProject(dir: string, name: string): Promise<void> {
   await writeRegistry(next);
 }
 
-/** List known projects, dropping any whose directory no longer has a project.json. */
+/**
+ * List known projects, self-healing the registry as it goes: any entry
+ * whose `dir` no longer has a project.json (deleted project, stale test
+ * scratch dir, etc.) is dropped and the pruned list is written back. Every
+ * caller of listProjects (currently just `vedit projects`) goes through
+ * this same path, so the registry can never accumulate dead entries for
+ * long — it prunes itself on the next read.
+ *
+ * fs.stat calls run in parallel (Promise.all) rather than sequentially, so
+ * pruning stays fast even with a few hundred entries.
+ */
 export async function listProjects(): Promise<ProjectRegistryEntry[]> {
   const entries = await readRegistry();
-  const alive: ProjectRegistryEntry[] = [];
-  for (const e of entries) {
-    try {
-      await fs.access(path.join(e.dir, 'project.json'));
-      alive.push(e);
-    } catch {
-      /* project directory gone; drop it from the registry */
-    }
-  }
+  const checks = await Promise.all(
+    entries.map(async (e) => {
+      try {
+        await fs.stat(path.join(e.dir, 'project.json'));
+        return e;
+      } catch {
+        return null; // project directory gone; drop it from the registry
+      }
+    }),
+  );
+  const alive = checks.filter((e): e is ProjectRegistryEntry => e !== null);
   if (alive.length !== entries.length) await writeRegistry(alive);
   return alive;
 }
