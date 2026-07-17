@@ -161,6 +161,12 @@
            ゾーンが無いプロジェクトでは要素ごと hidden。 -->
       <div id="intentZonesInfo" class="intentZonesInfo" hidden></div>
 
+      <!-- 波2.5: 「最後の書き出し」カード(GET /api/export-results, 実装済み —
+           read-only。実行系のボタンはここに作らない)。レコード0件・
+           プロジェクト空のいずれでも非表示(renderExportResultCard/
+           fetchExportResults in app.js)。 -->
+      <div id="exportResultCard" class="exportResultCard" hidden></div>
+
       <!-- W-UI IA v2 §5a: プロジェクトが空(素材ゼロ)のときだけ表示し、
            下の2群は隠す(renderInbox の isProjectEmpty() 分岐)。 -->
       <div id="confirmEmptyProject" class="hintText confirmEmptyProject" hidden>確認するものはまだありません</div>

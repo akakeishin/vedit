@@ -90,11 +90,21 @@ body {
   font: var(--fs-sm)/1.5 var(--font-jp);
   display: flex; flex-direction: column; overflow: hidden;
 }
+/* 波2.5 P3(a): 狭幅(Claude Desktop の隣に置く=現実の利用形態、~700px)で
+   タイトル+タイムコード(.hdrIdentity)が Claude 状態チップと重なっていた
+   バグの根本原因は2つの合わせ技 — (1) header に flex-wrap が無く、
+   全項目が常に1行に押し込まれようとしていた、(2) .hdrIdentity 自身は
+   min-width:0 でどこまでも縮んでいいのに、中の #projName/#headerTc は
+   縮んだ分の省略(ellipsis)もラップも一切していなかったので、縮んだ枠から
+   はみ出した文字がそのまま隣の #stat/.claudeStatus に重なって描画されて
+   いた。修正: header を折返し可にし、.hdrIdentity は「中身が丸ごと収まる
+   幅より縮まない」(min-width の初期値 auto に戻す=このルールの削除)。
+   これで狭幅では独自の行に折り返すだけになり、崩れた省略や重なりが起きない。 */
 header {
-  display: flex; align-items: center; gap: 12px;
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap; row-gap: 4px;
   padding: 8px 14px; border-bottom: 1px solid var(--zone-border); background: var(--zone-bg);
 }
-.hdrIdentity { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+.hdrIdentity { display: flex; align-items: baseline; gap: 10px; }
 #projName { font-weight: 600; font-size: var(--fs-md); white-space: nowrap; }
 /* タイムコード・フレーム数・秒数値だけ monospace + tabular-nums (design tokens'
    doc above) — every numeric readout in the timeline/inbox/media-pool UI
@@ -147,6 +157,11 @@ button {
 button:hover { border-color: var(--link); }
 button:disabled { opacity: 0.4; cursor: default; }
 button:focus-visible, [tabindex]:focus-visible, a:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
+/* 波2.5 P3(b): input[type=range]/checkbox の既定の青(ブラウザネイティブ)を
+   トークンへ — --link(「情報・フォーカス・操作アクセント」、design tokens
+   の doc 参照)。プロジェクト全体のスライダー/チェックボックス共通。 */
+input[type="range"], input[type="checkbox"] { accent-color: var(--link); }
+input[type="range"]:disabled, input[type="checkbox"]:disabled { opacity: 0.5; }
 
 main { flex: 1; display: flex; min-height: 0; }
 #stage { flex: 1.6; display: flex; flex-direction: column; padding: 12px; gap: 8px; min-width: 0; }
@@ -506,9 +521,15 @@ main { flex: 1; display: flex; min-height: 0; }
    字幕オフでも消えない、renderCaptionRow in app.js)。#timelineTracks を
    92px→104px に広げた分、ちょうど最下段の新しいレーンに収まる。 */
 #captionRow { position: absolute; left: 0; right: 0; bottom: 0; height: 12px; }
+/* 波2.5 P3(c): 元は rgba(232,160,60,*) = --tally そのもの(要確認・保留・
+   警告 専用のはずの色)を cue バーの装飾に流用していて、タリー琥珀(inbox
+   バッジ・警告行・showHighlight)と紛らわしかった。--wash(状態色を持たない
+   ニュートラル)ベースに変更 — design tokens のドキュメント(このファイル
+   冒頭)が定める「amber は警告専用」を cue バーにも適用しただけで、
+   .capRowOff/.capRowEmpty(既に zone-surface-2 で正しい)は変更不要。 */
 .capRowBlock {
   position: absolute; top: 0; height: 100%; border-radius: 3px;
-  background: rgba(232, 160, 60, 0.55); font-size: 9px; color: #241a05;
+  background: rgba(111, 104, 88, 0.85); font-size: 9px; color: var(--text);
   overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0 3px; cursor: pointer;
 }
 .capRowBlock.capRowOff, .capRowBlock.capRowEmpty {
@@ -612,6 +633,18 @@ aside {
    onto a new line. flex-shrink:0 forces "wrap as a whole unit or not at
    all", never "shrink into a sliver first". */
 .intentZoneInfoRow > span { flex-shrink: 0; }
+/* 波2.5: 「最後の書き出し」カード — read-only の結果表示なので
+   intentZoneInfoRow と同じ中立トーンの箱(--zone-surface-2)。ok=false のみ
+   --reject の左ボーダーで区別(--tally は「古い版」警告行だけに残す — その
+   行自体は inboxWarningRow をそのまま再利用しているので追加ルール不要)。 */
+.exportResultCard { padding: 8px 12px 2px; display: flex; flex-direction: column; gap: 6px; }
+.exportResultRow {
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 6px 8px; border-radius: var(--radius); background: var(--zone-surface-2);
+  border: 1px solid var(--zone-border); border-left: 2px solid var(--wash);
+}
+.exportResultRow.fail { border-left-color: var(--reject); }
+.exportResultWarning { color: var(--tally); }
 .inboxGroup + .inboxGroup { border-top: 1px solid var(--zone-border); margin-top: 4px; }
 .inboxHeading {
   display: flex; align-items: center; gap: 8px; padding: 10px 12px 2px;

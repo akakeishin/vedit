@@ -62,10 +62,11 @@ const S = {
   // selectItem/renderInspector). Caption cues are NOT tracked here — they
   // open the existing captionStyleDialog directly (see buildCueEl).
   selection: null,
-  // W-UI IA v2 波2 §9/追補#3: revision a mutate() response's `warning` field
-  // was already surfaced for, via toast — connectWs()'s generic "変更 #N"
-  // confirmation skips that SAME revision once so it doesn't immediately
-  // clobber the warning with a bland confirmation.
+  // W-UI IA v2 波2 §9/追補#3, 波2.5: revision a mutate() response's
+  // `warning` field (or a committed-but-refresh-failed notice) was already
+  // surfaced for, via toast — connectWs()'s generic "変更 #N" confirmation
+  // skips that SAME revision once so it doesn't immediately clobber the
+  // warning with a bland confirmation.
   lastWarningRevision: null,
   detectMinGap: 0.7,
   // W-UI IA v2 §5(c): best-effort "which of the 4 zero-candidate empty
@@ -94,6 +95,10 @@ const S = {
   timelineDrag: null, // in-progress timeline drag/trim (see startClipReorderDrag/startTrimDrag/startBlockDrag)
   fontsList: null, // W-CAP: /api/fonts response ({kit:[{name,family?,path}], system:[{family}]}), refreshed every reload()
   qc: { issues: [], counts: { errors: 0, warnings: 0, infos: 0 } }, // W9: /api/qc static report, refreshed every reload()
+  // 波2.5: GET /api/export-results — NOT refreshed by reload()/every mutate();
+  // fetched only when the 確認 tab is shown + a light 30s poll while it stays
+  // active (see fetchExportResults). Holds at most 1 record (the latest).
+  exportResults: [],
   takesCache: new Map(), // W-INTENT/W11: sourceId -> TakeGroup[], fetched on demand (GET /api/takes) when a "show takes" directive arrives
   // ---- W-ANIME: composition (source-less "sprite anime" production mode) ----
   backgroundIntervals: [], // [{t0,t1,ref}] from /api/project — the resolved "紙芝居"; empty for a non-composition project
@@ -560,7 +565,7 @@ $('reframeSelect').onchange = async (e) => {
   if (!confirm(`出力比率を ${spec} に変更します。クロップ位置は後から調整できます。よろしいですか？`)) return;
   await mutate(
     { op: 'reframe', spec, focus: 'center' },
-    { conflictMessage: '比率の変更は反映されませんでした。最新状態を確認してもう一度実行してください' },
+    { conflictMessage: '比率の変更は反映されませんでした。最新状態を確認してもう一度実行してください', trigger: $('reframeSelect') },
   );
 };
 
@@ -687,8 +692,9 @@ $('rangeDeleteBtn').onclick = async () => {
   const last = overlapping[overlapping.length - 1];
   const t0 = first.srcStart + Math.max(0, S.rangeIn - first.tlStart);
   const t1 = last.srcStart + Math.min(last.tlEnd - last.tlStart, S.rangeOut - last.tlStart);
+  const btn = $('rangeDeleteBtn');
   clearRange();
-  await mutate({ op: 'remove-range', sourceId, t0, t1 });
+  await mutate({ op: 'remove-range', sourceId, t0, t1 }, { trigger: btn });
 };
 
 // ---------- shortcuts dialog ----------
@@ -1544,7 +1550,7 @@ function cullingCounts(sourceId) {
   }
   return { total: scenes.length, keep, reject, unreviewed: scenes.length - keep - reject };
 }
-async function setSceneReviewUi(sourceId, sceneId, review) {
+async function setSceneReviewUi(sourceId, sceneId, review, trigger) {
   // Set the roving-tabindex target before the mutation so the reload()
   // triggered by mutate() re-renders the grid with this scene already the
   // tabbable stop; DOM focus itself still needs reclaiming afterward since
@@ -1552,7 +1558,7 @@ async function setSceneReviewUi(sourceId, sceneId, review) {
   S.sceneFocus.set(sourceId, sceneId);
   await mutate(
     { op: 'scene-review', sourceId, sceneIds: [sceneId], review },
-    { conflictMessage: '選別状態の更新は反映されませんでした。最新状態を確認してもう一度実行してください' },
+    { conflictMessage: '選別状態の更新は反映されませんでした。最新状態を確認してもう一度実行してください', trigger },
   );
   document.querySelector(`.sceneItem[data-source="${CSS.escape(sourceId)}"][data-scene="${CSS.escape(sceneId)}"]`)?.focus();
 }
@@ -1563,15 +1569,15 @@ function setMediaFocus(sourceId, { focus = true } = {}) {
   }
   if (focus) document.querySelector(`.srcRow[data-source="${CSS.escape(sourceId)}"]`)?.focus();
 }
-async function addSourceToTimeline(src) {
+async function addSourceToTimeline(src, trigger) {
   const name = basename(src.path);
-  const { ok } = await mutate({ op: 'clip-add', sourceId: src.id });
+  const { ok } = await mutate({ op: 'clip-add', sourceId: src.id }, { trigger });
   if (ok) toast(`${name} を追加 (+${src.duration.toFixed(1)}s)`);
 }
-async function addSceneToTimeline(src, sc) {
+async function addSceneToTimeline(src, sc, trigger) {
   const name = basename(src.path);
   const dur = Math.max(0, sc.t1 - sc.t0);
-  const { ok } = await mutate({ op: 'clip-add', sourceId: src.id, in: sc.t0, out: sc.t1 });
+  const { ok } = await mutate({ op: 'clip-add', sourceId: src.id, in: sc.t0, out: sc.t1 }, { trigger });
   if (ok) toast(`${name} ${sc.id} を追加 (+${dur.toFixed(1)}s)`);
 }
 function toggleScenes(sourceId) {
@@ -1603,13 +1609,13 @@ function sceneGridRow(src, scenes) {
     keepBtn.textContent = '✓';
     keepBtn.setAttribute('aria-pressed', String(review === 'keep'));
     keepBtn.setAttribute('aria-label', `${sc.id} を採用にする`);
-    keepBtn.onclick = (e) => { e.stopPropagation(); setSceneReviewUi(src.id, sc.id, review === 'keep' ? 'clear' : 'keep'); };
+    keepBtn.onclick = (e) => { e.stopPropagation(); setSceneReviewUi(src.id, sc.id, review === 'keep' ? 'clear' : 'keep', keepBtn); };
     const rejectBtn = document.createElement('button');
     rejectBtn.className = 'btn-sceneReject';
     rejectBtn.textContent = '✕';
     rejectBtn.setAttribute('aria-pressed', String(review === 'reject'));
     rejectBtn.setAttribute('aria-label', `${sc.id} を不採用にする`);
-    rejectBtn.onclick = (e) => { e.stopPropagation(); setSceneReviewUi(src.id, sc.id, review === 'reject' ? 'clear' : 'reject'); };
+    rejectBtn.onclick = (e) => { e.stopPropagation(); setSceneReviewUi(src.id, sc.id, review === 'reject' ? 'clear' : 'reject', rejectBtn); };
     reviewRow.append(keepBtn, rejectBtn);
     item.appendChild(reviewRow);
 
@@ -1629,7 +1635,7 @@ function sceneGridRow(src, scenes) {
     addBtn.className = 'btn-sceneAdd';
     addBtn.textContent = 'この区間を追加';
     addBtn.setAttribute('aria-label', `${sc.id} をタイムラインへ追加`);
-    addBtn.onclick = () => addSceneToTimeline(src, sc);
+    addBtn.onclick = () => addSceneToTimeline(src, sc, addBtn);
     item.appendChild(addBtn);
     wrap.appendChild(item);
   }
@@ -1735,7 +1741,7 @@ function mediaRow(src) {
   const addBtn = document.createElement('button');
   addBtn.textContent = 'タイムラインへ追加';
   addBtn.setAttribute('aria-label', `${name} をタイムラインへ追加`);
-  addBtn.onclick = (e) => { e.stopPropagation(); addSourceToTimeline(src); };
+  addBtn.onclick = (e) => { e.stopPropagation(); addSourceToTimeline(src, addBtn); };
   actions.appendChild(addBtn);
   const detailBtn = document.createElement('button');
   detailBtn.className = 'btn-toggleDetail';
@@ -1823,26 +1829,26 @@ function renderAudioPanel() {
 $('audioRepairPreset').onchange = async (e) => {
   await mutate(
     { op: 'audio-repair', preset: e.target.value, deess: $('audioRepairDeess').checked },
-    { conflictMessage: '会話リペアの設定は反映されませんでした。最新状態を確認してもう一度実行してください' },
+    { conflictMessage: '会話リペアの設定は反映されませんでした。最新状態を確認してもう一度実行してください', trigger: e.target },
   );
 };
 $('audioRepairDeess').onchange = async (e) => {
   const preset = S.manifest.audioRepair?.preset ?? 'off';
   await mutate(
     { op: 'audio-repair', preset, deess: e.target.checked },
-    { conflictMessage: 'デエッサーの設定は反映されませんでした。最新状態を確認してもう一度実行してください' },
+    { conflictMessage: 'デエッサーの設定は反映されませんでした。最新状態を確認してもう一度実行してください', trigger: e.target },
   );
 };
 $('audioMixDuck').onchange = async (e) => {
   await mutate(
     { op: 'audio-mix', duckAmount: Number(e.target.value) },
-    { conflictMessage: 'ダッキング量の変更は反映されませんでした。最新状態を確認してもう一度実行してください' },
+    { conflictMessage: 'ダッキング量の変更は反映されませんでした。最新状態を確認してもう一度実行してください', trigger: e.target },
   );
 };
 $('audioMixLufs').onchange = async (e) => {
   await mutate(
     { op: 'audio-mix', targetLufs: Number(e.target.value) },
-    { conflictMessage: '目標ラウドネスの変更は反映されませんでした。最新状態を確認してもう一度実行してください' },
+    { conflictMessage: '目標ラウドネスの変更は反映されませんでした。最新状態を確認してもう一度実行してください', trigger: e.target },
   );
 };
 // Live readout while dragging, before the change commits.
@@ -1875,7 +1881,7 @@ async function submitMusicAdd(fileOrPath) {
   const sfx = $('musicAddSfx').checked;
   const body = { op: 'music-add', path: filePath, tlStart: tlNow() };
   if (sfx) Object.assign(body, { duck: false, fadeIn: 0.03, fadeOut: 0.03, role: 'sfx' });
-  const { ok } = await mutate(body, { conflictMessage: 'BGM/SEの追加は反映されませんでした。最新状態を確認してもう一度実行してください' });
+  const { ok } = await mutate(body, { conflictMessage: 'BGM/SEの追加は反映されませんでした。最新状態を確認してもう一度実行してください', trigger: $('musicAddSubmit') });
   if (ok) { $('musicAddForm').hidden = true; $('musicAddPath').value = ''; $('musicAddSfx').checked = false; }
 }
 $('musicAddSubmit').onclick = () => submitMusicAdd($('musicAddPath').value);
@@ -1992,7 +1998,7 @@ $('buildSelectsBtn').onclick = async () => {
   if (!ok) return;
   const { ok: applied } = await mutate(
     { op: 'selects' },
-    { conflictMessage: '仮タイムラインの作成は適用されませんでした。最新状態を確認してもう一度実行してください' },
+    { conflictMessage: '仮タイムラインの作成は適用されませんでした。最新状態を確認してもう一度実行してください', trigger: $('buildSelectsBtn') },
   );
   if (applied) toast(`採用 ${keepCount} シーンで仮タイムラインを作成しました`);
 };
@@ -2055,7 +2061,14 @@ function inspSlider(labelText, { min, max, step, value, format = String, onCommi
   input.step = String(step);
   input.value = String(value);
   input.oninput = () => { valSpan.textContent = format(Number(input.value)); };
-  input.onchange = async () => { await onCommit(Number(input.value)); };
+  // 波2.5: disabled for the pending round-trip (prevents re-dragging the
+  // same slider again before the previous commit resolves) — onCommit's own
+  // mutate() call doesn't see this slider directly, so the disable/enable
+  // happens here instead of via mutate()'s opts.trigger.
+  input.onchange = async () => {
+    input.disabled = true;
+    try { await onCommit(Number(input.value)); } finally { input.disabled = false; }
+  };
   wrap.append(l, input);
   return wrap;
 }
@@ -2066,7 +2079,8 @@ function inspRemoveButton(labelText, confirmText, onConfirm) {
   btn.onclick = async () => {
     if (!confirm(confirmText)) return;
     deselect();
-    await onConfirm();
+    btn.disabled = true; // 波2.5: pending 中の連打防止(rebuilt by the inspector re-render on success anyway; only matters if the mutation fails and this DOM survives)
+    try { await onConfirm(); } finally { btn.disabled = false; }
   };
   return btn;
 }
@@ -2102,7 +2116,7 @@ function buildClipInspector(body, clipId) {
       const b = document.createElement('button');
       b.textContent = txt;
       b.setAttribute('aria-label', `${rowLabel}を${df > 0 ? '1フレーム進める' : '1フレーム戻す'}`);
-      b.onclick = async () => { await mutate({ op: 'trim', clipId, edge, frames: df }); };
+      b.onclick = async () => { await mutate({ op: 'trim', clipId, edge, frames: df }, { trigger: b }); };
       row.appendChild(b);
     }
     return row;
@@ -2277,7 +2291,7 @@ function buildMusicInspector(body, id) {
   const duckCb = document.createElement('input');
   duckCb.type = 'checkbox';
   duckCb.checked = mu.duck;
-  duckCb.onchange = async () => { await mutate({ op: 'music-update', id, duck: duckCb.checked }); };
+  duckCb.onchange = async () => { await mutate({ op: 'music-update', id, duck: duckCb.checked }, { trigger: duckCb }); };
   duckRow.append(duckCb, ' 発話でダッキング(自動的に音量を下げる)');
   body.appendChild(duckRow);
   inspDivider(body);
@@ -2756,13 +2770,13 @@ wireCapColorInput('capBoxColor', 'box');
 $('capEnabledToggle').onchange = async (e) => {
   await mutate(
     { op: 'captions', patch: { enabled: e.target.checked } },
-    { conflictMessage: '字幕の表示切り替えは反映されませんでした。最新状態を確認してもう一度実行してください' },
+    { conflictMessage: '字幕の表示切り替えは反映されませんでした。最新状態を確認してもう一度実行してください', trigger: e.target },
   );
 };
 $('capStylePreset').onchange = async (e) => {
   await mutate(
     { op: 'captions', patch: { style: e.target.value } },
-    { conflictMessage: '字幕プリセットの変更は反映されませんでした。最新状態を確認してもう一度実行してください' },
+    { conflictMessage: '字幕プリセットの変更は反映されませんでした。最新状態を確認してもう一度実行してください', trigger: e.target },
   );
 };
 $('capMaxChars').onchange = async (e) => {
@@ -2770,7 +2784,7 @@ $('capMaxChars').onchange = async (e) => {
   if (!Number.isFinite(v) || v < 1) { syncCaptionPopoverControls(); return; }
   await mutate(
     { op: 'captions', patch: { maxChars: Math.round(v) } },
-    { conflictMessage: '1行の最大文字数の変更は反映されませんでした。最新状態を確認してもう一度実行してください' },
+    { conflictMessage: '1行の最大文字数の変更は反映されませんでした。最新状態を確認してもう一度実行してください', trigger: e.target },
   );
 };
 $('capSizeScale').oninput = (e) => {
@@ -3453,7 +3467,7 @@ async function deleteSelectedWords() {
   const ids = [...S.selWords].map((k) => k.split(':')[1]);
   const { ok } = await mutate(
     { op: 'remove-words', ids, sourceId: srcId },
-    { conflictMessage: '削除は適用されませんでした。最新状態を確認してもう一度実行してください' },
+    { conflictMessage: '削除は適用されませんでした。最新状態を確認してもう一度実行してください', trigger: $('removeSelBtn') },
   );
   if (ok) {
     S.selWords.clear();
@@ -3813,6 +3827,104 @@ function renderWarningsGroup(el) {
   el.hidden = count === 0;
   return count;
 }
+// ---------- 波2.5: 「最後の書き出し」カード ----------
+// GET /api/export-results is read-only (docs/product-bet-sensory-vs-
+// structural.md: 構造系〔書き出し〕に必要なのは操作ではなく結果の可視化) —
+// no export-trigger UI lives here, on purpose. `vedit export *` /
+// `vedit publish-pack` (CLI-only) are what actually write a record; this
+// just surfaces the latest one. Fetched on 確認 tab display + a light 30s
+// poll while that tab stays active (see fetchExportResults' one caller at
+// the bottom of this file and activateTab above) — NOT tied to reload()/WS,
+// since exports don't go through mutate() and polling every commit would be
+// wasted work for something this low-frequency.
+const EXPORT_KIND_LABEL = {
+  render: 'MP4書き出し',
+  otio: 'OTIO(Resolve)',
+  srt: 'SRT字幕',
+  ass: 'ASS字幕',
+  fcp7xml: 'FCP XML(Premiere)',
+  'publish-pack': '公開パック',
+};
+async function fetchExportResults() {
+  try {
+    S.exportResults = await api('/api/export-results?n=1');
+  } catch {
+    S.exportResults = []; // best-effort — a failed fetch just means the card stays as it was/hidden, never a toast
+  }
+  renderExportResultCard();
+}
+function renderExportResultCard() {
+  const el = $('exportResultCard');
+  if (!el) return;
+  const rec = S.exportResults[0];
+  // レコード0件・プロジェクト空のいずれでも非表示(空状態の文言は出さない —
+  // 波2.5 スコープの明示指定)。
+  if (!rec || isProjectEmpty()) { el.hidden = true; el.innerHTML = ''; return; }
+  el.hidden = false;
+  el.innerHTML = '';
+  const heading = document.createElement('div');
+  heading.className = 'inboxHeading';
+  heading.innerHTML = '<span>最後の書き出し</span>';
+  el.appendChild(heading);
+
+  const row = document.createElement('div');
+  row.className = 'exportResultRow' + (rec.ok ? '' : ' fail');
+  const kindLabel = EXPORT_KIND_LABEL[rec.kind] ?? rec.kind;
+  const fileName = basename(rec.file);
+  const title = document.createElement('div');
+  title.className = 'showCardLbl';
+  title.textContent = `${rec.ok ? '✓' : '✕'} ${kindLabel}: ${fileName}`;
+  title.title = rec.file;
+  row.appendChild(title);
+
+  const ts = new Date(rec.ts);
+  const meta = document.createElement('div');
+  meta.className = 'hintText';
+  meta.textContent = `${Number.isNaN(ts.getTime()) ? rec.ts : ts.toLocaleString('ja-JP', { hour12: false })} · 版 ${rec.revision}`;
+  row.appendChild(meta);
+
+  if (!rec.ok && rec.error) {
+    const err = document.createElement('div');
+    err.className = 'hintText';
+    err.textContent = `失敗理由: ${rec.error}`;
+    row.appendChild(err);
+  }
+
+  // 字幕・セリフ焼き込み状況(render 以外の kind では両フィールドとも
+  // undefined のまま — その場合は何も表示しない)。
+  const burnBits = [];
+  if (typeof rec.captionsBurned === 'boolean') {
+    burnBits.push(rec.captionsBurned ? `字幕焼き込み済み(${rec.captionCueCount ?? 0}件)` : '字幕なし');
+  }
+  if (typeof rec.dialogueBurned === 'boolean') {
+    burnBits.push(rec.dialogueBurned ? `セリフ焼き込み済み(${rec.dialogueCount ?? 0}件)` : 'セリフなし');
+  }
+  if (burnBits.length) {
+    const b = document.createElement('div');
+    b.className = 'hintText';
+    b.textContent = burnBits.join(' · ');
+    row.appendChild(b);
+  }
+
+  if (rec.warnings?.length) {
+    for (const w of rec.warnings) {
+      const li = document.createElement('div');
+      li.className = 'hintText exportResultWarning';
+      li.textContent = `⚠ ${w}`;
+      row.appendChild(li);
+    }
+  }
+  el.appendChild(row);
+
+  // レコードの revision が現在の revision と食い違う = それ以降の編集が
+  // まだ反映されていない古い版の書き出し(--tally, 警告専用トーン)。
+  if (S.manifest && rec.revision !== S.manifest.revision) {
+    el.appendChild(inboxWarningRow(
+      '古い版の書き出しです — 最新の内容で書き出すには Claude に伝えてください',
+      { askPrompt: 'MP4を書き出して' },
+    ));
+  }
+}
 function renderInbox() {
   // W-UI IA v2 §5a: a brand-new (zero-source) project has nothing to review
   // yet — the whole 確認 tab collapses to one sentence instead of showing
@@ -3821,6 +3933,10 @@ function renderInbox() {
   $('confirmEmptyProject').hidden = !projectEmpty;
   $('candidatesSection').hidden = projectEmpty;
   $('warningsSection').hidden = projectEmpty;
+  // 波2.5: re-render from the already-fetched S.exportResults on every pass
+  // (revision may have just changed via reload(), which flips the "古い版"
+  // banner) — this does NOT re-fetch; see fetchExportResults for that.
+  renderExportResultCard();
   const badge = $('inboxCount');
   if (projectEmpty) { badge.hidden = true; return; }
 
@@ -4083,8 +4199,8 @@ function focusAfterHistoryAction() {
   if (rows.length === 0) { $('historyPanel').focus(); return; }
   rows[0].focus();
 }
-async function restoreToRevision(rev) {
-  const { ok } = await mutate({ op: 'restore', rev });
+async function restoreToRevision(rev, trigger) {
+  const { ok } = await mutate({ op: 'restore', rev }, { trigger });
   if (ok) toast(`変更 #${rev} の状態に戻しました`);
   // renderActivityFeed() always rebuilds #activityFeed's DOM on reload, so
   // the clicked button is stale either way — always re-focus something so
@@ -4160,7 +4276,7 @@ function renderActivityFeed() {
       btn.textContent = '⟲この編集より前に戻す';
       btn.onclick = async () => {
         if (!confirm(`変更 #${r.rev}「${r.summary}」より前の状態に戻しますか？(これ以降の変更も一緒に戻ります)`)) return;
-        await restoreToRevision(r.rev - 1);
+        await restoreToRevision(r.rev - 1, btn);
       };
       actions.appendChild(btn);
     }
@@ -4168,16 +4284,68 @@ function renderActivityFeed() {
     el.appendChild(card);
   }
 }
-// ---------- shared mutation path ----------
-// Returns {ok, conflict} instead of throwing so callers can decide what to
-// preserve (e.g. keep the transcript selection alive) when a 409 happens.
+// ---------- shared mutation path (波2.5: mutation 状態機械) ----------
+// Every mutate() call moves through: idle -> pending -> committed -> either
+// succeeded (reload OK) or committed-but-refresh-failed (POST /api/edit
+// applied the op, but the follow-up reload() that repaints the UI threw) —
+// OR, if the POST itself never lands, failed-before-commit (nothing was
+// saved; safe to just report and let the caller retry).
+//
+// This split exists because the two failure points look identical from a
+// naive try/catch (both throw) but mean opposite things to the user: a
+// failed-before-commit really is "何も保存されなかった", while a
+// committed-but-refresh-failed already succeeded server-side — showing the
+// same "編集に失敗しました" for both (the pre-波2.5 bug, docs/polish-backlog.md
+// 「保存成功なのに再読込失敗を編集失敗と誤表示」) is dishonest. The returned
+// `ok` stays false in both failure cases (existing callers use it to decide
+// whether to re-render/keep local state around for a retry, which is still
+// the right call when the view couldn't be refreshed), but the TOAST text —
+// and `committed`/`refreshed` for any caller that wants the distinction —
+// now tells them apart.
+//
+// opts.trigger (an element, or an array of elements — typically the button/
+// checkbox/select that started this mutation) is disabled for the duration
+// of the pending phase to prevent double-submission from a second click
+// before the first round-trip resolves; re-enabled once settled (a no-op if
+// reload()'s re-render already replaced/detached the element).
 async function mutate(body, opts = {}) {
+  const triggers = opts.trigger ? (Array.isArray(opts.trigger) ? opts.trigger : [opts.trigger]) : [];
+  for (const el of triggers) if (el) el.disabled = true;
   try {
-    const res = await api('/api/edit', {
-      method: 'POST',
-      body: JSON.stringify({ baseRev: S.manifest.revision, actor: 'ui', ...body }),
-    });
-    await reload();
+    // ---- idle -> pending -> (failed-before-commit | committed) ----
+    let res;
+    try {
+      res = await api('/api/edit', {
+        method: 'POST',
+        body: JSON.stringify({ baseRev: S.manifest.revision, actor: 'ui', ...body }),
+      });
+    } catch (e) {
+      // failed-before-commit: the server never applied this op — nothing
+      // to reconcile, just report it and best-effort resync (e.g. a 409
+      // means someone else moved the revision out from under us).
+      const conflict = e.status === 409;
+      const msg = conflict ? (opts.conflictMessage ?? '他の編集と競合しました。最新状態を再読み込みしました') : e.message;
+      toast(msg, { type: 'error' });
+      await reload().catch(() => {});
+      return { ok: false, conflict, committed: false };
+    }
+    // ---- committed -> syncing -> (succeeded | committed-but-refresh-failed) ----
+    // Everything past this point is a *display refresh* problem, not an
+    // edit failure — the op is already durably saved.
+    const revision = res?.state?.revision ?? null;
+    try {
+      await reload();
+    } catch {
+      toast('保存済みです。画面の更新に失敗しました — ページを再読み込みしてください', { type: 'warn' });
+      // The reload that would have shown the real "変更 #N" summary is the
+      // very thing that just failed, so there's nothing better to show —
+      // suppress the WS broadcast's generic confirmation for this revision
+      // too (same dedupe S.lastWarningRevision already does for `warning`,
+      // below) rather than let it flash a bare "変更 #N: " once the socket
+      // catches up.
+      if (revision != null) S.lastWarningRevision = revision;
+      return { ok: false, conflict: false, result: res, committed: true, refreshed: false };
+    }
     // W-UI IA v2 波2 追補#3: some ops (music-add/-update's duckWarningFor)
     // return a non-fatal `warning` alongside a 200 — previously dropped on
     // the floor entirely. Surface it, and remember which revision it was
@@ -4185,15 +4353,11 @@ async function mutate(body, opts = {}) {
     // immediately clobber it with a bland one for the very same commit.
     if (res && typeof res.warning === 'string' && res.warning) {
       toast(res.warning, { type: 'warn' });
-      S.lastWarningRevision = res.state?.revision ?? S.manifest.revision;
+      S.lastWarningRevision = revision ?? S.manifest.revision;
     }
-    return { ok: true, conflict: false, result: res };
-  } catch (e) {
-    const conflict = e.status === 409;
-    const msg = conflict ? (opts.conflictMessage ?? '他の編集と競合しました。最新状態を再読み込みしました') : e.message;
-    toast(msg, { type: 'error' });
-    await reload().catch(() => {});
-    return { ok: false, conflict };
+    return { ok: true, conflict: false, result: res, committed: true, refreshed: true };
+  } finally {
+    for (const el of triggers) if (el) el.disabled = false;
   }
 }
 
@@ -4267,6 +4431,10 @@ function activateTab(tab, { focus = true } = {}) {
   document.querySelectorAll('.panel').forEach((p) => p.classList.remove('active'));
   $(tab.dataset.panel).classList.add('active');
   if (focus) tab.focus();
+  // 波2.5: 確認タブが表示されるたび「最後の書き出し」カードを最新化(30秒
+  // ポーリングの他に、タブを開いた瞬間も反映されるようにする一手 — see
+  // fetchExportResults's doc).
+  if (tab.dataset.panel === 'nowPanel') fetchExportResults().catch(() => {});
 }
 for (const tab of tabs) {
   tab.onclick = () => activateTab(tab, { focus: false });
@@ -4459,7 +4627,7 @@ function renderTakesCard(sourceId, group) {
       const wordIds = others.flatMap((o) => o.wordIds);
       if (wordIds.length === 0) return;
       if (!confirm(`他の${others.length}テイクを削除します。よろしいですか？`)) return;
-      const { ok } = await mutate({ op: 'remove-words', ids: wordIds, sourceId });
+      const { ok } = await mutate({ op: 'remove-words', ids: wordIds, sourceId }, { trigger: keep });
       if (ok) hideTakesCard();
     };
     actions.append(preview, keep);
@@ -4896,6 +5064,14 @@ window.addEventListener('resize', () => { drawWave(); renderRuler(); });
 // opened later (via `vedit open`) instead of being stuck until a manual
 // browser refresh.
 connectWs();
+// 波2.5: 確認タブは既定で最初から表示されている(index.html の .tab.active)
+// ので、activateTab を経由しない初回だけここで明示的に1回フェッチする。
+// その後は 30秒ごとに確認タブが表示中のときだけポーリング(「軽い」— 他の
+// タブを見ている間は叩かない)。
+fetchExportResults().catch(() => {});
+setInterval(() => {
+  if ($('tab-nowPanel')?.classList.contains('active')) fetchExportResults().catch(() => {});
+}, 30000);
 requestAnimationFrame(tick);
 reload().then(() => {
   if (S.segments.length) loadSeg(0, { play: false });
