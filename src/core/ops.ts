@@ -690,6 +690,23 @@ export function cullingStats(
   return { perSource, totals };
 }
 
+/** Non-enumerable summary counters attached to buildSelectsTimeline's return value (see below). */
+export interface SelectsBuildSummary {
+  /** Scenes marked 'keep' across every source (== the scenes actually considered). */
+  keepScenes: number;
+  /** Total output clips. */
+  clips: number;
+  /** Keep-scenes whose range overlapped the current timeline — their existing in-scene edits (e.g. remove-words) were preserved rather than reset to the raw scene bounds. */
+  preservedScenes: number;
+  /** Keep-scenes with no overlap in the current timeline — newly promoted to keep, so the raw scene range was used as-is. */
+  newScenes: number;
+  /** Whether opts.raw was set (old scene-bounds-only behavior; preservedScenes/newScenes don't apply). */
+  raw: boolean;
+}
+
+/** buildSelectsTimeline's return value: a plain VideoClip[] (so existing array-typed call sites keep working unchanged) with a non-enumerable `.summary` for richer CLI/daemon reporting — invisible to JSON.stringify/toEqual, so it never leaks into the persisted manifest or breaks array equality checks. */
+export type SelectsBuildResult = VideoClip[] & { summary: SelectsBuildSummary };
+
 /**
  * Build a replacement video[] from every scene marked 'keep', in detection
  * order (source order as given, then scene order within each source — the
@@ -697,17 +714,102 @@ export function cullingStats(
  * NOT touch `m.timeline.video` — it's the caller's job to decide whether to
  * apply the replacement (the daemon's 'selects' op, after the CLI/UI has
  * shown a confirm-before-replace preview).
+ *
+ * Default behavior (opts?.raw falsy) preserves in-scene micro-edits that
+ * were already applied to the current timeline (e.g. remove-words cutting a
+ * filler out of the middle of a kept scene): for each keep scene's source
+ * range R, let U be the union of the current timeline's clip ranges for
+ * that same source. If R ∩ U is non-empty, each connected component of
+ * R ∩ U becomes its own output clip — so a word-level cut inside the scene
+ * survives as a gap between two clips instead of being silently reverted
+ * to the scene's raw t0/t1. If R ∩ U is empty (the scene has no presence
+ * on the timeline at all — e.g. it was just newly marked 'keep'), the raw
+ * scene range is used as-is: there's nothing to preserve, and the new
+ * keep verdict should win outright.
+ *
+ * opts.raw restores the old behavior (every keep scene emitted as its raw
+ * [t0,t1), unconditionally replacing whatever was already on the timeline).
  */
-export function buildSelectsTimeline(m: Manifest, sceneFiles: SceneFile[]): VideoClip[] {
-  const out: VideoClip[] = [];
-  for (const f of sceneFiles) {
-    const forSource = m.culling?.[f.sourceId] ?? {};
-    for (const sc of f.scenes) {
-      if (forSource[sc.id] !== 'keep') continue;
-      out.push({ id: freshId('c'), sourceId: f.sourceId, srcIn: sc.t0, srcOut: sc.t1 });
+export function buildSelectsTimeline(m: Manifest, sceneFiles: SceneFile[], opts?: { raw?: boolean }): SelectsBuildResult {
+  const raw = opts?.raw ?? false;
+  const EPS = 1e-6;
+
+  // Union of existing timeline ranges per source, merged into disjoint,
+  // time-sorted intervals — only computed when needed (raw mode skips it
+  // entirely, since nothing is preserved).
+  const unionBySource = new Map<string, { t0: number; t1: number }[]>();
+  if (!raw) {
+    for (const c of m.timeline.video) {
+      if (c.srcOut - c.srcIn <= EPS) continue;
+      const list = unionBySource.get(c.sourceId) ?? [];
+      list.push({ t0: c.srcIn, t1: c.srcOut });
+      unionBySource.set(c.sourceId, list);
+    }
+    for (const [sourceId, ranges] of unionBySource) {
+      ranges.sort((a, b) => a.t0 - b.t0);
+      const merged: { t0: number; t1: number }[] = [];
+      for (const r of ranges) {
+        const last = merged[merged.length - 1];
+        if (last && r.t0 <= last.t1 + EPS) last.t1 = Math.max(last.t1, r.t1);
+        else merged.push({ ...r });
+      }
+      unionBySource.set(sourceId, merged);
     }
   }
-  return out;
+
+  const out: VideoClip[] = [];
+  let keepScenes = 0;
+  let preservedScenes = 0;
+  let newScenes = 0;
+
+  for (const f of sceneFiles) {
+    const forSource = m.culling?.[f.sourceId] ?? {};
+    const union = raw ? [] : (unionBySource.get(f.sourceId) ?? []);
+    for (const sc of f.scenes) {
+      if (forSource[sc.id] !== 'keep') continue;
+      keepScenes++;
+
+      if (raw) {
+        if (sc.t1 - sc.t0 > EPS) {
+          out.push({ id: freshId('c'), sourceId: f.sourceId, srcIn: sc.t0, srcOut: sc.t1 });
+          newScenes++;
+        }
+        continue;
+      }
+
+      const components: { t0: number; t1: number }[] = [];
+      for (const r of union) {
+        const a = Math.max(sc.t0, r.t0);
+        const b = Math.min(sc.t1, r.t1);
+        if (b - a > EPS) components.push({ t0: a, t1: b });
+      }
+
+      if (components.length === 0) {
+        // R ∩ U = ∅ — this scene has no presence on the timeline yet
+        // (freshly promoted to keep). Nothing to preserve; use it whole.
+        if (sc.t1 - sc.t0 > EPS) {
+          out.push({ id: freshId('c'), sourceId: f.sourceId, srcIn: sc.t0, srcOut: sc.t1 });
+          newScenes++;
+        }
+      } else {
+        // R ∩ U ≠ ∅ — reuse the existing connected components so any
+        // in-scene micro-edit (e.g. a removed filler word) stays cut.
+        components.sort((a, b) => a.t0 - b.t0);
+        for (const comp of components) {
+          out.push({ id: freshId('c'), sourceId: f.sourceId, srcIn: comp.t0, srcOut: comp.t1 });
+        }
+        preservedScenes++;
+      }
+    }
+  }
+
+  const result = out as SelectsBuildResult;
+  Object.defineProperty(result, 'summary', {
+    value: { keepScenes, clips: out.length, preservedScenes, newScenes, raw } satisfies SelectsBuildSummary,
+    enumerable: false,
+    configurable: true,
+  });
+  return result;
 }
 
 // ---- B-roll V2 overlay track (W3) ----

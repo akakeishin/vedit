@@ -879,6 +879,112 @@ describe('buildSelectsTimeline', () => {
     buildSelectsTimeline(m, sceneFiles());
     expect(JSON.stringify(m.timeline.video)).toBe(before);
   });
+
+  // ---- P1 fix: preserve in-scene micro-edits (e.g. remove-words) instead
+  // of silently reverting a kept scene to its raw t0/t1. ----
+
+  it('preserves a word-level cut already applied inside a kept scene (R ∩ U keeps both fragments)', () => {
+    let m = twoSourceManifest();
+    // sc1 spans s1 [0,5). A prior remove-words cut out the middle word
+    // [2,3), leaving two clips already on the timeline: [0,2) and [3,5).
+    m = {
+      ...m,
+      timeline: {
+        ...m.timeline,
+        video: [
+          { id: 'w1', sourceId: 's1', srcIn: 0, srcOut: 2 },
+          { id: 'w2', sourceId: 's1', srcIn: 3, srcOut: 5 },
+        ],
+      },
+    };
+    m = setSceneReview(m, 's1', 'sc1', 'keep');
+    const video = buildSelectsTimeline(m, sceneFiles());
+    // The scene's raw range [0,5) is NOT reinstated — the existing gap survives.
+    expect(video.map((c) => [c.sourceId, c.srcIn, c.srcOut])).toEqual([
+      ['s1', 0, 2],
+      ['s1', 3, 5],
+    ]);
+    expect(video.summary).toEqual({ keepScenes: 1, clips: 2, preservedScenes: 1, newScenes: 0, raw: false });
+  });
+
+  it('emits a scene whole when it has no presence at all on the current timeline (freshly promoted to keep)', () => {
+    let m = twoSourceManifest();
+    // s2 has zero clips on the timeline at all (twoSourceManifest's only
+    // clip is on s1) — R ∩ U = ∅, so the raw scene range wins outright.
+    m = setSceneReview(m, 's2', 'sc1', 'keep');
+    const video = buildSelectsTimeline(m, sceneFiles());
+    expect(video.map((c) => [c.sourceId, c.srcIn, c.srcOut])).toEqual([['s2', 0, 8]]);
+    expect(video.summary).toEqual({ keepScenes: 1, clips: 1, preservedScenes: 0, newScenes: 1, raw: false });
+  });
+
+  it('opts.raw restores the old behavior: every keep scene emitted as its raw t0/t1, discarding in-scene edits', () => {
+    let m = twoSourceManifest();
+    m = {
+      ...m,
+      timeline: {
+        ...m.timeline,
+        video: [
+          { id: 'w1', sourceId: 's1', srcIn: 0, srcOut: 2 },
+          { id: 'w2', sourceId: 's1', srcIn: 3, srcOut: 5 },
+        ],
+      },
+    };
+    m = setSceneReview(m, 's1', 'sc1', 'keep');
+    const video = buildSelectsTimeline(m, sceneFiles(), { raw: true });
+    expect(video.map((c) => [c.sourceId, c.srcIn, c.srcOut])).toEqual([['s1', 0, 5]]);
+    expect(video.summary).toEqual({ keepScenes: 1, clips: 1, preservedScenes: 0, newScenes: 1, raw: true });
+  });
+
+  it('drops zero/near-zero-width intersection components instead of emitting a spurious sliver clip', () => {
+    let m = twoSourceManifest();
+    // sc1 spans s1 [0,10). One substantial existing clip [2,6) overlaps
+    // it cleanly; a second existing clip only grazes the scene's t1=10
+    // boundary by 5e-7s (below the file's 1e-6 epsilon) — that sliver must
+    // not surface as its own output clip.
+    m = {
+      ...m,
+      sources: [{ id: 's1', path: '/x.mp4', duration: 60, fps: 30, width: 1920, height: 1080, hasAudio: true }],
+      timeline: {
+        ...m.timeline,
+        video: [
+          { id: 'w1', sourceId: 's1', srcIn: 2, srcOut: 6 },
+          { id: 'w2', sourceId: 's1', srcIn: 10 - 5e-7, srcOut: 10 + 5e-7 },
+        ],
+      },
+    };
+    const scenes: SceneFile[] = [
+      { sourceId: 's1', scenes: [{ id: 'sc1', t0: 0, t1: 10, thumb: 'x', hasSpeech: false, energy: 0 }] },
+    ];
+    m = setSceneReview(m, 's1', 'sc1', 'keep');
+    const video = buildSelectsTimeline(m, scenes);
+    expect(video.map((c) => [c.sourceId, c.srcIn, c.srcOut])).toEqual([['s1', 2, 6]]);
+    expect(video.summary).toEqual({ keepScenes: 1, clips: 1, preservedScenes: 1, newScenes: 0, raw: false });
+  });
+
+  it('handles multiple sources independently — each source\'s union is computed on its own clips only', () => {
+    let m = twoSourceManifest();
+    m = {
+      ...m,
+      timeline: {
+        ...m.timeline,
+        video: [
+          // s1: a prior word-cut inside sc1 [0,5) leaves [0,2)+[3,5) on the timeline.
+          { id: 'w1', sourceId: 's1', srcIn: 0, srcOut: 2 },
+          { id: 'w2', sourceId: 's1', srcIn: 3, srcOut: 5 },
+          // s2 has no clips on the timeline at all.
+        ],
+      },
+    };
+    m = setSceneReview(m, 's1', 'sc1', 'keep');
+    m = setSceneReview(m, 's2', 'sc1', 'keep');
+    const video = buildSelectsTimeline(m, sceneFiles());
+    expect(video.map((c) => [c.sourceId, c.srcIn, c.srcOut])).toEqual([
+      ['s1', 0, 2],
+      ['s1', 3, 5],
+      ['s2', 0, 8],
+    ]);
+    expect(video.summary).toEqual({ keepScenes: 2, clips: 3, preservedScenes: 1, newScenes: 1, raw: false });
+  });
 });
 
 // ---- W3: B-roll V2 overlay track ----

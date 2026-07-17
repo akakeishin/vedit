@@ -73,7 +73,7 @@ const BOOLEAN_FLAGS = new Set([
   'latest', 'full', 'all', 'burn-captions', 'no-duck',
   'no-repair', 'fast-loudnorm', 'deess', 'confirm',
   'plan', 'link', 'no-verify', 'force', 'flip', 'no-flip',
-  'clear', 'no-motion', 'no-sprite',
+  'clear', 'no-motion', 'no-sprite', 'raw',
 ]);
 const argv = process.argv.slice(2);
 const cmd = argv[0];
@@ -363,7 +363,8 @@ scenes:    scenes detect [--source id] [--sensitivity 0.3] [--max-len 12] [--min
            --scene <sceneId> sugar on clip-add / remove-range / view (resolves to sourceId+t0+t1)
 culling:   review <sceneId...> keep|reject|clear [--source id] --base <rev>   # 3状態カリング(未確認/keep/reject)
            review-status                            # keep/reject/未確認の集計 + 次に確認すべきシーン id
-           selects --base <rev> [--confirm]         # keep シーンだけの仮タイムラインでタイムラインを置換(--confirm 無しはプレビューのみ)
+           selects --base <rev> [--confirm]         # keep シーンだけの仮タイムラインでタイムラインを置換(--confirm 無しはプレビューのみ)。keep シーン内の既存の微修正(remove-words 等)は既定で保持
+           selects --raw                            # プレビューのみ: 旧動作(シーン生範囲でそのまま置換、微修正は破棄)を確認。--raw --confirm は未対応
 reframe:   reframe <9:16|1:1|16:9|WxH> [--focus left|center|right|0..1]
            clip-crop <clipId> [--x 0..1] [--y 0..1]
 captions:  captions [--enabled true|false] [--style clean|bold|<kitStyleId>] [--max-chars 24]
@@ -1105,6 +1106,12 @@ async function main() {
     }
 
     case 'selects': {
+      const raw = !!flags.raw;
+      if (raw && flags.confirm) {
+        fail(
+          '--raw --confirm はまだ未対応です(適用は daemon の /api/edit "selects" 経由で行われ、daemon 側に raw の配線が無いため既定の微修正保持動作で適用されてしまいます)。--raw はプレビュー確認のみに使ってください',
+        );
+      }
       const dir = projectDir();
       const p = await Project.open(dir);
       const m = await p.manifest();
@@ -1113,12 +1120,21 @@ async function main() {
         const f = await p.scenes(s.id);
         if (f.scenes.length) sceneFiles.push(f);
       }
-      const newVideo = buildSelectsTimeline(m, sceneFiles);
+      const newVideo = buildSelectsTimeline(m, sceneFiles, raw ? { raw: true } : undefined);
+      const { keepScenes, preservedScenes, newScenes } = newVideo.summary;
+      const summaryLine = raw
+        ? `keep ${keepScenes}シーン → クリップ${newVideo.length}個(--raw: シーン範囲でそのまま置換、微修正は保持しません)`
+        : `keep ${keepScenes}シーン → クリップ${newVideo.length}個(微修正${preservedScenes}件を保持、${newScenes}シーンを新規追加)`;
       const preview = {
         currentClips: m.timeline.video.length,
         currentDuration: Number(timelineDuration(m).toFixed(2)),
         newClips: newVideo.length,
         newDuration: Number(newVideo.reduce((sum, c) => sum + (c.srcOut - c.srcIn), 0).toFixed(2)),
+        keepScenes,
+        preservedScenes,
+        newScenes,
+        raw,
+        summary: summaryLine,
       };
       if (!flags.confirm) {
         return out({
