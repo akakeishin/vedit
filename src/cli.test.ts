@@ -202,6 +202,121 @@ describe('cli: vedit export render wires motion sidecars into the render (W7)', 
   });
 });
 
+/**
+ * Critical trap fix: `vedit export render` used to require the opt-in
+ * `--burn-captions` flag even when `captions.enabled` was true — omitting it
+ * (the common/default invocation) silently produced a video with NO
+ * subtitles AND no dialogue (speech-bubble lines), since both lived behind
+ * the same `opts.burnCaptions && captions.enabled` gate in render.ts. Fixed
+ * spec: captions.enabled=true burns by DEFAULT now; `--no-burn-captions`
+ * opts out for a clean NLE hand-off render; dialogue always burns
+ * regardless of the captions gate (it has no other output path). These
+ * tests exercise the real CLI end-to-end (same ffmpeg-stub approach as the
+ * W7 describe block above) and assert both the JSON result and the
+ * stderr status line the spec calls for ("字幕を焼き込み(N cues)" /
+ * "字幕は焼き込みなし(...)").
+ */
+describe('cli: vedit export render — caption/dialogue default-burn gate (Critical trap fix)', () => {
+  let stub: string;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-cli-ffstub2-'));
+    stub = path.join(root, 'ffmpeg-stub.sh');
+    await fsp.writeFile(
+      stub,
+      '#!/bin/bash\n' +
+        'if [ "$1" = "-hide_banner" ] && [ "$2" = "-filters" ]; then\n' +
+        '  printf " T.. drawtext          Draw text\\n T.. ass               Render ASS\\n"\n' +
+        '  exit 0\n' +
+        'fi\n' +
+        'if [ -n "$FFMPEG_ARGS_LOG" ]; then printf "%s\\n" "$@" >> "$FFMPEG_ARGS_LOG"; fi\n' +
+        'exit 0\n',
+      { mode: 0o755 },
+    );
+  });
+
+  async function seedProjectWithCaptionableTranscript(name: string): Promise<{ root: string; dir: string; project: Project }> {
+    const root = mkdtempSync(path.join(tmpdir(), `vedit-cli-burngate-${name}-`));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, name);
+    const words: Word[] = [{ id: 'w0', text: 'Hello.', t0: 1.0, t1: 2.0, p: 0.95 }];
+    await project.writeTranscript({ sourceId: 's1', language: 'en', words });
+    await project.commit(0, 'system', 'setup', {}, 'seed', (m) => ({
+      ...m,
+      sources: [{ id: 's1', path: '/media/one.mp4', duration: 10, fps: 30, width: 1920, height: 1080, hasAudio: true, transcribed: true }],
+      timeline: { ...m.timeline, video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 10 }] },
+    }));
+    return { root, dir, project };
+  }
+
+  it('captions.enabled=true with NO --burn-captions flag burns captions by default and reports the cue count', async () => {
+    const { root, dir } = await seedProjectWithCaptionableTranscript('default-burn');
+    const argsLog = path.join(root, 'ffmpeg-args.log');
+    const { status, stdout, stderr } = runCli(
+      ['export', 'render', path.join(root, 'out.mp4'), '--project', dir],
+      { VEDIT_FFMPEG: stub, FFMPEG_ARGS_LOG: argsLog },
+    );
+    expect(status, stderr).toBe(0);
+    expect(JSON.parse(stdout).ok).toBe(true);
+    expect(stderr).toMatch(/字幕を焼き込み\(\d+ cues\)/);
+    const logged = await fsp.readFile(argsLog, 'utf8');
+    expect(logged).toMatch(/\.vedit-captions\.ass/);
+  });
+
+  it('--no-burn-captions opts out of the caption burn but dialogue on the timeline still burns', async () => {
+    const { root, dir, project } = await seedProjectWithCaptionableTranscript('no-burn-captions');
+    await project.commit(1, 'system', 'setup', {}, 'add dialogue', (m) => ({
+      ...m,
+      timeline: { ...m.timeline, dialogue: [{ id: 'dl1', text: 'hi', tlStart: 0, duration: 2 }] },
+    }));
+    const argsLog = path.join(root, 'ffmpeg-args.log');
+    const { status, stdout, stderr } = runCli(
+      ['export', 'render', path.join(root, 'out.mp4'), '--project', dir, '--no-burn-captions'],
+      { VEDIT_FFMPEG: stub, FFMPEG_ARGS_LOG: argsLog },
+    );
+    expect(status, stderr).toBe(0);
+    expect(JSON.parse(stdout).ok).toBe(true);
+    expect(stderr).toMatch(/字幕は焼き込みなし\(--no-burn-captions\)/);
+    expect(stderr).toMatch(/セリフを焼き込み\(1件\)/);
+    const logged = await fsp.readFile(argsLog, 'utf8');
+    expect(logged).toMatch(/\.vedit-captions\.ass/); // ass filter still present — burned for dialogue
+  });
+
+  it('captions.enabled=false with dialogue on the timeline still burns the dialogue (the trap this fix closes)', async () => {
+    const { root, dir, project } = await seedProjectWithCaptionableTranscript('disabled-with-dialogue');
+    await project.commit(1, 'system', 'setup', {}, 'disable captions + add dialogue', (m) => ({
+      ...m,
+      captions: { ...m.captions, enabled: false },
+      timeline: { ...m.timeline, dialogue: [{ id: 'dl1', text: 'hi', tlStart: 0, duration: 2 }] },
+    }));
+    const argsLog = path.join(root, 'ffmpeg-args.log');
+    const { status, stdout, stderr } = runCli(
+      ['export', 'render', path.join(root, 'out.mp4'), '--project', dir],
+      { VEDIT_FFMPEG: stub, FFMPEG_ARGS_LOG: argsLog },
+    );
+    expect(status, stderr).toBe(0);
+    expect(JSON.parse(stdout).ok).toBe(true);
+    expect(stderr).toMatch(/字幕は焼き込みなし\(captions\.enabled=false\)/);
+    expect(stderr).toMatch(/セリフを焼き込み\(1件\)/);
+    const logged = await fsp.readFile(argsLog, 'utf8');
+    expect(logged).toMatch(/\.vedit-captions\.ass/); // ass filter present for dialogue despite captions disabled
+  });
+
+  it('legacy --burn-captions flag alone still works exactly as before (backward compatible, now a no-op)', async () => {
+    const { root, dir } = await seedProjectWithCaptionableTranscript('legacy-flag');
+    const argsLog = path.join(root, 'ffmpeg-args.log');
+    const { status, stdout, stderr } = runCli(
+      ['export', 'render', path.join(root, 'out.mp4'), '--project', dir, '--burn-captions'],
+      { VEDIT_FFMPEG: stub, FFMPEG_ARGS_LOG: argsLog },
+    );
+    expect(status, stderr).toBe(0);
+    expect(JSON.parse(stdout).ok).toBe(true);
+    expect(stderr).toMatch(/字幕を焼き込み\(\d+ cues\)/);
+    const logged = await fsp.readFile(argsLog, 'utf8');
+    expect(logged).toMatch(/\.vedit-captions\.ass/);
+  });
+});
+
 describe('cli: vedit retro', () => {
   it('outputs structured JSON (introDropPct/dips/spikes) plus a fact-only human-readable summary', async () => {
     const root = mkdtempSync(path.join(tmpdir(), 'vedit-cli-retro-'));

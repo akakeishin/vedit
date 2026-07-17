@@ -300,6 +300,35 @@ describe('toAss', () => {
   });
 });
 
+// ---- toAss: opts.includeCaptions (dialogue-only ASS support) ----
+
+describe('toAss: opts.includeCaptions', () => {
+  it('defaults to true — omitting opts reproduces the exact pre-existing output (full regression)', () => {
+    const withDefault = toAss(manifest('clean'), [transcript()]);
+    const withExplicitTrue = toAss(manifest('clean'), [transcript()], undefined, { includeCaptions: true });
+    expect(withExplicitTrue).toBe(withDefault);
+  });
+
+  it('includeCaptions:false omits caption cue Dialogue lines while keeping dialogue speech-bubble lines', () => {
+    let m = manifest('clean');
+    m = addDialogue(m, 'こんにちは', { tlStart: 3, duration: 2, id: 'dl1' });
+    const ass = toAss(m, [transcript()], undefined, { includeCaptions: false });
+    // the transcript's own cue text must be gone...
+    expect(ass).not.toContain('Hello.');
+    expect(ass).not.toMatch(/^Dialogue: 0,.*,clean,,/m);
+    // ...but the dialogue speech-bubble line survives untouched.
+    const line = ass.split('\n').find((l) => l.includes(',dialogue,,'));
+    expect(line).toBeDefined();
+    expect(line).toContain('こんにちは');
+  });
+
+  it('includeCaptions:false with no dialogue either produces an ASS with styles but zero Dialogue events', () => {
+    const ass = toAss(manifest('clean'), [transcript()], undefined, { includeCaptions: false });
+    expect(ass).toMatch(/^Style: clean,/m); // styles are always emitted
+    expect(ass.split('\n').filter((l) => l.startsWith('Dialogue: '))).toHaveLength(0);
+  });
+});
+
 // ---- W-ANIME: dialogue speech bubbles -> ASS ----
 
 describe('toAss: W-ANIME dialogue speech bubbles', () => {
@@ -1343,6 +1372,116 @@ describe('renderFinal: W-CAP overrides.font', () => {
   });
 });
 
+// ---- Critical trap fix: captions burn by DEFAULT when enabled; dialogue
+// always burns regardless of the captions gate ----
+//
+// Truth table (see renderFinal's doc for the full rationale):
+//   captions.enabled | --no-burn-captions | dialogue present | captions burn | dialogue burns
+//   true              | (unset)            | *                | yes (cues>0)  | yes (if any)
+//   true              | true               | *                | no            | yes (if any)
+//   false             | *                  | *                | no            | yes (if any)
+//   false             | *                  | none             | no            | no (nothing to burn)
+// `opts.burnCaptions` no longer gates anything — kept only for backward
+// compatibility with existing callers/CLI invocations.
+describe('renderFinal: caption/dialogue default-burn gate', () => {
+  it('captions.enabled=true with NO flags at all burns captions by default (the fix — old code required --burn-captions)', async () => {
+    runMock.mockClear();
+    const m = manifest('clean');
+    const res = await renderFinal(m, [transcript()], outPathIn('/tmp'));
+    expect(res.captionsBurned).toBe(true);
+    expect(res.captionCueCount).toBeGreaterThan(0);
+    expect(res.dialogueBurned).toBe(false);
+    const args = runMock.mock.calls[0][1] as string[];
+    const graph = args[args.indexOf('-filter_complex') + 1];
+    expect(graph).toMatch(/ass='.*\.vedit-captions\.ass'\[vout\]/);
+  });
+
+  it('legacy opts.burnCaptions=false does NOT suppress the new default burn (the flag is now a no-op)', async () => {
+    runMock.mockClear();
+    const m = manifest('clean');
+    const res = await renderFinal(m, [transcript()], outPathIn('/tmp'), { burnCaptions: false });
+    expect(res.captionsBurned).toBe(true);
+    const args = runMock.mock.calls[0][1] as string[];
+    const graph = args[args.indexOf('-filter_complex') + 1];
+    expect(graph).toMatch(/ass=/);
+  });
+
+  it('explicit --burn-captions (legacy flag) still burns captions exactly as before — backward compatible', async () => {
+    runMock.mockClear();
+    const m = manifest('clean');
+    const res = await renderFinal(m, [transcript()], outPathIn('/tmp'), { burnCaptions: true });
+    expect(res.captionsBurned).toBe(true);
+    const args = runMock.mock.calls[0][1] as string[];
+    const graph = args[args.indexOf('-filter_complex') + 1];
+    expect(graph).toMatch(/ass='.*\.vedit-captions\.ass'\[vout\]/);
+  });
+
+  it('--no-burn-captions opts out of the caption burn, but dialogue still burns (dialogue has no off switch)', async () => {
+    runMock.mockClear();
+    const writeSpy = vi.spyOn(fsp, 'writeFile');
+    const m = addDialogue(manifest('clean'), 'こんにちは', { tlStart: 0, duration: 2, id: 'dl1' });
+    const res = await renderFinal(m, [transcript()], outPathIn('/tmp'), { noBurnCaptions: true });
+    expect(res.captionsBurned).toBe(false);
+    expect(res.captionCueCount).toBe(0);
+    expect(res.dialogueBurned).toBe(true);
+    expect(res.dialogueCount).toBe(1);
+    const args = runMock.mock.calls[0][1] as string[];
+    const graph = args[args.indexOf('-filter_complex') + 1];
+    expect(graph).toMatch(/ass='.*\.vedit-captions\.ass'\[vout\]/); // one shared ass doc, still burned (for dialogue)
+    const assWrite = writeSpy.mock.calls.find(([p]) => String(p).endsWith('.vedit-captions.ass'));
+    expect(assWrite).toBeDefined();
+    const assContent = String(assWrite![1]);
+    expect(assContent).toMatch(/^Dialogue: 0,.*,dialogue,,/m); // the speech-bubble line IS there
+    expect(assContent).not.toContain('Hello.'); // the transcript's caption text must NOT be burned
+    writeSpy.mockRestore();
+  });
+
+  it('captions.enabled=false with dialogue on the timeline burns dialogue only (THE trap this fix closes)', async () => {
+    runMock.mockClear();
+    const writeSpy = vi.spyOn(fsp, 'writeFile');
+    let m = manifest('clean');
+    m.captions.enabled = false;
+    m = addDialogue(m, 'こんにちは', { tlStart: 0, duration: 2, id: 'dl1' });
+    const res = await renderFinal(m, [transcript()], outPathIn('/tmp'));
+    expect(res.captionsBurned).toBe(false);
+    expect(res.dialogueBurned).toBe(true);
+    expect(res.dialogueCount).toBe(1);
+    const args = runMock.mock.calls[0][1] as string[];
+    const graph = args[args.indexOf('-filter_complex') + 1];
+    // Before the fix, this whole block was skipped entirely (gated on
+    // `opts.burnCaptions && captions.enabled`) — dialogue silently vanished.
+    expect(graph).toMatch(/ass='.*\.vedit-captions\.ass'\[vout\]/);
+    const assWrite = writeSpy.mock.calls.find(([p]) => String(p).endsWith('.vedit-captions.ass'));
+    const assContent = String(assWrite![1]);
+    expect(assContent).toMatch(/^Dialogue: 0,.*,dialogue,,/m);
+    expect(assContent).not.toContain('Hello.');
+    writeSpy.mockRestore();
+  });
+
+  it('captions.enabled=false and no dialogue burns nothing at all (regression: disabled + empty stays a no-op)', async () => {
+    runMock.mockClear();
+    const m = manifest('clean');
+    m.captions.enabled = false;
+    const res = await renderFinal(m, [transcript()], outPathIn('/tmp'));
+    expect(res.captionsBurned).toBe(false);
+    expect(res.dialogueBurned).toBe(false);
+    const args = runMock.mock.calls[0][1] as string[];
+    const graph = args[args.indexOf('-filter_complex') + 1];
+    expect(graph).not.toMatch(/ass=/);
+  });
+
+  it('no transcripts at all (enabled=true, no dialogue) still burns nothing — "enabled" alone is not "has cues"', async () => {
+    runMock.mockClear();
+    const m = manifest('clean');
+    const res = await renderFinal(m, [], outPathIn('/tmp'));
+    expect(res.captionsBurned).toBe(false);
+    expect(res.captionCueCount).toBe(0);
+    const args = runMock.mock.calls[0][1] as string[];
+    const graph = args[args.indexOf('-filter_complex') + 1];
+    expect(graph).not.toMatch(/ass=/);
+  });
+});
+
 // ---- W7: motion burn-in (renderFinal + renderComposition) ----
 
 function motionItemT(partial: Partial<MotionItem> & { id: string; tlStart: number; duration: number }): MotionItem {
@@ -1499,6 +1638,36 @@ describe('renderComposition: W7 motion burn-in', () => {
     const m = { ...compManifest(), timeline: { ...compManifest().timeline, motion: [motionItemT({ id: 'm1', tlStart: 0, duration: 2 })] } };
     const res = await renderComposition(m, outPathIn('/tmp'), { motionSpecs: { m1: motionSpecT('custom-html', {}) } });
     expect(res.warnings).toContain('custom-html は焼き込み対象外(1件)');
+    const args = runMock.mock.calls[0][1] as string[];
+    const graph = args[args.indexOf('-filter_complex') + 1];
+    expect(graph).not.toMatch(/ass=/);
+  });
+});
+
+// ---- renderComposition full regression against the renderFinal default-burn
+// change above: renderComposition's `opts` type has no burnCaptions/
+// noBurnCaptions field at all (compile-time proof it can't be affected), it
+// never passes transcripts to toAss (so captionCues is always []), and its
+// dialogue burn was ALREADY unconditional before this change — these tests
+// pin that "captions never burn, dialogue always burns when present" holds
+// exactly as before, regardless of manifest.captions.enabled. ----
+describe('renderComposition: full regression (unaffected by the renderFinal default-burn gate change)', () => {
+  it('dialogue burns unconditionally even with captions.enabled=false — composition never reads the captions gate at all', async () => {
+    runMock.mockClear();
+    let m = compManifest({ dialogue: [{ id: 'dl1', text: 'hi', tlStart: 0, duration: 2 }] });
+    m = { ...m, captions: { ...m.captions, enabled: false } };
+    const res = await renderComposition(m, outPathIn('/tmp'));
+    expect(res.warnings).toEqual([]);
+    const args = runMock.mock.calls[0][1] as string[];
+    const graph = args[args.indexOf('-filter_complex') + 1];
+    expect(graph).toMatch(/ass='.*\.vedit-dialogue\.ass'\[vout\]/);
+  });
+
+  it('no dialogue -> no ass burn at all, same as before this change (captions never enter this path — no transcripts are ever passed)', async () => {
+    runMock.mockClear();
+    const m = compManifest();
+    const res = await renderComposition(m, outPathIn('/tmp'));
+    expect(res.warnings).toEqual([]);
     const args = runMock.mock.calls[0][1] as string[];
     const graph = args[args.indexOf('-filter_complex') + 1];
     expect(graph).not.toMatch(/ass=/);

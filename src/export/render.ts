@@ -246,9 +246,22 @@ function applyCaptionOverrides(
  * MarginV override rather than touching the shared default. No `overrides`
  * at all reproduces the exact ASS this function emitted before W-CAP
  * existed — full regression.
+ *
+ * `opts.includeCaptions` (default true): set to `false` to omit caption
+ * cues entirely while still emitting dialogue `Dialogue:` lines — this is
+ * how renderFinal produces a dialogue-only burn (captions.enabled=false, or
+ * --no-burn-captions with dialogue on the timeline) without a second ASS
+ * document. Every existing caller omits this option, so the default (true)
+ * reproduces the exact pre-existing output — full regression.
  */
-export function toAss(m: Manifest, transcripts: Transcript[], kit?: KitFile | null): string {
-  const cues = captionCues(m, transcripts);
+export function toAss(
+  m: Manifest,
+  transcripts: Transcript[],
+  kit?: KitFile | null,
+  opts: { includeCaptions?: boolean } = {},
+): string {
+  const includeCaptions = opts.includeCaptions ?? true;
+  const cues = includeCaptions ? captionCues(m, transcripts) : [];
   const { width, height } = m.output ?? { width: m.width, height: m.height };
   const defaultFontSize = Math.round(height * 0.045);
   const defaultMarginV = Math.round(height * 0.06);
@@ -1102,9 +1115,24 @@ async function measureLoudnorm(
  * optional music mix/duck, optional conversational-audio repair chain
  * (manifest.audioRepair), final-stage loudness normalization (2-pass by
  * default — measure then apply; `--fast-loudnorm`/`fastLoudnorm` falls back
- * to the old 1-pass application), optional ASS caption burn, W7 motion burn
- * (see below), optional publish preset (encode params + forced loudnorm
- * target + resize).
+ * to the old 1-pass application), ASS caption/dialogue burn (see the gate
+ * below), W7 motion burn (see below), optional publish preset (encode
+ * params + forced loudnorm target + resize).
+ *
+ * Caption/dialogue burn gate: captions burn by DEFAULT whenever
+ * `m.captions.enabled` is true and actually produce at least one cue for
+ * the given transcripts — `opts.noBurnCaptions` (CLI: --no-burn-captions)
+ * opts OUT of the caption burn for a clean hand-off render (NLE/editor
+ * wants to add its own subtitles). `opts.burnCaptions` is accepted for
+ * backward compatibility but is now a no-op — it no longer gates anything,
+ * since burning is the default. `m.timeline.dialogue` (speech-bubble lines,
+ * see its doc in types.ts) burns UNCONDITIONALLY whenever present,
+ * independent of the captions gate — a render is dialogue's only output
+ * path, so there is no "off" switch for it (matches renderComposition's
+ * dialogue burn, which has always been unconditional). The two are still
+ * ONE shared ASS document/`ass` filter (toAss's `includeCaptions` option
+ * controls only whether caption cues are added to it; dialogue lines are
+ * always added when present) — see toAss's doc.
  *
  * W7 motion burn: when `opts.motionSpecs` is supplied (caller-resolved
  * MotionItem sidecar content, keyed by id — see loadMotionSpecs below), the
@@ -1120,16 +1148,32 @@ async function measureLoudnorm(
  * why render.ts can't resolve the sidecars itself.
  *
  * Regression contract: with no `--preset`, no `manifest.audioRepair` (or an
- * explicit `preset: 'off'`), no music, and no `opts.motionSpecs`, this
- * produces the exact same ffmpeg filtergraph as before loudnorm/repair/W7
- * existed — no loudnorm filter at all, audio chain unchanged.
+ * explicit `preset: 'off'`), no music, no `opts.motionSpecs`, and nothing
+ * that would actually produce a caption cue or dialogue line (no
+ * transcripts, or captions disabled/opted out, and no `m.timeline.dialogue`)
+ * this produces the exact same ffmpeg filtergraph as before loudnorm/repair/
+ * W7/this default-burn change existed — no loudnorm filter at all, audio
+ * chain unchanged, no `ass` filter at all.
  */
 export async function renderFinal(
   m: Manifest,
   transcripts: Transcript[],
   outPath: string,
-  opts: { burnCaptions?: boolean; fastLoudnorm?: boolean; noRepair?: boolean; motionSpecs?: Record<string, MotionSpec> } & RenderParamOverrides = {},
-): Promise<{ file: string; warnings: string[] }> {
+  opts: {
+    burnCaptions?: boolean;
+    noBurnCaptions?: boolean;
+    fastLoudnorm?: boolean;
+    noRepair?: boolean;
+    motionSpecs?: Record<string, MotionSpec>;
+  } & RenderParamOverrides = {},
+): Promise<{
+  file: string;
+  warnings: string[];
+  captionsBurned: boolean;
+  captionCueCount: number;
+  dialogueBurned: boolean;
+  dialogueCount: number;
+}> {
   // --no-repair (dry-audio A/B): disable the repair chain for this render
   // only, without touching the manifest's saved setting.
   const effectiveM: Manifest = opts.noRepair ? { ...m, audioRepair: undefined } : m;
@@ -1190,16 +1234,31 @@ export async function renderFinal(
   let graph = built.graph;
   const inputs = ffmpegInputArgs(built.inputPaths, built.spriteInputIndices);
 
+  // Caption/dialogue burn gate — see this function's doc for the full
+  // rationale. `burnCaptionsNow` is what actually gets PASSED to toAss (an
+  // intent — "captions are allowed to appear"); `cues` is what actually
+  // came OUT (captionCues returns [] for a caption-less/transcript-less
+  // project even with burnCaptionsNow true), so `needsAssBurn` — the thing
+  // that decides whether an .ass file/`ass` filter exists AT ALL — is keyed
+  // off the real cue count, not just the intent, to keep the "nothing to
+  // caption" case byte-for-byte regression-safe (no stray empty ass filter).
+  const noBurnCaptions = Boolean(opts.noBurnCaptions);
+  const burnCaptionsNow = effectiveM.captions.enabled && !noBurnCaptions;
+  const cues = burnCaptionsNow ? captionCues(effectiveM, transcripts) : [];
+  const dialogueCount = (effectiveM.timeline.dialogue ?? []).length;
+  const hasDialogue = dialogueCount > 0;
+  const needsAssBurn = cues.length > 0 || hasDialogue;
+
   let assPath: string | null = null;
-  if (opts.burnCaptions && effectiveM.captions.enabled && !ffmpegHasFilter('ass')) {
+  if (needsAssBurn && !ffmpegHasFilter('ass')) {
     throw new Error(
-      'this ffmpeg build lacks the `ass` filter (caption burn). Install `brew install ffmpeg-full` or set VEDIT_FFMPEG, or export without --burn-captions.',
+      'this ffmpeg build lacks the `ass` filter (caption/dialogue burn). Install `brew install ffmpeg-full` or set VEDIT_FFMPEG, or (captions only) export with --no-burn-captions.',
     );
   }
   let vLabel = built.videoLabel;
-  if (opts.burnCaptions && effectiveM.captions.enabled) {
+  if (needsAssBurn) {
     assPath = path.join(path.dirname(outPath), '.vedit-captions.ass');
-    await fs.writeFile(assPath, toAss(effectiveM, transcripts, kit));
+    await fs.writeFile(assPath, toAss(effectiveM, transcripts, kit, { includeCaptions: burnCaptionsNow }));
     // W8: point libass at the kit's font directory (fontsdir=) instead of
     // `--attach`ing the font, so the ASS Fontname (the font FILE's basename,
     // see kitAssStyle in toAss) actually resolves. No kit style in use (or
@@ -1304,7 +1363,14 @@ export async function renderFinal(
   ]);
   if (assPath) await fs.rm(assPath, { force: true });
   if (motionAssPath) await fs.rm(motionAssPath, { force: true });
-  return { file: outPath, warnings };
+  return {
+    file: outPath,
+    warnings,
+    captionsBurned: cues.length > 0,
+    captionCueCount: cues.length,
+    dialogueBurned: hasDialogue,
+    dialogueCount,
+  };
 }
 
 /**

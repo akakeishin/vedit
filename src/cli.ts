@@ -70,7 +70,7 @@ const BASE = `http://localhost:${PORT}`;
 // leave the positional argument list empty.
 const BOOLEAN_FLAGS = new Set([
   'transcribe', 'no-transcribe', 'no-scenes', 'no-add', 'no-fillers', 'no-silence',
-  'latest', 'full', 'all', 'burn-captions', 'no-duck',
+  'latest', 'full', 'all', 'burn-captions', 'no-burn-captions', 'no-duck',
   'no-repair', 'fast-loudnorm', 'deess', 'confirm',
   'plan', 'link', 'no-verify', 'force', 'flip', 'no-flip',
   'clear', 'no-motion', 'no-sprite', 'raw', 'keep-duration', 'sfx',
@@ -417,9 +417,12 @@ inspect:   view [--from a] [--to b] [--domain timeline|source] [--source id] [--
 qc:        qc [--render <out.mp4>] [--report <out.html>]
              # 静的チェック(未処理候補/orphan/字幕重複/色警告/素材欠落/kit尺乖離)。--render で暗転・無音・ラウドネスも実測
              # kit があれば tempo contract(表示のみ・合否判定なし)も付与。--report で buildQcReport の HTML を書き出し
-export:    export otio <out.otio> | export render <out.mp4> [--burn-captions] [--preset youtube|shorts|x]
+export:    export otio <out.otio> | export render <out.mp4> [--no-burn-captions] [--preset youtube|shorts|x]
            export render ... [--no-repair] [--fast-loudnorm]   # 乾音A/B比較 / 1-passループドネスに落とす
+             # captions.enabled なら字幕は既定で焼き込み。--no-burn-captions でクリーン映像に(NLE手渡し用)
+             # dialogue(セリフ)は captions 設定と無関係に常に焼き込み(唯一の出口のため)
              # motion(チャプターカード等4プリセット)は自動で焼き込み。custom-html は対象外(警告を出力)
+             # --burn-captions は後方互換の受理のみ(焼き込みが既定になったため no-op)
            export fcp7xml <out.xml> | export srt <out.srt> | export ass <out.ass>
 publish:   publish-pack <outdir> [--thumbs 6] [--render <file>]   # chapters.txt + thumbnails/ + materials.json (read-only)
              # --render <file>: コンポジション(スプライトアニメ)PJのサムネイルは書き出し済みファイルから抽出(未指定なら理由付きでスキップ)
@@ -1819,13 +1822,32 @@ async function main() {
           return out({ ok: true, file: dest, ...(res.warnings.length ? { warnings: res.warnings } : {}) });
         }
         console.error('rendering from original sources (this encodes the full timeline)...');
+        // Captions now burn by DEFAULT whenever captions.enabled + there's
+        // something to caption — --no-burn-captions opts out (clean hand-off
+        // render for an NLE/editor). --burn-captions is accepted for
+        // backward compatibility but is a no-op now that burning is the
+        // default; it no longer needs to be passed to opt in.
+        const noBurnCaptions = Boolean(flags['no-burn-captions']);
         const res = await renderFinal(m, await transcriptsOf(), path.resolve(dest), {
           burnCaptions: Boolean(flags['burn-captions']),
+          noBurnCaptions,
           preset: presetRaw as 'youtube' | 'shorts' | 'x' | undefined,
           noRepair: Boolean(flags['no-repair']),
           fastLoudnorm: Boolean(flags['fast-loudnorm']),
           ...(motionSpecs ? { motionSpecs } : {}),
         });
+        if (res.captionsBurned) {
+          console.error(`字幕を焼き込み(${res.captionCueCount} cues)`);
+        } else if (noBurnCaptions) {
+          console.error('字幕は焼き込みなし(--no-burn-captions)');
+        } else if (!m.captions.enabled) {
+          console.error('字幕は焼き込みなし(captions.enabled=false)');
+        } else {
+          console.error('字幕は焼き込みなし(cue 0件 — transcript未取得等)');
+        }
+        if (res.dialogueBurned) {
+          console.error(`セリフを焼き込み(${res.dialogueCount}件)`);
+        }
         return out({ ok: true, file: dest, ...(res.warnings.length ? { warnings: res.warnings } : {}) });
       }
       if (kind === 'fcp7xml') {
