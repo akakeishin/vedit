@@ -1,38 +1,135 @@
 * { box-sizing: border-box; margin: 0; }
 /* author display rules (e.g. display:flex) must never resurrect [hidden] elements */
 [hidden] { display: none !important; }
+
+/* ---------------------------------------------------------------------------
+ * Design tokens — "ステージと書斎" (W-UI redesign)
+ *
+ * Two zones, one vocabulary: the preview + timeline ("ステージ") stay an
+ * achromatic neutral dark so they never bias color judgment of the footage;
+ * the side panel + header ("書斎") carry a faint warm cast for a more human
+ * "相棒の書斎" feel. Both zones share the same text/accent tokens — only the
+ * background/surface/border hue differs, via the --zone-* custom properties
+ * that `header, aside` override below (CSS custom properties inherit down
+ * the DOM tree, so any component styled against var(--zone-*) automatically
+ * picks up whichever zone it's actually rendered in). Elements mounted
+ * directly on <body> (toast, dialogs, the D&D overlay, the floating "show"
+ * cards) get the root/stage default — they float over the stage visually,
+ * so that's the more consistent read.
+ *
+ * Amber (--tally) is reserved EXCLUSIVELY for "要確認/保留/警告" (the
+ * inbox's pending-review badges, warning rows, and the one-shot show/shown
+ * highlight pulse) — never used decoratively elsewhere, so its meaning
+ * stays unambiguous at a glance. Track-type accent colors on the timeline
+ * (B-roll teal, motion purple, music green, sprite pink, dialogue white)
+ * are a separate, pre-existing functional vocabulary (distinguishing row
+ * *kinds*, not drawing attention) and are kept, minus the one row that used
+ * to double-book amber (background-cut row, recolored to steel-blue below).
+ * --------------------------------------------------------------------- */
 :root {
-  --bg: #101216; --panel: #16191f; --edge: #262b34; --text: #d7dce3; --dim: #808894;
-  --accent: #4b9fff; --cut: #5a3038; --keep: #23384e; --ok: #3fb96b; --bad: #e06a6a;
+  /* ステージ: no-hue neutral dark */
+  --stage-bg: #17181a;
+  --stage-surface: #1e2023;
+  --stage-border: #2a2d31;
+  /* 書斎: faintly warm dark */
+  --study-bg: #211d18;
+  --study-panel: #2a251e;
+  --study-panel-2: #322c24;
+  --study-border: #3a342b;
+
+  /* shared text scale */
+  --text: #eae5db;
+  --text-dim: #98907f;
+  --text-faint: #6b655c;
+
+  /* shared semantic accents */
+  --tally: #e8a03c;       /* 要確認・保留・警告 専用 — do not reuse decoratively */
+  --tally-hover: #f2b45c;
+  --keep: #8fb996;        /* 承認・成功 */
+  --reject: #c97b6b;      /* 却下・破壊的 */
+  --link: #8fa8c9;        /* 情報・フォーカス・操作アクセント */
+  --wash: #6f6858;        /* 弱色 — 状態色を持たないニュートラルなアクション用アウトライン(例: 候補カードの「残す」) */
+
+  --radius: 6px;
+  --font-jp: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Yu Gothic", Meiryo, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+
+  /* type scale: 11 / 12.5 / 14 / 16 / 20 */
+  --fs-xs: 11px;
+  --fs-sm: 12.5px;
+  --fs-md: 14px;
+  --fs-lg: 16px;
+  --fs-xl: 20px;
+
+  /* zone defaults = ステージ; header/aside override to 書斎 below */
+  --zone-bg: var(--stage-bg);
+  --zone-surface: var(--stage-surface);
+  --zone-surface-2: var(--stage-surface);
+  --zone-border: var(--stage-border);
+
+  /* ---- W8 kit palette injection (unchanged mechanism — see ensureKitFontFace/
+     renderCaption in app.js) ---- */
+  --kit-text: #fff; --kit-outline: transparent; --kit-box: rgba(0,0,0,0.55); --kit-box-opacity: 1;
+}
+header, aside {
+  --zone-bg: var(--study-bg);
+  --zone-surface: var(--study-panel);
+  --zone-surface-2: var(--study-panel-2);
+  --zone-border: var(--study-border);
 }
 .sr-only {
   position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
   overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0;
 }
 @media (prefers-reduced-motion: reduce) {
-  .mo-chapter-card, .mo-lower-third, .mo-callout, .mo-cta { animation: none !important; }
+  .mo-chapter-card, .mo-lower-third, .mo-callout, .mo-cta, .badge.tallyPulse { animation: none !important; }
 }
 html, body { height: 100%; }
 body {
-  background: var(--bg); color: var(--text);
-  font: 13px/1.5 -apple-system, "Hiragino Sans", sans-serif;
+  background: var(--stage-bg); color: var(--text);
+  font: var(--fs-sm)/1.5 var(--font-jp);
   display: flex; flex-direction: column; overflow: hidden;
 }
 header {
   display: flex; align-items: center; gap: 12px;
-  padding: 8px 14px; border-bottom: 1px solid var(--edge); background: var(--panel);
+  padding: 8px 14px; border-bottom: 1px solid var(--zone-border); background: var(--zone-bg);
 }
-#projName { font-weight: 700; }
-#stat { color: var(--dim); }
+.hdrIdentity { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+#projName { font-weight: 600; font-size: var(--fs-md); white-space: nowrap; }
+/* タイムコード・フレーム数・秒数値だけ monospace + tabular-nums (design tokens'
+   doc above) — every numeric readout in the timeline/inbox/media-pool UI
+   shares this one rule rather than repeating font-family per component. */
+.mono, #headerTc, #tc, #rangeInfo, #revLabel, #minGapVal,
+.cand .srcTag, .cand .dur, .srcDur, .srcIdBadge, .srcUsageLabel, .btn-sceneSeek,
+dialog#shortcutsDialog td:first-child {
+  font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+}
+#headerTc { color: var(--text-dim); font-size: var(--fs-sm); }
+/* W-UI redesign §1: output res / material spec / fps / duration — a small,
+   dim secondary readout (never competes with project name + live timecode),
+   full text also lives in the title attribute for hover discovery. */
+#stat.hdrSecondary {
+  color: var(--text-faint); font-size: var(--fs-xs);
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .spacer { flex: 1; }
-.conn { color: var(--bad); font-size: 11px; white-space: nowrap; }
-.conn.up { color: var(--ok); }
+/* W-UI redesign §1: connection state is a small dot + title tooltip, not a
+   text label — the color alone (+ title/aria-label for a11y) carries it. */
+.connDot { color: var(--reject); font-size: var(--fs-md); line-height: 1; cursor: default; }
+.connDot.up { color: var(--keep); }
 button {
-  background: #1d2129; color: var(--text); border: 1px solid var(--edge);
-  border-radius: 6px; padding: 4px 10px; cursor: pointer; font: inherit;
+  background: var(--zone-surface-2); color: var(--text); border: 1px solid var(--zone-border);
+  border-radius: var(--radius); padding: 4px 10px; cursor: pointer; font: inherit;
+  /* self-critique pass: flex-parented buttons (panelbars, header) were
+     wrapping their Japanese label mid-word under space pressure — buttons
+     should shrink the row, never their own text. Pre-existing, not
+     redesign-introduced; fixed opportunistically since it's a one-line,
+     zero-risk change. */
+  white-space: nowrap; flex-shrink: 0;
 }
-button:hover { border-color: var(--accent); }
+button:hover { border-color: var(--link); }
 button:disabled { opacity: 0.4; cursor: default; }
+button:focus-visible, [tabindex]:focus-visible, a:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
 
 main { flex: 1; display: flex; min-height: 0; }
 #stage { flex: 1.6; display: flex; flex-direction: column; padding: 12px; gap: 8px; min-width: 0; }
@@ -71,7 +168,7 @@ main { flex: 1; display: flex; min-height: 0; }
 .compAmbientMedia { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; opacity: 0.35; mix-blend-mode: screen; }
 .compBgPlaceholder {
   position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
-  text-align: center; padding: 24px; color: var(--dim); font-size: 13px; background: #14161c;
+  text-align: center; padding: 24px; color: var(--text-dim); font-size: var(--fs-sm); background: #14161c;
 }
 
 /* W8 kit sprites: absolute-positioned <img>s (see renderSprites in app.js),
@@ -83,6 +180,12 @@ main { flex: 1; display: flex; min-height: 0; }
 #spriteLayer { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
 .spriteImg { position: absolute; }
 
+/* ---- Rendered-video preview layers (captions/motion/dialogue): these
+   approximate the ACTUAL burned-in export (see export/render.ts's toAss and
+   the motion-graphics templates) — their colors/sizes are content, not UI
+   chrome, and are deliberately NOT reskinned to the --tally/--keep/--link
+   token vocabulary above. Only interaction affordances (focus rings, the
+   drag guideline, the "edited" marker) are UI and do use it. ---- */
 #captionLayer {
   position: absolute; left: 0; right: 0; text-align: center; pointer-events: none;
   /* W-CAP: overrides.position.v (0=top,1=bottom of the box's bottom edge —
@@ -99,9 +202,9 @@ main { flex: 1; display: flex; min-height: 0; }
      double-clickable (inline text edit) — see renderCaption in app.js. */
   pointer-events: auto; cursor: pointer; position: relative;
 }
-#captionLayer .cue:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+#captionLayer .cue:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
 #captionLayer .cue[contenteditable="true"] {
-  cursor: text; outline: 2px dashed var(--accent); outline-offset: 2px;
+  cursor: text; outline: 2px dashed var(--link); outline-offset: 2px;
   -webkit-user-select: text; user-select: text;
 }
 #captionLayer.style-bold .cue { background: #000; color: #ffe45c; }
@@ -113,14 +216,15 @@ main { flex: 1; display: flex; min-height: 0; }
    #captionLayer.style-kit .cue's own ID-selector background rule below. */
 /* W-CAP "✎修正済み" marker (caption-text override active on this cue) —
    hover/focus shows the original transcript text via the native title
-   tooltip (see buildCueEl in app.js). */
+   tooltip (see buildCueEl in app.js). An informational marker, not a
+   warning — link-colored, not tally. */
 .cueEditedMark {
   display: inline-block; margin-left: 0.5em; font-size: 0.6em; font-weight: 400;
-  color: #ffbe3c; vertical-align: middle; cursor: help;
+  color: var(--link); vertical-align: middle; cursor: help;
 }
 /* W-CAP vertical-drag guideline, shown only while dragging a caption box. */
 #captionDragGuide {
-  position: absolute; left: 0; right: 0; height: 0; border-top: 1px dashed var(--accent);
+  position: absolute; left: 0; right: 0; height: 0; border-top: 1px dashed var(--link);
   pointer-events: none; z-index: 4;
 }
 /* W8 kit style (captions --style <kitStyleId>): approximation of the ASS
@@ -162,23 +266,23 @@ main { flex: 1; display: flex; min-height: 0; }
 }
 .mo-chapter-card h1 { color: #fff; font-size: clamp(22px, 5vw, 54px); letter-spacing: 0.06em; }
 .mo-chapter-card p { color: #9fb6d4; font-size: clamp(12px, 2vw, 20px); }
-.mo-chapter-card .bar { width: 3em; height: 3px; background: var(--accent); }
+.mo-chapter-card .bar { width: 3em; height: 3px; background: #4b9fff; }
 .mo-lower-third {
   position: absolute; left: 5%; bottom: 12%;
-  padding: 0.4em 1em; border-left: 4px solid var(--accent);
+  padding: 0.4em 1em; border-left: 4px solid #4b9fff;
   background: rgba(8,10,14,0.78); animation: moSlide 0.4s ease both;
 }
 .mo-lower-third h1 { color: #fff; font-size: clamp(14px, 2.4vw, 26px); }
 .mo-lower-third p { color: #a9b4c2; font-size: clamp(11px, 1.6vw, 16px); }
 .mo-callout {
   position: absolute; top: 12%; right: 6%;
-  padding: 0.5em 1em; border-radius: 10px; border: 2px solid var(--accent);
+  padding: 0.5em 1em; border-radius: 10px; border: 2px solid #4b9fff;
   background: rgba(8,10,14,0.8); color: #fff; font-weight: 700;
   font-size: clamp(13px, 2vw, 22px); animation: moPop 0.35s cubic-bezier(.2,1.6,.4,1) both;
 }
 .mo-cta {
   position: absolute; left: 50%; bottom: 8%; transform: translateX(-50%);
-  padding: 0.5em 1.4em; border-radius: 999px; background: var(--accent); color: #04101f;
+  padding: 0.5em 1.4em; border-radius: 999px; background: #4b9fff; color: #04101f;
   font-weight: 800; font-size: clamp(13px, 2.2vw, 24px); animation: moPop 0.35s ease both;
 }
 @keyframes moFade { from { opacity: 0 } }
@@ -198,37 +302,41 @@ main { flex: 1; display: flex; min-height: 0; }
 #stageEmpty {
   position: absolute; inset: 0; display: flex; flex-direction: column; gap: 12px;
   align-items: center; justify-content: center; text-align: center; padding: 24px;
-  background: rgba(10,12,16,0.94); color: var(--dim);
+  background: rgba(10,12,16,0.94); color: var(--text-dim);
 }
-#stageEmpty p { max-width: 320px; font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
+#stageEmpty p { max-width: 320px; font-size: var(--fs-sm); line-height: 1.6; white-space: pre-wrap; }
 
 #transport { display: flex; align-items: center; gap: 10px; }
-#tc { font-variant-numeric: tabular-nums; color: var(--dim); }
-#revLabel { color: var(--dim); font-size: 12px; }
+#tc { color: var(--text-dim); font-size: var(--fs-sm); }
+#revLabel { color: var(--text-dim); font-size: var(--fs-xs); }
 #rateLabel {
-  font-size: 11px; font-weight: 700; color: #04101f; background: var(--accent);
+  font-size: var(--fs-xs); font-weight: 700; color: #04101f; background: var(--link);
   padding: 1px 6px; border-radius: 999px;
 }
 
 #timeline {
-  position: relative; height: 92px; background: var(--panel);
-  border: 1px solid var(--edge); border-radius: 8px; overflow: hidden; cursor: crosshair;
+  position: relative; height: 92px; background: var(--stage-surface);
+  border: 1px solid var(--stage-border); border-radius: var(--radius); overflow: hidden; cursor: crosshair;
   flex: none;
 }
 #wave { position: absolute; inset: 0; width: 100%; height: 100%; }
 /* B-roll V2 row (W3): thin strip ABOVE the clip row per spec, teal so it
-   reads as a distinct layer from the A-roll clips/scene marks below it. */
+   reads as a distinct layer from the A-roll clips/scene marks below it.
+   Track-type colors (teal/purple/green/pink/white here and below) are a
+   functional row-kind vocabulary, independent of the --tally/--keep/
+   --reject/--link semantic tokens — kept as-is except the one row that used
+   to double-book amber (#bgRow, below). */
 #overlayRow { position: absolute; left: 0; right: 0; top: 0; height: 12%; }
 .ovBlock {
   position: absolute; top: 0; height: 100%; border-radius: 3px;
   background: rgba(45, 197, 191, 0.85); font-size: 9px; color: #04101f;
-  overflow: hidden; white-space: nowrap; padding: 0 3px; cursor: grab;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0 3px; cursor: grab;
 }
 /* Orphaned overlay (anchor cut away): fixed-width warning chips stacked at
    the row's left edge, since there's no resolved timeline position to place
-   them at — click shows the reason as a toast. */
+   them at — click shows the reason as a toast. This IS a warning -> tally. */
 .ovBlock.orphan {
-  width: 12px; background: rgba(214, 87, 60, 0.92); color: #fff;
+  width: 12px; background: var(--tally); color: #241a05;
   text-align: center; font-weight: 700; cursor: pointer;
 }
 #clips { position: absolute; left: 0; right: 0; top: 12%; height: 50%; }
@@ -237,168 +345,204 @@ main { flex: 1; display: flex; min-height: 0; }
   position: absolute; top: 0; width: 1px; height: 100%;
   background: rgba(255, 255, 255, 0.4); pointer-events: auto; cursor: pointer;
 }
-.sceneMark:hover { background: var(--accent); width: 2px; }
+.sceneMark:hover { background: var(--link); width: 2px; }
 /* W-INTENT: thin protected-region band, underlining the clip row rather than
    covering it, so it never competes with clip drag/trim pointer targets
    (only the thin bar itself re-enables pointer-events, for the hover title
-   tooltip — see intentZoneTimelineRanges/renderIntentZoneRow in app.js). */
+   tooltip — see intentZoneTimelineRanges/renderIntentZoneRow in app.js).
+   Informational ("this is protected"), not a warning -> link, not tally. */
 #intentZoneRow { position: absolute; left: 0; right: 0; top: 12%; height: 50%; pointer-events: none; }
 .intentZoneBlock {
   position: absolute; bottom: 0; height: 4px; border-radius: 2px;
-  background: rgba(224, 178, 90, 0.65); pointer-events: auto; cursor: default;
+  background: rgba(143, 168, 201, 0.6); pointer-events: auto; cursor: default;
 }
 .intentZoneBlock.hold { background: rgba(122, 92, 208, 0.65); }
+/* Clip fill: a neutral steel-blue base so the (optional) filmstrip
+   thumbnails tiled on top (.clipThumb below) still read as "this is a clip"
+   even before/without real frames — e.g. sources with no scene data yet. */
 .clip {
-  position: absolute; top: 8%; height: 84%; cursor: grab;
-  background: var(--keep); border: 1px solid #526c8b; border-left: 1px solid rgba(255,255,255,0.22);
+  position: absolute; top: 8%; height: 84%; cursor: grab; overflow: hidden;
+  background: #23384e; border: 1px solid #526c8b; border-left: 1px solid rgba(255,255,255,0.22);
   border-radius: 4px;
 }
 .clip.alt { background: #1e3348; }
-.clip.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.clip.sel { border-color: var(--link); box-shadow: 0 0 0 1px var(--link); }
+/* W-UI redesign §2 "フィルムストリップ": real-frame scene thumbnails tiled
+   inside the clip (see sceneThumbTilesFor/renderTimeline in app.js) — a
+   background layer only (pointer-events:none), so drag/trim/click handling
+   on the parent .clip is entirely unaffected. Slightly less than fully
+   opaque so the clip's own fill still tints the strip a touch and any gaps
+   between tiles (a source with sparse scene coverage) don't show raw black. */
+.clipThumb {
+  position: absolute; top: 0; bottom: 0; background-size: cover; background-position: center;
+  background-color: rgba(0,0,0,0.3); opacity: 0.92; pointer-events: none;
+}
 /* W-UI §2: direct timeline manipulation drag feedback. */
 .clip.dragging, .moBlock.dragging, .muBlock.dragging, .ovBlock.dragging, .spBlock.dragging {
-  opacity: 0.55; box-shadow: 0 0 0 1px var(--accent); cursor: grabbing;
+  opacity: 0.55; box-shadow: 0 0 0 1px var(--link); cursor: grabbing;
 }
 #dropIndicator {
-  position: absolute; top: 12%; height: 50%; width: 2px; background: var(--accent);
+  position: absolute; top: 12%; height: 50%; width: 2px; background: var(--link);
   pointer-events: none; z-index: 3;
 }
-/* W-UI §0 "show range": a dedicated highlight, separate from #rangeSel (the
-   I/O delete-range selection, which also surfaces a "この範囲を削除" bar we
-   don't want to imply here). */
+/* W-UI §0 "show range": Claude pointing at a spot on the timeline — a
+   one-shot attention cue, so it's the one non-badge place --tally is
+   sanctioned for (see the design tokens' doc above). Separate from
+   #rangeSel (the I/O delete-range selection, which also surfaces a "この
+   範囲を削除" action bar we don't want to imply here). */
 #showHighlight {
-  position: absolute; top: 0; bottom: 0; background: rgba(255, 190, 60, 0.22);
-  border-left: 1px solid #ffbe3c; border-right: 1px solid #ffbe3c; pointer-events: none;
+  position: absolute; top: 0; bottom: 0; background: rgba(232, 160, 60, 0.18);
+  border-left: 1px solid var(--tally); border-right: 1px solid var(--tally); pointer-events: none;
 }
 #motionRow { position: absolute; left: 0; right: 0; bottom: 2px; height: 14px; }
 .moBlock {
   position: absolute; height: 100%; border-radius: 3px; cursor: grab;
   background: rgba(122, 92, 208, 0.85); font-size: 9px; color: #fff;
-  overflow: hidden; white-space: nowrap; padding: 0 3px;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0 3px;
 }
 #musicRow { position: absolute; left: 0; right: 0; bottom: 18px; height: 12px; }
 .muBlock {
   position: absolute; height: 100%; border-radius: 3px; cursor: grab;
   background: rgba(63, 185, 107, 0.8); font-size: 9px; color: #04101f;
-  overflow: hidden; white-space: nowrap; padding: 0 3px;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0 3px;
 }
 /* W8 kit sprite row: thin strip just above musicRow, pink so it reads as
    distinct from B-roll (teal, #overlayRow) and music (green). Orphan chips
-   mirror .ovBlock.orphan. */
+   mirror .ovBlock.orphan (tally — see its doc). */
 #spriteRow { position: absolute; left: 0; right: 0; bottom: 32px; height: 12px; }
 .spBlock {
   position: absolute; top: 0; height: 100%; border-radius: 3px;
   background: rgba(214, 90, 200, 0.85); font-size: 9px; color: #04101f;
-  overflow: hidden; white-space: nowrap; padding: 0 3px; cursor: grab;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0 3px; cursor: grab;
 }
 .spBlock.orphan {
-  width: 12px; background: rgba(214, 87, 60, 0.92); color: #fff;
+  width: 12px; background: var(--tally); color: #241a05;
   text-align: center; font-weight: 700; cursor: pointer;
 }
 /* W-ANIME: background-cut ("紙芝居") + dialogue rows, stacked above
    spriteRow. Both stay empty (no visual footprint) for every project that
    isn't a composition / has no dialogue items — full regression. Click-to-
    seek only (no drag — these aren't anchor-based, see renderBgRow/
-   renderDialogueRow in app.js), so `cursor: pointer` rather than `grab`. */
+   renderDialogueRow in app.js), so `cursor: pointer` rather than `grab`.
+   Steel-blue rather than the row palette's original amber — amber is
+   reserved for tally (see the design tokens' doc above). */
 #bgRow { position: absolute; left: 0; right: 0; bottom: 46px; height: 12px; }
 .bgBlock {
   position: absolute; top: 0; height: 100%; border-radius: 3px;
-  background: rgba(224, 178, 90, 0.85); font-size: 9px; color: #04101f;
-  overflow: hidden; white-space: nowrap; padding: 0 3px; cursor: pointer;
+  background: rgba(92, 134, 168, 0.85); font-size: 9px; color: #04101f;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0 3px; cursor: pointer;
 }
 #dialogueRow { position: absolute; left: 0; right: 0; bottom: 60px; height: 12px; }
 .dlBlock {
   position: absolute; top: 0; height: 100%; border-radius: 3px;
   background: rgba(255, 255, 255, 0.85); font-size: 9px; color: #04101f;
-  overflow: hidden; white-space: nowrap; padding: 0 3px; cursor: pointer;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0 3px; cursor: pointer;
 }
 #playhead {
   position: absolute; top: 0; bottom: 0; width: 1px; background: #ff5252; pointer-events: none;
 }
 #rangeSel {
-  position: absolute; top: 0; bottom: 0; background: rgba(75, 159, 255, 0.22);
-  border-left: 1px solid var(--accent); border-right: 1px solid var(--accent); pointer-events: none;
+  position: absolute; top: 0; bottom: 0; background: rgba(143, 168, 201, 0.22);
+  border-left: 1px solid var(--link); border-right: 1px solid var(--link); pointer-events: none;
 }
-#timelineHint { margin-top: -2px; }
 /* Source preview mode: the timeline strip goes semi-transparent while #video
    plays a raw source proxy instead of the timeline mix (see enterSourcePreview
    in app.js). Interacting with the strip (or Esc) exits back to it. */
 #timeline.previewing { opacity: 0.35; transition: opacity 0.15s ease; }
 #previewBanner {
   display: flex; align-items: center; gap: 10px; padding: 6px 10px;
-  background: var(--panel); border: 1px solid var(--accent); border-radius: 8px;
-  color: var(--text); font-size: 12px; margin-top: -2px;
+  background: var(--stage-surface); border: 1px solid var(--link); border-radius: var(--radius);
+  color: var(--text); font-size: var(--fs-sm); margin-top: -2px;
 }
 #previewBannerExit {
   padding: 0 6px; border-radius: 4px; line-height: 1; margin-left: auto;
 }
 #rangeBar {
   display: flex; align-items: center; gap: 10px; padding: 6px 10px;
-  background: var(--panel); border: 1px solid var(--accent); border-radius: 8px;
+  background: var(--stage-surface); border: 1px solid var(--link); border-radius: var(--radius);
 }
-#rangeInfo { font-variant-numeric: tabular-nums; color: var(--text); }
+#rangeInfo { color: var(--text); }
 #clipInspector {
   display: flex; gap: 6px; align-items: center;
-  padding: 6px 10px; background: var(--panel); border: 1px solid var(--edge); border-radius: 8px;
+  padding: 6px 10px; background: var(--stage-surface); border: 1px solid var(--stage-border); border-radius: var(--radius);
 }
-#clipLabel { color: var(--dim); margin-right: 6px; }
+#clipLabel { color: var(--text-dim); margin-right: 6px; }
 
 aside {
-  width: var(--aside-w, 340px); min-width: 240px; max-width: 70vw; border-left: 1px solid var(--edge); background: var(--panel);
+  width: var(--aside-w, 340px); min-width: 240px; max-width: 70vw; border-left: 1px solid var(--zone-border); background: var(--zone-bg);
   display: flex; flex-direction: column; min-height: 0;
 }
-.tabs { display: flex; border-bottom: 1px solid var(--edge); }
-.tab { flex: 1; border: 0; border-radius: 0; background: none; padding: 8px; color: var(--dim); }
-.tab.active { color: var(--text); box-shadow: inset 0 -2px var(--accent); }
-.tab:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.tabs { display: flex; border-bottom: 1px solid var(--zone-border); }
+.tab { flex: 1; border: 0; border-radius: 0; background: none; padding: 8px; color: var(--text-dim); font-size: var(--fs-sm); }
+.tab.active { color: var(--text); box-shadow: inset 0 -2px var(--link); }
+.tab:focus-visible { outline: 2px solid var(--link); outline-offset: -2px; }
 .panel { display: none; flex: 1; min-height: 0; overflow: auto; flex-direction: column; }
 .panel.active { display: flex; }
 .panelbar {
   display: flex; gap: 8px; align-items: center; padding: 8px;
-  border-bottom: 1px solid var(--edge); position: sticky; top: 0; background: var(--panel); z-index: 2;
+  border-bottom: 1px solid var(--zone-border); position: sticky; top: 0; background: var(--zone-bg); z-index: 2;
 }
-.hintText { color: var(--dim); font-size: 11px; }
+.hintText { color: var(--text-dim); font-size: var(--fs-xs); }
 
 /* ---- W-UI §1: "いま" tab (Claude presence strip + 要確認インボックス + 変更履歴) ---- */
 .claudeStrip {
   display: flex; align-items: center; gap: 8px; padding: 8px 12px;
-  background: rgba(75, 159, 255, 0.12); border-bottom: 1px solid var(--edge);
-  color: var(--accent); font-size: 12px;
+  background: rgba(143, 168, 201, 0.12); border-bottom: 1px solid var(--zone-border);
+  color: var(--link); font-size: var(--fs-sm);
 }
 .inboxHeading {
   display: flex; align-items: center; gap: 8px; padding: 10px 12px 2px;
-  font-size: 12px; font-weight: 700; color: var(--text);
+  font-size: var(--fs-sm); font-weight: 600; color: var(--text);
+}
+/* W-UI polish: 要確認 count badge — a "tally lamp" that only lights up while
+   there's something pending (renderInbox in app.js only un-hides it when
+   count > 0). The `[hidden]` -> visible transition is a display:none ->
+   flex change, which browsers already treat as a fresh animation start, so
+   the short pulse below replays each time the inbox goes from empty to
+   non-empty with no extra JS bookkeeping needed. Reduced-motion users still
+   get the amber fill/text (that's state, not motion) — only the pulse
+   itself is suppressed, via the existing `.badge.tallyPulse` rule up top. */
+#inboxCount.badge {
+  background: rgba(232, 160, 60, 0.18); border-color: transparent; color: var(--tally); font-weight: 700;
+}
+#inboxCount.badge.tallyPulse { animation: tallyPulse 0.6s ease-out; }
+@keyframes tallyPulse {
+  from { box-shadow: 0 0 0 0 rgba(232, 160, 60, 0.55); }
+  to { box-shadow: 0 0 0 5px rgba(232, 160, 60, 0); }
 }
 .inboxBar { flex-wrap: wrap; position: static; }
 .inboxEmpty { padding: 4px 12px 12px; }
 #inboxList { padding: 4px 8px 10px; display: flex; flex-direction: column; gap: 6px; }
+/* The one place amber is a background/border fill rather than a small dot —
+   this whole row IS the "要確認" content, so it earns it (see the design
+   tokens' doc above). */
 .inboxWarn {
-  padding: 6px 8px; border-radius: 6px; background: rgba(224, 178, 90, 0.1);
-  border: 1px solid rgba(224, 178, 90, 0.4); color: #e0b25a; font-size: 12px; line-height: 1.5;
+  padding: 6px 8px; border-radius: var(--radius); background: rgba(232, 160, 60, 0.1);
+  border: 1px solid rgba(232, 160, 60, 0.4); color: var(--tally); font-size: var(--fs-sm); line-height: 1.5;
 }
 .inboxWarn[role="button"] { cursor: pointer; }
-.inboxWarn[role="button"]:hover { background: rgba(224, 178, 90, 0.18); }
-.inboxWarn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.inboxWarn[role="button"]:hover { background: rgba(232, 160, 60, 0.18); }
+.inboxWarn:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
 
-#activitySection { border-top: 1px solid var(--edge); }
+#activitySection { border-top: 1px solid var(--zone-border); }
 #activityFeed { padding: 6px 8px 12px; display: flex; flex-direction: column; gap: 6px; }
 .activityCard {
-  padding: 6px 8px; border-radius: 6px; border-left: 2px solid var(--edge);
-  background: #1a1e26; display: flex; flex-direction: column; gap: 4px;
+  padding: 6px 8px; border-radius: var(--radius); border-left: 2px solid var(--zone-border);
+  background: var(--zone-surface-2); display: flex; flex-direction: column; gap: 4px;
 }
-.activityInfo { font-size: 12px; color: var(--dim); line-height: 1.5; }
+.activityInfo { font-size: var(--fs-sm); color: var(--text-dim); line-height: 1.5; }
 .activityInfo b { color: var(--text); }
-.activityActor { color: var(--accent); }
+.activityActor { color: var(--link); }
 .activityActions { display: flex; gap: 6px; flex-wrap: wrap; }
-.activityActions button { font-size: 11px; padding: 2px 8px; }
-.btn-activityShow { color: var(--accent); border-color: var(--accent); }
+.activityActions button { font-size: var(--fs-xs); padding: 2px 8px; }
+.btn-activityShow { color: var(--link); border-color: var(--link); }
 
 /* ---- W-UI §0: floating "show" cards (candidate / compare) + D&D ingest flow card ---- */
 .showCard {
   position: absolute; right: 16px; bottom: 16px; max-width: 340px; min-width: 220px;
-  background: var(--panel); border: 1px solid var(--accent); border-radius: 10px;
+  background: var(--stage-surface); border: 1px solid var(--link); border-radius: 10px;
   padding: 14px 16px; box-shadow: 0 8px 30px rgba(0,0,0,0.5); z-index: 5;
-  color: var(--text); font-size: 13px;
+  color: var(--text); font-size: var(--fs-sm);
 }
 .showCardLbl { font-weight: 600; margin: 6px 0; line-height: 1.5; }
 /* W-INTENT/W11: takes card is a stack of rows (one per detected take), so it
@@ -406,77 +550,90 @@ aside {
 .showCard.wide { max-width: 420px; max-height: 70vh; overflow-y: auto; }
 .cardClose {
   position: absolute; top: 6px; right: 6px; padding: 0 6px; line-height: 1.4;
-  border-radius: 4px; background: none; border: 1px solid var(--edge);
+  border-radius: 4px; background: none; border: 1px solid var(--stage-border);
 }
 .compareOps { list-style: none; margin-top: 8px; display: flex; flex-direction: column; gap: 4px; max-height: 160px; overflow-y: auto; }
-.compareOps li { font-size: 11px; color: var(--dim); border-left: 2px solid var(--edge); padding-left: 6px; }
+.compareOps li { font-size: var(--fs-xs); color: var(--text-dim); border-left: 2px solid var(--stage-border); padding-left: 6px; }
 .compareOps li b { color: var(--text); }
 .takeRow {
-  padding: 8px; margin-top: 8px; border-radius: 6px; border: 1px solid var(--edge); background: #1a1e26;
+  padding: 8px; margin-top: 8px; border-radius: var(--radius); border: 1px solid var(--stage-border); background: var(--stage-surface);
 }
-.takeRow.recommended { border-color: var(--ok); }
+.takeRow.recommended { border-color: var(--keep); }
 .takeRow .showCardLbl { margin: 0 0 4px; font-weight: 500; }
 .ingestFlowCard { position: fixed; z-index: 20; }
 
 #words { padding: 10px 12px; user-select: none; overflow-y: auto; }
 .srcHeading {
-  color: var(--text); font-size: 11px; font-weight: 700; letter-spacing: 0.02em;
-  padding: 10px 0 4px; margin-top: 4px; border-bottom: 1px solid var(--edge);
+  color: var(--text); font-size: var(--fs-xs); font-weight: 600; letter-spacing: 0.02em;
+  padding: 10px 0 4px; margin-top: 4px; border-bottom: 1px solid var(--zone-border);
 }
 .srcHeading:first-child { margin-top: 0; }
 .w { cursor: pointer; border-radius: 3px; padding: 1px 1px; }
-.w:hover { background: #26303e; }
-.w:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.w:hover { background: rgba(143, 168, 201, 0.16); }
+.w:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
 .w.cut { color: #9a7b82; text-decoration: line-through; }
-.w.ignored { color: #8b93a0; text-decoration: none; border-bottom: 1px dotted #8b93a0; }
-.w.sel { background: #2c4a6e; outline: 1px solid var(--accent); outline-offset: -1px; }
-.w.active { background: #3d5e86; outline: 1px solid var(--accent); outline-offset: -1px; }
-/* W-UI §0 "show words" — a highlight distinct from .sel (no delete-selection side effect). */
-.w.shown { outline: 2px solid #ffbe3c; outline-offset: 1px; border-radius: 3px; }
-.gap { color: var(--dim); font-size: 11px; margin: 0 2px; }
+.w.ignored { color: var(--text-dim); text-decoration: none; border-bottom: 1px dotted var(--text-dim); }
+.w.sel { background: rgba(143, 168, 201, 0.32); outline: 1px solid var(--link); outline-offset: -1px; }
+.w.active { background: rgba(143, 168, 201, 0.5); outline: 1px solid var(--link); outline-offset: -1px; }
+/* W-UI §0 "show words" — Claude pointing at specific words; a distinct
+   highlight from .sel (no delete-selection side effect). One-shot attention
+   cue, same tally exception as #showHighlight above. */
+.w.shown { outline: 2px solid var(--tally); outline-offset: 1px; border-radius: 3px; }
+.gap { color: var(--text-dim); font-size: var(--fs-xs); margin: 0 2px; }
 
-.thresholdCtl { display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 11px; white-space: nowrap; }
+.thresholdCtl { display: flex; align-items: center; gap: 6px; color: var(--text-dim); font-size: var(--fs-xs); white-space: nowrap; }
 .thresholdCtl input[type="range"] { width: 90px; }
 #minGapVal { color: var(--text); font-variant-numeric: tabular-nums; min-width: 3em; }
 
 .candGroup { display: flex; flex-direction: column; gap: 6px; margin-bottom: 4px; }
 .candGroupHeader {
-  display: flex; align-items: center; gap: 8px; padding: 4px 2px;
-  border-bottom: 1px solid var(--edge);
+  /* self-critique pass: kind badge + hint text + 2 action buttons don't fit
+     one row at the default aside width once buttons refuse to shrink (see
+     the base `button` rule's doc) — wrap the row instead of squeezing text,
+     same pattern .inboxBar already uses below. */
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; padding: 4px 2px;
+  border-bottom: 1px solid var(--zone-border);
 }
-.candGroupHeader button { padding: 2px 8px; font-size: 11px; }
+.candGroupHeader button { padding: 2px 8px; font-size: var(--fs-xs); }
 .cand {
   display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; padding: 6px 8px;
-  background: #1a1e26; border: 1px solid var(--edge); border-radius: 6px; cursor: pointer;
+  background: var(--zone-surface-2); border: 1px solid var(--zone-border); border-radius: var(--radius); cursor: pointer;
 }
 .cand .lbl, .cand .srcTag, .cand .dur { flex: none; }
 .cand .lbl { flex: 1 1 auto; min-width: 60px; }
 .candActions { display: flex; gap: 6px; flex: 1 0 100%; justify-content: flex-end; }
-.cand .kind { font-size: 10px; padding: 1px 6px; border-radius: 999px; background: #33405a; }
-.cand .kind.filler { background: #5a4a33; }
-.cand .kind.retake { background: #4a3a5a; }
-.cand .kind.low-energy { background: #3a4a3a; }
-.cand .lbl { flex: 1; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cand .srcTag { color: var(--dim); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.cand .dur { color: var(--dim); font-size: 11px; font-variant-numeric: tabular-nums; }
-.cand:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.cand .kind { font-size: 10px; padding: 1px 6px; border-radius: 999px; background: var(--zone-surface-2); border: 1px solid var(--zone-border); white-space: nowrap; flex-shrink: 0; }
+.cand .kind.filler { color: #d0a878; }
+.cand .kind.retake { color: #b79ce0; }
+.cand .kind.low-energy { color: #8fb08f; }
+.cand .lbl { flex: 1; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cand .srcTag { color: var(--text-dim); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.cand .dur { color: var(--text-dim); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; }
+.cand:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
 .cand button { padding: 2px 8px; white-space: nowrap; }
-.btn-preview { color: var(--text); font-size: 11px; }
-.btn-approve, .btn-reject, .btn-preview { font-size: 11px; }
-.btn-approve { color: var(--ok); border-color: var(--ok); }
-.btn-approve:hover { background: rgba(63, 185, 107, 0.12); }
-.btn-reject { color: var(--bad); border-color: var(--bad); }
-.btn-reject:hover { background: rgba(208, 86, 86, 0.12); }
+.btn-preview { color: var(--text); font-size: var(--fs-xs); }
+.btn-approve, .btn-reject, .btn-preview { font-size: var(--fs-xs); }
+.btn-approve { color: var(--keep); border-color: var(--keep); }
+.btn-approve:hover { background: rgba(143, 185, 150, 0.12); }
+.btn-reject { color: var(--reject); border-color: var(--reject); }
+.btn-reject:hover { background: rgba(201, 123, 107, 0.12); }
+/* 候補カード(#candidateCard)の「残す」— declining a cut candidate isn't a
+   destructive act (nothing is lost, the footage just stays put), so it
+   doesn't earn a semantic status color at all; neutral --wash outline
+   instead. Kept distinct from .btn-reject, which still colors the いま
+   タブ・inbox row's per-row/bulk 却下 buttons. */
+.btn-wash { color: var(--text-dim); border-color: var(--wash); }
+.btn-wash:hover { border-color: var(--text-dim); background: rgba(255, 255, 255, 0.05); }
 
 /* ---- media pool ("素材") panel ---- */
 #mediaList { padding: 8px; display: flex; flex-direction: column; gap: 6px; overflow-y: auto; }
 .srcRow {
   display: flex; gap: 10px; align-items: center; padding: 6px; cursor: pointer;
-  background: #1a1e26; border: 1px solid var(--edge); border-radius: 6px;
+  background: var(--zone-surface-2); border: 1px solid var(--zone-border); border-radius: var(--radius);
 }
-.srcRow:hover { border-color: var(--accent); }
-.srcRow:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-.srcRow.previewing { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.srcRow:hover { border-color: var(--link); }
+.srcRow:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
+.srcRow.previewing { border-color: var(--link); box-shadow: 0 0 0 1px var(--link); }
 .srcThumb {
   width: 72px; height: 40px; object-fit: cover; border-radius: 4px;
   background: #0a0c10; flex: none;
@@ -486,101 +643,101 @@ aside {
 .srcName {
   font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
 }
-.srcDur { color: var(--dim); font-size: 11px; font-variant-numeric: tabular-nums; flex: none; }
+.srcDur { color: var(--text-dim); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; flex: none; }
 .srcBadges { display: flex; gap: 4px; flex-wrap: wrap; }
 .badge {
-  font-size: 10px; padding: 1px 6px; border-radius: 999px; background: #33405a; color: var(--text);
+  font-size: 10px; padding: 1px 6px; border-radius: 999px; background: var(--zone-surface-2); border: 1px solid var(--zone-border); color: var(--text);
 }
-.badge.ok { background: rgba(63, 185, 107, 0.18); color: var(--ok); }
-.badge.warn { background: rgba(224, 178, 90, 0.18); color: #e0b25a; }
+.badge.ok { background: rgba(143, 185, 150, 0.18); border-color: transparent; color: var(--keep); }
+.badge.warn { background: rgba(232, 160, 60, 0.18); border-color: transparent; color: var(--tally); }
 /* W-UI §3: raw ids (sourceId etc.) shown only in the expanded row detail, styled a step dimmer than the other badges. */
-.srcIdBadge { background: transparent; border: 1px solid var(--edge); color: var(--dim); font-variant-numeric: tabular-nums; }
+.srcIdBadge { background: transparent; border: 1px solid var(--zone-border); color: var(--text-dim); font-variant-numeric: tabular-nums; }
 .srcUsage { display: flex; align-items: center; gap: 8px; }
 .srcUsageBar {
   display: block; flex: 1 1 auto; height: 6px; min-width: 40px; border-radius: 999px;
-  background: var(--edge); overflow: hidden;
+  background: var(--zone-border); overflow: hidden;
 }
-.srcUsageFill { display: block; height: 100%; background: var(--accent); }
-.srcUsageLabel { color: var(--dim); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; flex: none; }
+.srcUsageFill { display: block; height: 100%; background: var(--link); }
+.srcUsageLabel { color: var(--text-dim); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; flex: none; }
 .srcActions { display: flex; flex-direction: column; gap: 4px; flex: none; }
-.srcActions button { padding: 2px 8px; font-size: 11px; white-space: nowrap; }
+.srcActions button { padding: 2px 8px; font-size: var(--fs-xs); white-space: nowrap; }
 
 .sceneGrid {
   display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 6px;
   padding: 4px 4px 4px 20px; margin-top: -2px;
 }
 .sceneItem {
-  display: flex; flex-direction: column; gap: 4px; padding: 6px; border-radius: 6px;
-  background: #14171d; border: 1px solid var(--edge);
+  display: flex; flex-direction: column; gap: 4px; padding: 6px; border-radius: var(--radius);
+  background: var(--zone-surface); border: 1px solid var(--zone-border);
 }
-.sceneItem:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-.sceneItem.review-keep { border-color: var(--ok); box-shadow: 0 0 0 1px var(--ok); }
-.sceneItem.review-reject { border-color: var(--bad); opacity: 0.55; }
-.btn-sceneSeek, .btn-sceneAdd { font-size: 11px; padding: 2px 6px; }
+.sceneItem:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
+.sceneItem.review-keep { border-color: var(--keep); box-shadow: 0 0 0 1px var(--keep); }
+.sceneItem.review-reject { border-color: var(--reject); opacity: 0.55; }
+.btn-sceneSeek, .btn-sceneAdd { font-size: var(--fs-xs); padding: 2px 6px; }
 .btn-sceneSeek { font-variant-numeric: tabular-nums; }
-.sceneNote { color: var(--dim); font-size: 11px; font-style: italic; overflow-wrap: break-word; }
+.sceneNote { color: var(--text-dim); font-size: var(--fs-xs); font-style: italic; overflow-wrap: break-word; }
 .sceneReview { display: flex; gap: 4px; }
-.btn-sceneKeep, .btn-sceneReject { font-size: 11px; padding: 1px 8px; line-height: 1.4; }
-.btn-sceneKeep[aria-pressed="true"] { background: var(--ok); border-color: var(--ok); color: #06210f; }
-.btn-sceneReject[aria-pressed="true"] { background: var(--bad); border-color: var(--bad); color: #2a0505; }
-.cullBadge { background: #33405a; }
+.btn-sceneKeep, .btn-sceneReject { font-size: var(--fs-xs); padding: 1px 8px; line-height: 1.4; }
+.btn-sceneKeep[aria-pressed="true"] { background: var(--keep); border-color: var(--keep); color: #06210f; }
+.btn-sceneReject[aria-pressed="true"] { background: var(--reject); border-color: var(--reject); color: #2a0505; }
+.cullBadge { background: var(--zone-surface-2); }
 
 /* ---- W-UI §4: window-wide drag-and-drop ingest ---- */
 #dropOverlay {
   position: fixed; inset: 0; z-index: 30; display: flex; align-items: center; justify-content: center;
-  background: rgba(20, 60, 110, 0.55);
+  background: rgba(20, 30, 40, 0.6);
 }
 .dropOverlayInner {
-  padding: 24px 40px; background: var(--panel); border: 3px dashed var(--accent); border-radius: 12px;
-  font-size: 18px; font-weight: 700; color: var(--text); box-shadow: 0 8px 40px rgba(0,0,0,0.5);
+  padding: 24px 40px; background: var(--stage-surface); border: 3px dashed var(--link); border-radius: 12px;
+  font-size: var(--fs-lg); font-weight: 600; color: var(--text); box-shadow: 0 8px 40px rgba(0,0,0,0.5);
 }
 
 #toast {
   position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
-  background: #202633; border: 1px solid var(--edge); padding: 8px 16px; border-radius: 8px;
+  background: var(--stage-surface); border: 1px solid var(--stage-border); padding: 8px 16px; border-radius: var(--radius);
   box-shadow: 0 4px 20px rgba(0,0,0,0.5); z-index: 10;
-  display: flex; align-items: center; gap: 10px; max-width: 60vw;
+  display: flex; align-items: center; gap: 10px; max-width: 60vw; font-size: var(--fs-sm);
 }
-#toast[role="alert"] { border-color: var(--bad); }
+#toast[role="alert"] { border-color: var(--reject); }
 .toastClose {
   padding: 0 6px; border-radius: 4px; line-height: 1; flex: none;
-  background: none; border: 1px solid var(--edge);
+  background: none; border: 1px solid var(--stage-border);
 }
 
 dialog#shortcutsDialog {
-  background: var(--panel); color: var(--text); border: 1px solid var(--edge); border-radius: 10px;
+  background: var(--stage-surface); color: var(--text); border: 1px solid var(--stage-border); border-radius: 10px;
   padding: 20px 24px; min-width: 320px; max-width: 480px; box-shadow: 0 8px 40px rgba(0,0,0,0.6);
 }
 dialog#shortcutsDialog::backdrop { background: rgba(0,0,0,0.6); }
-dialog#shortcutsDialog h2 { font-size: 15px; margin-bottom: 12px; }
+dialog#shortcutsDialog h2 { font-size: var(--fs-lg); font-weight: 600; margin-bottom: 12px; }
 dialog#shortcutsDialog table { border-collapse: collapse; width: 100%; margin-bottom: 14px; }
-dialog#shortcutsDialog td { padding: 4px 8px; font-size: 12px; border-bottom: 1px solid var(--edge); }
-dialog#shortcutsDialog td:first-child { color: var(--accent); font-variant-numeric: tabular-nums; white-space: nowrap; font-weight: 600; }
+dialog#shortcutsDialog td { padding: 4px 8px; font-size: var(--fs-sm); border-bottom: 1px solid var(--stage-border); }
+dialog#shortcutsDialog td:first-child { color: var(--link); font-family: var(--font-mono); white-space: nowrap; font-weight: 600; }
 dialog#shortcutsDialog td:last-child { color: var(--text); }
 dialog#shortcutsDialog .hintText { display: block; margin-bottom: 14px; }
 
 /* ---- W-CAP: caption style popover ---- */
 dialog#captionStyleDialog {
-  background: var(--panel); color: var(--text); border: 1px solid var(--edge); border-radius: 10px;
+  background: var(--stage-surface); color: var(--text); border: 1px solid var(--stage-border); border-radius: 10px;
   padding: 18px 22px; min-width: 280px; max-width: 360px; box-shadow: 0 8px 40px rgba(0,0,0,0.6);
 }
 dialog#captionStyleDialog::backdrop { background: rgba(0,0,0,0.6); }
-dialog#captionStyleDialog h2 { font-size: 15px; margin-bottom: 14px; }
+dialog#captionStyleDialog h2 { font-size: var(--fs-lg); font-weight: 600; margin-bottom: 14px; }
 .capField { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
-.capField label { font-size: 11px; color: var(--dim); display: flex; justify-content: space-between; gap: 6px; }
+.capField label { font-size: var(--fs-xs); color: var(--text-dim); display: flex; justify-content: space-between; gap: 6px; }
 .capField select, .capField input[type="range"] { width: 100%; }
 .capField input[type="color"] {
-  width: 100%; height: 26px; padding: 0; border: 1px solid var(--edge); border-radius: 4px;
+  width: 100%; height: 26px; padding: 0; border: 1px solid var(--stage-border); border-radius: 4px;
   background: transparent; cursor: pointer;
 }
 .capColorRow { display: flex; gap: 10px; }
 .capColorRow .capField { flex: 1; margin-bottom: 10px; }
 .capActions { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
-#capResetBtn { color: var(--bad); border-color: var(--bad); }
+#capResetBtn { color: var(--reject); border-color: var(--reject); }
 
 #paneDivider {
-  flex: none; width: 6px; cursor: col-resize; background: var(--edge);
+  flex: none; width: 6px; cursor: col-resize; background: var(--zone-border);
   transition: background 0.15s;
 }
-#paneDivider:hover, #paneDivider.dragging { background: var(--accent); }
-#paneDivider:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+#paneDivider:hover, #paneDivider.dragging { background: var(--link); }
+#paneDivider:focus-visible { outline: 2px solid var(--link); outline-offset: -2px; }

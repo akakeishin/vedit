@@ -8,12 +8,14 @@
 </head>
 <body>
 <header>
-  <span id="projName">vedit</span>
-  <span id="stat"></span>
+  <div class="hdrIdentity">
+    <span id="projName">vedit</span>
+    <span id="headerTc" class="mono">0:00.0</span>
+  </div>
+  <span id="stat" class="hdrSecondary"></span>
   <span class="spacer"></span>
-  <button id="shortcutsBtn" title="ショートカット一覧 (?)" aria-label="ショートカット一覧を開く">⌨ ?</button>
-  <button id="undoBtn" aria-label="直前の変更に戻す">⟲ undo</button>
-  <span id="conn" class="conn" title="接続待ち">● 接続待ち</span>
+  <button id="shortcutsBtn" title="ショートカット一覧 (?)" aria-label="ショートカット一覧を開く">?</button>
+  <span id="conn" class="connDot" title="接続待ち" aria-label="接続状態: 接続待ち">●</span>
 </header>
 
 <main>
@@ -83,7 +85,6 @@
       <span>素材プレビュー中 — Esc で戻る</span>
       <button id="previewBannerExit" aria-label="タイムラインモードに戻る">×</button>
     </div>
-    <div id="timelineHint" class="hintText">Alt+ホバーでスクラブ / I・Oで範囲選択 / ドラッグで並べ替え・トリム・移動 / ?でショートカット一覧</div>
     <div id="rangeBar" hidden>
       <span id="rangeInfo"></span>
       <button id="rangeDeleteBtn">この範囲を削除</button>
@@ -118,7 +119,7 @@
 
       <div id="inboxSection">
         <div class="inboxHeading">
-          <span>要確認</span><span id="inboxCount" class="badge cullBadge" hidden></span>
+          <span>要確認</span><span id="inboxCount" class="badge cullBadge tallyPulse" hidden></span>
         </div>
         <div class="panelbar inboxBar">
           <button id="approveAllBtn">すべて承認</button>

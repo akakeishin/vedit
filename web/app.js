@@ -185,7 +185,7 @@ function renderStageState() {
     // Manifest.composition's doc) — this "ingest a file" empty state is
     // only meaningful for a normal (source-driven) project.
     el.hidden = false;
-    msg.textContent = '素材がありません — `vedit ingest <file>` で取り込み';
+    msg.textContent = 'まだ素材がありません — ここに動画をドラッグして取り込み';
     retry.hidden = true;
   } else {
     el.hidden = true;
@@ -307,6 +307,7 @@ function tickComposition() {
   }
   $('playhead').style.left = `${(tl / Math.max(1e-6, S.duration)) * 100}%`;
   $('tc').textContent = `${fmtF(tl)} / ${fmtF(S.duration)}`;
+  $('headerTc').textContent = fmt(tl);
   renderCompositionBackground(tl);
   renderMotion(tl);
   renderSprites(tl);
@@ -331,6 +332,7 @@ function tick() {
     // rendering (playhead, captions, motion, word highlight) and just show
     // the source-relative timecode.
     $('tc').textContent = `${fmtF(video.currentTime)} / ${fmtF(video.duration || 0)}`;
+    $('headerTc').textContent = fmt(video.currentTime);
     syncMusicPlayback(null); // source-preview mode plays a raw source proxy, not the timeline mix
     syncOverlayVideo(null); // source preview owns the stage; hide the B-roll overlay video too
     requestAnimationFrame(tick);
@@ -346,6 +348,7 @@ function tick() {
     const tl = tlNow();
     $('playhead').style.left = `${(tl / S.duration) * 100}%`;
     $('tc').textContent = `${fmtF(tl)} / ${fmtF(S.duration)}`;
+    $('headerTc').textContent = fmt(tl);
     renderCaption(tl);
     renderMotion(tl);
     renderSprites(tl);
@@ -737,6 +740,41 @@ function startBlockDrag(e, kind, id, originalTlStart, blockEl) {
   window.addEventListener('pointerup', onUp);
 }
 
+// W-UI redesign §2/§6: "素材の表示名 · 長さ" — never the internal clipId.
+// Sums every segment sharing this clipId (a clip can be split into several
+// non-contiguous timeline segments once an internal remove-words/candidate
+// cut lands inside it), so the duration always reads as "how much of this
+// clip actually plays", not just one fragment's length.
+function clipDisplayLabel(clipId) {
+  const segs = S.segments.filter((s) => s.clipId === clipId);
+  if (segs.length === 0) return clipId;
+  const name = sourceDisplayName(segs[0].sourceId);
+  const totalDur = segs.reduce((sum, s) => sum + (s.tlEnd - s.tlStart), 0);
+  return `${name} · ${fmt(totalDur)}`;
+}
+// W-UI redesign §2 "フィルムストリップ": scene thumbnails (S.scenes, from
+// GET /api/scenes) that overlap [srcStart, srcEnd) of `sourceId`, as
+// left%/width% tiles spanning that range — see renderTimeline's clip loop.
+// Sources with no detected scenes return [] (renderTimeline just falls back
+// to the plain clip fill).
+function sceneThumbTilesFor(sourceId, srcStart, srcEnd) {
+  const scenes = S.scenes.get(sourceId);
+  const span = srcEnd - srcStart;
+  if (!scenes || !scenes.length || !(span > 0)) return [];
+  const tiles = [];
+  for (const sc of scenes) {
+    const a = Math.max(sc.t0, srcStart);
+    const b = Math.min(sc.t1, srcEnd);
+    if (b <= a) continue;
+    tiles.push({
+      leftPct: ((a - srcStart) / span) * 100,
+      widthPct: ((b - a) / span) * 100,
+      url: `/media/scene-thumb/${sourceId}/${sc.id}`,
+    });
+  }
+  return tiles;
+}
+
 function renderTimeline() {
   const clips = $('clips');
   clips.innerHTML = '';
@@ -747,7 +785,23 @@ function renderTimeline() {
     d.className = 'clip' + (idx % 2 ? ' alt' : '') + (S.selectedClip === s.clipId ? ' sel' : '');
     d.style.left = `${(s.tlStart / S.duration) * 100}%`;
     d.style.width = `${((s.tlEnd - s.tlStart) / S.duration) * 100}%`;
-    d.title = `${s.clipId} (${fmt(s.tlEnd - s.tlStart)}) — ドラッグで並べ替え、端(6px)をドラッグでトリム`;
+    d.title = `${clipDisplayLabel(s.clipId)} — ドラッグで並べ替え、端(6px)をドラッグでトリム`;
+    // W-UI redesign §2 "フィルムストリップ": tile the real-frame scene
+    // thumbnails that overlap this segment's [srcStart, srcEnd) source
+    // range side by side as a background layer — reuses the poster frames
+    // `vedit scenes detect` already wrote to cache/ (served read-only via
+    // GET /media/scene-thumb/<sourceId>/<sceneId> in daemon.ts, no new
+    // ffmpeg call). Sources with no scene data render as the plain color
+    // fill exactly as before (full regression).
+    const srcEnd = s.srcStart + (s.tlEnd - s.tlStart);
+    for (const t of sceneThumbTilesFor(s.sourceId, s.srcStart, srcEnd)) {
+      const tile = document.createElement('div');
+      tile.className = 'clipThumb';
+      tile.style.left = `${t.leftPct}%`;
+      tile.style.width = `${t.widthPct}%`;
+      tile.style.backgroundImage = `url("${t.url}")`;
+      d.appendChild(tile);
+    }
     attachClipHandlers(d, s);
     clips.appendChild(d);
   });
@@ -759,8 +813,12 @@ function renderTimeline() {
     d.className = 'moBlock';
     d.style.left = `${(mo.tlStart / S.duration) * 100}%`;
     d.style.width = `${(mo.duration / S.duration) * 100}%`;
-    d.textContent = mo.id;
-    d.title = `${mo.id} — ドラッグで移動`;
+    // W-UI redesign §6: label by motion type, not the internal spec id (mo.id
+    // stays available via the title tooltip) — MOTION_TYPE_LABEL is defined
+    // with humanizeRevision below but this only runs after full module load.
+    const moType = S.motionSpecs?.[mo.id]?.type;
+    d.textContent = moType ? (MOTION_TYPE_LABEL[moType] ?? moType) : 'モーション';
+    d.title = `${mo.id} (${fmt(mo.duration)}) — ドラッグで移動`;
     d.onpointerdown = (e) => startBlockDrag(e, 'motion', mo.id, mo.tlStart, d);
     mrow.appendChild(d);
   }
@@ -901,11 +959,15 @@ function renderOverlayRow() {
       orphanIdx++;
     } else {
       const dur = ov.srcOut - ov.srcIn;
+      const ovSrc = S.manifest.sources.find((s) => s.id === ov.sourceId);
       d.className = 'ovBlock';
       d.style.left = `${(r.tlStart / S.duration) * 100}%`;
       d.style.width = `${(dur / S.duration) * 100}%`;
-      d.title = `${ov.id} (${dur.toFixed(1)}s, ${ov.audioMode}) — ドラッグで移動`;
-      d.textContent = ov.id;
+      // W-UI polish: raw filename lives in the title (hover) alongside the
+      // existing id/dur/audioMode debug info; the block's own text stays
+      // the short "素材N · HH:MM" alias — see sourceLabel's doc.
+      d.title = `${ovSrc ? basename(ovSrc.path) : ov.sourceId} — ${ov.id} (${dur.toFixed(1)}s, ${ov.audioMode}) — ドラッグで移動`;
+      d.textContent = sourceLabel(ovSrc); // W-UI redesign §6: display name, not the internal overlay id (full filename in title)
       d.onpointerdown = (e) => startBlockDrag(e, 'broll', ov.id, r.tlStart, d);
     }
     row.appendChild(d);
@@ -1404,7 +1466,7 @@ function renderMediaPanel() {
   el.innerHTML = '';
   const sources = S.manifest.sources;
   if (sources.length === 0) {
-    el.innerHTML = '<div class="hintText" style="padding:8px">素材がありません — `vedit ingest <file>` で取り込み</div>';
+    el.innerHTML = '<div class="hintText" style="padding:8px">まだ素材がありません — ここに動画をドラッグして取り込み</div>';
     return;
   }
   if (S.mediaFocusKey && !sources.some((s) => s.id === S.mediaFocusKey)) S.mediaFocusKey = null;
@@ -1491,7 +1553,11 @@ $('buildSelectsBtn').onclick = async () => {
 function selectClip(clipId) {
   S.selectedClip = clipId;
   $('clipInspector').hidden = !clipId;
-  if (clipId) $('clipLabel').textContent = clipId;
+  if (clipId) {
+    const label = $('clipLabel');
+    label.textContent = clipDisplayLabel(clipId);
+    label.title = clipId; // internal id kept as a tooltip only — see clipDisplayLabel's doc
+  }
   renderTimeline();
 }
 $('clipClose').onclick = () => selectClip(null);
@@ -2605,9 +2671,10 @@ function candRow(c) {
   d.tabIndex = 0;
   const dur = Math.max(0, c.t1 - c.t0);
   const src = S.manifest.sources.find((s) => s.id === c.sourceId);
-  const srcName = src ? basename(src.path) : c.sourceId;
+  const srcName = sourceLabel(src);
+  const srcTitle = src ? basename(src.path) : c.sourceId;
   const timeRange = `${fmt(c.t0)}–${fmt(c.t1)}`;
-  d.innerHTML = `<span class="kind ${c.kind}">${esc(KIND_LABEL[c.kind] ?? c.kind)}</span><span class="lbl">${esc(c.label)}</span><span class="srcTag">${esc(srcName)} ${timeRange}</span><span class="dur">-${dur.toFixed(1)}s</span>`;
+  d.innerHTML = `<span class="kind ${c.kind}">${esc(KIND_LABEL[c.kind] ?? c.kind)}</span><span class="lbl">${esc(c.label)}</span><span class="srcTag" title="${esc(srcTitle)}">${esc(srcName)} ${timeRange}</span><span class="dur">-${dur.toFixed(1)}s</span>`;
   d.setAttribute('aria-label', `${KIND_LABEL[c.kind] ?? c.kind}: ${c.label}(${srcName} ${timeRange}, -${dur.toFixed(1)}秒)`);
   const seekHere = () => {
     const tl = candidateTl(c.t0, c);
@@ -2670,6 +2737,7 @@ function inboxWarningRow(text, opts = {}) {
   const d = document.createElement('div');
   d.className = 'inboxWarn';
   d.textContent = text;
+  if (opts.title) d.title = opts.title; // internal id/detail, kept out of the visible text — see the anchor-orphan warnings below
   if (opts.onClick) {
     d.tabIndex = 0;
     d.setAttribute('role', 'button');
@@ -2723,7 +2791,8 @@ function renderInbox() {
     count++;
     const ov = r.overlay;
     el.appendChild(inboxWarningRow(
-      `⚠ アンカー切れ(B-roll ${ov.id}): アンカー(${ov.anchor.sourceId}@${ov.anchor.srcTime.toFixed(2)}s)がカットで失われました。再アンカーしてください(vedit broll-update)`,
+      `⚠ アンカー切れ(B-roll: ${sourceDisplayName(ov.sourceId)}): アンカー先(${sourceDisplayName(ov.anchor.sourceId)} ${ov.anchor.srcTime.toFixed(2)}s)がカットで失われました。タイムラインで再アンカーしてください`,
+      { title: `overlay id: ${ov.id} / anchor sourceId: ${ov.anchor.sourceId} (vedit broll-update)` },
     ));
   }
   for (const r of S.sprites) {
@@ -2731,14 +2800,16 @@ function renderInbox() {
     count++;
     const sp = r.sprite;
     el.appendChild(inboxWarningRow(
-      `⚠ アンカー切れ(スプライト ${sp.id}): アンカー(${sp.anchor.sourceId}@${sp.anchor.srcTime.toFixed(2)}s)がカットで失われました。再アンカーしてください(vedit sprite-update)`,
+      `⚠ アンカー切れ(スプライト: ${sp.assetId}): アンカー先(${sourceDisplayName(sp.anchor.sourceId)} ${sp.anchor.srcTime.toFixed(2)}s)がカットで失われました。タイムラインで再アンカーしてください`,
+      { title: `sprite id: ${sp.id} / anchor sourceId: ${sp.anchor.sourceId} (vedit sprite-update)` },
     ));
   }
 
   // color warnings
   for (const src of colorWarningSources()) {
     count++;
-    el.appendChild(inboxWarningRow(`⚠ 要色変換: ${basename(src.path)} — Log/HLG/PQ 素材のため浅い色で見えています(vedit color)`, {
+    el.appendChild(inboxWarningRow(`⚠ 要色変換: ${sourceLabel(src)} — Log/HLG/PQ 素材のため浅い色で見えています(vedit color)`, {
+      title: basename(src.path),
       onClick: () => { activateTab($('tab-mediaPanel'), { focus: false }); setMediaFocus(src.id, { focus: false }); },
     }));
   }
@@ -2747,8 +2818,9 @@ function renderInbox() {
   for (const lc of lowConfidenceCounts()) {
     count++;
     const src = S.manifest.sources.find((s) => s.id === lc.sourceId);
-    const name = src ? basename(src.path) : lc.sourceId;
+    const name = sourceLabel(src);
     el.appendChild(inboxWarningRow(`⚠ 低信頼のトランスクリプト: ${name} に${lc.count}語(Transcript タブの"?"付きを確認)`, {
+      title: src ? basename(src.path) : lc.sourceId,
       onClick: () => activateTab($('tab-transcriptPanel'), { focus: false }),
     }));
   }
@@ -2820,6 +2892,188 @@ async function decide(ids, decision) {
 // ---------- activity feed / undo (W-UI §1: 履歴タブを吸収 — "rev" は表示上「変更 #」と呼ぶ。CLI/API の語彙(rev/r12)はそのまま) ----------
 const ACTOR_LABEL = { claude: 'Claude', ui: 'あなた', system: 'システム' };
 
+// ---------- op -> human-readable Japanese summary (W-UI redesign §4) ----------
+// `entry.op`/`entry.params` are exactly the wire vocabulary daemon.ts's
+// `/api/edit` dispatch uses (the `b.op === '...'` branches in
+// src/server/daemon.ts) — internal, never meant for a user to read directly.
+// This turns each op into a short Japanese sentence; the raw op/summary the
+// server generated is preserved as a title tooltip by the callers
+// (renderActivityFeed/renderCompareCard) so nothing is lost, it's just not
+// the primary reading. Falls back to the server's raw summary for any op
+// added later that this map hasn't caught up with yet.
+// W-UI polish "素材の短い別名": raw camera/phone filenames (e.g.
+// dji_mimo_20260710_212922_20260710212922_1783773924674_video.MP4) aren't
+// meaningful to read at a glance, so every UI surface that names a source
+// shows "素材N" (N = 1-based registration order in manifest.sources — ingest
+// always appends, never reorders/removes sources, so this stays stable)
+// plus "· HH:MM" when a shooting time can be parsed out of the filename.
+// The raw filename itself is never dropped — callers put it in a `title`
+// attribute for hover discovery instead (see candRow/renderCandidateCard/
+// renderOverlayRow/humanizeRevision's 'ingest' case).
+function sourceLabel(source) {
+  if (!source) return '素材';
+  const idx = (S.manifest?.sources ?? []).findIndex((s) => s.id === source.id);
+  const n = idx >= 0 ? idx + 1 : '?';
+  const hhmm = shootTimeFromFilename(basename(source.path ?? ''));
+  return hhmm ? `素材${n} · ${hhmm}` : `素材${n}`;
+}
+// Best-effort HH:MM extraction from a filename with an embedded capture
+// timestamp. Consumer camera/phone naming conventions commonly embed a
+// YYYYMMDD date run next to (or fused with) an HHMMSS time run — e.g.
+// "..._20260710_212922_20260710212922_...". Rather than parse a specific
+// vendor format, just look for any standalone 6-digit run (not part of a
+// longer digit run, so an 8-digit date or a 13-digit epoch-ms don't match)
+// whose first 4 digits are a plausible HH:MM. Returns null — falling back
+// to the plain sequence number — when nothing plausible is found.
+function shootTimeFromFilename(name) {
+  for (const run of name.match(/\d+/g) ?? []) {
+    if (run.length !== 6) continue;
+    const hh = Number(run.slice(0, 2));
+    const mm = Number(run.slice(2, 4));
+    if (hh < 24 && mm < 60) return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
+  }
+  return null;
+}
+function sourceDisplayName(sourceId) {
+  return sourceLabel(S.manifest?.sources?.find((s) => s.id === sourceId));
+}
+const MOTION_TYPE_LABEL = {
+  'chapter-card': 'チャプターカード', 'lower-third': 'ローワーサード', callout: 'コールアウト', cta: 'CTA',
+};
+const COLOR_TYPE_LABEL = { hlg: 'HLG', pq: 'PQ', lut: 'LUT', none: '素材そのまま' };
+function humanizeRevision(entry) {
+  const op = entry.op;
+  const p = entry.params ?? {};
+  const summary = entry.summary ?? '';
+  switch (op) {
+    case 'ingest': {
+      // p.file is the absolute path passed to ingestFile (see
+      // src/ingest/ingest.ts's project.commit call) — sources never get
+      // reordered/removed, so it should still be findable in the live
+      // manifest by exact path match. Raw path stays available via the
+      // activity feed's own `info.title = ${op}: ${summary}` (summary
+      // already embeds the full path — see daemon.ts's ingest broadcast).
+      const file = typeof p.file === 'string' ? p.file : null;
+      const ingestedSrc = file ? S.manifest.sources.find((s) => s.path === file) : null;
+      const label = ingestedSrc ? sourceLabel(ingestedSrc) : (file ? basename(file) : summary);
+      return `素材を追加(${label})`;
+    }
+    case 'apply-candidates': {
+      const ids = Array.isArray(p.ids) ? p.ids : [];
+      const kinds = new Set(ids.map((id) => S.candidatesAll.find((c) => c.id === id)?.kind).filter(Boolean));
+      const label = kinds.size === 1 ? (KIND_LABEL[[...kinds][0]] ?? '') : '';
+      const secs = summary.match(/-([\d.]+)s\)/)?.[1];
+      const bits = [ids.length > 0 ? `${ids.length}件` : '', secs ? `-${secs}s` : ''].filter(Boolean).join(', ');
+      return `${label}カットを承認${bits ? `(${bits})` : ''}`;
+    }
+    case 'remove-words': {
+      const secs = summary.match(/\(([\d.]+)s\)/)?.[1];
+      const n = Array.isArray(p.ids) ? p.ids.length : null;
+      return `発言を削除(${n != null ? `${n}語` : ''}${secs ? `, -${secs}s` : ''})`;
+    }
+    case 'remove-range': {
+      const range = typeof p.t0 === 'number' && typeof p.t1 === 'number' ? `${fmt(p.t0)}–${fmt(p.t1)}` : '';
+      const src = p.sourceId ? sourceDisplayName(p.sourceId) : '';
+      const bits = [src, range].filter(Boolean).join(' ');
+      return `範囲を削除${bits ? `(${bits})` : ''}`;
+    }
+    case 'trim': {
+      const edgeLabel = p.edge === 'in' ? 'IN側' : p.edge === 'out' ? 'OUT側' : '';
+      const frames = typeof p.frames === 'number' ? `${p.frames > 0 ? '+' : ''}${p.frames}f` : '';
+      const bits = [edgeLabel, frames].filter(Boolean).join(' ');
+      return `クリップをトリム${bits ? `(${bits})` : ''}`;
+    }
+    case 'captions':
+      return '字幕設定を変更';
+    case 'caption-text':
+      return p.text === null ? '字幕修正を解除' : '字幕テキストを修正';
+    case 'motion-add': {
+      const typeLabel = p.spec?.type ? (MOTION_TYPE_LABEL[p.spec.type] ?? p.spec.type) : '';
+      const at = typeof p.tlStart === 'number' ? ` @ ${fmt(p.tlStart)}` : '';
+      return `モーション演出を追加${typeLabel || at ? `(${typeLabel}${at})` : ''}`;
+    }
+    case 'motion-update':
+      return 'モーション演出を調整';
+    case 'motion-remove':
+      return 'モーション演出を削除';
+    case 'music-add': {
+      const name = typeof p.path === 'string' && p.path ? basename(p.path) : '';
+      const at = typeof p.tlStart === 'number' ? ` @ ${fmt(p.tlStart)}` : '';
+      return `BGM/SEを追加${name || at ? `(${name}${at})` : ''}`;
+    }
+    case 'music-update':
+      return 'BGM/SEを調整';
+    case 'music-remove':
+      return 'BGM/SEを削除';
+    case 'broll-add':
+      return `B-rollを追加${typeof p.in === 'number' && typeof p.out === 'number' ? `(${fmt(p.in)}–${fmt(p.out)})` : ''}`;
+    case 'broll-update':
+      return 'B-rollを調整';
+    case 'broll-remove':
+      return 'B-rollを削除';
+    case 'sprite-add':
+      return 'キャラクターを追加';
+    case 'sprite-update':
+      return 'キャラクターを調整';
+    case 'sprite-remove':
+      return 'キャラクターを削除';
+    case 'compose':
+      return `構成モードを設定${typeof p.width === 'number' && typeof p.height === 'number' ? `(${p.width}×${p.height}, ${p.duration}s)` : ''}`;
+    case 'bg-set':
+      return `背景を切り替え${typeof p.t === 'number' ? `(${fmt(p.t)}〜)` : ''}`;
+    case 'bg-remove':
+      return '背景の切り替えを削除';
+    case 'dialogue-add':
+      return `セリフを追加${typeof p.text === 'string' && p.text ? `("${p.text.slice(0, 16)}")` : ''}`;
+    case 'dialogue-update':
+      return 'セリフを調整';
+    case 'dialogue-remove':
+      return 'セリフを削除';
+    case 'audio-mix':
+      return '音量バランスを調整';
+    case 'audio-repair':
+      return `音声を補正(${p.preset ?? ''}${p.deess ? ' + 歯擦音抑制' : ''})`;
+    case 'color-transform': {
+      const typeLabel = p.type ? (COLOR_TYPE_LABEL[p.type] ?? p.type) : '';
+      const src = p.sourceId ? sourceDisplayName(p.sourceId) : '';
+      return `色変換を適用${src || typeLabel ? `(${src}${src && typeLabel ? ' → ' : ''}${typeLabel})` : ''}`;
+    }
+    case 'color-adjust':
+      return `色を調整${p.sourceId ? `(${sourceDisplayName(p.sourceId)})` : ''}`;
+    case 'clip-add':
+      return `クリップを追加${p.sourceId ? `(${sourceDisplayName(p.sourceId)})` : ''}`;
+    case 'clip-remove':
+      return 'クリップを外す';
+    case 'clip-move':
+      return 'クリップを並べ替え';
+    case 'reframe':
+      return `画面比率を変更${p.spec ? `(${p.spec})` : ''}`;
+    case 'clip-crop':
+      return 'クリップの位置を調整';
+    case 'scene-review': {
+      const n = Array.isArray(p.sceneIds) ? p.sceneIds.length : (p.sceneId ? 1 : null);
+      const label = p.review === 'keep' ? 'keep' : p.review === 'reject' ? 'reject' : p.review === 'clear' ? '未確認' : '';
+      return `シーンを${label ? `${label}に設定` : '見直し'}${n != null ? `(${n}件)` : ''}`;
+    }
+    case 'selects':
+      return 'keepシーンだけで仮タイムラインを作成';
+    case 'kit-link':
+      return 'キットを連携';
+    case 'kit-unlink':
+      return 'キットの連携を解除';
+    case 'intent-add':
+      return `保護区間を追加${typeof p.label === 'string' && p.label ? `("${p.label}")` : ''}`;
+    case 'intent-remove':
+      return '保護区間を削除';
+    case 'restore':
+      return `変更 #${typeof p.rev === 'number' ? p.rev : '?'}の状態に復元`;
+    case 'transcribe':
+      return '文字起こしを実行';
+    default:
+      return summary || op || '';
+  }
+}
+
 function focusAfterHistoryAction() {
   const rows = [...document.querySelectorAll('#activityFeed .restoreBtn')];
   if (rows.length === 0) { $('nowPanel').focus(); return; }
@@ -2882,7 +3136,8 @@ function renderActivityFeed() {
     card.className = 'activityCard';
     const info = document.createElement('div');
     info.className = 'activityInfo';
-    info.innerHTML = `<b>変更 #${r.rev}</b> <span class="activityActor">[${esc(ACTOR_LABEL[r.actor] ?? r.actor)}]</span> ${esc(r.summary)}`;
+    info.title = `${r.op}: ${r.summary}`; // raw op/summary (internal vocabulary) — tooltip only, see humanizeRevision's doc
+    info.innerHTML = `<b>変更 #${r.rev}</b> <span class="activityActor">[${esc(ACTOR_LABEL[r.actor] ?? r.actor)}]</span> ${esc(humanizeRevision(r))}`;
     card.appendChild(info);
 
     const actions = document.createElement('div');
@@ -2909,25 +3164,6 @@ function renderActivityFeed() {
     el.appendChild(card);
   }
 }
-function updateUndoBtn() {
-  const btn = $('undoBtn');
-  const rev = S.manifest?.revision ?? 0;
-  if (rev <= 1) {
-    btn.textContent = '⟲ 戻せません';
-    btn.disabled = true;
-    btn.setAttribute('aria-label', '戻せる変更がありません');
-  } else {
-    btn.textContent = `⟲ 変更 #${rev - 1}へ戻す`;
-    btn.disabled = false;
-    btn.setAttribute('aria-label', `変更 #${rev - 1}へ戻す`);
-  }
-}
-$('undoBtn').onclick = async () => {
-  const rev = S.manifest?.revision ?? 0;
-  if (rev <= 1) { toast('戻せる変更がありません', { type: 'error' }); return; }
-  await restoreToRevision(rev - 1);
-};
-
 // ---------- shared mutation path ----------
 // Returns {ok, conflict} instead of throwing so callers can decide what to
 // preserve (e.g. keep the transcript selection alive) when a 409 happens.
@@ -3064,10 +3300,11 @@ function renderCandidateCard(c) {
   const body = $('candidateCardBody');
   const dur = Math.max(0, c.t1 - c.t0);
   const src = S.manifest.sources.find((s) => s.id === c.sourceId);
-  const srcName = src ? basename(src.path) : c.sourceId;
+  const srcName = sourceLabel(src);
+  const srcTitle = src ? basename(src.path) : c.sourceId;
   body.innerHTML = `<div><span class="kind ${c.kind}">${esc(KIND_LABEL[c.kind] ?? c.kind)}</span></div>` +
     `<div class="showCardLbl">${esc(c.label)}</div>` +
-    `<div class="hintText">${esc(srcName)} ${fmt(c.t0)}–${fmt(c.t1)}(-${dur.toFixed(1)}s)</div>`;
+    `<div class="hintText" title="${esc(srcTitle)}">${esc(srcName)} ${fmt(c.t0)}–${fmt(c.t1)}(-${dur.toFixed(1)}s)</div>`;
   const actions = document.createElement('div');
   actions.className = 'candActions';
   const preview = document.createElement('button');
@@ -3087,7 +3324,7 @@ function renderCandidateCard(c) {
   ok.textContent = 'カット適用';
   ok.onclick = async () => { await decide([c.id], 'approve'); };
   const ng = document.createElement('button');
-  ng.className = 'btn-reject';
+  ng.className = 'btn-wash'; // 候補カード: 残すは状態色ではなくニュートラル(--wash) — 「カット適用」は現状の --keep のまま
   ng.textContent = '残す';
   ng.onclick = async () => { await decide([c.id], 'reject'); };
   actions.append(preview, ok, ng);
@@ -3108,7 +3345,7 @@ function renderCompareCard(d) {
   const body = $('compareCardBody');
   const deltaLabel = `${d.deltaSeconds >= 0 ? '+' : ''}${d.deltaSeconds.toFixed(1)}s`;
   const opsHtml = (d.ops ?? [])
-    .map((o) => `<li><b>変更 #${o.rev}</b> [${esc(ACTOR_LABEL[o.actor] ?? o.actor)}] ${esc(o.op)}: ${esc(o.summary)}</li>`)
+    .map((o) => `<li title="${esc(`${o.op}: ${o.summary}`)}"><b>変更 #${o.rev}</b> [${esc(ACTOR_LABEL[o.actor] ?? o.actor)}] ${esc(humanizeRevision(o))}</li>`)
     .join('');
   body.innerHTML =
     `<div class="showCardLbl">変更 #${d.revA}(${fmt(d.durationA)}) → 変更 #${d.revB}(${fmt(d.durationB)}): ${deltaLabel}</div>` +
@@ -3226,14 +3463,14 @@ function connectWs() {
   ws.onopen = () => {
     const el = $('conn');
     el.classList.add('up');
-    el.textContent = '● 接続済み';
     el.title = '接続済み';
+    el.setAttribute('aria-label', '接続状態: 接続済み');
   };
   ws.onclose = () => {
     const el = $('conn');
     el.classList.remove('up');
-    el.textContent = '● 再接続中';
     el.title = '再接続中';
+    el.setAttribute('aria-label', '接続状態: 再接続中');
     setTimeout(connectWs, 1500);
   };
   ws.onmessage = async (ev) => {
@@ -3520,14 +3757,21 @@ function renderStat() {
   const base = out
     ? `${fmt(S.duration)} / 出力 ${out.width}×${out.height} (${aspectLabel(out.width, out.height)}) · 素材 ${m.width}×${m.height} ${Math.round(m.fps)}fps`
     : `${fmt(S.duration)} / ${m.width}×${m.height} ${Math.round(m.fps)}fps`;
-  $('stat').textContent = base + durationTargetLabel();
+  // W-UI redesign: this line is deliberately a small/dim secondary readout
+  // (see header CSS) — output res/material spec/fps are useful but shouldn't
+  // compete with the project name + live timecode for attention. The full
+  // text is also the title tooltip, so it's fully readable on hover even at
+  // a truncated width.
+  const full = base + durationTargetLabel();
+  const statEl = $('stat');
+  statEl.textContent = full;
+  statEl.title = full;
 }
 async function renderAll() {
   const m = S.manifest;
   $('projName').textContent = m.name;
   renderStat();
   $('revLabel').textContent = `変更 #${m.revision}`;
-  updateUndoBtn();
   applyCompositionMode();
   await loadMotionSpecs();
   syncMusicElements();
