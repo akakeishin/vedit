@@ -1,4 +1,19 @@
-import type { IntentZoneItem, Manifest, MusicItem, OverlayClip, SceneFile, Segment, Source, SpriteItem, VideoClip, Word } from './types.js';
+import type {
+  BackgroundRef,
+  DialogueItem,
+  IntentZoneItem,
+  Manifest,
+  MusicItem,
+  OverlayClip,
+  SceneFile,
+  Segment,
+  Source,
+  SpriteItem,
+  SpriteLoopName,
+  SpriteMotionName,
+  VideoClip,
+  Word,
+} from './types.js';
 
 /** Snap a time to the timeline frame grid. */
 export function snap(t: number, fps: number): number {
@@ -24,7 +39,16 @@ export function segments(m: Manifest): Segment[] {
   return out;
 }
 
+/**
+ * Timeline length in seconds. For a W-ANIME composition project (no video
+ * clips at all — see Manifest.composition), this is the composition's
+ * declared duration directly rather than a segments() sum (which would
+ * always be 0, since compositions never populate `timeline.video`); every
+ * normal (source-driven) project is completely unaffected — full
+ * regression — since `m.composition` is unset for those.
+ */
 export function timelineDuration(m: Manifest): number {
+  if (m.composition) return m.composition.duration;
   return segments(m).reduce((acc, s) => acc + (s.tlEnd - s.tlStart), 0);
 }
 
@@ -163,8 +187,24 @@ export function keptWords(m: Manifest, sourceId: string, words: Word[]): Word[] 
   });
 }
 
+/**
+ * W-ANIME sentinel `sourceId` recognized by sprite/dialogue anchors in a
+ * composition project (see Manifest.composition): under this id,
+ * `anchor.srcTime` IS the absolute timeline time directly — a composition
+ * has no A-roll source to anchor into, so there is nothing to "resolve".
+ * Only ever meaningful when `m.composition` is set (see
+ * sourceTimeToTimeline below and addSprite/updateSprite's anchor
+ * validation); a normal project's real source ids (freshId() output) never
+ * collide with this literal string, so this is purely additive — no normal
+ * project's anchor resolution changes at all.
+ */
+export const COMP_SOURCE_ID = '__comp__';
+
 /** Map a source time to timeline time, or null if cut away. */
 export function sourceTimeToTimeline(m: Manifest, sourceId: string, t: number): number | null {
+  if (m.composition && sourceId === COMP_SOURCE_ID) {
+    return t >= 0 && t <= m.composition.duration ? t : null;
+  }
   for (const s of segments(m)) {
     if (s.sourceId !== sourceId) continue;
     const d = s.tlEnd - s.tlStart;
@@ -923,7 +963,70 @@ function assertUnit(v: number, label: string, name: string): void {
   }
 }
 
-/** Add a sprite, anchored to an A-roll moment. Validates finiteness, the anchor source exists, and 0..1 ranges — NOT that assetId exists in a kit (see module doc above). */
+/**
+ * Whether `sourceId` is a valid sprite/dialogue anchor source: a real
+ * ingested source, OR (W-ANIME) the COMP_SOURCE_ID sentinel when the
+ * project is a composition — see sourceTimeToTimeline's doc. A normal
+ * project has no `m.composition`, so the sentinel branch never activates
+ * for it; full regression.
+ */
+function isKnownAnchorSource(m: Manifest, sourceId: string): boolean {
+  if (m.composition && sourceId === COMP_SOURCE_ID) return true;
+  return m.sources.some((s) => s.id === sourceId);
+}
+
+const SPRITE_MOTION_NAMES = new Set<SpriteMotionName>(['slide-left', 'slide-right', 'hop-in', 'pop', 'fade']);
+const SPRITE_LOOP_NAMES = new Set<SpriteLoopName>(['sway', 'bob', 'hop', 'breathe', 'none']);
+
+/**
+ * Validate a `SpriteItem.motion` patch (W-ANIME) — every field optional,
+ * unrecognized enum values rejected, `emoteAt` entries shape-checked (NOT
+ * that their `assetId` resolves in a linked kit — same "daemon validates
+ * against the kit, ops.ts validates shape only" split as the sprite's own
+ * top-level `assetId`, see the module doc above). Returns a normalized
+ * copy, or `undefined` when `motion` itself is undefined or ends up with no
+ * recognized fields set (so a `{}` patch never gets stored as clutter).
+ */
+function assertSpriteMotion(motion: SpriteItem['motion'] | undefined, label: string): SpriteItem['motion'] | undefined {
+  if (motion === undefined) return undefined;
+  if (typeof motion !== 'object' || motion === null || Array.isArray(motion)) {
+    throw new Error(`${label}: motion must be an object`);
+  }
+  const out: NonNullable<SpriteItem['motion']> = {};
+  if (motion.enter !== undefined) {
+    if (!SPRITE_MOTION_NAMES.has(motion.enter)) {
+      throw new Error(`${label}: motion.enter (${JSON.stringify(motion.enter)}) is not a recognized preset`);
+    }
+    out.enter = motion.enter;
+  }
+  if (motion.exit !== undefined) {
+    if (!SPRITE_MOTION_NAMES.has(motion.exit)) {
+      throw new Error(`${label}: motion.exit (${JSON.stringify(motion.exit)}) is not a recognized preset`);
+    }
+    out.exit = motion.exit;
+  }
+  if (motion.loop !== undefined) {
+    if (!SPRITE_LOOP_NAMES.has(motion.loop)) {
+      throw new Error(`${label}: motion.loop (${JSON.stringify(motion.loop)}) is not a recognized preset`);
+    }
+    out.loop = motion.loop;
+  }
+  if (motion.emoteAt !== undefined) {
+    if (!Array.isArray(motion.emoteAt)) throw new Error(`${label}: motion.emoteAt must be an array`);
+    out.emoteAt = motion.emoteAt.map((e, i) => {
+      if (!e || typeof e.t !== 'number' || !Number.isFinite(e.t) || e.t < 0) {
+        throw new Error(`${label}: motion.emoteAt[${i}].t must be a finite number >= 0`);
+      }
+      if (typeof e.assetId !== 'string' || !e.assetId) {
+        throw new Error(`${label}: motion.emoteAt[${i}].assetId is required`);
+      }
+      return { t: e.t, assetId: e.assetId };
+    });
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+/** Add a sprite, anchored to an A-roll moment (or, in a composition project, the COMP_SOURCE_ID sentinel — see isKnownAnchorSource). Validates finiteness, the anchor source exists, and 0..1 ranges — NOT that assetId exists in a kit (see module doc above). */
 export function addSprite(
   m: Manifest,
   assetId: string,
@@ -935,10 +1038,11 @@ export function addSprite(
     opacity?: number;
     flip?: boolean;
     id?: string;
+    motion?: SpriteItem['motion'];
   },
 ): Manifest {
   if (typeof assetId !== 'string' || !assetId) throw new Error('sprite-add: assetId is required');
-  if (!opts.anchor || !m.sources.some((s) => s.id === opts.anchor.sourceId)) {
+  if (!opts.anchor || !isKnownAnchorSource(m, opts.anchor.sourceId)) {
     throw new Error(`sprite-add: unknown anchor source: ${opts.anchor?.sourceId}`);
   }
   if (!Number.isFinite(opts.anchor.srcTime) || opts.anchor.srcTime < 0) {
@@ -960,6 +1064,7 @@ export function addSprite(
   const sprites = m.timeline.sprites ?? [];
   const id = opts.id ?? freshId('sp');
   if (sprites.some((s) => s.id === id)) throw new Error(`sprite-add: sprite id already exists: ${id}`);
+  const motion = assertSpriteMotion(opts.motion, 'sprite-add');
   const item: SpriteItem = {
     id,
     assetId,
@@ -969,6 +1074,7 @@ export function addSprite(
     scale,
     opacity,
     ...(opts.flip ? { flip: true } : {}),
+    ...(motion ? { motion } : {}),
   };
   return { ...m, timeline: { ...m.timeline, sprites: [...sprites, item] } };
 }
@@ -984,6 +1090,7 @@ export function updateSprite(
     scale?: number;
     opacity?: number;
     flip?: boolean;
+    motion?: SpriteItem['motion'] | null;
   },
 ): Manifest {
   const sprites = m.timeline.sprites ?? [];
@@ -992,7 +1099,7 @@ export function updateSprite(
   const cur = sprites[idx];
   const next: SpriteItem = { ...cur };
   if (patch.anchor !== undefined) {
-    if (!m.sources.some((s) => s.id === patch.anchor!.sourceId)) {
+    if (!isKnownAnchorSource(m, patch.anchor!.sourceId)) {
       throw new Error(`sprite-update: unknown anchor source: ${patch.anchor.sourceId}`);
     }
     if (!Number.isFinite(patch.anchor.srcTime) || patch.anchor.srcTime < 0) {
@@ -1024,6 +1131,20 @@ export function updateSprite(
   if (patch.flip !== undefined) {
     if (patch.flip) next.flip = true;
     else delete next.flip;
+  }
+  if (patch.motion !== undefined) {
+    if (patch.motion === null) {
+      delete next.motion;
+    } else {
+      // Merge field-by-field onto the existing motion (same convention as
+      // mergeCaptionOverrides in daemon.ts) — a patch that only sets `loop`
+      // never wipes out an already-set `enter`/`exit`/`emoteAt`. Pass
+      // `motion: null` to clear everything instead.
+      const validated = assertSpriteMotion(patch.motion, 'sprite-update');
+      const merged = { ...(cur.motion ?? {}), ...(validated ?? {}) };
+      if (Object.keys(merged).length) next.motion = merged;
+      else delete next.motion;
+    }
   }
   const out = [...sprites];
   out[idx] = next;
@@ -1092,6 +1213,419 @@ export function spriteGeometry(
   const anchorX = position.x * outputWH.width;
   const anchorY = position.y * outputWH.height;
   return { x: anchorX - anchorPxX, y: anchorY - anchorPxY, width: fullWidth, height: fullHeight, anchorX, anchorY };
+}
+
+// ---- sprite motion presets (W-ANIME "ゆる紙芝居" — see docs/superpowers/specs/2026-07-17-vedit-anime-design.md) ----
+//
+// Pure ffmpeg-expression builders: given a sprite's static SpriteGeometryResult
+// (from spriteGeometry above) and its resolved [tlStart,tlEnd) window,
+// spriteMotionPlan produces `overlay` x/y expressions (and, for the 'breathe'
+// loop, `scale` w/h expressions) plus any `fade`-filter alpha-fade clauses —
+// every value stays byte-for-byte the pre-W-ANIME static x/y when
+// SpriteItem.motion is unset (full regression). render.ts splices these
+// directly into the ffmpeg filtergraph; web/app.js's spriteMotionOffsetJS is
+// a hand-kept-in-sync per-frame NUMERIC port of the same formulas (evaluated
+// directly in JS every rendered frame, rather than as ffmpeg expression
+// strings) — spec: "見た目近似で可" (only the TIMING, not pixel-identical
+// curves between render and preview, is guaranteed to match).
+
+/** Entrance/exit transition length, seconds. */
+export const SPRITE_TRANSITION_SECONDS = 0.35;
+/** emoteAt crossfade length, seconds (spec: "フェード 0.15s"). */
+export const SPRITE_EMOTE_CROSSFADE_SECONDS = 0.15;
+/** sway/bob loop amplitude in pixels — matches the spec's own ffmpeg example (`x='X + 8*sin(...)'`) literally. */
+const SPRITE_LOOP_SWAY_PX = 8;
+const SPRITE_LOOP_BOB_PX = 6;
+const SPRITE_LOOP_HOP_PX = 10;
+/** breathe scale-pulse amplitude as a 0..1 fraction; spec's stated default ("既定1.2%"). A per-kit-style override was left unwired — see the W-ANIME implementation report. */
+export const SPRITE_BREATHE_AMPLITUDE = 0.012;
+
+/** Format a number for splicing into an ffmpeg expression (fixed precision, no trailing noise). */
+function fexpr(v: number): string {
+  return Number.isInteger(v) ? String(v) : v.toFixed(6);
+}
+
+/** `min(1,max(0,(t-t0)/d))` — a 0..1 ramp that's flat outside [t0,t0+d]. */
+function rampExpr(t0: number, d: number): string {
+  return `min(1,max(0,(t-${fexpr(t0)})/${fexpr(d)}))`;
+}
+
+interface MotionTerms {
+  /** Additive x/y offset expression fragments (e.g. "+8*sin(...)"), or '' when the preset doesn't touch that axis. */
+  dx: string;
+  dy: string;
+  /** ffmpeg `fade=...:alpha=1` clause (no brackets), or null when the preset has no alpha fade. */
+  fade: string | null;
+}
+
+const NO_TERMS: MotionTerms = { dx: '', dy: '', fade: null };
+
+/** Entrance-transition terms, active during [tlStart, tlStart+D). */
+function enterTerms(name: SpriteMotionName | undefined, tlStart: number, geo: { width: number; height: number }): MotionTerms {
+  if (!name) return NO_TERMS;
+  const D = SPRITE_TRANSITION_SECONDS;
+  const p = rampExpr(tlStart, D);
+  const travelX = geo.width * 0.6;
+  const travelY = geo.height * 0.5;
+  const bounceY = geo.height * 0.05;
+  switch (name) {
+    case 'slide-left':
+      // Starts displaced to the right of rest, settles as p->1 — reads as sliding LEFT into place.
+      return { dx: `+${fexpr(travelX)}*(1-${p})`, dy: '', fade: null };
+    case 'slide-right':
+      return { dx: `-${fexpr(travelX)}*(1-${p})`, dy: '', fade: null };
+    case 'hop-in':
+      // Ease-out rise from below.
+      return { dx: '', dy: `+${fexpr(travelY)}*(1-${p})*(1-${p})`, fade: null };
+    case 'pop':
+      return { dx: '', dy: `-${fexpr(bounceY)}*sin(PI*${p})`, fade: `fade=t=in:st=${fexpr(tlStart)}:d=${fexpr(D)}:alpha=1` };
+    case 'fade':
+      return { dx: '', dy: '', fade: `fade=t=in:st=${fexpr(tlStart)}:d=${fexpr(D)}:alpha=1` };
+  }
+}
+
+/** Exit-transition terms, active during [tlEnd-D, tlEnd). */
+function exitTerms(name: SpriteMotionName | undefined, tlEnd: number, geo: { width: number; height: number }): MotionTerms {
+  if (!name) return NO_TERMS;
+  const D = SPRITE_TRANSITION_SECONDS;
+  const start = tlEnd - D;
+  const p = rampExpr(start, D);
+  const travelX = geo.width * 0.6;
+  const travelY = geo.height * 0.5;
+  const bounceY = geo.height * 0.05;
+  switch (name) {
+    case 'slide-left':
+      return { dx: `-${fexpr(travelX)}*${p}`, dy: '', fade: null };
+    case 'slide-right':
+      return { dx: `+${fexpr(travelX)}*${p}`, dy: '', fade: null };
+    case 'hop-in':
+      return { dx: '', dy: `+${fexpr(travelY)}*${p}*${p}`, fade: null };
+    case 'pop':
+      return { dx: '', dy: `-${fexpr(bounceY)}*sin(PI*(1-${p}))`, fade: `fade=t=out:st=${fexpr(start)}:d=${fexpr(D)}:alpha=1` };
+    case 'fade':
+      return { dx: '', dy: '', fade: `fade=t=out:st=${fexpr(start)}:d=${fexpr(D)}:alpha=1` };
+  }
+}
+
+/** Continuous idle-loop terms, active across the sprite's whole [tlStart,tlEnd) window ('breathe' is handled separately in spriteMotionPlan — it's scale-only, not a simple x/y offset). */
+function loopTerms(loop: SpriteLoopName | undefined, tlStart: number): { dx: string; dy: string } {
+  if (!loop || loop === 'none' || loop === 'breathe') return { dx: '', dy: '' };
+  const lt = `(t-${fexpr(tlStart)})`;
+  if (loop === 'sway') return { dx: `+${SPRITE_LOOP_SWAY_PX}*sin(2*PI*${lt}/3)`, dy: '' };
+  if (loop === 'bob') return { dx: '', dy: `+${SPRITE_LOOP_BOB_PX}*sin(2*PI*${lt}/2.4)` };
+  // hop: periodic upward bounce back to baseline.
+  return { dx: '', dy: `-${SPRITE_LOOP_HOP_PX}*abs(sin(2*PI*${lt}/1))` };
+}
+
+export interface SpriteMotionExpr {
+  /** ffmpeg `overlay` x expression (a plain number string when nothing touches x). */
+  xExpr: string;
+  yExpr: string;
+  /** ffmpeg filter clause(s) (no brackets) to splice into the sprite's own per-frame chain, ahead of the overlay — alpha fades for pop/fade enter/exit. */
+  fadeClauses: string[];
+  /** Set only when `motion.loop === 'breathe'`: eval=frame `scale` width/height expressions replacing the static display size. */
+  breathe?: { widthExpr: string; heightExpr: string };
+}
+
+/**
+ * Build ffmpeg expressions for one sprite's motion (W-ANIME), given its
+ * static placement (`geo`, from spriteGeometry) and resolved [tlStart,tlEnd)
+ * window. `motion` undefined (or `{}`) returns a plan whose x/y are the
+ * plain static geo.x/geo.y and no fade/breathe — byte-for-byte what a
+ * pre-W-ANIME static overlay would use.
+ */
+export function spriteMotionPlan(
+  motion: SpriteItem['motion'] | undefined,
+  geo: { x: number; y: number; width: number; height: number; anchorX: number; anchorY: number },
+  tlStart: number,
+  tlEnd: number,
+): SpriteMotionExpr {
+  const enter = enterTerms(motion?.enter, tlStart, geo);
+  const exit = exitTerms(motion?.exit, tlEnd, geo);
+  const loop = loopTerms(motion?.loop, tlStart);
+  const dxTerms = [enter.dx, exit.dx, loop.dx].filter(Boolean).join('');
+  const dyTerms = [enter.dy, exit.dy, loop.dy].filter(Boolean).join('');
+  const fadeClauses = [enter.fade, exit.fade].filter((c): c is string => Boolean(c));
+
+  if (motion?.loop === 'breathe') {
+    const period = 2;
+    const lt = `(t-${fexpr(tlStart)})`;
+    const scaleExpr = `(1+${SPRITE_BREATHE_AMPLITUDE}*sin(2*PI*${lt}/${period}))`;
+    const widthExpr = `${fexpr(geo.width)}*${scaleExpr}`;
+    const heightExpr = `${fexpr(geo.height)}*${scaleExpr}`;
+    // Keep the anchor point (the character's feet) fixed as it breathes:
+    // recompute the top-left corner from the anchor's fixed fraction within
+    // the sprite's own resting box, applied to the CURRENT (pulsing) size.
+    const fracX = geo.width > 0 ? (geo.anchorX - geo.x) / geo.width : 0.5;
+    const fracY = geo.height > 0 ? (geo.anchorY - geo.y) / geo.height : 1;
+    return {
+      xExpr: `${fexpr(geo.anchorX)}-${fexpr(fracX)}*(${widthExpr})${dxTerms}`,
+      yExpr: `${fexpr(geo.anchorY)}-${fexpr(fracY)}*(${heightExpr})${dyTerms}`,
+      fadeClauses,
+      breathe: { widthExpr, heightExpr },
+    };
+  }
+
+  return {
+    xExpr: dxTerms ? `${fexpr(geo.x)}${dxTerms}` : fexpr(geo.x),
+    yExpr: dyTerms ? `${fexpr(geo.y)}${dyTerms}` : fexpr(geo.y),
+    fadeClauses,
+  };
+}
+
+export interface EmoteWindow {
+  /** Sprite-local seconds (0 = the sprite's own tlStart), NOT absolute timeline time. */
+  t0: number;
+  t1: number;
+  assetId: string;
+}
+
+/**
+ * Turn a sprite's `motion.emoteAt` list into non-overlapping, time-sorted
+ * windows (W-ANIME "表情差分"): each entry is active from its own `t` until
+ * either the next entry's `t` or the sprite's own `duration`, whichever
+ * comes first. Entries at/after `duration` (or with a negative/non-finite
+ * `t`) are dropped — nothing to show. Pure; render.ts/web/app.js both walk
+ * this to know which extra asset layer to crossfade in during which
+ * sprite-local window.
+ */
+export function emoteWindows(emoteAt: { t: number; assetId: string }[] | undefined, duration: number): EmoteWindow[] {
+  const valid = (emoteAt ?? []).filter((e) => Number.isFinite(e.t) && e.t >= 0 && e.t < duration);
+  const sorted = [...valid].sort((a, b) => a.t - b.t);
+  const out: EmoteWindow[] = [];
+  for (let i = 0; i < sorted.length; i++) {
+    const t0 = sorted[i].t;
+    const t1 = i + 1 < sorted.length ? Math.min(sorted[i + 1].t, duration) : duration;
+    if (t1 - t0 < 1e-6) continue;
+    out.push({ t0, t1, assetId: sorted[i].assetId });
+  }
+  return out;
+}
+
+// ---- composition (W-ANIME): source-less "sprite anime" production mode ----
+//
+// A composition project (Manifest.composition) has NO video sources/clips
+// at all — `segments()`/`timeline.video` stay permanently empty, and every
+// consumer that iterates them (buildFilterGraph, view.ts, otio.ts, qc.ts's
+// segment-based checks) simply sees "nothing there" rather than needing a
+// special case, EXCEPT timelineDuration/sourceTimeToTimeline above (which
+// composition needs a real answer from) and the composition-specific
+// mutators/resolvers below. render.ts's buildCompositionFilterGraph (a
+// SEPARATE function from the normal buildFilterGraph — see its doc) is
+// where the actual background/sprite/dialogue compositing happens.
+
+const COMP_HEX_COLOR_RE = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
+
+function assertBackgroundRef(ref: BackgroundRef, label: string): void {
+  if (!ref || typeof ref !== 'object' || Array.isArray(ref)) throw new Error(`${label}: background ref is required`);
+  if (ref.type === 'color') {
+    if (typeof ref.hex !== 'string' || !COMP_HEX_COLOR_RE.test(ref.hex)) {
+      throw new Error(`${label}: invalid hex color: ${JSON.stringify((ref as { hex?: unknown }).hex)}`);
+    }
+  } else if (ref.type === 'asset') {
+    if (typeof ref.assetId !== 'string' || !ref.assetId) throw new Error(`${label}: assetId is required`);
+  } else if (ref.type === 'video') {
+    if (typeof ref.path !== 'string' || !ref.path) throw new Error(`${label}: path is required`);
+  } else {
+    throw new Error(`${label}: background type must be "color", "asset", or "video" (got ${JSON.stringify((ref as { type?: unknown })?.type)})`);
+  }
+}
+
+/**
+ * `vedit compose <dir> --duration --size [--kit]`: initialize (or re-tune) a
+ * project as a composition (see Manifest.composition's doc in types.ts).
+ * Refuses a project that already has ingested sources/clips — composition
+ * and normal A-roll editing are mutually exclusive modes on one project.
+ * Calling this again on an already-composed (still source-less) project is
+ * allowed and simply updates duration/size/background; there's no separate
+ * "uncompose" short of `vedit undo`, same as any other manifest edit.
+ * `width`/`height` are written directly onto the manifest (there is no
+ * source to derive them from, unlike a normal project's ingest-time fps/
+ * width/height) and rounded to the nearest even pixel (yuv420p requirement,
+ * same convention as parseReframeSpec).
+ */
+export function setComposition(
+  m: Manifest,
+  opts: { duration: number; width: number; height: number; background?: BackgroundRef },
+): Manifest {
+  if (m.sources.length > 0 || m.timeline.video.length > 0) {
+    throw new Error('compose: project already has ingested video sources; composition mode is for a source-less production project only');
+  }
+  if (!Number.isFinite(opts.duration) || opts.duration <= 0) {
+    throw new Error(`compose: duration (${opts.duration}) must be a finite number > 0`);
+  }
+  if (!Number.isFinite(opts.width) || opts.width <= 0 || !Number.isFinite(opts.height) || opts.height <= 0) {
+    throw new Error('compose: size must be positive width/height');
+  }
+  const background = opts.background ?? { type: 'color', hex: '#000000' };
+  assertBackgroundRef(background, 'compose');
+  return {
+    ...m,
+    width: Math.max(2, Math.round(opts.width / 2) * 2),
+    height: Math.max(2, Math.round(opts.height / 2) * 2),
+    composition: { duration: opts.duration, background },
+  };
+}
+
+/**
+ * `vedit bg-set --at <t> --to <ref>`: set the active background from `t`
+ * onward — a "紙芝居" scene change. `t` at (or within half a frame of) 0
+ * replaces the base `composition.background` itself (the layer active
+ * before any cut); any later `t` upserts (by frame-snapped time, replacing
+ * an existing cut at the same instant) into `backgroundTrack`, kept sorted
+ * ascending — see resolvedBackgroundAt/backgroundIntervals for how these
+ * resolve at a given instant.
+ */
+export function setBackgroundAt(m: Manifest, t: number, ref: BackgroundRef): Manifest {
+  if (!m.composition) throw new Error('bg-set: project has no composition (run `vedit compose` first)');
+  if (!Number.isFinite(t) || t < 0) throw new Error(`bg-set: at (${t}) must be a finite number >= 0`);
+  if (t > m.composition.duration) {
+    throw new Error(`bg-set: at (${t}) exceeds composition duration (${m.composition.duration})`);
+  }
+  assertBackgroundRef(ref, 'bg-set');
+  const fps = m.fps;
+  if (t < 0.5 / fps) {
+    return { ...m, composition: { ...m.composition, background: ref } };
+  }
+  const tSnapped = snap(t, fps);
+  const track = [...(m.composition.backgroundTrack ?? [])];
+  const idx = track.findIndex((e) => Math.abs(e.t - tSnapped) < 0.5 / fps);
+  if (idx >= 0) track[idx] = { t: tSnapped, ref };
+  else track.push({ t: tSnapped, ref });
+  track.sort((a, b) => a.t - b.t);
+  return { ...m, composition: { ...m.composition, backgroundTrack: track } };
+}
+
+/** Remove a background cut at (or within half a frame of) `t` from `backgroundTrack`. Refuses t=0 (that's the base `background`, not removable — use another `bg-set --at 0` to replace it instead). */
+export function removeBackgroundAt(m: Manifest, t: number): Manifest {
+  if (!m.composition) throw new Error('bg-remove: project has no composition');
+  const fps = m.fps;
+  if (t < 0.5 / fps) throw new Error('bg-remove: t=0 is the base background — replace it with `vedit bg-set --at 0 --to ...` instead of removing it');
+  const track = m.composition.backgroundTrack ?? [];
+  const next = track.filter((e) => Math.abs(e.t - t) >= 0.5 / fps);
+  if (next.length === track.length) throw new Error(`bg-remove: no background cut at t=${t}`);
+  return { ...m, composition: { ...m.composition, backgroundTrack: next } };
+}
+
+/** The active background ref at absolute timeline time `t` — the base `background` unless a `backgroundTrack` cut at or before `t` overrides it. */
+export function resolvedBackgroundAt(m: Manifest, t: number): BackgroundRef {
+  if (!m.composition) throw new Error('resolvedBackgroundAt: project has no composition');
+  let active = m.composition.background;
+  for (const e of m.composition.backgroundTrack ?? []) {
+    if (e.t <= t) active = e.ref;
+    else break; // backgroundTrack is kept sorted ascending by setBackgroundAt
+  }
+  return active;
+}
+
+export interface BackgroundInterval {
+  t0: number;
+  t1: number;
+  ref: BackgroundRef;
+}
+
+/** The full "紙芝居" as non-overlapping, time-sorted [t0,t1) intervals covering [0,duration) — what render.ts/web/app.js actually iterate to build the background layer. Empty for a non-composition manifest. */
+export function backgroundIntervals(m: Manifest): BackgroundInterval[] {
+  if (!m.composition) return [];
+  const duration = m.composition.duration;
+  const cutPoints = [0, ...(m.composition.backgroundTrack ?? []).map((e) => e.t)];
+  const points = [...new Set(cutPoints)].filter((t) => t < duration).sort((a, b) => a - b);
+  const out: BackgroundInterval[] = [];
+  for (let i = 0; i < points.length; i++) {
+    const t0 = points[i];
+    const t1 = i + 1 < points.length ? points[i + 1] : duration;
+    if (t1 - t0 < 1e-9) continue;
+    out.push({ t0, t1, ref: resolvedBackgroundAt(m, t0) });
+  }
+  return out;
+}
+
+// ---- dialogue (W-ANIME speech bubbles) ----
+//
+// Unlike sprites/overlays, a DialogueItem is placed directly at an absolute
+// timeline time (no anchor indirection) — see DialogueItem's doc in
+// types.ts. Available on any project (not gated to composition), since
+// nothing about it depends on Manifest.composition.
+
+/** Add a speech-bubble line at an absolute timeline time. `spriteId`, when given, must reference an existing sprite (used only to aim the bubble's tail — see kit.ts's deriveSpeechBubbleStyle). */
+export function addDialogue(
+  m: Manifest,
+  text: string,
+  opts: { tlStart: number; duration?: number; spriteId?: string; voiceMusicId?: string; id?: string },
+): Manifest {
+  if (typeof text !== 'string' || !text.trim()) throw new Error('dialogue-add: text is required');
+  if (!Number.isFinite(opts.tlStart) || opts.tlStart < 0) {
+    throw new Error(`dialogue-add: at (${opts.tlStart}) must be a finite number >= 0`);
+  }
+  const duration = opts.duration ?? 2.5;
+  if (!Number.isFinite(duration) || duration <= 0) {
+    throw new Error(`dialogue-add: duration (${duration}) must be a finite number > 0`);
+  }
+  if (opts.spriteId !== undefined && !(m.timeline.sprites ?? []).some((s) => s.id === opts.spriteId)) {
+    throw new Error(`dialogue-add: unknown sprite: ${opts.spriteId}`);
+  }
+  const dialogue = m.timeline.dialogue ?? [];
+  const id = opts.id ?? freshId('dl');
+  if (dialogue.some((d) => d.id === id)) throw new Error(`dialogue-add: id already exists: ${id}`);
+  const item: DialogueItem = {
+    id,
+    text,
+    tlStart: opts.tlStart,
+    duration,
+    ...(opts.spriteId ? { spriteId: opts.spriteId } : {}),
+    ...(opts.voiceMusicId ? { voiceMusicId: opts.voiceMusicId } : {}),
+  };
+  return { ...m, timeline: { ...m.timeline, dialogue: [...dialogue, item] } };
+}
+
+/** Patch an existing dialogue line's text/placement/sprite reference (never its `voiceMusicId` — re-add with `--voice` to change the voice clip). `spriteId: null` clears the tail-direction reference. */
+export function updateDialogue(
+  m: Manifest,
+  id: string,
+  patch: { text?: string; tlStart?: number; duration?: number; spriteId?: string | null },
+): Manifest {
+  const dialogue = m.timeline.dialogue ?? [];
+  const idx = dialogue.findIndex((d) => d.id === id);
+  if (idx < 0) throw new Error(`unknown dialogue item: ${id}`);
+  const cur = dialogue[idx];
+  const next: DialogueItem = { ...cur };
+  if (patch.text !== undefined) {
+    if (typeof patch.text !== 'string' || !patch.text.trim()) throw new Error('dialogue-update: text must be a non-empty string');
+    next.text = patch.text;
+  }
+  if (patch.tlStart !== undefined) {
+    if (!Number.isFinite(patch.tlStart) || patch.tlStart < 0) {
+      throw new Error(`dialogue-update: at (${patch.tlStart}) must be a finite number >= 0`);
+    }
+    next.tlStart = patch.tlStart;
+  }
+  if (patch.duration !== undefined) {
+    if (!Number.isFinite(patch.duration) || patch.duration <= 0) {
+      throw new Error(`dialogue-update: duration (${patch.duration}) must be a finite number > 0`);
+    }
+    next.duration = patch.duration;
+  }
+  if (patch.spriteId !== undefined) {
+    if (patch.spriteId === null) {
+      delete next.spriteId;
+    } else {
+      if (!(m.timeline.sprites ?? []).some((s) => s.id === patch.spriteId)) {
+        throw new Error(`dialogue-update: unknown sprite: ${patch.spriteId}`);
+      }
+      next.spriteId = patch.spriteId;
+    }
+  }
+  const out = [...dialogue];
+  out[idx] = next;
+  return { ...m, timeline: { ...m.timeline, dialogue: out } };
+}
+
+/** Remove a dialogue line. Does NOT remove its `voiceMusicId`'s MusicItem — that cascade (one commit, two ops.ts calls) is the daemon's job, keeping this a single-purpose mutator like removeSprite/removeMusic. */
+export function removeDialogue(m: Manifest, id: string): Manifest {
+  const dialogue = m.timeline.dialogue ?? [];
+  const next = dialogue.filter((d) => d.id !== id);
+  if (next.length === dialogue.length) throw new Error(`unknown dialogue item: ${id}`);
+  return { ...m, timeline: { ...m.timeline, dialogue: next } };
 }
 
 // ---- intent zones ("静寂スコア" protection zones — W-INTENT) ------------------

@@ -98,7 +98,41 @@ export interface Manifest {
    * (see ops.ts's addIntentZone/removeIntentZone).
    */
   intentZones?: IntentZoneItem[];
+  /**
+   * W-ANIME "コンポジション(スプライトアニメ)": marks this project as a
+   * source-less production ("映像ソースなしの製作モード") — kit sprites
+   * moving over a background, no A-roll footage at all. Optional/absent
+   * means a normal (source-driven) project; every composition-aware
+   * consumer (timelineDuration, sourceTimeToTimeline's `__comp__` sentinel,
+   * render's buildCompositionFilterGraph, the web timeline) degrades to its
+   * pre-W-ANIME behavior when this is unset — full regression for every
+   * existing project. Set via `vedit compose <dir> --duration --size`
+   * (see ops.ts's setComposition); `width`/`height` above are set directly
+   * to the composition's canvas size at that point (there is no source to
+   * derive them from). `background` is the base/default layer, active from
+   * t=0 until the first `backgroundTrack` cut (if any) — see
+   * resolvedBackgroundAt in ops.ts. `backgroundTrack` holds subsequent
+   * "紙芝居" scene changes, set via `vedit bg-set --at <t> --to <ref>`.
+   */
+  composition?: {
+    duration: number;
+    background: BackgroundRef;
+    backgroundTrack?: { t: number; ref: BackgroundRef }[];
+  };
 }
+
+/**
+ * A composition's background layer at one instant (W-ANIME): a solid color,
+ * a linked kit's background-type asset, or a looping video file (absolute
+ * path, same "user-owned, not sandboxed to the project" trust model as
+ * MusicItem.path / Source.colorTransform.lut). Resolved to a concrete
+ * ffmpeg/web source only at render/preview time — never copied/baked
+ * anywhere else in the manifest.
+ */
+export type BackgroundRef =
+  | { type: 'color'; hex: string }
+  | { type: 'asset'; assetId: string }
+  | { type: 'video'; path: string };
 
 /** One "静寂スコア" protection zone — see Manifest.intentZones. */
 export interface IntentZoneItem {
@@ -200,6 +234,40 @@ export interface Timeline {
    * for backward compatibility with older project.json files.
    */
   sprites?: SpriteItem[];
+  /**
+   * Speech-bubble lines (W-ANIME) — the composition-mode alternative to
+   * captions ("captions は使わない代わりに dialogue"), though nothing
+   * restricts it to composition projects specifically. Unlike sprites/
+   * overlays, a DialogueItem is placed directly at an absolute timeline
+   * time (`tlStart`) rather than anchored to an A-roll moment — a
+   * composition has no A-roll to anchor to, and even in a normal project a
+   * speech bubble reads more like MotionItem's placement (a fixed timeline
+   * decoration) than a source-anchored overlay. Optional for backward
+   * compatibility with older project.json files.
+   */
+  dialogue?: DialogueItem[];
+}
+
+/**
+ * One speech-bubble line (W-ANIME). `spriteId`, when set, must reference an
+ * existing `Timeline.sprites[]` entry — used only to aim the bubble's tail
+ * toward that sprite's position (a presentation detail; render/web decide
+ * exactly how, see kit.ts's deriveSpeechBubbleStyle and render.ts's ASS
+ * BorderStyle=3 approximation). `voiceMusicId`, when set, is the id of a
+ * `Timeline.music[]` entry created alongside this dialogue item (via
+ * `--voice <file>`, the "SE 経路" the spec describes — voice audio rides
+ * the same MusicItem pipeline as background music/sound effects, just with
+ * duck disabled and short anti-click fades instead of BGM-style ones) so
+ * removing the dialogue line also removes its voice clip (see the daemon's
+ * `dialogue-remove` op).
+ */
+export interface DialogueItem {
+  id: string;
+  text: string;
+  tlStart: number;
+  duration: number;
+  spriteId?: string;
+  voiceMusicId?: string;
 }
 
 /**
@@ -223,7 +291,39 @@ export interface SpriteItem {
   opacity: number;
   /** Mirror horizontally. */
   flip?: boolean;
+  /**
+   * Lightweight animation (W-ANIME) — entirely a render/preview-time
+   * presentation detail layered on top of the static placement above
+   * (position/scale/opacity stay the sprite's RESTING values; motion
+   * expressions displace/fade around them). Optional/absent means a
+   * perfectly static sprite, byte-for-byte the pre-W-ANIME render/preview
+   * output — see spriteMotionPlan in ops.ts (the pure expression builder)
+   * and its ffmpeg/CSS consumers in render.ts/web/app.js.
+   */
+  motion?: {
+    /** Entrance transition, played during the sprite's first ~0.35s on screen. */
+    enter?: SpriteMotionName;
+    /** Continuous idle animation for the sprite's full [tlStart,tlEnd) window (also runs under enter/exit — their offsets add on top). */
+    loop?: SpriteLoopName;
+    /** Exit transition, played during the sprite's last ~0.35s on screen. */
+    exit?: SpriteMotionName;
+    /**
+     * Expression-swap points ("表情差分"): at each `t` (seconds from the
+     * sprite's OWN tlStart, i.e. sprite-local time — not absolute timeline
+     * time), `assetId` (another entry in the same linked kit) is composited
+     * on top of the base asset with a 0.15s crossfade, until the next
+     * emoteAt entry (or the sprite's end). Sorted by `t` ascending is not
+     * required of callers — see emoteWindows in ops.ts, which sorts.
+     */
+    emoteAt?: { t: number; assetId: string }[];
+  };
 }
+
+/** Enter/exit sprite transition presets (W-ANIME) — symmetric: the same name means "play this transition" whether entering or exiting. */
+export type SpriteMotionName = 'slide-left' | 'slide-right' | 'hop-in' | 'pop' | 'fade';
+
+/** Continuous idle-loop sprite animation presets (W-ANIME). */
+export type SpriteLoopName = 'sway' | 'bob' | 'hop' | 'breathe' | 'none';
 
 /**
  * A B-roll clip anchored to a moment in an A-roll source rather than to an
@@ -500,7 +600,13 @@ export interface KitAsset {
   id: string;
   /** Relative to the kit root. */
   path: string;
-  type: 'sprite' | 'background' | 'prop';
+  /**
+   * `'ambient'` (W-ANIME): an optional looping particle/atmosphere layer a
+   * composition renders over its background at low opacity — purely
+   * declarative (see kit.ts's firstAmbientAsset); a kit with none simply
+   * never triggers the feature ("キットに無ければ機能ごと非表示").
+   */
+  type: 'sprite' | 'background' | 'prop' | 'ambient';
   tags?: string[];
   emotion?: string;
   intensity?: number;

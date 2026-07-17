@@ -20,12 +20,18 @@
   <section id="stage" aria-label="プレビュー">
     <div id="videoWrap">
       <div id="videoBox">
+        <!-- W-ANIME: composition background/ambient layer, behind everything
+             else — hidden for a normal (source-driven) project (see
+             applyCompositionMode in app.js). -->
+        <div id="compBgLayer" hidden aria-hidden="true"></div>
         <video id="video" playsinline aria-label="プレビュー動画"></video>
         <video id="videoOverlay" hidden muted playsinline aria-hidden="true"></video>
         <div id="spriteLayer" aria-hidden="true"></div>
         <div id="captionLayer"></div>
         <div id="captionDragGuide" hidden aria-hidden="true"></div>
         <div id="motionLayer"></div>
+        <!-- W-ANIME: speech-bubble dialogue layer, above everything else. -->
+        <div id="dialogueLayer" aria-hidden="true"></div>
         <div id="ingestOverlay" hidden><div class="spin"></div><span id="ingestStep" aria-live="polite"></span></div>
         <div id="stageEmpty" hidden>
           <p id="stageEmptyMsg"></p>
@@ -59,6 +65,9 @@
       <canvas id="wave"></canvas>
       <div id="overlayRow"></div>
       <div id="spriteRow"></div>
+      <!-- W-ANIME: background-cut ("紙芝居") + dialogue (speech bubble) rows -->
+      <div id="bgRow"></div>
+      <div id="dialogueRow"></div>
       <div id="clips"></div>
       <div id="dropIndicator" hidden></div>
       <div id="sceneMarks"></div>

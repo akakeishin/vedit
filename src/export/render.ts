@@ -1,17 +1,29 @@
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import {
+  backgroundIntervals,
   cropGeometry,
+  emoteWindows,
   OVERLAY_GAIN_DEFAULT,
   resolvedActiveOverlays,
   resolvedActiveSprites,
   segments,
+  SPRITE_EMOTE_CROSSFADE_SECONDS,
   spriteGeometry,
+  spriteMotionPlan,
   timelineDuration,
 } from '../core/ops.js';
 import { captionCues } from '../core/captions.js';
-import type { CaptionSettings, KitFile, KitStyle, Manifest, Transcript } from '../core/types.js';
-import { readKitFile, resolveKitAssets, type ResolvedKitAsset } from '../core/kit.js';
+import type { CaptionSettings, KitFile, KitStyle, Manifest, MusicItem, Transcript } from '../core/types.js';
+import {
+  AMBIENT_LAYER_OPACITY,
+  deriveSpeechBubbleStyle,
+  firstAmbientAsset,
+  readKitFile,
+  resolveKitAssets,
+  type ResolvedKitAsset,
+  type SpeechBubbleStyle,
+} from '../core/kit.js';
 import { resolveWithinDir } from '../core/project.js';
 import { listSystemFonts, resolveKitFontFile } from '../core/fonts.js';
 import { buildColorChain } from './color.js';
@@ -103,6 +115,70 @@ function kitAssStyle(style: KitStyle, outputHeight: number): AssStylePreset {
   };
 }
 
+// ---- W-ANIME: dialogue speech bubbles -> ASS (BorderStyle=3 rounded-box approximation) ----
+
+/** ASS style name reserved for W-ANIME dialogue speech bubbles. */
+const DIALOGUE_STYLE_NAME = 'dialogue';
+
+/**
+ * Speech-bubble palette (kit.ts's deriveSpeechBubbleStyle) -> ASS style:
+ * BorderStyle=3 (opaque box) is the "丸角ボックス近似" the spec calls for —
+ * ASS has no literal corner-radius or tail, so the rounded shape/tail only
+ * render literally in the web preview (CSS); the burned-in render gets a
+ * plain solid rectangle in the bubble's colors, positioned via each
+ * Dialogue event's own `\pos()` override (see dialogueAssLines) rather than
+ * this style's shared Alignment/MarginV.
+ */
+function speechBubbleAssStyle(bubble: SpeechBubbleStyle, outputHeight: number): AssStylePreset {
+  return {
+    primary: assColor(bubble.palette.text, '111111'),
+    outline: assColor(bubble.palette.outline, '111111'),
+    back: assColor(bubble.palette.box, 'FFFFFF'),
+    bold: 0,
+    borderStyle: 3,
+    outlineWidth: 0,
+    shadow: 0,
+    fontsize: Math.round(outputHeight * 0.04),
+  };
+}
+
+/**
+ * Pixel anchor for one dialogue line's speech bubble: above the referenced
+ * sprite's head (via the SAME spriteGeometry math render/web use for
+ * placement) when `spriteId` resolves to both a real sprite AND its kit
+ * asset, else a fixed top-center default. Pure given an already-loaded
+ * `kit` (or none).
+ */
+function dialogueAnchorPixels(
+  m: Manifest,
+  d: { spriteId?: string },
+  kit: KitFile | null | undefined,
+  output: { width: number; height: number },
+): { x: number; y: number } {
+  const sprite = d.spriteId ? (m.timeline.sprites ?? []).find((s) => s.id === d.spriteId) : undefined;
+  const asset = sprite ? kit?.assets?.find((a) => a.id === sprite.assetId) : undefined;
+  if (sprite && asset) {
+    const geo = spriteGeometry(asset, sprite.position, sprite.scale, output, { flip: sprite.flip });
+    return { x: geo.anchorX, y: Math.max(output.height * 0.08, geo.y - output.height * 0.04) };
+  }
+  return { x: output.width / 2, y: output.height * 0.15 };
+}
+
+/**
+ * `m.timeline.dialogue` -> ASS `Dialogue:` lines, each positioned via a
+ * `{\an5\pos(x,y)}` override (middle-center anchor at the computed pixel
+ * point) rather than relying on the shared style's Alignment/MarginV — see
+ * dialogueAnchorPixels. Empty when the manifest has no dialogue items
+ * (the overwhelmingly common case — every existing project).
+ */
+function dialogueAssLines(m: Manifest, kit: KitFile | null | undefined, output: { width: number; height: number }): string[] {
+  return (m.timeline.dialogue ?? []).map((d) => {
+    const { x, y } = dialogueAnchorPixels(m, d, kit, output);
+    const text = `{\\an5\\pos(${Math.round(x)},${Math.round(y)})}${d.text.replace(/\n/g, '\\N')}`;
+    return `Dialogue: 0,${assTime(d.tlStart)},${assTime(d.tlStart + d.duration)},${DIALOGUE_STYLE_NAME},,0,0,0,,${text}`;
+  });
+}
+
 /** Split an ASS `&HAABBGGRR` colour string into its alpha and BGR components (uppercase hex). Malformed input falls back to opaque white. */
 function parseAssColor(ass: string): { alphaHex: string; bgr: string } {
   const m = /^&H([0-9A-Fa-f]{2})([0-9A-Fa-f]{6})$/.exec(ass);
@@ -174,6 +250,16 @@ export function toAss(m: Manifest, transcripts: Transcript[], kit?: KitFile | nu
     activeStyle = kitStyle.id;
   }
 
+  // W-ANIME: only added when the manifest actually HAS dialogue items — an
+  // unused style line would otherwise change the .ass output of every
+  // existing (dialogue-less) project, breaking full regression.
+  const dialogue = m.timeline.dialogue ?? [];
+  if (dialogue.length > 0) {
+    const dialogueKitStyle =
+      kit?.styles?.find((s) => (s.use_for ?? []).some((u) => u === 'dialogue' || u === 'speech-bubble')) ?? kitStyle;
+    presets[DIALOGUE_STYLE_NAME] = speechBubbleAssStyle(deriveSpeechBubbleStyle(dialogueKitStyle ?? null), height);
+  }
+
   const overrides = m.captions.overrides;
   if (overrides) {
     presets[activeStyle] = applyCaptionOverrides(presets[activeStyle], overrides, defaultFontSize);
@@ -211,7 +297,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
   const lines = cues.map(
     (c) => `Dialogue: 0,${assTime(c.tlStart)},${assTime(c.tlEnd)},${activeStyle},,0,0,0,,${c.text.replace(/\n/g, '\\N')}`,
   );
-  return head + lines.join('\n') + '\n';
+  const dialogueLines = dialogue.length > 0 ? dialogueAssLines(m, kit, { width, height }) : [];
+  return head + [...lines, ...dialogueLines].join('\n') + '\n';
 }
 
 export interface FilterGraphBuild {
@@ -489,6 +576,246 @@ export function buildFilterGraph(
   return { inputPaths, graph, videoLabel, audioLabel, ...(spriteInputIndices ? { spriteInputIndices } : {}) };
 }
 
+// ---- W-ANIME: composition-mode filtergraph (background/ambient/sprites, no A-roll) ----
+
+export interface CompositionFilterGraphBuild {
+  /** Ordered `-i` inputs: deduped background/ambient/sprite image+video assets first, then one per music item. */
+  inputPaths: string[];
+  /** Indices into `inputPaths` needing `-loop 1` (still images: resolved kit background/sprite/emote PNGs). */
+  loopInputIndices: number[];
+  /** Indices into `inputPaths` needing `-stream_loop -1` (looping video backgrounds/ambient). */
+  streamLoopInputIndices: number[];
+  graph: string;
+  videoLabel: string;
+  audioLabel: string;
+}
+
+/**
+ * Composition-mode counterpart to buildFilterGraph (W-ANIME) — a SEPARATE
+ * function rather than a branch inside the normal one, so every existing
+ * (source-driven) project's filtergraph stays byte-for-byte unaffected (see
+ * ops.ts's "composition" section doc for why this split was chosen over
+ * teaching segments()/buildFilterGraph itself about composition).
+ *
+ * Background: each backgroundIntervals() entry becomes its own chain (a
+ * `color` generator, a `-loop 1` kit image, or a `-stream_loop -1` looping
+ * video — all scaled/cropped "cover"-style to the exact output canvas, no
+ * source-dimension probing needed since `force_original_aspect_ratio=
+ * increase`+`crop` works from whatever ffmpeg actually decodes) and the
+ * intervals are concatenated end-to-end. Ambient: the kit's first
+ * `type:'ambient'` asset (opts.ambientAssetId), looped for the WHOLE
+ * duration at a fixed low opacity, composited over the background —
+ * entirely absent when the kit has none (opts.ambientAssetId undefined).
+ * Sprites: same overlay-compositing shape as buildFilterGraph's W8 block,
+ * but with motion-aware x/y/scale expressions (spriteMotionPlan) instead of
+ * a static position, plus extra crossfade layers for `motion.emoteAt`
+ * windows (emoteWindows) sharing the base sprite's motion phase. Audio:
+ * dialogue voice clips (MusicItem entries a DialogueItem.voiceMusicId
+ * references) are mixed into a synthesized "spoken" track that other music
+ * ducks against — the composition-mode analog of a normal project's
+ * concatenated A-roll conversation track ([ac]).
+ */
+export function buildCompositionFilterGraph(
+  m: Manifest,
+  opts: {
+    loudnorm?: { measured?: LoudnormMeasured; printJson?: boolean };
+    kitAssets?: Map<string, ResolvedKitAsset>;
+    ambientAssetId?: string;
+  } = {},
+): CompositionFilterGraphBuild {
+  if (!m.composition) throw new Error('buildCompositionFilterGraph: manifest has no composition');
+  const duration = m.composition.duration;
+  const output = m.output ?? { width: m.width, height: m.height };
+  const fps = m.fps;
+
+  const inputPaths: string[] = [];
+  const loopInputIndices: number[] = [];
+  const streamLoopInputIndices: number[] = [];
+  const pathIndex = new Map<string, number>(); // dedupe by resolved absolute path
+  const addImageInput = (absPath: string): number => {
+    const existing = pathIndex.get(absPath);
+    if (existing !== undefined) return existing;
+    const idx = inputPaths.length;
+    inputPaths.push(absPath);
+    loopInputIndices.push(idx);
+    pathIndex.set(absPath, idx);
+    return idx;
+  };
+  const addVideoLoopInput = (absPath: string): number => {
+    const existing = pathIndex.get(absPath);
+    if (existing !== undefined) return existing;
+    const idx = inputPaths.length;
+    inputPaths.push(absPath);
+    streamLoopInputIndices.push(idx);
+    pathIndex.set(absPath, idx);
+    return idx;
+  };
+  const coverScale = `scale=${output.width}:${output.height}:force_original_aspect_ratio=increase,crop=${output.width}:${output.height}`;
+
+  // ---- background: per-interval color/image/video chain, concatenated ----
+  const intervals = backgroundIntervals(m);
+  const parts: string[] = [];
+  const bgLabels: string[] = [];
+  intervals.forEach((iv, i) => {
+    const dur = Math.max(1 / fps, iv.t1 - iv.t0);
+    const label = `[bgc${i}]`;
+    if (iv.ref.type === 'color') {
+      parts.push(`color=c=${iv.ref.hex}:s=${output.width}x${output.height}:d=${dur}:r=${fps}${label}`);
+    } else if (iv.ref.type === 'asset') {
+      const asset = opts.kitAssets?.get(iv.ref.assetId);
+      if (!asset) {
+        // Unresolved background asset (missing/escaping — see
+        // resolveKitAssets, whose warnings the caller already surfaces)
+        // degrades to black rather than failing the whole render.
+        parts.push(`color=c=black:s=${output.width}x${output.height}:d=${dur}:r=${fps}${label}`);
+      } else {
+        const idx = addImageInput(asset.absPath);
+        parts.push(`[${idx}:v]${coverScale},trim=duration=${dur},setpts=PTS-STARTPTS,fps=${fps}${label}`);
+      }
+    } else {
+      const idx = addVideoLoopInput(iv.ref.path);
+      parts.push(`[${idx}:v]${coverScale},trim=duration=${dur},setpts=PTS-STARTPTS,fps=${fps}${label}`);
+    }
+    bgLabels.push(label);
+  });
+  if (bgLabels.length === 0) {
+    parts.push(`color=c=black:s=${output.width}x${output.height}:d=${duration}:r=${fps}[bgAll]`);
+  } else if (bgLabels.length === 1) {
+    parts.push(`${bgLabels[0]}null[bgAll]`);
+  } else {
+    parts.push(`${bgLabels.join('')}concat=n=${bgLabels.length}:v=1:a=0[bgAll]`);
+  }
+  let videoLabel = '[bgAll]';
+
+  // ---- ambient layer (optional; see kit.ts's firstAmbientAsset) ----
+  if (opts.ambientAssetId) {
+    const ambient = opts.kitAssets?.get(opts.ambientAssetId);
+    if (ambient) {
+      const idx = addVideoLoopInput(ambient.absPath);
+      parts.push(
+        `[${idx}:v]${coverScale},trim=duration=${duration},setpts=PTS-STARTPTS,fps=${fps},format=rgba,colorchannelmixer=aa=${AMBIENT_LAYER_OPACITY}[amb]`,
+      );
+      parts.push(`${videoLabel}[amb]overlay=x=0:y=0[bgAmb]`);
+      videoLabel = '[bgAmb]';
+    }
+  }
+
+  // ---- sprites (motion-aware; emoteAt crossfade layers on top) ----
+  if (opts.kitAssets) {
+    const activeSprites = resolvedActiveSprites(m).filter((r) => opts.kitAssets!.has(r.sprite.assetId));
+    activeSprites.forEach((r, n) => {
+      const sp = r.sprite;
+      const asset = opts.kitAssets!.get(sp.assetId)!;
+      const geo = spriteGeometry(asset, sp.position, sp.scale, output, { flip: sp.flip });
+      const plan = spriteMotionPlan(sp.motion, geo, r.tlStart, r.tlEnd);
+      const idx = addImageInput(asset.absPath);
+      const chain = [`scale=${Math.max(1, Math.round(geo.width))}:${Math.max(1, Math.round(geo.height))}`];
+      if (sp.flip) chain.push('hflip');
+      chain.push('format=rgba');
+      if (sp.opacity < 0.999) chain.push(`colorchannelmixer=aa=${sp.opacity}`);
+      chain.push(...plan.fadeClauses);
+      const svLabel = `[spv${n}]`;
+      parts.push(`[${idx}:v]${chain.join(',')}${svLabel}`);
+      const composited = `[spc${n}]`;
+      parts.push(
+        `${videoLabel}${svLabel}overlay=x='${plan.xExpr}':y='${plan.yExpr}':enable='between(t,${r.tlStart},${r.tlEnd})'${composited}`,
+      );
+      videoLabel = composited;
+
+      const windows = emoteWindows(sp.motion?.emoteAt, sp.duration);
+      windows.forEach((w, wi) => {
+        const emoteAsset = opts.kitAssets!.get(w.assetId);
+        if (!emoteAsset) return; // unresolved emote asset — skip this window (warning already surfaced upstream by resolveKitAssets)
+        const eGeo = spriteGeometry(emoteAsset, sp.position, sp.scale, output, { flip: sp.flip });
+        const eIdx = addImageInput(emoteAsset.absPath);
+        const absT0 = r.tlStart + w.t0;
+        const absT1 = r.tlStart + w.t1;
+        const fd = Math.min(SPRITE_EMOTE_CROSSFADE_SECONDS, (w.t1 - w.t0) / 2);
+        const eChain = [`scale=${Math.max(1, Math.round(eGeo.width))}:${Math.max(1, Math.round(eGeo.height))}`];
+        if (sp.flip) eChain.push('hflip');
+        eChain.push('format=rgba');
+        if (sp.opacity < 0.999) eChain.push(`colorchannelmixer=aa=${sp.opacity}`);
+        eChain.push(`fade=t=in:st=${absT0}:d=${fd}:alpha=1`, `fade=t=out:st=${Math.max(absT0, absT1 - fd)}:d=${fd}:alpha=1`);
+        const evLabel = `[spe${n}_${wi}]`;
+        parts.push(`[${eIdx}:v]${eChain.join(',')}${evLabel}`);
+        const eComposited = `[spec${n}_${wi}]`;
+        // Emote layers reuse the SAME motion x/y expression as the base
+        // (phase-locked to r.tlStart), so the expression swap never visibly jumps.
+        parts.push(
+          `${videoLabel}${evLabel}overlay=x='${plan.xExpr}':y='${plan.yExpr}':enable='between(t,${absT0},${absT1})'${eComposited}`,
+        );
+        videoLabel = eComposited;
+      });
+    });
+  }
+
+  // ---- audio: dialogue voice clips form the "spoken" track other music ducks against ----
+  const music = m.timeline.music ?? [];
+  const voiceIds = new Set((m.timeline.dialogue ?? []).map((d) => d.voiceMusicId).filter((id): id is string => Boolean(id)));
+  const musicInputBase = inputPaths.length;
+  inputPaths.push(...music.map((mu) => mu.path));
+
+  const musicClause = (mu: MusicItem, i: number): string => {
+    const inIdx = musicInputBase + i;
+    const label = `[mu${i}]`;
+    const fd = Math.max(0, mu.fadeIn);
+    const fo = Math.max(0, mu.fadeOut);
+    parts.push(
+      `[${inIdx}:a]atrim=start=${mu.srcIn}:end=${mu.srcIn + mu.duration},asetpts=PTS-STARTPTS,` +
+        `volume=${mu.gain}dB,afade=t=in:st=0:d=${fd},afade=t=out:st=${Math.max(0, mu.duration - fo)}:d=${fo},` +
+        `adelay=${Math.round(mu.tlStart * 1000)}:all=1${label}`,
+    );
+    return label;
+  };
+  const voiceLabels: string[] = [];
+  const bgDuckLabels: string[] = [];
+  const bgPlainLabels: string[] = [];
+  music.forEach((mu, i) => {
+    const label = musicClause(mu, i);
+    if (voiceIds.has(mu.id)) voiceLabels.push(label);
+    else (mu.duck ? bgDuckLabels : bgPlainLabels).push(label);
+  });
+
+  parts.push(`anullsrc=r=48000:cl=stereo,atrim=duration=${duration}[silence]`);
+  let acLabel = '[silence]';
+  if (voiceLabels.length > 0) {
+    parts.push(
+      `[silence]${voiceLabels.join('')}amix=inputs=${voiceLabels.length + 1}:duration=first:dropout_transition=0:normalize=0[acVoice]`,
+    );
+    acLabel = '[acVoice]';
+  }
+
+  const targetLufs = m.audioMix?.targetLufs ?? -14;
+  const duckMix = mixLabels(parts, bgDuckLabels, 'duckPre');
+  let convLabel = acLabel;
+  let duckFinal = duckMix;
+  if (duckMix) {
+    parts.push(`${acLabel}asplit=2[acMain][acKey]`);
+    parts.push(`${duckMix}[acKey]sidechaincompress=threshold=0.02:ratio=8:attack=20:release=400:makeup=1[duckOut]`);
+    duckFinal = '[duckOut]';
+    convLabel = '[acMain]';
+  }
+  const plainMix = mixLabels(parts, bgPlainLabels, 'plainMix');
+  let musicFinal: string;
+  if (duckFinal && plainMix) {
+    parts.push(`${duckFinal}${plainMix}amix=inputs=2:duration=longest:dropout_transition=0:normalize=0[musicMix]`);
+    musicFinal = '[musicMix]';
+  } else {
+    musicFinal = duckFinal || plainMix;
+  }
+  let audioLabel: string;
+  if (musicFinal) {
+    parts.push(`${convLabel}${musicFinal}amix=inputs=2:duration=first:dropout_transition=0:normalize=0[mixed]`);
+    audioLabel = '[mixed]';
+  } else {
+    audioLabel = convLabel;
+  }
+  parts.push(`${audioLabel}${loudnormClause(targetLufs, opts.loudnorm ?? {})}[final]`);
+  audioLabel = '[final]';
+
+  return { inputPaths, loopInputIndices, streamLoopInputIndices, graph: parts.join(';'), videoLabel, audioLabel };
+}
+
 /**
  * One sprite's video chain: scale the (still-image, `-loop 1`) PNG input to
  * its computed display size, optionally mirror it, force an alpha channel
@@ -660,15 +987,21 @@ export function resolveRenderParams(m: Manifest, opts: RenderParamOverrides = {}
  * Build `-i` args for `inputPaths`, prefixing `-loop 1` before any index
  * listed in `loopIndices` (W8 sprite PNGs — a still image needs looping to
  * behave like a continuous stream for the duration `overlay`'s `enable`
- * window needs it). Absent/empty `loopIndices` produces the exact same
- * flat `-i p -i p ...` sequence as before W8 — no regression for sprite-less
+ * window needs it) and `-stream_loop -1` before any index in
+ * `streamLoopIndices` (W-ANIME: a looping background/ambient VIDEO file,
+ * which may be shorter than the interval it needs to fill — see
+ * buildCompositionFilterGraph). Absent/empty `loopIndices`/
+ * `streamLoopIndices` produces the exact same flat `-i p -i p ...` sequence
+ * as before W8/W-ANIME — no regression for sprite-less/composition-less
  * projects.
  */
-function ffmpegInputArgs(inputPaths: string[], loopIndices?: number[]): string[] {
+function ffmpegInputArgs(inputPaths: string[], loopIndices?: number[], streamLoopIndices?: number[]): string[] {
   const loopSet = new Set(loopIndices ?? []);
+  const streamLoopSet = new Set(streamLoopIndices ?? []);
   const out: string[] = [];
   inputPaths.forEach((p, i) => {
     if (loopSet.has(i)) out.push('-loop', '1');
+    if (streamLoopSet.has(i)) out.push('-stream_loop', '-1');
     out.push('-i', p);
   });
   return out;
@@ -880,6 +1213,106 @@ export async function renderFinal(
     '-pix_fmt', 'yuv420p',
     '-c:a', 'aac', '-b:a', params.audioBitrate,
     '-dn', // drop any data streams (e.g. DJI tmcd) that survived the filtergraph
+    '-movflags', '+faststart',
+    outPath,
+  ]);
+  if (assPath) await fs.rm(assPath, { force: true });
+  return { file: outPath, warnings };
+}
+
+/**
+ * Composition-mode counterpart to renderFinal (W-ANIME) — background +
+ * ambient + motion-aware sprites + dialogue speech bubbles, no A-roll at
+ * all. Dialogue is ALWAYS burned in via the same toAss()/`ass` ffmpeg
+ * filter captions use (there is no other way for a DialogueItem to reach
+ * the rendered output); a project with no dialogue items skips the ass
+ * filter entirely (dialogueAssLines returns []). Unlike renderFinal, this
+ * does not run a 2-pass loudnorm measurement pass — a single-pass loudnorm
+ * target is applied directly (see the W-ANIME implementation report for
+ * why this was judged an acceptable simplification for a first cut).
+ */
+export async function renderComposition(
+  m: Manifest,
+  outPath: string,
+  opts: RenderParamOverrides = {},
+): Promise<{ file: string; warnings: string[] }> {
+  if (!m.composition) throw new Error('renderComposition: manifest has no composition');
+  const params = resolveRenderParams(m, opts);
+  const warnings = [...params.warnings];
+
+  let kit: KitFile | null = null;
+  if (m.kit) {
+    try {
+      kit = await readKitFile(m.kit.path);
+    } catch (e: any) {
+      warnings.push(`kit: ${e?.message ?? e} — rendering without kit background/sprites/styles`);
+    }
+  }
+
+  let kitAssets: Map<string, ResolvedKitAsset> | undefined;
+  let ambientAssetId: string | undefined;
+  if (kit && m.kit) {
+    const ids = new Set<string>();
+    for (const s of m.timeline.sprites ?? []) {
+      ids.add(s.assetId);
+      for (const e of s.motion?.emoteAt ?? []) ids.add(e.assetId);
+    }
+    const bgRef = m.composition.background;
+    if (bgRef.type === 'asset') ids.add(bgRef.assetId);
+    for (const e of m.composition.backgroundTrack ?? []) if (e.ref.type === 'asset') ids.add(e.ref.assetId);
+    const ambient = firstAmbientAsset(kit);
+    if (ambient) {
+      ambientAssetId = ambient.id;
+      ids.add(ambient.id);
+    }
+    const { resolved, warnings: assetWarnings } = await resolveKitAssets(m.kit.path, kit, ids);
+    kitAssets = resolved;
+    warnings.push(...assetWarnings);
+  }
+
+  const built = buildCompositionFilterGraph(m, { kitAssets, ambientAssetId });
+  let graph = built.graph;
+  const inputs = ffmpegInputArgs(built.inputPaths, built.loopInputIndices, built.streamLoopInputIndices);
+
+  let vLabel = built.videoLabel;
+  let assPath: string | null = null;
+  const hasDialogue = (m.timeline.dialogue ?? []).length > 0;
+  if (hasDialogue) {
+    if (!ffmpegHasFilter('ass')) {
+      throw new Error(
+        'this ffmpeg build lacks the `ass` filter (dialogue burn). Install `brew install ffmpeg-full` or set VEDIT_FFMPEG.',
+      );
+    }
+    assPath = path.join(path.dirname(outPath), '.vedit-dialogue.ass');
+    await fs.writeFile(assPath, toAss(m, [], kit));
+    let fontsdirPart = '';
+    const activeKitStyle = kit?.styles?.find((s) => s.id === m.captions.style);
+    if (m.kit && activeKitStyle?.caption?.font) {
+      try {
+        const fontAbs = await resolveWithinDir(m.kit.path, activeKitStyle.caption.font);
+        fontsdirPart = `:fontsdir='${path.dirname(fontAbs).replace(/'/g, "\\'")}'`;
+      } catch {
+        warnings.push(`kit style ${activeKitStyle.id}: font path invalid (${activeKitStyle.caption.font}) — dialogue burns without the kit font`);
+      }
+    }
+    graph += `;${built.videoLabel}ass='${assPath.replace(/'/g, "\\'")}'${fontsdirPart}[vout]`;
+    vLabel = '[vout]';
+  }
+
+  if (params.postFilter) {
+    graph += `;${vLabel}${params.postFilter}[presetVideo]`;
+    vLabel = '[presetVideo]';
+  }
+
+  await run('ffmpeg', [
+    '-y', ...inputs,
+    '-filter_complex', graph,
+    '-map', vLabel, '-map', built.audioLabel,
+    '-t', String(m.composition.duration),
+    '-c:v', 'libx264', '-preset', params.encPreset, '-crf', String(params.crf),
+    '-pix_fmt', 'yuv420p',
+    '-c:a', 'aac', '-b:a', params.audioBitrate,
+    '-dn',
     '-movflags', '+faststart',
     outPath,
   ]);

@@ -36,8 +36,9 @@ vi.mock('../core/fonts.js', async (importOriginal) => {
   return { ...actual, listSystemFonts: listSystemFontsMock };
 });
 
-import { addOverlay, addSprite } from '../core/ops.js';
+import { addDialogue, addOverlay, addSprite, COMP_SOURCE_ID, setBackgroundAt, setComposition } from '../core/ops.js';
 import {
+  buildCompositionFilterGraph,
   buildFilterGraph,
   buildRepairChain,
   loudnormClause,
@@ -295,6 +296,57 @@ describe('toAss', () => {
       // floating-point equality — within a pixel's worth of scale error.
       expect(assFontSize / baseFontSize).toBeCloseTo(sizeScale, 1);
     });
+  });
+});
+
+// ---- W-ANIME: dialogue speech bubbles -> ASS ----
+
+describe('toAss: W-ANIME dialogue speech bubbles', () => {
+  it('a dialogue-less project never emits the "dialogue" style/events — full regression', () => {
+    const ass = toAss(manifest('clean'), [transcript()]);
+    expect(ass).not.toMatch(/^Style: dialogue,/m);
+    expect(ass).not.toMatch(/,dialogue,,/);
+  });
+
+  it('emits a "dialogue" style + a positioned Dialogue event per DialogueItem, timed at tlStart/tlStart+duration', () => {
+    let m = manifest('clean');
+    m = addDialogue(m, 'こんにちは', { tlStart: 3, duration: 2, id: 'dl1' });
+    const ass = toAss(m, [transcript()]);
+    expect(ass).toMatch(/^Style: dialogue,/m);
+    const line = ass.split('\n').find((l) => l.includes(',dialogue,,'))!;
+    expect(line).toBeDefined();
+    expect(line).toContain('{\\an5\\pos(');
+    expect(line).toContain('こんにちは');
+    expect(line.startsWith('Dialogue: 0,0:00:03.00,0:00:05.00,dialogue,,')).toBe(true);
+  });
+
+  it('positions a dialogue line above its referenced sprite (spriteId) rather than the fixed top-center default', () => {
+    const kit: KitFile = {
+      version: 'vedit-kit/v1',
+      assets: [{ id: 'char1', path: 'assets/characters/char1.png', type: 'sprite', width: 200, height: 400 }],
+    };
+    let withSpriteM = manifest('clean');
+    withSpriteM = addSprite(withSpriteM, 'char1', { id: 'sp1', anchor: { sourceId: 's1', srcTime: 1 }, position: { x: 0.8, y: 0.9 }, scale: 0.3 });
+    withSpriteM = addDialogue(withSpriteM, 'hi', { tlStart: 1, duration: 1, id: 'dl1', spriteId: 'sp1' });
+    const withoutSpriteM = addDialogue(manifest('clean'), 'hi', { tlStart: 1, duration: 1, id: 'dl1' });
+
+    const posOf = (ass: string) => ass.split('\n').find((l) => l.includes(',dialogue,,'))!.match(/\\pos\((\d+),(\d+)\)/)!;
+    const p1 = posOf(toAss(withSpriteM, [], kit));
+    const p2 = posOf(toAss(withoutSpriteM, [], kit));
+    expect(p1[1]).not.toBe(p2[1]); // x differs: anchored to the sprite's x=0.8 position instead of the 50% default
+  });
+
+  it('a kit style tagged use_for:["dialogue"] wins over the active captions style for the bubble palette', () => {
+    let m = manifest('clean');
+    m = addDialogue(m, 'hi', { tlStart: 0, duration: 1, id: 'dl1' });
+    const kit: KitFile = {
+      version: 'vedit-kit/v1',
+      styles: [{ id: 'bubbleStyle', use_for: ['dialogue'], palette: { box: '#ff00ff' } }],
+    };
+    const ass = toAss(m, [], kit);
+    const styleLine = ass.split('\n').find((l) => l.startsWith('Style: dialogue,'))!;
+    // #ff00ff box -> ASS BGR FF00FF, back colour field.
+    expect(styleLine).toContain('&H00FF00FF');
   });
 });
 
@@ -665,6 +717,134 @@ describe('buildFilterGraph: W8 kit sprite compositing', () => {
     expect(built.graph).toContain("[vc][ov0]overlay=enable='between(t,2,4)'[ovc0]");
     expect(built.graph).toContain('[ovc0][sv0]overlay=x=');
     expect(built.videoLabel).toBe('[svc0]');
+  });
+});
+
+// ---- W-ANIME: buildCompositionFilterGraph (background/ambient/sprites, no A-roll) ----
+
+function compManifest(opts: { duration?: number; width?: number; height?: number; music?: MusicItem[]; dialogue?: { tlStart: number; duration: number; voiceMusicId?: string; id: string; text: string }[] } = {}): Manifest {
+  const blank: Manifest = {
+    version: 1, name: 't', revision: 0, fps: 30, width: 1920, height: 1080,
+    sources: [], timeline: { video: [], motion: [], music: opts.music, dialogue: opts.dialogue as any },
+    captions: { enabled: true, style: 'clean', maxChars: 24 },
+  };
+  return setComposition(blank, { duration: opts.duration ?? 20, width: opts.width ?? 1080, height: opts.height ?? 1920 });
+}
+
+describe('buildCompositionFilterGraph', () => {
+  it('throws for a non-composition manifest', () => {
+    expect(() => buildCompositionFilterGraph(baseManifest())).toThrow(/no composition/);
+  });
+
+  it('a single-interval color background: one color generator, no concat needed, silent audio loudnorm-ed to [final]', () => {
+    const built = buildCompositionFilterGraph(compManifest());
+    expect(built.graph).toContain('color=c=#000000:s=1080x1920:d=20:r=30[bgc0]');
+    expect(built.graph).toContain('[bgc0]null[bgAll]');
+    expect(built.graph).not.toContain('concat=');
+    expect(built.videoLabel).toBe('[bgAll]');
+    expect(built.graph).toContain('anullsrc=r=48000:cl=stereo,atrim=duration=20[silence]');
+    expect(built.audioLabel).toBe('[final]');
+    expect(built.inputPaths).toEqual([]);
+    expect(built.loopInputIndices).toEqual([]);
+    expect(built.streamLoopInputIndices).toEqual([]);
+  });
+
+  it('multiple bg-set cuts become multiple color chains, concatenated in time order', () => {
+    let m = compManifest();
+    m = setBackgroundAt(m, 10, { type: 'color', hex: '#ff0000' });
+    const built = buildCompositionFilterGraph(m);
+    expect(built.graph).toContain('color=c=#000000:s=1080x1920:d=10:r=30[bgc0]');
+    expect(built.graph).toContain('color=c=#ff0000:s=1080x1920:d=10:r=30[bgc1]');
+    expect(built.graph).toContain('[bgc0][bgc1]concat=n=2:v=1:a=0[bgAll]');
+  });
+
+  it('a kit-asset background resolves via kitAssets (cover scale/crop); an unresolved one falls back to black', () => {
+    let m = compManifest();
+    m = setBackgroundAt(m, 0, { type: 'asset', assetId: 'room' });
+    const resolved = buildCompositionFilterGraph(m, { kitAssets: new Map([['room', fakeAsset('room', { path: 'assets/backgrounds/room.png', absPath: '/kit/assets/backgrounds/room.png' })]]) });
+    expect(resolved.inputPaths).toEqual(['/kit/assets/backgrounds/room.png']);
+    expect(resolved.loopInputIndices).toEqual([0]); // still image -> -loop 1
+    expect(resolved.graph).toContain('[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920');
+
+    const unresolved = buildCompositionFilterGraph(m, { kitAssets: new Map() });
+    expect(unresolved.graph).toContain('color=c=black:s=1080x1920:d=20:r=30[bgc0]');
+    expect(unresolved.inputPaths).toEqual([]);
+  });
+
+  it('a looping video background uses -stream_loop -1 (streamLoopInputIndices), not -loop 1', () => {
+    let m = compManifest();
+    m = setBackgroundAt(m, 0, { type: 'video', path: '/media/loop.mp4' });
+    const built = buildCompositionFilterGraph(m);
+    expect(built.inputPaths).toEqual(['/media/loop.mp4']);
+    expect(built.streamLoopInputIndices).toEqual([0]);
+    expect(built.loopInputIndices).toEqual([]);
+  });
+
+  it('the ambient layer composites over the background at a fixed low opacity, only when both an ambientAssetId AND a resolving kitAssets entry are given', () => {
+    const kitAssets = new Map([['amb1', fakeAsset('amb1', { path: 'assets/ambient/dust.mp4', absPath: '/kit/assets/ambient/dust.mp4' })]]);
+    const withAmbient = buildCompositionFilterGraph(compManifest(), { kitAssets, ambientAssetId: 'amb1' });
+    expect(withAmbient.graph).toContain('colorchannelmixer=aa=0.35[amb]');
+    expect(withAmbient.graph).toContain('[bgAll][amb]overlay=x=0:y=0[bgAmb]');
+    expect(withAmbient.videoLabel).toBe('[bgAmb]');
+    expect(withAmbient.streamLoopInputIndices).toContain(0);
+
+    const noAmbientId = buildCompositionFilterGraph(compManifest(), { kitAssets });
+    expect(noAmbientId.graph).not.toContain('colorchannelmixer');
+    expect(noAmbientId.videoLabel).toBe('[bgAll]');
+  });
+
+  it('composites a motion-aware sprite: overlay x/y carry the ffmpeg expression, not a static number', () => {
+    let m = compManifest();
+    m = addSprite(m, 'char1', {
+      id: 'sp1', anchor: { sourceId: COMP_SOURCE_ID, srcTime: 2 }, duration: 3,
+      motion: { loop: 'sway' },
+    });
+    const built = buildCompositionFilterGraph(m, { kitAssets: new Map([['char1', fakeAsset('char1')]]) });
+    expect(built.inputPaths).toEqual(['/kit/assets/characters/char1.png']);
+    expect(built.loopInputIndices).toEqual([0]);
+    expect(built.graph).toMatch(/overlay=x='[^']*8\*sin/); // sway term present in the x expression
+    expect(built.graph).toContain("enable='between(t,2,5)'");
+  });
+
+  it('a static (no motion) sprite keeps a plain numeric overlay x/y — same shape as buildFilterGraph', () => {
+    let m = compManifest();
+    m = addSprite(m, 'char1', { id: 'sp1', anchor: { sourceId: COMP_SOURCE_ID, srcTime: 0 }, duration: 3, position: { x: 0.5, y: 1 }, scale: 0.5 });
+    const built = buildCompositionFilterGraph(m, { kitAssets: new Map([['char1', fakeAsset('char1')]]) });
+    expect(built.graph).toMatch(/overlay=x='\d+'/);
+  });
+
+  it('emoteAt adds an extra crossfade overlay layer sharing the base sprite\'s motion expression', () => {
+    let m = compManifest();
+    m = addSprite(m, 'char1', {
+      id: 'sp1', anchor: { sourceId: COMP_SOURCE_ID, srcTime: 0 }, duration: 5,
+      motion: { emoteAt: [{ t: 2, assetId: 'happy' }] },
+    });
+    const built = buildCompositionFilterGraph(m, {
+      kitAssets: new Map([['char1', fakeAsset('char1')], ['happy', fakeAsset('happy')]]),
+    });
+    expect(built.inputPaths).toContain('/kit/assets/characters/happy.png');
+    expect(built.graph).toContain('fade=t=in:st=2:d=0.15:alpha=1');
+    expect(built.graph).toMatch(/enable='between\(t,2,5\)'\[spec0_0\]/);
+  });
+
+  it('dialogue voice clips form a "spoken" track ([acVoice]) that duck=true background music sidechains against', () => {
+    const voice = { id: 'mu1', path: '/voice.mp3', tlStart: 1, duration: 2, srcIn: 0, gain: 0, fadeIn: 0.05, fadeOut: 0.05, duck: false };
+    const bgm = { id: 'mu2', path: '/bgm.mp3', tlStart: 0, duration: 20, srcIn: 0, gain: -18, fadeIn: 1, fadeOut: 1, duck: true };
+    const m = compManifest({ music: [voice, bgm], dialogue: [{ id: 'dl1', text: 'hi', tlStart: 1, duration: 2, voiceMusicId: 'mu1' }] });
+    const built = buildCompositionFilterGraph(m);
+    expect(built.inputPaths).toEqual(['/voice.mp3', '/bgm.mp3']);
+    expect(built.graph).toContain('[silence][mu0]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[acVoice]');
+    expect(built.graph).toContain('[acVoice]asplit=2[acMain][acKey]');
+    expect(built.graph).toContain('[mu1][acKey]sidechaincompress=');
+    expect(built.audioLabel).toBe('[final]');
+  });
+
+  it('a background image/video referenced from MULTIPLE places (two intervals, same asset) is de-duplicated to one -i input', () => {
+    let m = compManifest();
+    m = setBackgroundAt(m, 0, { type: 'asset', assetId: 'room' });
+    m = setBackgroundAt(m, 10, { type: 'asset', assetId: 'room' }); // same asset again, later cut
+    const built = buildCompositionFilterGraph(m, { kitAssets: new Map([['room', fakeAsset('room', { path: 'assets/backgrounds/room.png', absPath: '/kit/assets/backgrounds/room.png' })]]) });
+    expect(built.inputPaths).toEqual(['/kit/assets/backgrounds/room.png']); // one input, not two
   });
 });
 

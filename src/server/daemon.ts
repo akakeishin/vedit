@@ -6,7 +6,9 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { Project, resolveWithinDir } from '../core/project.js';
 import {
   addClip,
+  addDialogue,
   addIntentZone,
+  backgroundIntervals,
   addMusic,
   addOverlay,
   addSprite,
@@ -25,7 +27,9 @@ import {
   parseFocus,
   parseReframeSpec,
   quietZonesOverlappingTimelineRange,
+  removeBackgroundAt,
   removeClip,
+  removeDialogue,
   removeIntentZone,
   removeMusic,
   removeOverlay,
@@ -36,13 +40,16 @@ import {
   segments,
   setAudioMix,
   setAudioRepair,
+  setBackgroundAt,
   setClipCrop,
   setColorAdjust,
   setColorTransform,
+  setComposition,
   setSceneReview,
   sourceRangeToTimeline,
   timelineDuration,
   trimClip,
+  updateDialogue,
   updateMusic,
   updateOverlay,
   updateSprite,
@@ -58,7 +65,7 @@ import { detectTakes, type TakeGroup } from '../core/takes.js';
 import { staticChecks } from '../export/qc.js';
 import { ingestFile, makeProxy, probeAudio, transcribe } from '../ingest/ingest.js';
 import { run } from '../ingest/run.js';
-import type { CaptionSettings, CutCandidate, KitProfile, Manifest, MotionItem, MusicItem, RevisionEntry, SceneFile, Transcript } from '../core/types.js';
+import type { BackgroundRef, CaptionSettings, CutCandidate, KitAsset, KitProfile, Manifest, MotionItem, MusicItem, RevisionEntry, SceneFile, Transcript } from '../core/types.js';
 import { freshId } from '../core/ops.js';
 import { applyKitDefaults, readKitFile, recognizedKitSections } from '../core/kit.js';
 import { listSystemFonts, scanKitFonts } from '../core/fonts.js';
@@ -363,6 +370,51 @@ async function kitProfileFor(m: Manifest): Promise<KitProfile | null> {
   }
 }
 
+/** W-ANIME: the linked kit's asset list, or undefined when no kit is linked / it's unreadable — feeds GET /api/qc's checkKitAssetReferences (undefined means "skip the check", never "flag everything as missing"; see that function's doc). */
+async function kitAssetsFor(m: Manifest): Promise<KitAsset[] | undefined> {
+  if (!m.kit) return undefined;
+  try {
+    return (await readKitFile(m.kit.path)).assets;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * W-ANIME: resolve a `compose --background <ref>` / `bg-set --to <ref>` CLI
+ * argument into a BackgroundRef — the daemon's job (not ops.ts, which stays
+ * I/O-free) since disambiguating "kit asset id" vs "video file path" needs
+ * to read the linked kit and stat the filesystem. Resolution order: a
+ * `#rrggbb`/`#rgb` string is always a color (kit asset ids/file paths never
+ * start with `#`); else, when a kit is linked, a matching asset id wins;
+ * else it's a video file path, checked for existence at `pathHint` when
+ * given. `pathHint` — NOT `path.resolve(raw)` computed here — matters
+ * because the daemon is a long-lived background process that may have been
+ * launched from a different (and, across many CLI invocations, possibly
+ * stale) working directory than whatever `vedit bg-set`/`compose` is run
+ * from right now; the CLI resolves `raw` against ITS OWN (the user's
+ * actual) cwd before sending, same convention as music-add's `path` /
+ * color's `--lut` (both resolved client-side in cli.ts). A direct API
+ * caller that omits `pathHint` (e.g. a test) falls back to resolving `raw`
+ * against the daemon's own cwd, same as before this parameter existed.
+ */
+async function resolveBackgroundArg(raw: string, pathHint: string | undefined, m: Manifest): Promise<{ ref: BackgroundRef } | { error: string }> {
+  if (HEX_COLOR_RE.test(raw)) return { ref: { type: 'color', hex: raw } };
+  if (m.kit) {
+    try {
+      const kit = await readKitFile(m.kit.path);
+      if ((kit.assets ?? []).some((a) => a.id === raw)) return { ref: { type: 'asset', assetId: raw } };
+    } catch { /* kit unreadable — fall through to video-path interpretation */ }
+  }
+  const abs = pathHint ?? path.resolve(raw);
+  try {
+    await fs.access(abs);
+  } catch {
+    return { error: `background: not a hex color, known kit asset id, or existing file: ${raw}` };
+  }
+  return { ref: { type: 'video', path: abs } };
+}
+
 /** Memoized detectTakes(t) per sourceId — see Ctx.takesCache's doc for why this can't just call detectTakes fresh on every route. */
 function takesFor(ctx: Ctx, sourceId: string, t: Transcript): TakeGroup[] {
   if (!ctx.takesCache.has(sourceId)) ctx.takesCache.set(sourceId, detectTakes(t));
@@ -418,6 +470,8 @@ async function stateSummary(p: Project, transcribingIds: Set<string> = new Set()
     music: (m.timeline.music ?? []).length,
     overlays: (m.timeline.overlays ?? []).length,
     sprites: (m.timeline.sprites ?? []).length,
+    dialogue: (m.timeline.dialogue ?? []).length,
+    composition: m.composition ? { duration: m.composition.duration } : undefined,
     kit: m.kit ? { path: m.kit.path } : undefined,
     sources: m.sources.map((s) => ({
       id: s.id,
@@ -578,9 +632,16 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       // job state, not part of the manifest — so the web UI can render the
       // right "文字起こし: なし/処理中/済" state even for a browser tab that
       // (re)loads mid-job, before the next transcribe-progress WS message.
+      // W-ANIME: `backgroundIntervals` gives the web preview/timeline the
+      // fully-resolved "紙芝居" ([t0,t1)+ref per cut) without reimplementing
+      // resolvedBackgroundAt itself; empty for a non-composition manifest.
+      // `dialogue` rides along verbatim (already absolute-placed, no
+      // resolution needed — see DialogueItem's doc).
       return json(res, 200, {
         manifest: m, segments: segments(m), duration: timelineDuration(m),
         overlays: resolveOverlays(m), sprites: resolveSprites(m),
+        dialogue: m.timeline.dialogue ?? [],
+        backgroundIntervals: backgroundIntervals(m),
         transcribing: [...ctx.transcribeJobs],
       });
     }
@@ -740,13 +801,14 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       // tempoContractLite passes are `vedit qc --render`-only (CLI, not the
       // daemon) since they need an actual rendered file / ffmpeg probe.
       const m = await p.manifest();
-      const [transcripts, sceneFiles, candidates, kitProfile] = await Promise.all([
+      const [transcripts, sceneFiles, candidates, kitProfile, kitAssets] = await Promise.all([
         allTranscripts(p),
         sceneFilesFor(p, m),
         p.candidates(),
         kitProfileFor(m),
+        kitAssetsFor(m),
       ]);
-      const report = await staticChecks(m, transcripts, sceneFiles, { candidates, kitProfile });
+      const report = await staticChecks(m, transcripts, sceneFiles, { candidates, kitProfile, kitAssets });
       return json(res, 200, report);
     }
     if (pathname === '/api/takes' && method === 'GET') {
@@ -1317,7 +1379,8 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
           p, actor, baseRev, 'sprite-add', b,
           `sprite-add ${b.assetId} anchor ${b.anchor.sourceId}@${Number(b.anchor.srcTime).toFixed(2)}`,
           (m) => addSprite(m, b.assetId, {
-            anchor: b.anchor, duration: b.duration, position: b.position, scale: b.scale, opacity: b.opacity, flip: b.flip, id,
+            anchor: b.anchor, duration: b.duration, position: b.position, scale: b.scale, opacity: b.opacity, flip: b.flip,
+            motion: b.motion, id,
           }),
         );
         return json(res, 200, { id, state: await stateSummary(p, ctx.transcribeJobs) });
@@ -1332,6 +1395,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         await mutate(p, actor, baseRev, 'sprite-update', b, `sprite-update ${b.id}`, (m) =>
           updateSprite(m, b.id, {
             anchor: b.anchor, duration: b.duration, position: b.position, scale: b.scale, opacity: b.opacity, flip: b.flip,
+            motion: b.motion,
           }),
         );
         return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
@@ -1341,6 +1405,110 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
           return json(res, 400, { error: `unknown sprite: ${b.id}` });
         }
         await mutate(p, actor, baseRev, 'sprite-remove', b, `sprite-remove ${b.id}`, (m) => removeSprite(m, b.id));
+        return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
+      }
+      // ---- W-ANIME: composition (source-less "sprite anime" production mode) ----
+      if (b.op === 'compose') {
+        const duration = Number(b.duration);
+        const width = Number(b.width);
+        const height = Number(b.height);
+        let background: BackgroundRef | undefined;
+        if (b.background !== undefined) {
+          const resolved = await resolveBackgroundArg(String(b.background), typeof b.backgroundPathHint === 'string' ? b.backgroundPathHint : undefined, m0);
+          if ('error' in resolved) return json(res, 400, { error: resolved.error });
+          background = resolved.ref;
+        }
+        await mutate(
+          p, actor, baseRev, 'compose', b,
+          `compose ${width}x${height} duration=${duration}s`,
+          (m) => setComposition(m, { duration, width, height, background }),
+        );
+        return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
+      }
+      if (b.op === 'bg-set') {
+        const t = Number(b.t);
+        if (typeof b.to !== 'string' || !b.to) return json(res, 400, { error: 'bg-set: to is required' });
+        const resolved = await resolveBackgroundArg(b.to, typeof b.toPathHint === 'string' ? b.toPathHint : undefined, m0);
+        if ('error' in resolved) return json(res, 400, { error: resolved.error });
+        await mutate(
+          p, actor, baseRev, 'bg-set', b,
+          `bg-set at ${t}s -> ${b.to}`,
+          (m) => setBackgroundAt(m, t, resolved.ref),
+        );
+        return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
+      }
+      if (b.op === 'bg-remove') {
+        const t = Number(b.t);
+        await mutate(p, actor, baseRev, 'bg-remove', b, `bg-remove at ${t}s`, (m) => removeBackgroundAt(m, t));
+        return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
+      }
+      // ---- W-ANIME: dialogue (speech bubbles) ----
+      if (b.op === 'dialogue-add') {
+        if (typeof b.text !== 'string' || !b.text.trim()) return json(res, 400, { error: 'dialogue-add: text is required' });
+        if (b.spriteId !== undefined && !(m0.timeline.sprites ?? []).some((s) => s.id === b.spriteId)) {
+          return json(res, 400, { error: `dialogue-add: unknown sprite: ${b.spriteId}` });
+        }
+        const tlStart = Number(b.tlStart);
+        const duration = b.duration !== undefined ? Number(b.duration) : undefined;
+        const id = freshId('dl');
+        let voicePath: string | undefined;
+        let voiceMusicId: string | undefined;
+        if (typeof b.voice === 'string' && b.voice) {
+          voicePath = path.resolve(b.voice);
+          let info: { duration: number; hasAudio: boolean };
+          try {
+            info = await probeAudio(voicePath);
+          } catch (e: any) {
+            return json(res, 400, { error: `dialogue-add: could not read --voice ${voicePath}: ${e?.message ?? e}` });
+          }
+          if (!info.hasAudio) return json(res, 400, { error: `dialogue-add: no audio stream in ${voicePath}` });
+          voiceMusicId = freshId('mu');
+        }
+        await mutate(
+          p, actor, baseRev, 'dialogue-add', b,
+          `dialogue-add "${String(b.text).slice(0, 20)}" at ${tlStart}s`,
+          (m) => {
+            let cur = m;
+            if (voiceMusicId && voicePath) {
+              // Voice audio rides the SAME MusicItem pathway as BGM/SE (spec:
+              // "SE と同じ経路に配置") — foreground dialogue, so duck is off
+              // and gain/fades favor a clean, un-ducked voice line rather
+              // than BGM-style long fades.
+              cur = addMusic(cur, voicePath, {
+                id: voiceMusicId, tlStart, duration: duration ?? 2.5, gain: 0, fadeIn: 0.05, fadeOut: 0.05, duck: false,
+              });
+            }
+            return addDialogue(cur, b.text, { tlStart, duration, spriteId: b.spriteId, voiceMusicId, id });
+          },
+        );
+        return json(res, 200, { id, ...(voiceMusicId ? { voiceMusicId } : {}), state: await stateSummary(p, ctx.transcribeJobs) });
+      }
+      if (b.op === 'dialogue-update') {
+        if (!(m0.timeline.dialogue ?? []).some((d) => d.id === b.id)) {
+          return json(res, 400, { error: `unknown dialogue item: ${b.id}` });
+        }
+        if (b.spriteId !== undefined && b.spriteId !== null && !(m0.timeline.sprites ?? []).some((s) => s.id === b.spriteId)) {
+          return json(res, 400, { error: `dialogue-update: unknown sprite: ${b.spriteId}` });
+        }
+        await mutate(p, actor, baseRev, 'dialogue-update', b, `dialogue-update ${b.id}`, (m) =>
+          updateDialogue(m, b.id, { text: b.text, tlStart: b.tlStart, duration: b.duration, spriteId: b.spriteId }),
+        );
+        return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
+      }
+      if (b.op === 'dialogue-remove') {
+        const item = (m0.timeline.dialogue ?? []).find((d) => d.id === b.id);
+        if (!item) return json(res, 400, { error: `unknown dialogue item: ${b.id}` });
+        await mutate(p, actor, baseRev, 'dialogue-remove', b, `dialogue-remove ${b.id}`, (m) => {
+          let cur = removeDialogue(m, b.id);
+          // Cascade: a dialogue line's voice clip has no purpose once the
+          // line itself is gone — remove it too, same "one commit, two
+          // ops.ts calls" pattern the daemon uses elsewhere for
+          // multi-field mutations (see e.g. 'selects').
+          if (item.voiceMusicId && (cur.timeline.music ?? []).some((x) => x.id === item.voiceMusicId)) {
+            cur = removeMusic(cur, item.voiceMusicId);
+          }
+          return cur;
+        });
         return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'audio-mix') {

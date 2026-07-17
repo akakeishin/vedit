@@ -125,6 +125,31 @@ describe('buildResume', () => {
     expect(r.nextSteps.some((s) => s.includes('ingest'))).toBe(true);
   });
 
+  it('W-ANIME: a composition project (no video sources by design) never suggests ingesting; nudges toward sprite-add instead', () => {
+    const m = manifest({
+      sources: [],
+      timeline: { video: [], motion: [] },
+      composition: { duration: 20, background: { type: 'color', hex: '#000000' } },
+    });
+    const r = buildResume(m, '/d', [], []);
+    expect(r.nextSteps.some((s) => s.includes('ingest'))).toBe(false);
+    expect(r.nextSteps.some((s) => s.includes('スプライトを配置') && s.includes('sprite-add'))).toBe(true);
+    expect(r.project.duration).toBe(20); // timelineDuration is composition-aware
+  });
+
+  it('W-ANIME: a composition with sprites already placed drops the sprite-add nudge too', () => {
+    const m = manifest({
+      sources: [],
+      timeline: {
+        video: [], motion: [],
+        sprites: [{ id: 'sp1', assetId: 'char1', anchor: { sourceId: '__comp__', srcTime: 0 }, duration: 3, position: { x: 0.5, y: 0.9 }, scale: 0.3, opacity: 1 }],
+      },
+      composition: { duration: 20, background: { type: 'color', hex: '#000000' } },
+    });
+    const r = buildResume(m, '/d', [], []);
+    expect(r.nextSteps.some((s) => s.includes('スプライトを配置'))).toBe(false);
+  });
+
   it('orphanedOverlays is empty and no nextSteps hint appears when there are no B-roll overlays', () => {
     const r = buildResume(manifest(), '/d', [], []);
     expect(r.orphanedOverlays).toEqual([]);

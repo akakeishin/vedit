@@ -21,9 +21,12 @@ vi.mock('../ingest/run.js', () => ({
 }));
 
 import {
+  AMBIENT_LAYER_OPACITY,
   applyKitDefaults,
   computeAlphaGeometry,
   deriveAssetId,
+  deriveSpeechBubbleStyle,
+  firstAmbientAsset,
   inferAssetType,
   KIT_VERSION,
   kitProfileHighlights,
@@ -36,6 +39,7 @@ import {
   scanAssetAlpha,
   scanKit,
   searchKitAssets,
+  speechBubbleTailDirection,
   validateKitFile,
   writeKitFile,
 } from './kit.js';
@@ -119,9 +123,10 @@ describe('computeAlphaGeometry', () => {
 // ---- asset id/type inference (pure) ----
 
 describe('inferAssetType / deriveAssetId', () => {
-  it('maps assets/characters -> sprite, assets/backgrounds -> background, anything else -> prop', () => {
+  it('maps assets/characters -> sprite, assets/backgrounds -> background, assets/ambient -> ambient, anything else -> prop', () => {
     expect(inferAssetType('assets/characters/hero.png')).toBe('sprite');
     expect(inferAssetType('assets/backgrounds/room.png')).toBe('background');
+    expect(inferAssetType('assets/ambient/particles.mp4')).toBe('ambient');
     expect(inferAssetType('assets/props/mug.png')).toBe('prop');
     expect(inferAssetType('assets/misc/thing.png')).toBe('prop');
   });
@@ -429,5 +434,72 @@ describe('resolveKitAssets', () => {
     expect(warnings.some((w) => w.includes('mismatch') && w.includes('sha256'))).toBe(true);
     expect(warnings.some((w) => w.includes('escape') && w.includes('escapes kit directory'))).toBe(true);
     expect(warnings.some((w) => w.includes('nope') && w.includes('not found in kit.json'))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ---- W-ANIME: ambient layer + speech-bubble style derivation (pure) -------
+// ---------------------------------------------------------------------------
+
+describe('firstAmbientAsset', () => {
+  it('returns the FIRST type:"ambient" asset in declaration order', () => {
+    const kit: KitFile = {
+      version: KIT_VERSION,
+      assets: [
+        { id: 'a', path: 'assets/props/a.png', type: 'prop' },
+        { id: 'amb1', path: 'assets/ambient/dust.mp4', type: 'ambient' },
+        { id: 'amb2', path: 'assets/ambient/rain.mp4', type: 'ambient' },
+      ],
+    };
+    expect(firstAmbientAsset(kit)?.id).toBe('amb1');
+  });
+
+  it('returns null when the kit has no ambient asset (or no kit at all) — the feature is simply absent', () => {
+    expect(firstAmbientAsset({ version: KIT_VERSION, assets: [{ id: 'a', path: 'x.png', type: 'prop' }] })).toBeNull();
+    expect(firstAmbientAsset(null)).toBeNull();
+    expect(firstAmbientAsset(undefined)).toBeNull();
+  });
+
+  it('AMBIENT_LAYER_OPACITY is a sane low-opacity fraction', () => {
+    expect(AMBIENT_LAYER_OPACITY).toBeGreaterThan(0);
+    expect(AMBIENT_LAYER_OPACITY).toBeLessThan(1);
+  });
+});
+
+describe('deriveSpeechBubbleStyle', () => {
+  it('falls back to a neutral white-bubble/black-text default with no style linked', () => {
+    const s = deriveSpeechBubbleStyle(null);
+    expect(s.palette.box).toBe('#ffffff');
+    expect(s.palette.text).toBe('#111111');
+    expect(s.cornerRadiusFrac).toBeGreaterThan(0);
+    expect(s.cornerRadiusFrac).toBeLessThan(1);
+  });
+
+  it('derives palette fields from a kit style, falling back per-field to the default when unset', () => {
+    const s = deriveSpeechBubbleStyle({ id: 'main', palette: { text: '#222222', box: '#f0e0d0' } });
+    expect(s.palette.text).toBe('#222222');
+    expect(s.palette.box).toBe('#f0e0d0');
+    expect(s.palette.outline).toBe('#111111'); // not set on the style -> default
+  });
+
+  it('a heavier outline_width yields a larger (but clamped) corner radius', () => {
+    const thin = deriveSpeechBubbleStyle({ id: 'a', caption: { outline_width: 0 } });
+    const thick = deriveSpeechBubbleStyle({ id: 'b', caption: { outline_width: 20 } });
+    expect(thick.cornerRadiusFrac).toBeGreaterThan(thin.cornerRadiusFrac);
+    expect(thick.cornerRadiusFrac).toBeLessThanOrEqual(0.4);
+    expect(thin.cornerRadiusFrac).toBeGreaterThanOrEqual(0.16);
+  });
+});
+
+describe('speechBubbleTailDirection', () => {
+  it('points toward the sprite along whichever axis has the larger offset', () => {
+    expect(speechBubbleTailDirection({ x: 0.5, y: 0.2 }, { x: 0.5, y: 0.9 })).toBe('bottom');
+    expect(speechBubbleTailDirection({ x: 0.5, y: 0.9 }, { x: 0.5, y: 0.2 })).toBe('top');
+    expect(speechBubbleTailDirection({ x: 0.2, y: 0.5 }, { x: 0.9, y: 0.5 })).toBe('right');
+    expect(speechBubbleTailDirection({ x: 0.9, y: 0.5 }, { x: 0.2, y: 0.5 })).toBe('left');
+  });
+
+  it('a tie defaults to "bottom" (the common case: bubble above a speaker\'s head)', () => {
+    expect(speechBubbleTailDirection({ x: 0.5, y: 0.5 }, { x: 0.5, y: 0.5 })).toBe('bottom');
   });
 });

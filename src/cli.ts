@@ -5,12 +5,20 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { startDaemon } from './server/daemon.js';
 import { Project } from './core/project.js';
-import { buildSelectsTimeline, segments, sourceRangeToTimeline, timelineDuration, timelineTimeToSource } from './core/ops.js';
+import {
+  buildSelectsTimeline,
+  COMP_SOURCE_ID,
+  parseReframeSpec,
+  segments,
+  sourceRangeToTimeline,
+  timelineDuration,
+  timelineTimeToSource,
+} from './core/ops.js';
 import { listProjects } from './core/registry.js';
 import { loadPreset, listPresets, savePreset } from './core/presets.js';
 import { renderView, renderSceneSheet } from './export/view.js';
 import { hasReframe, writeOtio } from './export/otio.js';
-import { renderFinal, toAss } from './export/render.js';
+import { renderComposition, renderFinal, toAss } from './export/render.js';
 import { chaptersFromMotion, loadPeaksBySource, publishPack } from './export/publish.js';
 import {
   buildQcReport,
@@ -40,7 +48,7 @@ import { ffmpegBin, ffmpegHasFilter, run } from './ingest/run.js';
 import { buildResume } from './core/resume.js';
 import { detectTakes, packTakes } from './core/takes.js';
 import { buildRetrospective, parseRetentionCsv } from './core/analytics.js';
-import type { KitProfile, SceneFile, Transcript } from './core/types.js';
+import type { KitAsset, KitProfile, SceneFile, Transcript } from './core/types.js';
 import {
   kitProfileHighlights,
   packKitAssets,
@@ -64,7 +72,7 @@ const BOOLEAN_FLAGS = new Set([
   'latest', 'full', 'all', 'burn-captions', 'no-duck',
   'no-repair', 'fast-loudnorm', 'deess', 'confirm',
   'plan', 'link', 'no-verify', 'force', 'flip', 'no-flip',
-  'clear',
+  'clear', 'no-motion', 'no-sprite',
 ]);
 const argv = process.argv.slice(2);
 const cmd = argv[0];
@@ -247,9 +255,23 @@ async function resolveScene(dir: string, sceneId: string, explicitSource?: strin
  * broll-add/broll-update/sprite-add/sprite-update.
  */
 async function resolveAnchorFlags(dir: string): Promise<{ sourceId: string; srcTime: number } | undefined> {
-  const given = ['at-word', 'at-src', 'at-tl'].filter((k) => flags[k] !== undefined);
+  const given = ['at-word', 'at-src', 'at-tl', 'at'].filter((k) => flags[k] !== undefined);
   if (given.length === 0) return undefined;
-  if (given.length > 1) fail(`specify only one of --at-word / --at-src / --at-tl (got ${given.map((k) => `--${k}`).join(', ')})`);
+  if (given.length > 1) {
+    fail(`specify only one of --at / --at-word / --at-src / --at-tl (got ${given.map((k) => `--${k}`).join(', ')})`);
+  }
+
+  if (flags['at'] !== undefined) {
+    // W-ANIME: composition-mode sugar — `--at <t>` IS the absolute timeline
+    // time directly (COMP_SOURCE_ID sentinel), since a composition has no
+    // A-roll source to anchor into (see ops.ts's sourceTimeToTimeline doc).
+    const p = await Project.open(dir);
+    const m = await p.manifest();
+    if (!m.composition) {
+      fail('--at requires a composition project (`vedit compose` first); use --at-word/--at-src/--at-tl for a normal (source-driven) project');
+    }
+    return { sourceId: COMP_SOURCE_ID, srcTime: numFlag('at', flags.at)! };
+  }
 
   if (flags['at-word'] !== undefined) {
     const wordId = String(flags['at-word']);
@@ -286,6 +308,28 @@ async function resolveAnchorFlags(dir: string): Promise<{ sourceId: string; srcT
   const r = timelineTimeToSource(m, tl);
   if (!r) fail(`--at-tl ${tl}: not a valid timeline position (0..${timelineDuration(m).toFixed(2)})`);
   return r;
+}
+
+/** `--emote-at "1:happy,3.5:sad"` -> [{t,assetId},...] (W-ANIME). The tiny flag parser only keeps ONE value per flag name, so multiple emote points are comma-separated in a single flag rather than repeated `--emote-at` occurrences. */
+function parseEmoteAt(raw: string): { t: number; assetId: string }[] {
+  return raw.split(',').map((pair) => {
+    const [tStr, assetId] = pair.split(':');
+    const t = Number(tStr);
+    if (!Number.isFinite(t) || !assetId) {
+      fail(`--emote-at: invalid entry "${pair}" (expected "t:assetId", comma-separated for multiple, e.g. "1:happy,3.5:sad")`);
+    }
+    return { t, assetId };
+  });
+}
+
+/** Collect `--enter`/`--loop`/`--exit`/`--emote-at` into a SpriteItem.motion patch (W-ANIME), or undefined when none were given — sprite-add/sprite-update share this. */
+function spriteMotionFromFlags(): Record<string, unknown> | undefined {
+  const motion: Record<string, unknown> = {};
+  if (flags.enter !== undefined) motion.enter = flags.enter;
+  if (flags.loop !== undefined) motion.loop = flags.loop;
+  if (flags.exit !== undefined) motion.exit = flags.exit;
+  if (flags['emote-at'] !== undefined) motion.emoteAt = parseEmoteAt(String(flags['emote-at']));
+  return Object.keys(motion).length ? motion : undefined;
 }
 
 const HELP = `vedit — conversational local NLE
@@ -338,9 +382,18 @@ kit:       kit-init <dir> [--name n]                  # 雛形生成(kit.json + 
            kit-link <dir> --base <rev> | kit-unlink --base <rev> | kit   # リンク/解除/内容表示(profile要点含む)
            kit-scan [dir] [--force]                    # assets/ の PNG からアルファ境界・足元アンカーを自動計算
            kit-assets [--tag t] [--emotion e]           # キット素材の検索(read-only)
-sprites:   sprite-add <assetId> (--at-word wXXXX [--source aRollSrc] | --at-src aRollSrc t | --at-tl t)
-             [--pos x,y] [--scale 0..1] [--opacity 0..1] [--duration s] [--flip] --base <rev>
-           sprite-update <id> [同フラグ] --base <rev> | sprite-remove <id> --base <rev>
+sprites:   sprite-add <assetId> (--at t [composition] | --at-word wXXXX [--source aRollSrc] | --at-src aRollSrc t | --at-tl t)
+             [--pos x,y] [--scale 0..1] [--opacity 0..1] [--duration s] [--flip]
+             [--enter slide-left|slide-right|hop-in|pop|fade] [--loop sway|bob|hop|breathe|none] [--exit 同名]
+             [--emote-at "t:assetId,..."] --base <rev>
+           sprite-update <id> [同フラグ] [--no-motion] --base <rev> | sprite-remove <id> --base <rev>
+anime:     compose <dir> --duration 秒 --size WxH|比率 [--name n] [--background #hex|assetId|videoPath] [--kit <dir>]
+             # コンポジション(スプライトアニメ): 映像ソースなしの製作モード。ゆる紙芝居+キャラが緩く動くショート
+           bg-set --at t --to <#hex|assetId|videoPath> --base <rev>   # 紙芝居の背景切替(t=0 は基本背景を置換)
+           bg-remove --at t --base <rev>
+           dialogue-add "セリフ" --at t [--duration s] [--sprite <spriteItemId>] [--voice <音声ファイル>] --base <rev>
+           dialogue-update <id> ["新テキスト"] [--at t] [--duration s] [--sprite <id>|--no-sprite] --base <rev>
+           dialogue-remove <id> --base <rev>
 takes:     takes [--source id]   # 言い直し(撮り直し)候補の検出結果を表示(read-only、何も適用しない)
 intent:    intent-add <sourceId> <t0> <t1> --label "余韻" [--kind quiet|hold] --base <rev>
              # 「静寂スコア」保護区間: --kind quiet(既定)は無音検出の自動除外+BGMダッキング警告、hold は検出除外のみ
@@ -418,6 +471,84 @@ async function main() {
       await ensureDaemon(dir);
       return out({ ok: true, dir, next: `vedit ingest <video> --project ${dir}` });
     }
+
+    case 'compose': {
+      // W-ANIME: create (or re-tune) a source-less "composition" project —
+      // sprites moving over a background, no A-roll footage. `dir` is
+      // created if it doesn't exist yet (same convention as `create`).
+      const USAGE = 'usage: vedit compose <dir> --duration <seconds> --size <WxH|ratio> [--name n] [--background #hex|assetId|videoPath] [--kit <dir>]';
+      const dir = path.resolve(pos[0] ?? fail(USAGE));
+      const duration = numFlag('duration', flags.duration) ?? fail(USAGE);
+      if (!flags.size) fail(USAGE);
+      const size = parseReframeSpec(String(flags.size));
+      await ensureDaemon(dir);
+      const state = await api('/api/state');
+      const res = await api('/api/edit', {
+        method: 'POST',
+        body: JSON.stringify({
+          baseRev: baseRevOf(state), actor: flags.actor ?? 'claude',
+          op: 'compose', duration, width: size.width, height: size.height,
+          background: flags.background,
+          // Resolved against THIS process's cwd (the user's actual shell),
+          // not the daemon's — see resolveBackgroundArg's doc in daemon.ts.
+          backgroundPathHint: flags.background ? path.resolve(String(flags.background)) : undefined,
+        }),
+      });
+      if (flags.kit) {
+        const state2 = await api('/api/state');
+        await api('/api/edit', {
+          method: 'POST',
+          body: JSON.stringify({
+            baseRev: state2.revision, actor: flags.actor ?? 'claude',
+            op: 'kit-link', path: path.resolve(String(flags.kit)),
+          }),
+        });
+      }
+      return out({
+        ok: true, dir, ...res,
+        hint: 'vedit sprite-add <assetId> --at <t> --pos x,y --scale .. --enter .. --loop .. --base <rev>',
+      });
+    }
+
+    case 'bg-set': {
+      const t = numFlag('at', flags.at) ?? fail('usage: vedit bg-set --at <t> --to <#hex|assetId|videoPath> --base <rev>');
+      const to = flags.to as string | undefined;
+      if (!to) fail('usage: vedit bg-set --at <t> --to <#hex|assetId|videoPath> --base <rev>');
+      // Resolved against THIS process's cwd — see resolveBackgroundArg's doc in daemon.ts.
+      return edit({ op: 'bg-set', t, to, toPathHint: path.resolve(to) });
+    }
+
+    case 'bg-remove':
+      return edit({ op: 'bg-remove', t: numFlag('at', flags.at) ?? fail('usage: vedit bg-remove --at <t> --base <rev>') });
+
+    case 'dialogue-add': {
+      const USAGE = 'usage: vedit dialogue-add "text" --at <t> [--duration s] [--sprite <spriteItemId>] [--voice <audioFile>] --base <rev>';
+      const text = pos[0] ?? fail(USAGE);
+      const tlStart = numFlag('at', flags.at) ?? fail(USAGE);
+      return edit({
+        op: 'dialogue-add',
+        text,
+        tlStart,
+        duration: numFlag('duration', flags.duration),
+        spriteId: flags.sprite,
+        voice: flags.voice ? path.resolve(String(flags.voice)) : undefined,
+      });
+    }
+
+    case 'dialogue-update': {
+      const id = pos[0] ?? fail('usage: vedit dialogue-update <id> ["text"] [--at t] [--duration s] [--sprite <id>|--no-sprite] --base <rev>');
+      return edit({
+        op: 'dialogue-update',
+        id,
+        text: pos[1],
+        tlStart: numFlag('at', flags.at),
+        duration: numFlag('duration', flags.duration),
+        spriteId: flags['no-sprite'] ? null : flags.sprite,
+      });
+    }
+
+    case 'dialogue-remove':
+      return edit({ op: 'dialogue-remove', id: pos[0] ?? fail('usage: vedit dialogue-remove <id> --base <rev>') });
 
     case 'open': {
       const dir = projectDir();
@@ -1291,12 +1422,13 @@ async function main() {
 
     case 'sprite-add': {
       const USAGE =
-        'usage: vedit sprite-add <assetId> (--at-word wXXXX [--source aRollSrc] | --at-src aRollSrc t | --at-tl t) ' +
-        '[--pos x,y] [--scale 0..1] [--opacity 0..1] [--duration s] [--flip] --base <rev>';
+        'usage: vedit sprite-add <assetId> (--at t [composition] | --at-word wXXXX [--source aRollSrc] | --at-src aRollSrc t | --at-tl t) ' +
+        '[--pos x,y] [--scale 0..1] [--opacity 0..1] [--duration s] [--flip] ' +
+        '[--enter slide-left|slide-right|hop-in|pop|fade] [--loop sway|bob|hop|breathe|none] [--exit ...] [--emote-at "t:assetId,..."] --base <rev>';
       const assetId = pos[0] ?? fail(USAGE);
       const dir = projectDir();
       const anchor = await resolveAnchorFlags(dir);
-      if (!anchor) fail(`sprite-add requires an anchor: --at-word / --at-src / --at-tl\n${USAGE}`);
+      if (!anchor) fail(`sprite-add requires an anchor: --at / --at-word / --at-src / --at-tl\n${USAGE}`);
       let position: { x: number; y: number } | undefined;
       if (flags.pos !== undefined) {
         const [xs, ys] = String(flags.pos).split(',');
@@ -1311,11 +1443,17 @@ async function main() {
         scale: numFlag('scale', flags.scale),
         opacity: numFlag('opacity', flags.opacity),
         flip: flags.flip ? true : undefined,
+        motion: spriteMotionFromFlags(),
       });
     }
 
     case 'sprite-update': {
-      const id = pos[0] ?? fail('usage: vedit sprite-update <id> [--pos x,y] [--scale ..] [--opacity ..] [--duration s] [--flip|--no-flip] [anchor flags] --base <rev>');
+      const id =
+        pos[0] ??
+        fail(
+          'usage: vedit sprite-update <id> [--pos x,y] [--scale ..] [--opacity ..] [--duration s] [--flip|--no-flip] ' +
+            '[--enter ..] [--loop ..] [--exit ..] [--emote-at "t:assetId,..."] [--no-motion] [anchor flags] --base <rev>',
+        );
       const dir = projectDir();
       const anchor = await resolveAnchorFlags(dir);
       let position: { x: number; y: number } | undefined;
@@ -1332,6 +1470,7 @@ async function main() {
         scale: numFlag('scale', flags.scale),
         opacity: numFlag('opacity', flags.opacity),
         flip: flags.flip ? true : flags['no-flip'] ? false : undefined,
+        motion: flags['no-motion'] ? null : spriteMotionFromFlags(),
       });
     }
 
@@ -1475,12 +1614,15 @@ async function main() {
       }
       const candidates = await p.candidates();
       let kitProfile: KitProfile | null = null;
+      let kitAssets: KitAsset[] | undefined;
       if (m.kit) {
         try {
-          kitProfile = (await readKitFile(m.kit.path)).profile ?? null;
-        } catch { /* kit unreadable — proceed without kitProfile, same degrade-not-fail convention as `vedit kit` */ }
+          const kitFile = await readKitFile(m.kit.path);
+          kitProfile = kitFile.profile ?? null;
+          kitAssets = kitFile.assets;
+        } catch { /* kit unreadable — proceed without kitProfile/kitAssets, same degrade-not-fail convention as `vedit kit` */ }
       }
-      const staticReport = await staticChecks(m, transcripts, sceneFiles, { candidates, kitProfile });
+      const staticReport = await staticChecks(m, transcripts, sceneFiles, { candidates, kitProfile, kitAssets });
 
       let probe: ProbeRenderedFileResult | undefined;
       if (flags.render) {
@@ -1555,6 +1697,16 @@ async function main() {
         }
         if (presetRaw !== undefined && !['youtube', 'shorts', 'x'].includes(presetRaw)) {
           fail(`unknown --preset: ${presetRaw} (use youtube, shorts, or x)`);
+        }
+        // W-ANIME: a composition project has no A-roll at all — renderFinal
+        // (segments()-based) would throw "empty timeline"; renderComposition
+        // is the dedicated background/sprite/dialogue pipeline instead. The
+        // existing export presets (crf/audio-bitrate/resize/loudnorm target)
+        // apply unchanged either way (resolveRenderParams is shared).
+        if (m.composition) {
+          console.error('rendering composition (background + sprites + dialogue)...');
+          const res = await renderComposition(m, path.resolve(dest), { preset: presetRaw as 'youtube' | 'shorts' | 'x' | undefined });
+          return out({ ok: true, file: dest, ...(res.warnings.length ? { warnings: res.warnings } : {}) });
         }
         console.error('rendering from original sources (this encodes the full timeline)...');
         const res = await renderFinal(m, await transcriptsOf(), path.resolve(dest), {

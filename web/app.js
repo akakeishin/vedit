@@ -79,6 +79,15 @@ const S = {
   fontsList: null, // W-CAP: /api/fonts response ({kit:[{name,family?,path}], system:[{family}]}), refreshed every reload()
   qc: { issues: [], counts: { errors: 0, warnings: 0, infos: 0 } }, // W9: /api/qc static report, refreshed every reload()
   takesCache: new Map(), // W-INTENT/W11: sourceId -> TakeGroup[], fetched on demand (GET /api/takes) when a "show takes" directive arrives
+  // ---- W-ANIME: composition (source-less "sprite anime" production mode) ----
+  backgroundIntervals: [], // [{t0,t1,ref}] from /api/project — the resolved "紙芝居"; empty for a non-composition project
+  dialogue: [], // Timeline.dialogue verbatim from /api/project (already absolute-placed, no resolution needed)
+  speechBubbleStyle: null, // derived once per reload — see deriveSpeechBubbleStyleJS
+  // A composition project has no <video> to drive playback (no A-roll at
+  // all) — compTl/compClockAnchor/compPlaying implement an independent
+  // requestAnimationFrame-driven virtual clock; see compTlNow()/tickComposition().
+  compTl: 0,
+  compClockAnchor: null,
 };
 const PLAY_RATES = [1, 1.5, 2];
 
@@ -106,8 +115,22 @@ async function reload() {
     S.duration = pr.duration;
     S.overlays = pr.overlays ?? [];
     S.sprites = pr.sprites ?? [];
+    S.dialogue = pr.dialogue ?? []; // W-ANIME
+    S.backgroundIntervals = pr.backgroundIntervals ?? []; // W-ANIME
     S.transcribing = new Set(pr.transcribing ?? []); // W-LAZY: live job state (see /api/project in daemon.ts), not part of the manifest
     S.kit = await api('/api/kit').catch(() => ({ path: null, kit: null }));
+    // W-ANIME: derive the speech-bubble palette once per reload — a kit
+    // style tagged use_for:['dialogue'|'speech-bubble'] wins, else the
+    // active captions style, else a neutral default (see
+    // deriveSpeechBubbleStyleJS, a hand-kept-in-sync port of kit.ts's
+    // deriveSpeechBubbleStyle).
+    {
+      const styles = S.kit?.kit?.styles ?? [];
+      const dialogueStyle =
+        styles.find((s) => (s.use_for ?? []).some((u) => u === 'dialogue' || u === 'speech-bubble')) ??
+        styles.find((s) => s.id === S.manifest.captions.style);
+      S.speechBubbleStyle = deriveSpeechBubbleStyleJS(dialogueStyle);
+    }
     // W-CAP: fetched once per reload (daemon-side memory+disk cached, see
     // GET /api/fonts in daemon.ts) rather than only on popover-open, so
     // renderCaption can resolve an ALREADY-set overrides.font's @font-face
@@ -157,7 +180,10 @@ function renderStageState() {
     el.hidden = false;
     msg.textContent = 'プロジェクト未選択';
     retry.hidden = true;
-  } else if (S.manifest && (S.manifest.sources?.length ?? 0) === 0) {
+  } else if (S.manifest && !S.manifest.composition && (S.manifest.sources?.length ?? 0) === 0) {
+    // W-ANIME: a composition project has NO sources by design (see
+    // Manifest.composition's doc) — this "ingest a file" empty state is
+    // only meaningful for a normal (source-driven) project.
     el.hidden = false;
     msg.textContent = '素材がありません — `vedit ingest <file>` で取り込み';
     retry.hidden = true;
@@ -172,6 +198,7 @@ function segAt(tl) {
   return S.segments.findIndex((s) => tl >= s.tlStart && tl < s.tlEnd);
 }
 function tlNow() {
+  if (isComposition()) return compTlNow();
   const i = S.currentSeg;
   if (i < 0 || !S.segments[i]) return 0;
   const s = S.segments[i];
@@ -217,19 +244,87 @@ function updateFraming() {
   const y = clip?.crop?.y != null ? Math.round(clip.crop.y * 100) : 50;
   video.style.objectPosition = `${x}% ${y}%`;
 }
+function isComposition() {
+  return Boolean(S.manifest?.composition);
+}
 function seekTl(tl, { play } = {}) {
   // Any timeline seek/scrub ("playhead operation") returns from source
   // preview mode to the timeline, at the position being sought.
   if (S.sourcePreview) { S.sourcePreview = null; renderPreviewBanner(); }
   tl = Math.max(0, Math.min(tl, S.duration - 0.001));
+  if (isComposition()) {
+    // W-ANIME: no <video>/segments to drive playback at all — just move the
+    // virtual-clock anchor (see compTlNow/tickComposition below).
+    S.compTl = tl;
+    S.compClockAnchor = performance.now();
+    if (play !== undefined) {
+      S.playing = play;
+      setPlayBtnState(play);
+    }
+    return;
+  }
   let i = segAt(tl);
   if (i < 0) i = S.segments.length - 1;
   if (i < 0) return; // no segments at all
   loadSeg(i, { play: play ?? S.playing, offset: tl - S.segments[i].tlStart });
 }
 
+// ---------- W-ANIME: composition virtual clock (no <video>/segments to drive playback) ----------
+// A composition project has no A-roll at all, so tlNow()'s "map video.
+// currentTime through the current segment" approach has nothing to map —
+// compTl/compClockAnchor implement an independent requestAnimationFrame
+// clock instead, reusing video.playbackRate for J/K/L shuttle speed (the
+// <video> element itself stays hidden/src-less in this mode, see
+// applyCompositionMode, but its .playbackRate property still holds the
+// user's selected shuttle speed harmlessly).
+function compTlNow() {
+  if (!S.playing || S.compClockAnchor == null) return S.compTl;
+  const elapsed = ((performance.now() - S.compClockAnchor) / 1000) * (video.playbackRate || 1);
+  return Math.min(S.duration, S.compTl + elapsed);
+}
+function applyCompositionMode() {
+  const comp = isComposition();
+  const bg = $('compBgLayer');
+  if (bg) bg.hidden = !comp;
+  video.hidden = comp;
+  if (comp && video.src) {
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
+  }
+  if (!comp) {
+    S.compTl = 0;
+    S.compClockAnchor = null;
+  }
+}
+function tickComposition() {
+  const tl = compTlNow();
+  if (S.playing && tl >= S.duration - 1e-3) {
+    S.compTl = S.duration;
+    S.compClockAnchor = null;
+    S.playing = false;
+    setPlayBtnState(false);
+  }
+  $('playhead').style.left = `${(tl / Math.max(1e-6, S.duration)) * 100}%`;
+  $('tc').textContent = `${fmtF(tl)} / ${fmtF(S.duration)}`;
+  renderCompositionBackground(tl);
+  renderMotion(tl);
+  renderSprites(tl);
+  renderDialogueBubbles(tl);
+  syncMusicPlayback(tl);
+  if (S.previewStopAt != null && S.playing && tl >= S.previewStopAt) {
+    S.previewStopAt = null;
+    stopPlayback();
+  }
+}
+
 // The frame loop: cross segment boundaries, drive playhead/captions/motion.
 function tick() {
+  if (isComposition()) {
+    tickComposition();
+    requestAnimationFrame(tick);
+    return;
+  }
   if (S.sourcePreview) {
     // Source preview mode: #video plays a raw source proxy that has no
     // relation to S.segments/S.currentSeg, so skip all timeline-linked
@@ -288,15 +383,26 @@ function setPlayBtnState(playing) {
   btn.setAttribute('aria-label', playing ? '一時停止' : '再生');
 }
 function stopPlayback() {
-  video.pause();
+  if (isComposition()) {
+    S.compTl = compTlNow();
+    S.compClockAnchor = null;
+  } else {
+    video.pause();
+  }
   S.playing = false;
   setPlayBtnState(false);
   S.rateIdx = 0;
   setPlaybackRate(1);
 }
 function startPlayback() {
-  if (S.currentSeg < 0) seekTl(0, { play: true });
-  else video.play().catch(() => {});
+  if (isComposition()) {
+    if (S.compTl >= S.duration - 1e-3) S.compTl = 0; // replay from the top once fully played out
+    S.compClockAnchor = performance.now();
+  } else if (S.currentSeg < 0) {
+    seekTl(0, { play: true });
+  } else {
+    video.play().catch(() => {});
+  }
   S.playing = true;
   setPlayBtnState(true);
 }
@@ -673,7 +779,56 @@ function renderTimeline() {
   renderOverlayRow();
   renderSpriteRow();
   renderIntentZoneRow();
+  renderBgRow();
+  renderDialogueRow();
   drawWave();
+}
+
+// W-ANIME: background-cut row ("紙芝居") — one block per backgroundIntervals()
+// entry, click-to-seek only (no drag/reanchor — a background cut is placed
+// at an absolute time, not anchored to anything draggable). Empty for a
+// non-composition project.
+function bgRefLabel(ref) {
+  if (ref.type === 'color') return ref.hex;
+  if (ref.type === 'asset') return ref.assetId;
+  return basename(ref.path);
+}
+function renderBgRow() {
+  const row = $('bgRow');
+  if (!row) return;
+  row.innerHTML = '';
+  if (!S.duration || !isComposition()) return;
+  for (const iv of S.backgroundIntervals) {
+    const d = document.createElement('div');
+    d.className = 'bgBlock';
+    d.style.left = `${(iv.t0 / S.duration) * 100}%`;
+    d.style.width = `${Math.max(0, (iv.t1 - iv.t0) / S.duration) * 100}%`;
+    const label = bgRefLabel(iv.ref);
+    d.title = `背景: ${label} — クリックでシーク`;
+    d.textContent = label;
+    d.onclick = () => seekTl(iv.t0);
+    row.appendChild(d);
+  }
+}
+
+// W-ANIME: dialogue (speech bubble) row — one block per DialogueItem,
+// click-to-seek only (dialogue is placed at an absolute tlStart, no anchor
+// to drag/reanchor).
+function renderDialogueRow() {
+  const row = $('dialogueRow');
+  if (!row) return;
+  row.innerHTML = '';
+  if (!S.duration) return;
+  for (const d of S.dialogue ?? []) {
+    const el = document.createElement('div');
+    el.className = 'dlBlock';
+    el.style.left = `${(d.tlStart / S.duration) * 100}%`;
+    el.style.width = `${Math.max(0, d.duration / S.duration) * 100}%`;
+    el.title = `${d.id}: ${d.text}`;
+    el.textContent = d.text;
+    el.onclick = () => seekTl(d.tlStart);
+    row.appendChild(el);
+  }
 }
 
 // W-INTENT: map one intentZone (Manifest.intentZones — SOURCE-domain t0/t1)
@@ -1819,37 +1974,247 @@ function spriteGeometryJS(asset, position, scale, outputWH, flip) {
   const fullHeight = displayHeight / visibleHeightFrac;
   const fullWidth = fullHeight * aspect;
   const anchorXFrac = flip ? 1 - anchor.x : anchor.x;
-  const x = position.x * outputWH.width - anchorXFrac * fullWidth;
-  const y = position.y * outputWH.height - anchor.y * fullHeight;
-  return { x, y, width: fullWidth, height: fullHeight };
+  const anchorX = position.x * outputWH.width;
+  const anchorY = position.y * outputWH.height;
+  const x = anchorX - anchorXFrac * fullWidth;
+  const y = anchorY - anchor.y * fullHeight;
+  return { x, y, width: fullWidth, height: fullHeight, anchorX, anchorY };
 }
+
+// W-ANIME: per-frame NUMERIC port of ops.ts's spriteMotionPlan (enterTerms/
+// exitTerms/loopTerms) — pure math kept in sync by hand (same duplication
+// convention as spriteGeometryJS above). Unlike the render pipeline (which
+// builds ffmpeg expression STRINGS evaluated once by ffmpeg), the browser
+// just recomputes this every rendered frame directly in JS — simpler than
+// generating CSS @keyframes, and exactly as accurate to the same formulas.
+// Constants (transition duration, loop amplitudes, breathe amplitude) MUST
+// stay numerically identical to ops.ts's SPRITE_TRANSITION_SECONDS /
+// SPRITE_BREATHE_AMPLITUDE / the sway/bob/hop literals for timing to match
+// per the spec's "タイミングのみ一致保証" contract.
+const SPRITE_TRANSITION_SECONDS = 0.35;
+const SPRITE_BREATHE_AMPLITUDE = 0.012;
+function spriteMotionOffsetJS(motion, tl, tlStart, tlEnd, geo) {
+  let dx = 0, dy = 0, alpha = 1, scaleMul = 1;
+  const D = SPRITE_TRANSITION_SECONDS;
+  const ramp = (t, t0) => Math.min(1, Math.max(0, (t - t0) / D));
+  const travelX = geo.width * 0.6;
+  const travelY = geo.height * 0.5;
+  const bounceY = geo.height * 0.05;
+  if (motion?.enter && tl < tlStart + D) {
+    const p = ramp(tl, tlStart);
+    if (motion.enter === 'slide-left') dx += travelX * (1 - p);
+    else if (motion.enter === 'slide-right') dx -= travelX * (1 - p);
+    else if (motion.enter === 'hop-in') dy += travelY * (1 - p) * (1 - p);
+    else if (motion.enter === 'pop') { dy -= bounceY * Math.sin(Math.PI * p); alpha *= p; }
+    else if (motion.enter === 'fade') alpha *= p;
+  }
+  if (motion?.exit && tl > tlEnd - D) {
+    const p = ramp(tl, tlEnd - D);
+    if (motion.exit === 'slide-left') dx -= travelX * p;
+    else if (motion.exit === 'slide-right') dx += travelX * p;
+    else if (motion.exit === 'hop-in') dy += travelY * p * p;
+    else if (motion.exit === 'pop') { dy -= bounceY * Math.sin(Math.PI * (1 - p)); alpha *= (1 - p); }
+    else if (motion.exit === 'fade') alpha *= (1 - p);
+  }
+  if (motion?.loop && motion.loop !== 'none') {
+    const lt = tl - tlStart;
+    if (motion.loop === 'sway') dx += 8 * Math.sin((2 * Math.PI * lt) / 3);
+    else if (motion.loop === 'bob') dy += 6 * Math.sin((2 * Math.PI * lt) / 2.4);
+    else if (motion.loop === 'hop') dy -= 10 * Math.abs(Math.sin((2 * Math.PI * lt) / 1));
+    else if (motion.loop === 'breathe') scaleMul = 1 + SPRITE_BREATHE_AMPLITUDE * Math.sin((2 * Math.PI * lt) / 2);
+  }
+  return { dx, dy, alpha: Math.max(0, Math.min(1, alpha)), scaleMul };
+}
+
+// W-ANIME: which of a sprite's asset images is showing at sprite-local time
+// `tl - tlStart` — a JS port of ops.ts's emoteWindows (last emoteAt entry
+// with t <= localT wins; no emoteAt at all just returns the base assetId).
+function activeSpriteAssetId(sp, tl, tlStart) {
+  const emoteAt = sp.motion?.emoteAt;
+  if (!emoteAt || emoteAt.length === 0) return sp.assetId;
+  const localT = tl - tlStart;
+  const sorted = [...emoteAt]
+    .filter((e) => Number.isFinite(e.t) && e.t >= 0 && e.t < sp.duration)
+    .sort((a, b) => a.t - b.t);
+  let active = sp.assetId;
+  for (const e of sorted) {
+    if (e.t <= localT) active = e.assetId;
+    else break;
+  }
+  return active;
+}
+
 function renderSprites(tl) {
   const layer = $('spriteLayer');
   if (!layer) return;
   const active = S.sprites.filter((r) => r.tlStart != null && tl >= r.tlStart && tl < r.tlStart + r.sprite.duration);
   const key = active.map((r) => r.sprite.id).join(',');
+  const assets = S.kit?.kit?.assets ?? [];
+  if (layer.dataset.cur !== key) {
+    layer.dataset.cur = key;
+    layer.innerHTML = '';
+    layer._entries = [];
+    for (const r of active) {
+      const img = document.createElement('img');
+      img.className = 'spriteImg';
+      img.alt = '';
+      layer.appendChild(img);
+      layer._entries.push({ img, r, curAssetId: null });
+    }
+  }
+  const entries = layer._entries ?? [];
+  if (entries.length === 0) return;
+  const out = S.manifest?.output ?? { width: S.manifest?.width ?? 1920, height: S.manifest?.height ?? 1080 };
+  for (const entry of entries) {
+    const sp = entry.r.sprite;
+    const tlStart = entry.r.tlStart;
+    const tlEnd = tlStart + sp.duration;
+    // W-ANIME "表情差分": which asset shows can change mid-sprite (emoteAt).
+    const assetId = activeSpriteAssetId(sp, tl, tlStart);
+    const asset = assets.find((a) => a.id === assetId);
+    if (!asset) continue;
+    if (entry.curAssetId !== assetId) {
+      entry.curAssetId = assetId;
+      entry.img.src = `/media/kit/${asset.path.split('/').map(encodeURIComponent).join('/')}`;
+    }
+    const geo = spriteGeometryJS(asset, sp.position, sp.scale, out, sp.flip);
+    const off = spriteMotionOffsetJS(sp.motion, tl, tlStart, tlEnd, geo);
+    const w = geo.width * off.scaleMul;
+    const h = geo.height * off.scaleMul;
+    let x, y;
+    if (sp.motion?.loop === 'breathe') {
+      // Keep the anchor point (feet) fixed as the sprite "breathes" — same
+      // fraction-of-box compensation as ops.ts's spriteMotionPlan.
+      const fracX = geo.width > 0 ? (geo.anchorX - geo.x) / geo.width : 0.5;
+      const fracY = geo.height > 0 ? (geo.anchorY - geo.y) / geo.height : 1;
+      x = geo.anchorX - fracX * w + off.dx;
+      y = geo.anchorY - fracY * h + off.dy;
+    } else {
+      x = geo.x + off.dx;
+      y = geo.y + off.dy;
+    }
+    entry.img.style.left = `${(x / out.width) * 100}%`;
+    entry.img.style.top = `${(y / out.height) * 100}%`;
+    entry.img.style.width = `${(w / out.width) * 100}%`;
+    entry.img.style.height = `${(h / out.height) * 100}%`;
+    entry.img.style.opacity = String(sp.opacity * off.alpha);
+    entry.img.style.transform = sp.flip ? 'scaleX(-1)' : '';
+  }
+}
+
+// ---------- W-ANIME: composition background/ambient + dialogue speech bubbles ----------
+
+function renderCompositionBackground(tl) {
+  const layer = $('compBgLayer');
+  if (!layer) return;
+  const iv =
+    S.backgroundIntervals.find((v) => tl >= v.t0 && tl < v.t1) ?? S.backgroundIntervals[S.backgroundIntervals.length - 1];
+  const ambient = (S.kit?.kit?.assets ?? []).find((a) => a.type === 'ambient');
+  const key = `${iv ? `${iv.t0}:${JSON.stringify(iv.ref)}` : 'none'}|${ambient?.id ?? ''}`;
+  if (layer.dataset.cur === key) return;
+  layer.dataset.cur = key;
+  layer.innerHTML = '';
+  layer.style.background = '';
+  const kitMediaUrl = (relPath) => `/media/kit/${relPath.split('/').map(encodeURIComponent).join('/')}`;
+  if (iv) {
+    const ref = iv.ref;
+    if (ref.type === 'color') {
+      layer.style.background = ref.hex;
+    } else if (ref.type === 'asset') {
+      const asset = (S.kit?.kit?.assets ?? []).find((a) => a.id === ref.assetId);
+      if (asset) {
+        const isVideo = /\.(mp4|mov|webm|m4v)$/i.test(asset.path);
+        const el = document.createElement(isVideo ? 'video' : 'img');
+        el.className = 'compBgMedia';
+        el.src = kitMediaUrl(asset.path);
+        if (isVideo) { el.loop = true; el.autoplay = true; el.muted = true; el.playsInline = true; }
+        else el.alt = '';
+        layer.appendChild(el);
+      } else {
+        layer.style.background = '#000';
+      }
+    } else {
+      // type 'video' (arbitrary absolute file path): not yet previewable in
+      // the web UI — see the W-ANIME implementation report. The RENDER
+      // pipeline (buildCompositionFilterGraph) plays it correctly either way.
+      const ph = document.createElement('div');
+      ph.className = 'compBgPlaceholder';
+      ph.textContent = '🎥 動画背景(プレビュー未対応・レンダーには反映されます)';
+      layer.appendChild(ph);
+    }
+  }
+  if (ambient) {
+    const v = document.createElement('video');
+    v.className = 'compAmbientMedia';
+    v.src = kitMediaUrl(ambient.path);
+    v.loop = true;
+    v.autoplay = true;
+    v.muted = true;
+    v.playsInline = true;
+    layer.appendChild(v);
+  }
+}
+
+// A JS port of kit.ts's deriveSpeechBubbleStyle (pure, kept in sync by hand).
+function deriveSpeechBubbleStyleJS(style) {
+  const DEFAULT = { palette: { text: '#111111', outline: '#111111', box: '#ffffff', accent: '#ff6b81' }, cornerRadiusFrac: 0.28 };
+  if (!style) return DEFAULT;
+  const palette = style.palette ?? {};
+  const outlineWidth = style.caption?.outline_width ?? style.title?.outline_width ?? 3;
+  return {
+    palette: {
+      text: palette.text ?? DEFAULT.palette.text,
+      outline: palette.outline ?? DEFAULT.palette.outline,
+      box: palette.box ?? DEFAULT.palette.box,
+      accent: palette.accent ?? DEFAULT.palette.accent,
+    },
+    cornerRadiusFrac: Math.max(0.16, Math.min(0.4, 0.2 + outlineWidth * 0.02)),
+  };
+}
+// A JS port of kit.ts's speechBubbleTailDirection.
+function speechBubbleTailDirectionJS(bubblePos, spritePos) {
+  const dx = spritePos.x - bubblePos.x;
+  const dy = spritePos.y - bubblePos.y;
+  if (Math.abs(dy) >= Math.abs(dx)) return dy >= 0 ? 'bottom' : 'top';
+  return dx >= 0 ? 'right' : 'left';
+}
+// A JS port of render.ts's dialogueAnchorPixels.
+function dialogueAnchorPx(d, out) {
+  const sprite = d.spriteId ? (S.manifest.timeline.sprites ?? []).find((s) => s.id === d.spriteId) : undefined;
+  const asset = sprite ? (S.kit?.kit?.assets ?? []).find((a) => a.id === sprite.assetId) : undefined;
+  if (sprite && asset) {
+    const geo = spriteGeometryJS(asset, sprite.position, sprite.scale, out, sprite.flip);
+    return { x: geo.anchorX, y: Math.max(out.height * 0.08, geo.y - out.height * 0.04), sprite };
+  }
+  return { x: out.width / 2, y: out.height * 0.15, sprite: undefined };
+}
+function renderDialogueBubbles(tl) {
+  const layer = $('dialogueLayer');
+  if (!layer) return;
+  const active = (S.dialogue ?? []).filter((d) => tl >= d.tlStart && tl < d.tlStart + d.duration);
+  const key = active.map((d) => d.id).join(',');
   if (layer.dataset.cur === key) return;
   layer.dataset.cur = key;
   layer.innerHTML = '';
   if (active.length === 0) return;
   const out = S.manifest?.output ?? { width: S.manifest?.width ?? 1920, height: S.manifest?.height ?? 1080 };
-  const assets = S.kit?.kit?.assets ?? [];
-  for (const r of active) {
-    const sp = r.sprite;
-    const asset = assets.find((a) => a.id === sp.assetId);
-    if (!asset) continue;
-    const geo = spriteGeometryJS(asset, sp.position, sp.scale, out, sp.flip);
-    const img = document.createElement('img');
-    img.className = 'spriteImg';
-    img.src = `/media/kit/${asset.path.split('/').map(encodeURIComponent).join('/')}`;
-    img.alt = '';
-    img.style.left = `${(geo.x / out.width) * 100}%`;
-    img.style.top = `${(geo.y / out.height) * 100}%`;
-    img.style.width = `${(geo.width / out.width) * 100}%`;
-    img.style.height = `${(geo.height / out.height) * 100}%`;
-    img.style.opacity = String(sp.opacity);
-    if (sp.flip) img.style.transform = 'scaleX(-1)';
-    layer.appendChild(img);
+  const style = S.speechBubbleStyle ?? deriveSpeechBubbleStyleJS(null);
+  for (const d of active) {
+    const { x, y, sprite } = dialogueAnchorPx(d, out);
+    const bubble = document.createElement('div');
+    bubble.className = 'dialogueBubble';
+    bubble.style.left = `${(x / out.width) * 100}%`;
+    bubble.style.top = `${(y / out.height) * 100}%`;
+    bubble.style.color = style.palette.text;
+    bubble.style.borderColor = style.palette.outline;
+    bubble.style.background = style.palette.box;
+    bubble.style.borderRadius = `${Math.round(style.cornerRadiusFrac * 100)}%`;
+    bubble.textContent = d.text;
+    if (sprite) {
+      const dir = speechBubbleTailDirectionJS({ x: x / out.width, y: y / out.height }, sprite.position);
+      bubble.classList.add(`tail-${dir}`);
+    }
+    layer.appendChild(bubble);
   }
 }
 function renderMotion(tl) {
@@ -3160,6 +3525,7 @@ async function renderAll() {
   renderStat();
   $('revLabel').textContent = `変更 #${m.revision}`;
   updateUndoBtn();
+  applyCompositionMode();
   await loadMotionSpecs();
   syncMusicElements();
   renderTimeline();

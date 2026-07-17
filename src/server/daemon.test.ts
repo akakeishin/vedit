@@ -3260,3 +3260,261 @@ describe('daemon: show takes directive', () => {
     expect(body.error).toMatch(/groupId is required/);
   });
 });
+
+// ---- Suite: W-ANIME composition (compose / bg-set / bg-remove / sprite anchor+motion / dialogue) ----
+describe('daemon: W-ANIME composition', () => {
+  const PORT = 18250;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let dir: string;
+  let kitDir: string;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-anime-'));
+    dir = path.join(root, 'proj');
+    kitDir = path.join(root, 'kit');
+    await fsp.mkdir(kitDir, { recursive: true });
+    const kit: KitFile = {
+      version: 'vedit-kit/v1',
+      assets: [
+        { id: 'char1', path: 'assets/characters/char1.png', type: 'sprite' },
+        { id: 'happy', path: 'assets/characters/happy.png', type: 'sprite' },
+        { id: 'room', path: 'assets/backgrounds/room.png', type: 'background' },
+      ],
+    };
+    await writeKitFile(kitDir, kit);
+    await Project.create(dir, 'anime');
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('compose creates a source-less composition project (width/height set directly, background defaults to black)', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'compose', duration: 20, width: 1080, height: 1920,
+    });
+    expect(status).toBe(200);
+    expect(body.state.composition).toEqual({ duration: 20 });
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.composition.background).toEqual({ type: 'color', hex: '#000000' });
+    expect(project.manifest.width).toBe(1080);
+    expect(project.manifest.height).toBe(1920);
+    expect(project.duration).toBe(20);
+  });
+
+  it('compose --kit links the kit in a second op (CLI issues these as two sequential edits)', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'kit-link', path: kitDir,
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.kit).toEqual({ path: kitDir });
+  });
+
+  it('bg-set --to <#hex> sets the base background at t=0', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'bg-set', t: 0, to: '#ff0000',
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.composition.background).toEqual({ type: 'color', hex: '#ff0000' });
+    expect(project.backgroundIntervals).toEqual([{ t0: 0, t1: 20, ref: { type: 'color', hex: '#ff0000' } }]);
+  });
+
+  it('bg-set --to <kitAssetId> resolves against the linked kit', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'bg-set', t: 5, to: 'room',
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    const cut = project.manifest.composition.backgroundTrack.find((e: any) => e.t === 5);
+    expect(cut.ref).toEqual({ type: 'asset', assetId: 'room' });
+  });
+
+  it('bg-set --to <relative-name> resolves against toPathHint (the CLI\'s cwd), NOT the daemon process\'s own cwd', async () => {
+    // Simulates the real CLI: `to` is whatever the user typed (here a bare
+    // relative filename), `toPathHint` is what cli.ts's `path.resolve(to)`
+    // would have computed against the user's actual shell cwd — which the
+    // long-lived daemon process has no way to know on its own (see
+    // resolveBackgroundArg's doc). Omitting toPathHint here would 400 (the
+    // daemon's own cwd almost certainly has no file named "loop.mp4").
+    const videoPath = path.join(dir, 'loop.mp4');
+    await fsp.writeFile(videoPath, 'fake-bytes');
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'bg-set', t: 10, to: 'loop.mp4', toPathHint: videoPath,
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    const cut = project.manifest.composition.backgroundTrack.find((e: any) => e.t === 10);
+    expect(cut.ref).toEqual({ type: 'video', path: videoPath });
+  });
+
+  it('bg-set --to <unresolvable> (not a hex, kit asset, or existing file) is rejected with a clear message', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'bg-set', t: 1, to: 'totally-unknown-thing',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/not a hex color, known kit asset id, or existing file/);
+  });
+
+  it('bg-remove removes a cut; refuses t=0', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'bg-remove', t: 10,
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.composition.backgroundTrack.some((e: any) => e.t === 10)).toBe(false);
+    const state2 = (await getJson(BASE, '/api/state')).body;
+    const rejected = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state2.revision, op: 'bg-remove', t: 0 });
+    expect(rejected.status).toBe(400);
+  });
+
+  let spriteId: string;
+  it('sprite-add accepts --at (COMP_SOURCE_ID sentinel) in a composition project, with motion', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'sprite-add', assetId: 'char1',
+      anchor: { sourceId: '__comp__', srcTime: 1 }, duration: 5, position: { x: 0.3, y: 0.9 }, scale: 0.35,
+      motion: { enter: 'hop-in', loop: 'sway', emoteAt: [{ t: 2, assetId: 'happy' }] },
+    });
+    expect(status).toBe(200);
+    spriteId = body.id;
+    const project = (await getJson(BASE, '/api/project')).body;
+    const resolved = project.sprites.find((r: any) => r.sprite.id === spriteId);
+    expect(resolved.tlStart).toBeCloseTo(1); // COMP_SOURCE_ID: srcTime IS the absolute timeline time
+    expect(resolved.sprite.motion).toEqual({ enter: 'hop-in', loop: 'sway', emoteAt: [{ t: 2, assetId: 'happy' }] });
+  });
+
+  it('sprite-update merges a motion patch rather than replacing it wholesale', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'sprite-update', id: spriteId, motion: { loop: 'bob' },
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    const resolved = project.sprites.find((r: any) => r.sprite.id === spriteId);
+    expect(resolved.sprite.motion).toEqual({ enter: 'hop-in', loop: 'bob', emoteAt: [{ t: 2, assetId: 'happy' }] });
+  });
+
+  let dialogueId: string;
+  let voiceMusicId: string;
+  it('dialogue-add with --voice creates a MusicItem (duck=false, short fades) alongside the dialogue line', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'dialogue-add', text: '今日は雨…',
+      tlStart: 2, duration: 2.5, spriteId, voice: '/media/voice.mp3',
+    });
+    expect(status).toBe(200);
+    dialogueId = body.id;
+    voiceMusicId = body.voiceMusicId;
+    expect(voiceMusicId).toMatch(/^mu/);
+    const project = (await getJson(BASE, '/api/project')).body;
+    const dl = project.dialogue.find((d: any) => d.id === dialogueId);
+    expect(dl).toMatchObject({ text: '今日は雨…', tlStart: 2, duration: 2.5, spriteId, voiceMusicId });
+    const mu = project.manifest.timeline.music.find((x: any) => x.id === voiceMusicId);
+    expect(mu).toMatchObject({ path: '/media/voice.mp3', tlStart: 2, gain: 0, duck: false });
+  });
+
+  it('dialogue-add rejects an unknown --sprite, and a --voice file with no audio stream', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const noSprite = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'dialogue-add', text: 'x', tlStart: 0, spriteId: 'nope',
+    });
+    expect(noSprite.status).toBe(400);
+    expect(noSprite.body.error).toMatch(/unknown sprite/);
+
+    const noAudio = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'dialogue-add', text: 'x', tlStart: 0, voice: '/media/novoice.mp3',
+    });
+    expect(noAudio.status).toBe(400);
+    expect(noAudio.body.error).toMatch(/no audio stream/);
+  });
+
+  it('dialogue-update patches text/timing and can clear spriteId', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'dialogue-update', id: dialogueId, text: '晴れました', spriteId: null,
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    const dl = project.dialogue.find((d: any) => d.id === dialogueId);
+    expect(dl.text).toBe('晴れました');
+    expect(dl.spriteId).toBeUndefined();
+  });
+
+  it('dialogue-remove cascades: also removes the voiceMusicId MusicItem it created', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'dialogue-remove', id: dialogueId,
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.dialogue.find((d: any) => d.id === dialogueId)).toBeUndefined();
+    expect(project.manifest.timeline.music.find((x: any) => x.id === voiceMusicId)).toBeUndefined();
+  });
+
+  it('/api/state reports dialogue count and composition summary', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    expect(state.composition).toEqual({ duration: 20 });
+    expect(typeof state.dialogue).toBe('number');
+  });
+
+  it('/api/qc flags a sprite whose assetId is no longer in the linked kit (checkKitAssetReferences)', async () => {
+    // sprite-add itself validates assetId against the CURRENT kit (see the
+    // "sprite-add rejects an unknown kit asset id" test above) — the
+    // realistic way this check ever fires is a kit edited EXTERNALLY after
+    // the sprite was placed (the asset renamed/removed from kit.json).
+    const state = (await getJson(BASE, '/api/state')).body;
+    const added = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'sprite-add', assetId: 'char1',
+      anchor: { sourceId: '__comp__', srcTime: 0 }, id: 'spGhost',
+    });
+    expect(added.status).toBe(200);
+    const kit: KitFile = {
+      version: 'vedit-kit/v1',
+      assets: [{ id: 'happy', path: 'assets/characters/happy.png', type: 'sprite' }, { id: 'room', path: 'assets/backgrounds/room.png', type: 'background' }],
+    };
+    await writeKitFile(kitDir, kit); // 'char1' removed externally
+    const qc = (await getJson(BASE, '/api/qc')).body;
+    expect(qc.issues.some((i: any) => i.category === 'kit-asset-missing' && i.message.includes('char1'))).toBe(true);
+  });
+});
+
+// ---- Suite: compose refuses a project that already has ingested sources ----
+describe('daemon: compose on an already-ingested project is refused', () => {
+  const PORT = 18251;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-anime-refuse-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'refuse');
+    await project.commit(0, 'system', 'setup', {}, 'seed source', (m) => ({
+      ...m,
+      sources: [{ id: 's1', path: '/media/one.mp4', duration: 10, fps: 30, width: 1920, height: 1080, hasAudio: true }],
+      timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 10 }], motion: [] },
+    }));
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('compose is rejected with a clear message', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'compose', duration: 10, width: 100, height: 100,
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/already has ingested/);
+  });
+});

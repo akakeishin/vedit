@@ -3,7 +3,7 @@ import path from 'node:path';
 import { resolveWithinDir } from './project.js';
 import { run, runBinary } from '../ingest/run.js';
 import { sha256File } from '../ingest/ingest.js';
-import type { KitAsset, KitFile, KitProfile, Manifest } from './types.js';
+import type { KitAsset, KitFile, KitPalette, KitProfile, KitStyle, Manifest } from './types.js';
 
 /**
  * W8 "kit" — a cross-project production-settings directory (see
@@ -313,11 +313,12 @@ export async function listAssetPngs(kitRoot: string): Promise<string[]> {
   return walkPngs(path.join(kitRoot, 'assets'), kitRoot);
 }
 
-/** assets/characters -> sprite, assets/backgrounds -> background, anything else under assets/ -> prop. */
+/** assets/characters -> sprite, assets/backgrounds -> background, assets/ambient -> ambient (W-ANIME), anything else under assets/ -> prop. */
 export function inferAssetType(relPath: string): KitAsset['type'] {
   const top = relPath.split('/')[1];
   if (top === 'characters') return 'sprite';
   if (top === 'backgrounds') return 'background';
+  if (top === 'ambient') return 'ambient';
   return 'prop';
 }
 
@@ -486,4 +487,80 @@ export async function resolveKitAssets(
     resolved.set(id, { ...asset, absPath: abs });
   }
   return { resolved, warnings };
+}
+
+// ---- W-ANIME: ambient layer + speech-bubble style derivation (pure) ----
+
+/**
+ * The kit asset a composition's ambient layer uses (spec: "パーティクル等" —
+ * a low-opacity looping decoration over the background), or `null` when the
+ * kit has none — the whole feature is then simply absent
+ * ("キットに無ければ機能ごと非表示"). Deterministic: the first `type:
+ * 'ambient'` entry in declaration order, so a kit author controls which one
+ * wins by listing it first.
+ */
+export function firstAmbientAsset(kit: KitFile | null | undefined): KitAsset | null {
+  return (kit?.assets ?? []).find((a) => a.type === 'ambient') ?? null;
+}
+
+/** Default opacity the composition renderer/preview applies to the ambient layer — a fixed, non-configurable constant (spec leaves this to implementation judgment; "低 opacity"). */
+export const AMBIENT_LAYER_OPACITY = 0.35;
+
+/**
+ * A speech-bubble variant of a kit style's palette (W-ANIME "speech-bubble
+ * スタイルはキット style から自動派生"): the box becomes the bubble's fill,
+ * text/outline stay as-is, and a rounded-corner radius is derived from the
+ * style's own caption/title outline width (a heavier outline implies a
+ * chunkier, more rounded bubble — purely a cosmetic heuristic). No kit
+ * style linked (or none matching `styleId`) falls back to a neutral
+ * white-bubble/black-text/black-outline default so dialogue is always
+ * legible even in a kit-less or unstyled project.
+ */
+export interface SpeechBubbleStyle {
+  palette: Required<KitPalette>;
+  /** Corner radius as a 0..1 fraction of the bubble's own height — purely cosmetic, consumed by web/app.js's CSS border-radius. */
+  cornerRadiusFrac: number;
+}
+
+const DEFAULT_SPEECH_BUBBLE: SpeechBubbleStyle = {
+  palette: { text: '#111111', outline: '#111111', box: '#ffffff', accent: '#ff6b81' },
+  cornerRadiusFrac: 0.28,
+};
+
+export function deriveSpeechBubbleStyle(style: KitStyle | undefined | null): SpeechBubbleStyle {
+  if (!style) return DEFAULT_SPEECH_BUBBLE;
+  const palette = style.palette ?? {};
+  const outlineWidth = style.caption?.outline_width ?? style.title?.outline_width ?? 3;
+  return {
+    palette: {
+      text: palette.text ?? DEFAULT_SPEECH_BUBBLE.palette.text,
+      outline: palette.outline ?? DEFAULT_SPEECH_BUBBLE.palette.outline,
+      box: palette.box ?? DEFAULT_SPEECH_BUBBLE.palette.box,
+      accent: palette.accent ?? DEFAULT_SPEECH_BUBBLE.palette.accent,
+    },
+    // Clamp into a sane 16%..40% band so an extreme outline_width never
+    // produces a degenerate (near-0 or near-circular) bubble shape.
+    cornerRadiusFrac: Math.max(0.16, Math.min(0.4, 0.2 + outlineWidth * 0.02)),
+  };
+}
+
+/**
+ * Which of a speech bubble's four corners its "tail" should point from,
+ * derived from the target sprite's placement relative to the bubble's own
+ * position — purely geometric, no kit involvement. `spritePos`/`bubblePos`
+ * are both 0..1 canvas fractions (SpriteItem.position / wherever the
+ * caller decided to place the bubble). Ties (dx/dy both ~0) default to
+ * 'bottom' (pointing straight down at the speaker), the common case for a
+ * bubble placed above a character's head.
+ */
+export type SpeechBubbleTailDirection = 'bottom' | 'top' | 'left' | 'right';
+
+export function speechBubbleTailDirection(
+  bubblePos: { x: number; y: number },
+  spritePos: { x: number; y: number },
+): SpeechBubbleTailDirection {
+  const dx = spritePos.x - bubblePos.x;
+  const dy = spritePos.y - bubblePos.y;
+  if (Math.abs(dy) >= Math.abs(dx)) return dy >= 0 ? 'bottom' : 'top';
+  return dx >= 0 ? 'right' : 'left';
 }

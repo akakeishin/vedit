@@ -142,7 +142,16 @@ export function buildResume(
   }
   if (orphans.length > 0) nextSteps.push(`B-roll オーバーレイ ${orphans.length} 件が orphan です — 再アンカーしてください (vedit broll-update)`);
   if (spriteOrphans.length > 0) nextSteps.push(`スプライト ${spriteOrphans.length} 件が orphan です — 再アンカーしてください (vedit sprite-update)`);
-  if (nextSteps.length < 3 && m.timeline.video.length === 0) nextSteps.push('素材を ingest してタイムラインを作成する');
+  // W-ANIME: a composition project has NO video sources by design (see
+  // Manifest.composition's doc) — "ingest a file" is meaningless there;
+  // nudge toward placing sprites instead when the composition is still empty.
+  if (m.composition) {
+    if (nextSteps.length < 3 && (m.timeline.sprites ?? []).length === 0) {
+      nextSteps.push('スプライトを配置する (vedit sprite-add <assetId> --at <t> --base <rev>)');
+    }
+  } else if (nextSteps.length < 3 && m.timeline.video.length === 0) {
+    nextSteps.push('素材を ingest してタイムラインを作成する');
+  }
 
   return {
     project: { name: m.name, dir, revision: m.revision, duration: timelineDuration(m), output: m.output ?? null },

@@ -6,10 +6,11 @@ import {
   orphanedOverlays,
   orphanedSprites,
   segments,
+  timelineDuration,
 } from '../core/ops.js';
 import { captionCues, type CaptionCue } from '../core/captions.js';
 import { adaptiveThreshold, type Peaks } from '../core/detect.js';
-import type { CutCandidate, KitProfile, Manifest, SceneFile, Source, Transcript } from '../core/types.js';
+import type { BackgroundRef, CutCandidate, KitAsset, KitProfile, Manifest, SceneFile, Source, Transcript } from '../core/types.js';
 import { runCapture } from '../ingest/run.js';
 
 /**
@@ -48,7 +49,8 @@ export type QcCategory =
   | 'captions'
   | 'color'
   | 'source-missing'
-  | 'kit-duration';
+  | 'kit-duration'
+  | 'kit-asset-missing';
 
 export interface QcIssue {
   id: string;
@@ -182,6 +184,43 @@ export async function checkMediaFilesExist(m: Manifest): Promise<QcIssue[]> {
 }
 
 /**
+ * W-ANIME: every kit-asset REFERENCE a composition (or a normal project's
+ * sprites) makes — `composition.background`/`backgroundTrack[].ref` (when
+ * their `type` is `'asset'`), every `SpriteItem.assetId`, and every
+ * `SpriteItem.motion.emoteAt[].assetId` — must resolve against the linked
+ * kit's `assets[]`. `kitAssets` is the caller's already-loaded
+ * `kit.assets` (same "caller loads kit.json, this stays I/O-free"
+ * division of labor as checkKitDuration's `kitProfile`); `undefined` means
+ * "the kit couldn't be loaded" and this check is skipped entirely (an
+ * unloadable kit is `checkKitDuration`'s/render's problem to warn about,
+ * not a reason to flood every reference here as "missing"). No `m.kit` at
+ * all also skips — nothing to check against.
+ */
+export function checkKitAssetReferences(m: Manifest, kitAssets: KitAsset[] | undefined): QcIssue[] {
+  const { issues, push } = issueList('kit-asset-missing');
+  if (!m.kit || kitAssets === undefined) return issues;
+  const known = new Set(kitAssets.map((a) => a.id));
+  const checkRef = (label: string, ref: BackgroundRef | undefined) => {
+    if (ref?.type === 'asset' && !known.has(ref.assetId)) {
+      push('error', `${label}: kit素材が見つかりません: ${ref.assetId}`);
+    }
+  };
+  if (m.composition) {
+    checkRef('背景', m.composition.background);
+    for (const e of m.composition.backgroundTrack ?? []) checkRef(`背景切替(t=${e.t.toFixed(1)}s)`, e.ref);
+  }
+  for (const s of m.timeline.sprites ?? []) {
+    if (!known.has(s.assetId)) push('error', `スプライト ${s.id}: kit素材が見つかりません: ${s.assetId}`);
+    for (const e of s.motion?.emoteAt ?? []) {
+      if (!known.has(e.assetId)) {
+        push('error', `スプライト ${s.id} の emoteAt(t=${e.t.toFixed(1)}s): kit素材が見つかりません: ${e.assetId}`);
+      }
+    }
+  }
+  return issues;
+}
+
+/**
  * Diff the current timeline duration against a linked kit's declared
  * duration_seconds target/min/max (KitProfile.duration_seconds — see
  * types.ts). Only fires when the project actually links a kit
@@ -232,11 +271,18 @@ export async function staticChecks(
   m: Manifest,
   transcripts: Transcript[],
   sceneFiles: SceneFile[] = [],
-  opts: { candidates?: CutCandidate[]; kitProfile?: KitProfile | null } = {},
+  opts: { candidates?: CutCandidate[]; kitProfile?: KitProfile | null; kitAssets?: KitAsset[] } = {},
 ): Promise<StaticCheckReport> {
   const cues = captionCues(m, transcripts);
   const maxCps = m.captions.maxCps ?? 8;
-  const durationSeconds = segments(m).reduce((acc, s) => acc + (s.tlEnd - s.tlStart), 0);
+  // W-ANIME: timelineDuration(m) already accounts for Manifest.composition
+  // (segments()-based duration is always 0 for a composition project, since
+  // it never populates timeline.video) — using it here (rather than
+  // re-deriving the same segments() sum by hand, as before) makes
+  // checkKitDuration meaningful for composition projects too, with no
+  // behavior change for normal ones (timelineDuration falls through to the
+  // exact same segments() sum when m.composition is unset).
+  const durationSeconds = timelineDuration(m);
 
   const issues: QcIssue[] = [
     ...checkPendingQueues(m, sceneFiles, opts.candidates ?? []),
@@ -245,6 +291,7 @@ export async function staticChecks(
     ...checkColorWarnings(m.sources),
     ...(await checkMediaFilesExist(m)),
     ...checkKitDuration(m, durationSeconds, opts.kitProfile),
+    ...checkKitAssetReferences(m, opts.kitAssets),
   ];
 
   return {

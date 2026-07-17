@@ -4,17 +4,21 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
   addClip,
+  addDialogue,
   addIntentZone,
   addMusic,
   addOverlay,
   addSprite,
   applyReframe,
+  backgroundIntervals,
   buildSelectsTimeline,
   COLOR_WARNING_MESSAGE,
+  COMP_SOURCE_ID,
   cropGeometry,
   cropOffset,
   cropWindow,
   cullingStats,
+  emoteWindows,
   expandWordIds,
   intentZonesForSource,
   keptWords,
@@ -28,7 +32,9 @@ import {
   parseFocus,
   parseReframeSpec,
   quietZonesOverlappingTimelineRange,
+  removeBackgroundAt,
   removeClip,
+  removeDialogue,
   removeIntentZone,
   removeMusic,
   removeOverlay,
@@ -38,18 +44,23 @@ import {
   resolvedActiveOverlays,
   resolvedActiveSprites,
   resolveSprites,
+  resolvedBackgroundAt,
   segments,
   setAudioMix,
   setAudioRepair,
+  setBackgroundAt,
   setClipCrop,
   setColorAdjust,
   setColorTransform,
+  setComposition,
   setSceneReview,
   sourceTimeToTimeline,
   spriteGeometry,
+  spriteMotionPlan,
   timelineDuration,
   timelineTimeToSource,
   trimClip,
+  updateDialogue,
   updateMusic,
   updateOverlay,
   updateSprite,
@@ -1429,5 +1440,328 @@ describe('quietZonesOverlappingTimelineRange', () => {
     // A duck range spanning the whole timeline overlaps s1's [12,18) via BOTH clips.
     const hits = quietZonesOverlappingTimelineRange(zoned, 0, 30);
     expect(hits.map((z) => z.id)).toEqual(['z1']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ---- W-ANIME: composition (source-less "sprite anime" production mode) ----
+// ---------------------------------------------------------------------------
+
+function blankManifest(): Manifest {
+  return {
+    version: 1, name: 't', revision: 0, fps: 30, width: 1920, height: 1080,
+    sources: [], timeline: { video: [], motion: [] },
+    captions: { enabled: true, style: 'clean', maxChars: 24 },
+  };
+}
+function compositionManifest(): Manifest {
+  return setComposition(blankManifest(), { duration: 20, width: 1080, height: 1920 });
+}
+
+describe('setComposition', () => {
+  it('sets composition + width/height, defaulting background to black', () => {
+    const m = setComposition(blankManifest(), { duration: 20, width: 1080, height: 1920 });
+    expect(m.composition).toEqual({ duration: 20, background: { type: 'color', hex: '#000000' } });
+    expect(m.width).toBe(1080);
+    expect(m.height).toBe(1920);
+  });
+
+  it('accepts an explicit background ref', () => {
+    const m = setComposition(blankManifest(), {
+      duration: 10, width: 100, height: 100, background: { type: 'asset', assetId: 'bg1' },
+    });
+    expect(m.composition!.background).toEqual({ type: 'asset', assetId: 'bg1' });
+  });
+
+  it('rounds odd width/height to the nearest even pixel', () => {
+    const m = setComposition(blankManifest(), { duration: 10, width: 1081, height: 1919 });
+    expect(m.width % 2).toBe(0);
+    expect(m.height % 2).toBe(0);
+  });
+
+  it('refuses a project that already has ingested sources/clips', () => {
+    expect(() => setComposition(manifest(), { duration: 10, width: 100, height: 100 })).toThrow(/already has ingested/);
+  });
+
+  it('rejects invalid duration/width/height', () => {
+    expect(() => setComposition(blankManifest(), { duration: 0, width: 100, height: 100 })).toThrow(/duration/);
+    expect(() => setComposition(blankManifest(), { duration: 10, width: 0, height: 100 })).toThrow(/size/);
+    expect(() => setComposition(blankManifest(), { duration: 10, width: 100, height: -1 })).toThrow(/size/);
+  });
+
+  it('rejects a malformed background ref', () => {
+    expect(() =>
+      setComposition(blankManifest(), { duration: 10, width: 100, height: 100, background: { type: 'color', hex: 'red' } as any }),
+    ).toThrow(/invalid hex/);
+  });
+
+  it('re-running compose on an already-composed (still source-less) project updates its fields', () => {
+    let m = compositionManifest();
+    m = setComposition(m, { duration: 30, width: 720, height: 1280 });
+    expect(m.composition!.duration).toBe(30);
+    expect(m.width).toBe(720);
+  });
+});
+
+describe('setBackgroundAt / removeBackgroundAt / resolvedBackgroundAt / backgroundIntervals', () => {
+  it('t=0 (or within half a frame) replaces the BASE background, not backgroundTrack', () => {
+    let m = compositionManifest();
+    m = setBackgroundAt(m, 0, { type: 'color', hex: '#ff0000' });
+    expect(m.composition!.background).toEqual({ type: 'color', hex: '#ff0000' });
+    expect(m.composition!.backgroundTrack ?? []).toHaveLength(0);
+  });
+
+  it('t>0 upserts into backgroundTrack, kept sorted ascending', () => {
+    let m = compositionManifest();
+    m = setBackgroundAt(m, 10, { type: 'color', hex: '#00ff00' });
+    m = setBackgroundAt(m, 5, { type: 'color', hex: '#0000ff' });
+    expect(m.composition!.backgroundTrack!.map((e) => e.t)).toEqual([5, 10]);
+  });
+
+  it('a second bg-set at the same (frame-snapped) t replaces the earlier cut rather than duplicating it', () => {
+    let m = compositionManifest();
+    m = setBackgroundAt(m, 5, { type: 'color', hex: '#00ff00' });
+    m = setBackgroundAt(m, 5.001, { type: 'color', hex: '#0000ff' }); // within half a frame at 30fps
+    expect(m.composition!.backgroundTrack).toHaveLength(1);
+    expect(m.composition!.backgroundTrack![0].ref).toEqual({ type: 'color', hex: '#0000ff' });
+  });
+
+  it('resolvedBackgroundAt picks the LAST cut at or before t', () => {
+    let m = compositionManifest();
+    m = setBackgroundAt(m, 5, { type: 'color', hex: '#00ff00' });
+    m = setBackgroundAt(m, 10, { type: 'color', hex: '#0000ff' });
+    expect(resolvedBackgroundAt(m, 0)).toEqual({ type: 'color', hex: '#000000' });
+    expect(resolvedBackgroundAt(m, 4.9)).toEqual({ type: 'color', hex: '#000000' });
+    expect(resolvedBackgroundAt(m, 5)).toEqual({ type: 'color', hex: '#00ff00' });
+    expect(resolvedBackgroundAt(m, 9.9)).toEqual({ type: 'color', hex: '#00ff00' });
+    expect(resolvedBackgroundAt(m, 10)).toEqual({ type: 'color', hex: '#0000ff' });
+    expect(resolvedBackgroundAt(m, 19.9)).toEqual({ type: 'color', hex: '#0000ff' });
+  });
+
+  it('backgroundIntervals covers [0,duration) as non-overlapping, time-sorted intervals', () => {
+    let m = compositionManifest(); // duration 20
+    m = setBackgroundAt(m, 5, { type: 'color', hex: '#00ff00' });
+    m = setBackgroundAt(m, 10, { type: 'color', hex: '#0000ff' });
+    const ivs = backgroundIntervals(m);
+    expect(ivs).toEqual([
+      { t0: 0, t1: 5, ref: { type: 'color', hex: '#000000' } },
+      { t0: 5, t1: 10, ref: { type: 'color', hex: '#00ff00' } },
+      { t0: 10, t1: 20, ref: { type: 'color', hex: '#0000ff' } },
+    ]);
+  });
+
+  it('backgroundIntervals is empty for a non-composition manifest', () => {
+    expect(backgroundIntervals(blankManifest())).toEqual([]);
+  });
+
+  it('bg-set rejects a t beyond the composition duration, an unset composition, or a malformed ref', () => {
+    const m = compositionManifest();
+    expect(() => setBackgroundAt(m, 999, { type: 'color', hex: '#fff' })).toThrow(/exceeds composition duration/);
+    expect(() => setBackgroundAt(blankManifest(), 1, { type: 'color', hex: '#fff' })).toThrow(/no composition/);
+    expect(() => setBackgroundAt(m, 1, { type: 'asset', assetId: '' } as any)).toThrow(/assetId is required/);
+    expect(() => setBackgroundAt(m, 1, { type: 'video', path: '' } as any)).toThrow(/path is required/);
+  });
+
+  it('removeBackgroundAt removes a cut, refuses t=0, and throws on an unknown t', () => {
+    let m = compositionManifest();
+    m = setBackgroundAt(m, 5, { type: 'color', hex: '#00ff00' });
+    m = removeBackgroundAt(m, 5);
+    expect(m.composition!.backgroundTrack ?? []).toHaveLength(0);
+    expect(() => removeBackgroundAt(m, 0)).toThrow(/base background/);
+    expect(() => removeBackgroundAt(m, 5)).toThrow(/no background cut/);
+  });
+});
+
+describe('timelineDuration / sourceTimeToTimeline (composition)', () => {
+  it('timelineDuration returns composition.duration directly (never a segments() sum)', () => {
+    const m = compositionManifest();
+    expect(timelineDuration(m)).toBe(20);
+    expect(segments(m)).toEqual([]); // never populated for a composition project
+  });
+
+  it('a normal (non-composition) project is completely unaffected — full regression', () => {
+    const m = manifest();
+    expect(timelineDuration(m)).toBeCloseTo(60);
+    expect(sourceTimeToTimeline(m, COMP_SOURCE_ID, 5)).toBeNull(); // sentinel means nothing without m.composition
+  });
+
+  it('sourceTimeToTimeline(COMP_SOURCE_ID, t) is the identity within [0,duration], null outside', () => {
+    const m = compositionManifest();
+    expect(sourceTimeToTimeline(m, COMP_SOURCE_ID, 0)).toBe(0);
+    expect(sourceTimeToTimeline(m, COMP_SOURCE_ID, 12.5)).toBe(12.5);
+    expect(sourceTimeToTimeline(m, COMP_SOURCE_ID, 20)).toBe(20); // inclusive at the end (see doc)
+    expect(sourceTimeToTimeline(m, COMP_SOURCE_ID, -1)).toBeNull();
+    expect(sourceTimeToTimeline(m, COMP_SOURCE_ID, 21)).toBeNull();
+  });
+});
+
+describe('sprite anchor (COMP_SOURCE_ID) + motion validation', () => {
+  it('addSprite accepts the COMP_SOURCE_ID anchor only when the project is a composition', () => {
+    const comp = compositionManifest();
+    const r = addSprite(comp, 'char1', { anchor: { sourceId: COMP_SOURCE_ID, srcTime: 3 } });
+    expect(resolveSprites(r)[0].tlStart).toBe(3);
+    expect(() => addSprite(manifest(), 'char1', { anchor: { sourceId: COMP_SOURCE_ID, srcTime: 3 } })).toThrow(
+      /unknown anchor source/,
+    );
+  });
+
+  it('addSprite validates motion presets, rejecting unrecognized enter/loop/exit/emoteAt values', () => {
+    const comp = compositionManifest();
+    const anchor = { sourceId: COMP_SOURCE_ID, srcTime: 0 };
+    const r = addSprite(comp, 'c1', { anchor, motion: { enter: 'pop', loop: 'sway', exit: 'fade' } });
+    expect(r.timeline.sprites![0].motion).toEqual({ enter: 'pop', loop: 'sway', exit: 'fade' });
+    expect(() => addSprite(comp, 'c1', { anchor, motion: { enter: 'nope' as any } })).toThrow(/motion.enter/);
+    expect(() => addSprite(comp, 'c1', { anchor, motion: { loop: 'nope' as any } })).toThrow(/motion.loop/);
+    expect(() => addSprite(comp, 'c1', { anchor, motion: { emoteAt: [{ t: -1, assetId: 'x' }] } })).toThrow(/emoteAt/);
+    expect(() => addSprite(comp, 'c1', { anchor, motion: { emoteAt: [{ t: 1, assetId: '' }] } })).toThrow(/emoteAt/);
+  });
+
+  it('updateSprite MERGES a motion patch field-by-field rather than replacing wholesale; motion:null clears it', () => {
+    const comp = compositionManifest();
+    const anchor = { sourceId: COMP_SOURCE_ID, srcTime: 0 };
+    let r = addSprite(comp, 'c1', { anchor, id: 'sp1', motion: { enter: 'pop', loop: 'sway' } });
+    r = updateSprite(r, 'sp1', { motion: { loop: 'bob' } }); // only touches loop
+    expect(r.timeline.sprites![0].motion).toEqual({ enter: 'pop', loop: 'bob' });
+    r = updateSprite(r, 'sp1', { motion: null });
+    expect(r.timeline.sprites![0].motion).toBeUndefined();
+  });
+});
+
+describe('spriteMotionPlan (pure ffmpeg-expression builder — every preset)', () => {
+  const geo = { x: 100, y: 100, width: 200, height: 300, anchorX: 200, anchorY: 400 };
+  const tlStart = 10;
+  const tlEnd = 20;
+
+  it('no motion at all -> plain static x/y, no fades, no breathe (byte-for-byte pre-W-ANIME)', () => {
+    const plan = spriteMotionPlan(undefined, geo, tlStart, tlEnd);
+    expect(plan.xExpr).toBe('100');
+    expect(plan.yExpr).toBe('100');
+    expect(plan.fadeClauses).toEqual([]);
+    expect(plan.breathe).toBeUndefined();
+  });
+
+  const enterPresets = ['slide-left', 'slide-right', 'hop-in', 'pop', 'fade'] as const;
+  it.each(enterPresets)('enter=%s produces a distinct, well-formed expression', (name) => {
+    const plan = spriteMotionPlan({ enter: name }, geo, tlStart, tlEnd);
+    // Every enter preset's expression must reference the sprite's own tlStart
+    // (the entrance window's origin) somewhere in x, y, or a fade clause.
+    const touchesTlStart = plan.xExpr.includes('10') || plan.yExpr.includes('10') || plan.fadeClauses.some((f) => f.includes('st=10'));
+    expect(touchesTlStart).toBe(true);
+    if (name === 'pop' || name === 'fade') expect(plan.fadeClauses.length).toBeGreaterThan(0);
+    else expect(plan.fadeClauses).toEqual([]);
+  });
+
+  const exitPresets = enterPresets;
+  it.each(exitPresets)('exit=%s produces a distinct, well-formed expression anchored at tlEnd-D', (name) => {
+    const plan = spriteMotionPlan({ exit: name }, geo, tlStart, tlEnd);
+    expect(plan.xExpr + plan.yExpr + plan.fadeClauses.join('')).toMatch(/19\.65|20/); // tlEnd(20) - 0.35 = 19.65
+    if (name === 'pop' || name === 'fade') expect(plan.fadeClauses.length).toBeGreaterThan(0);
+  });
+
+  it('loop=sway offsets x with the spec\'s own literal example shape (X + 8*sin(2*PI*(t-t0)/3))', () => {
+    const plan = spriteMotionPlan({ loop: 'sway' }, geo, tlStart, tlEnd);
+    expect(plan.xExpr).toContain('8*sin(2*PI*(t-10');
+    expect(plan.yExpr).toBe('100'); // sway never touches y
+  });
+
+  it('loop=bob offsets y, loop=hop offsets y with an abs(sin(...)) envelope', () => {
+    const bob = spriteMotionPlan({ loop: 'bob' }, geo, tlStart, tlEnd);
+    expect(bob.yExpr).toContain('sin(2*PI*(t-10');
+    expect(bob.xExpr).toBe('100');
+    const hop = spriteMotionPlan({ loop: 'hop' }, geo, tlStart, tlEnd);
+    expect(hop.yExpr).toContain('abs(sin(');
+  });
+
+  it('loop=none is a full no-op (same as undefined)', () => {
+    const plan = spriteMotionPlan({ loop: 'none' }, geo, tlStart, tlEnd);
+    expect(plan.xExpr).toBe('100');
+    expect(plan.yExpr).toBe('100');
+    expect(plan.breathe).toBeUndefined();
+  });
+
+  it('loop=breathe emits eval=frame-style scale w/h expressions AND keeps the anchor (feet) fixed', () => {
+    const plan = spriteMotionPlan({ loop: 'breathe' }, geo, tlStart, tlEnd);
+    expect(plan.breathe).toBeDefined();
+    expect(plan.breathe!.widthExpr).toContain('200');
+    expect(plan.breathe!.heightExpr).toContain('300');
+    // anchor-relative recompute, not the plain static geo.x/geo.y.
+    expect(plan.xExpr).toContain(String(geo.anchorX));
+    expect(plan.yExpr).toContain(String(geo.anchorY));
+  });
+
+  it('enter/exit/loop offsets compose additively (all three present at once)', () => {
+    const plan = spriteMotionPlan({ enter: 'fade', loop: 'sway', exit: 'fade' }, geo, tlStart, tlEnd);
+    expect(plan.xExpr).toContain('8*sin'); // sway term present
+    expect(plan.fadeClauses).toHaveLength(2); // one for enter, one for exit
+  });
+});
+
+describe('emoteWindows (pure)', () => {
+  it('no emoteAt -> []', () => {
+    expect(emoteWindows(undefined, 5)).toEqual([]);
+    expect(emoteWindows([], 5)).toEqual([]);
+  });
+
+  it('a single entry covers from its own t to the sprite\'s duration', () => {
+    const w = emoteWindows([{ t: 1, assetId: 'happy' }], 5);
+    expect(w).toEqual([{ t0: 1, t1: 5, assetId: 'happy' }]);
+  });
+
+  it('multiple entries are sorted and non-overlapping, each ending where the next begins', () => {
+    const w = emoteWindows([{ t: 3, assetId: 'sad' }, { t: 1, assetId: 'happy' }], 5);
+    expect(w).toEqual([
+      { t0: 1, t1: 3, assetId: 'happy' },
+      { t0: 3, t1: 5, assetId: 'sad' },
+    ]);
+  });
+
+  it('entries at/after duration, or with a negative t, are dropped', () => {
+    const w = emoteWindows([{ t: 5, assetId: 'late' }, { t: -1, assetId: 'bad' }, { t: 2, assetId: 'ok' }], 5);
+    expect(w).toEqual([{ t0: 2, t1: 5, assetId: 'ok' }]);
+  });
+});
+
+describe('dialogue (addDialogue / updateDialogue / removeDialogue)', () => {
+  it('addDialogue fills in a default duration and validates required text', () => {
+    const r = addDialogue(compositionManifest(), '今日は雨…', { tlStart: 3 });
+    const d = r.timeline.dialogue![0];
+    expect(d.text).toBe('今日は雨…');
+    expect(d.tlStart).toBe(3);
+    expect(d.duration).toBeCloseTo(2.5);
+    expect(d.id).toMatch(/^dl/);
+    expect(() => addDialogue(compositionManifest(), '', { tlStart: 0 })).toThrow(/text is required/);
+    expect(() => addDialogue(compositionManifest(), 'x', { tlStart: -1 })).toThrow(/at.*>= 0/);
+  });
+
+  it('addDialogue validates an optional spriteId against existing sprites', () => {
+    let m = compositionManifest();
+    m = addSprite(m, 'c1', { id: 'sp1', anchor: { sourceId: COMP_SOURCE_ID, srcTime: 0 } });
+    const r = addDialogue(m, 'hi', { tlStart: 1, spriteId: 'sp1' });
+    expect(r.timeline.dialogue![0].spriteId).toBe('sp1');
+    expect(() => addDialogue(m, 'hi', { tlStart: 1, spriteId: 'nope' })).toThrow(/unknown sprite/);
+  });
+
+  it('addDialogue carries voiceMusicId through untouched (the daemon creates the MusicItem, ops.ts just records the id)', () => {
+    const r = addDialogue(compositionManifest(), 'hi', { tlStart: 1, voiceMusicId: 'mu1' });
+    expect(r.timeline.dialogue![0].voiceMusicId).toBe('mu1');
+  });
+
+  it('updateDialogue patches text/tlStart/duration/spriteId; spriteId:null clears it', () => {
+    let m = compositionManifest();
+    m = addSprite(m, 'c1', { id: 'sp1', anchor: { sourceId: COMP_SOURCE_ID, srcTime: 0 } });
+    let r = addDialogue(m, 'hi', { tlStart: 1, id: 'dl1', spriteId: 'sp1' });
+    r = updateDialogue(r, 'dl1', { text: 'bye', tlStart: 2 });
+    expect(r.timeline.dialogue![0]).toMatchObject({ text: 'bye', tlStart: 2, spriteId: 'sp1' });
+    r = updateDialogue(r, 'dl1', { spriteId: null });
+    expect(r.timeline.dialogue![0].spriteId).toBeUndefined();
+    expect(() => updateDialogue(r, 'nope', { text: 'x' })).toThrow(/unknown dialogue item/);
+    expect(() => updateDialogue(r, 'dl1', { text: '' })).toThrow(/non-empty string/);
+  });
+
+  it('removeDialogue drops the item; unknown id throws', () => {
+    let r = addDialogue(compositionManifest(), 'hi', { tlStart: 1, id: 'dl1' });
+    r = removeDialogue(r, 'dl1');
+    expect(r.timeline.dialogue).toEqual([]);
+    expect(() => removeDialogue(r, 'dl1')).toThrow(/unknown dialogue item/);
   });
 });
