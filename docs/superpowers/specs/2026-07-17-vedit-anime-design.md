@@ -1,6 +1,6 @@
-# vedit コンポジション(ゆるキャラアニメ) — ミニ仕様(W-ANIME)
+# vedit コンポジション(スプライトアニメ) — ミニ仕様(W-ANIME)
 
-日付: 2026-07-17。要件: キットのスプライト(ぽんしゃす等)が**緩く動く**
+日付: 2026-07-17。要件: キットのスプライトが**緩く動く**
 ショートを、会話+プレビューで作れる。目標はゆる紙芝居+であり、
 アニメ制作ツールではない。
 
@@ -11,8 +11,7 @@
 
 - background: 単色(hex)、キット背景画像、またはループ動画(パス参照)
 - ambient レイヤー(任意): キット assets の `type: 'ambient'`(ループ動画/連番)を
-  背景の上に低 opacity で重ねる(漂う花・粒子。無ければ無し)。
-  参照見本: 「ぽんしゃすと まるい暮らし」の部屋の空気感
+  背景の上に低 opacity で重ねる(パーティクル等。キットに無ければ機能ごと非表示)
 - タイムラインは通常と同じ revision/undo/409。カット(シーン替え)は
   `bg-set --at <t> --to <背景>` で背景を切り替える紙芝居構造
 - 既存機能はそのまま乗る: sprites(拡張)、music/SE、captions は使わない
@@ -24,7 +23,7 @@ SpriteItem に `motion?: { enter?: MotionName; loop?: LoopName; exit?: MotionNam
 
 - MotionName: `slide-left|slide-right|hop-in|pop|fade`(enter/exit 対称)
 - LoopName: `sway`(ゆらゆら)|`bob`(ぷかぷか)|`hop`(ぴょこぴょこ)|
-  `breathe`(呼吸: scale ±1.2%、ぽんしゃすの maximum_scale_pulse_fraction 由来)|`none`
+  `breathe`(呼吸: 微小な scale パルス、振幅はキット style の指定 or 既定1.2%)|`none`
 - `emoteAt`: 表情差分の切替(同キットの別 assetId へ、フェード 0.15s)
   — 感情タグ検索(`kit-assets --emotion`)と組で「うれしそうに」が通る
 - **コンポジション内ではアンカーは絶対 tl 時刻**(anchor.sourceId='__comp__' 規約
