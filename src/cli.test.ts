@@ -317,6 +317,112 @@ describe('cli: vedit export render — caption/dialogue default-burn gate (Criti
   });
 });
 
+/**
+ * 「書き出し結果カード」バックエンド(cache/export-results.json)の CLI 統合
+ * テスト。docs/product-bet-sensory-vs-structural.md: 構造系(書き出し)に
+ * 必要なのは操作ではなく結果の可視化——`vedit export *` が成功・失敗どちら
+ * でも記録を残すことを、実プロセス起動(spawnSync)+ffmpeg スタブという
+ * このファイルの通常の流儀のまま確認する。
+ */
+describe('cli: vedit export records to cache/export-results.json', () => {
+  let okStub: string;
+  let failStub: string;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-cli-exportresults-stub-'));
+    okStub = path.join(root, 'ffmpeg-ok.sh');
+    await fsp.writeFile(
+      okStub,
+      '#!/bin/bash\n' +
+        'if [ "$1" = "-hide_banner" ] && [ "$2" = "-filters" ]; then\n' +
+        '  printf " T.. drawtext          Draw text\\n T.. ass               Render ASS\\n"\n' +
+        '  exit 0\n' +
+        'fi\n' +
+        'exit 0\n',
+      { mode: 0o755 },
+    );
+    failStub = path.join(root, 'ffmpeg-fail.sh');
+    await fsp.writeFile(
+      failStub,
+      '#!/bin/bash\n' +
+        'if [ "$1" = "-hide_banner" ] && [ "$2" = "-filters" ]; then\n' +
+        '  printf " T.. drawtext          Draw text\\n T.. ass               Render ASS\\n"\n' +
+        '  exit 0\n' +
+        'fi\n' +
+        'echo "synthetic encode failure" >&2\n' +
+        'exit 1\n',
+      { mode: 0o755 },
+    );
+  });
+
+  async function seedSimpleProject(name: string): Promise<{ root: string; dir: string }> {
+    const root = mkdtempSync(path.join(tmpdir(), `vedit-cli-exportresults-${name}-`));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, name);
+    await project.commit(0, 'system', 'setup', {}, 'seed', (m) => ({
+      ...m,
+      sources: [{ id: 's1', path: '/media/one.mp4', duration: 10, fps: 30, width: 1920, height: 1080, hasAudio: true }],
+      timeline: { ...m.timeline, video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 10 }] },
+    }));
+    return { root, dir };
+  }
+
+  async function readResults(dir: string): Promise<any[]> {
+    return JSON.parse(await fsp.readFile(path.join(dir, 'cache', 'export-results.json'), 'utf8'));
+  }
+
+  it('a successful `export render` appends an ok:true record with revision/options/warnings', async () => {
+    const { root, dir } = await seedSimpleProject('render-ok');
+    const outFile = path.join(root, 'out.mp4');
+    const { status, stderr } = runCli(
+      ['export', 'render', outFile, '--project', dir, '--preset', 'youtube', '--fast-loudnorm'],
+      { VEDIT_FFMPEG: okStub },
+    );
+    expect(status, stderr).toBe(0);
+    const results = await readResults(dir);
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ kind: 'render', file: outFile, ok: true, revision: 1 });
+    expect(results[0].options).toMatchObject({ preset: 'youtube', fastLoudnorm: true });
+    expect(typeof results[0].ts).toBe('string');
+    expect(new Date(results[0].ts).toString()).not.toBe('Invalid Date');
+  });
+
+  it('a failed `export render` (ffmpeg exits non-zero) appends an ok:false record with the error, and the CLI itself still fails', async () => {
+    const { root, dir } = await seedSimpleProject('render-fail');
+    const outFile = path.join(root, 'out.mp4');
+    const { status, stderr } = runCli(
+      ['export', 'render', outFile, '--project', dir],
+      { VEDIT_FFMPEG: failStub },
+    );
+    expect(status).toBe(1); // export failure must still fail the CLI command itself
+    const results = await readResults(dir);
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ kind: 'render', file: outFile, ok: false });
+    expect(results[0].error).toMatch(/synthetic encode failure|failed/);
+    expect(stderr).toBeTruthy();
+  });
+
+  it('`export otio` (no ffmpeg involved) also records ok:true', async () => {
+    const { root, dir } = await seedSimpleProject('otio-ok');
+    const outFile = path.join(root, 'out.otio');
+    const { status, stderr } = runCli(['export', 'otio', outFile, '--project', dir]);
+    expect(status, stderr).toBe(0);
+    const results = await readResults(dir);
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ kind: 'otio', file: outFile, ok: true, revision: 1 });
+  });
+
+  it('a second export prepends a new record, most-recent first', async () => {
+    const { root, dir } = await seedSimpleProject('two-exports');
+    await runCli(['export', 'srt', path.join(root, 'a.srt'), '--project', dir]);
+    await runCli(['export', 'srt', path.join(root, 'b.srt'), '--project', dir]);
+    const results = await readResults(dir);
+    expect(results).toHaveLength(2);
+    expect(results[0].file).toBe(path.join(root, 'b.srt'));
+    expect(results[1].file).toBe(path.join(root, 'a.srt'));
+  });
+});
+
 describe('cli: vedit retro', () => {
   it('outputs structured JSON (introDropPct/dips/spikes) plus a fact-only human-readable summary', async () => {
     const root = mkdtempSync(path.join(tmpdir(), 'vedit-cli-retro-'));

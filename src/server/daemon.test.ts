@@ -7,6 +7,7 @@ import { WebSocket } from 'ws';
 import { Project } from '../core/project.js';
 import { startDaemon } from './daemon.js';
 import { writeKitFile } from '../core/kit.js';
+import { appendExportResult, type ExportResultRecord } from '../core/exportResults.js';
 import type { CutCandidate, KitFile, Word } from '../core/types.js';
 
 // music-add shells out to ffprobe via probeAudio(); stub it so the "daemon:
@@ -3693,5 +3694,75 @@ describe('daemon: selects raw wiring', () => {
     const video = project.manifest.timeline.video;
     expect(video).toHaveLength(1);
     expect(video[0]).toMatchObject({ sourceId: 's1', srcIn: 0, srcOut: 10 }); // raw: full scene range, micro-edit discarded
+  });
+});
+
+// ---- 「書き出し結果カード」read-only route: GET /api/export-results ----
+// docs/product-bet-sensory-vs-structural.md: 構造系(書き出し)に必要なのは
+// 操作ではなく結果の可視化。実行ルートはここにも daemon にも作らない——
+// CLI(export/publish-pack)が cache/export-results.json に書いた記録を
+// そのまま読むだけの route。stateSummary(/api/state)には含めないので、
+// その非混入も別途確認する。
+describe('daemon: GET /api/export-results', () => {
+  const PORT = 18255;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let dir: string;
+
+  function rec(overrides: Partial<ExportResultRecord> = {}): ExportResultRecord {
+    return {
+      ts: new Date().toISOString(),
+      kind: 'render',
+      file: '/tmp/out.mp4',
+      ok: true,
+      revision: 0,
+      ...overrides,
+    };
+  }
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-export-results-'));
+    dir = path.join(root, 'proj');
+    await Project.create(dir, 'export-results');
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('returns [] when no export has ever been recorded', async () => {
+    const { status, body } = await getJson(BASE, '/api/export-results');
+    expect(status).toBe(200);
+    expect(body).toEqual([]);
+  });
+
+  it('returns the most recent records first, defaulting to 5', async () => {
+    for (let i = 0; i < 7; i++) {
+      await appendExportResult(dir, rec({ file: `out-${i}.mp4`, revision: i }));
+    }
+    const { status, body } = await getJson(BASE, '/api/export-results');
+    expect(status).toBe(200);
+    expect(body).toHaveLength(5);
+    expect(body.map((r: ExportResultRecord) => r.file)).toEqual(['out-6.mp4', 'out-5.mp4', 'out-4.mp4', 'out-3.mp4', 'out-2.mp4']);
+  });
+
+  it('honors ?n= to widen or narrow the count', async () => {
+    const { body: wide } = await getJson(BASE, '/api/export-results?n=7');
+    expect(wide).toHaveLength(7);
+    const { body: narrow } = await getJson(BASE, '/api/export-results?n=1');
+    expect(narrow).toHaveLength(1);
+    expect(narrow[0].file).toBe('out-6.mp4');
+  });
+
+  it('surfaces a failed export record with ok=false and error intact', async () => {
+    await appendExportResult(dir, rec({ kind: 'srt', file: 'out.srt', ok: false, error: 'disk full' }));
+    const { body } = await getJson(BASE, '/api/export-results?n=1');
+    expect(body[0]).toMatchObject({ kind: 'srt', file: 'out.srt', ok: false, error: 'disk full' });
+  });
+
+  it('does not leak into /api/state (stateSummary stays export-results-free by design)', async () => {
+    const { body } = await getJson(BASE, '/api/state');
+    expect(body).not.toHaveProperty('exportResults');
+    expect(body).not.toHaveProperty('export-results');
   });
 });

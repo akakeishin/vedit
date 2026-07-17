@@ -72,6 +72,7 @@ import { freshId } from '../core/ops.js';
 import { applyKitDefaults, readKitFile, recognizedKitSections } from '../core/kit.js';
 import { listSystemFonts, scanKitFonts } from '../core/fonts.js';
 import { locateMedia, type MediaFingerprint } from '../ingest/locate.js';
+import { readExportResults } from '../core/exportResults.js';
 
 const WEB_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'web');
 
@@ -839,6 +840,17 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       }
       const t = await p.transcript(sourceId);
       return json(res, 200, takesFor(ctx, sourceId, t));
+    }
+    if (pathname === '/api/export-results' && method === 'GET') {
+      // 「書き出し結果カード」read-only route (docs/product-bet-sensory-vs-structural.md:
+      // 構造系〔書き出し〕に必要なのは操作ではなく結果の可視化)。CLI
+      // (`vedit export *` / `vedit publish-pack`) が cache/export-results.json
+      // に書いた記録を直近 N 件返すだけ——実行系ルートはここに作らない
+      // (書き出しは会話主導のまま)。stateSummary には含めない: この
+      // カードのポーリング要否は web 側の判断に委ねる。
+      const n = Math.min(Math.max(Number(url.searchParams.get('n') ?? 5) || 5, 1), 20);
+      const all = await readExportResults(p.dir);
+      return json(res, 200, all.slice(0, n));
     }
 
     // ---- ingest ----

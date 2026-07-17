@@ -49,6 +49,7 @@ import { buildResume } from './core/resume.js';
 import { appendNote, markTodoDone, readNotes, type NoteType } from './core/notes.js';
 import { detectTakes, packTakes } from './core/takes.js';
 import { buildRetrospective, parseRetentionCsv } from './core/analytics.js';
+import { appendExportResult, type ExportResultRecord } from './core/exportResults.js';
 import type { KitAsset, KitProfile, SceneFile, Transcript } from './core/types.js';
 import {
   kitProfileHighlights,
@@ -116,6 +117,22 @@ function numArg(label: string, raw: string | undefined): number {
   const n = Number(raw);
   if (!Number.isFinite(n)) fail(`${label} must be a finite number (got ${JSON.stringify(raw)})`);
   return n;
+}
+
+/**
+ * 「書き出し結果カード」への記録(cache/export-results.json, best-effort)。
+ * docs/product-bet-sensory-vs-structural.md:「構造系に必要なのは操作では
+ * なく結果の可視化」— 書き出し(export/publish-pack)の完了ごとに成功・
+ * 失敗どちらも記録する。書き込み失敗は書き出し自体を失敗させない契約
+ * (exportResults.ts の doc 参照)なので、ここで例外を握りつぶして stderr
+ * に注記するだけにとどめる。
+ */
+async function recordExportResult(dir: string, record: Omit<ExportResultRecord, 'ts'>): Promise<void> {
+  try {
+    await appendExportResult(dir, { ts: new Date().toISOString(), ...record });
+  } catch (e: any) {
+    console.error(`警告: export-results.json への記録に失敗しました: ${e?.message ?? e}`);
+  }
 }
 
 const MUTATE_HINT = '確認: vedit view / 取消: vedit undo';
@@ -1771,20 +1788,31 @@ async function main() {
         return t;
       };
       if (kind === 'otio') {
-        await writeOtio(m, path.resolve(dest));
-        // OTIO has no cue-list concept, so captions would silently vanish on
-        // import; write a sidecar .srt next to it so Resolve/Premiere still
-        // get the subtitles.
-        const parsed = path.parse(path.resolve(dest));
-        const srtPath = path.join(parsed.dir, parsed.name + '.srt');
-        await writeSrt(m, await transcriptsOf(), srtPath);
-        if (hasReframe(m)) console.error('Resolve 側でリフレームは再現されません(メタデータとして記録)');
-        return out({
-          ok: true,
-          file: dest,
-          srt: srtPath,
-          hint: 'DaVinci Resolve: File > Import > Timeline (18.5+, free version OK). 字幕は File > Import > Subtitle で .srt を読み込んでください',
-        });
+        try {
+          await writeOtio(m, path.resolve(dest));
+          // OTIO has no cue-list concept, so captions would silently vanish on
+          // import; write a sidecar .srt next to it so Resolve/Premiere still
+          // get the subtitles.
+          const parsed = path.parse(path.resolve(dest));
+          const srtPath = path.join(parsed.dir, parsed.name + '.srt');
+          await writeSrt(m, await transcriptsOf(), srtPath);
+          const warnings: string[] = [];
+          if (hasReframe(m)) {
+            const w = 'Resolve 側でリフレームは再現されません(メタデータとして記録)';
+            console.error(w);
+            warnings.push(w);
+          }
+          await recordExportResult(dir, { kind: 'otio', file: dest, ok: true, revision: m.revision, ...(warnings.length ? { warnings } : {}) });
+          return out({
+            ok: true,
+            file: dest,
+            srt: srtPath,
+            hint: 'DaVinci Resolve: File > Import > Timeline (18.5+, free version OK). 字幕は File > Import > Subtitle で .srt を読み込んでください',
+          });
+        } catch (e: any) {
+          await recordExportResult(dir, { kind: 'otio', file: dest, ok: false, revision: m.revision, error: e?.message ?? String(e) });
+          throw e;
+        }
       }
       if (kind === 'render') {
         let presetRaw = flags.preset as string | undefined;
@@ -1815,11 +1843,23 @@ async function main() {
         const motionSpecs = m.timeline.motion.length > 0 ? await loadMotionSpecs(p, m) : undefined;
         if (m.composition) {
           console.error('rendering composition (background + sprites + dialogue)...');
-          const res = await renderComposition(m, path.resolve(dest), {
-            preset: presetRaw as 'youtube' | 'shorts' | 'x' | undefined,
-            ...(motionSpecs ? { motionSpecs } : {}),
-          });
-          return out({ ok: true, file: dest, ...(res.warnings.length ? { warnings: res.warnings } : {}) });
+          const options = { preset: presetRaw };
+          try {
+            const res = await renderComposition(m, path.resolve(dest), {
+              preset: presetRaw as 'youtube' | 'shorts' | 'x' | undefined,
+              ...(motionSpecs ? { motionSpecs } : {}),
+            });
+            const dialogueCount = (m.timeline.dialogue ?? []).length;
+            await recordExportResult(dir, {
+              kind: 'render', file: dest, ok: true, revision: m.revision, options,
+              ...(res.warnings.length ? { warnings: res.warnings } : {}),
+              ...(dialogueCount > 0 ? { dialogueBurned: true, dialogueCount } : {}),
+            });
+            return out({ ok: true, file: dest, ...(res.warnings.length ? { warnings: res.warnings } : {}) });
+          } catch (e: any) {
+            await recordExportResult(dir, { kind: 'render', file: dest, ok: false, revision: m.revision, options, error: e?.message ?? String(e) });
+            throw e;
+          }
         }
         console.error('rendering from original sources (this encodes the full timeline)...');
         // Captions now burn by DEFAULT whenever captions.enabled + there's
@@ -1828,14 +1868,23 @@ async function main() {
         // backward compatibility but is a no-op now that burning is the
         // default; it no longer needs to be passed to opt in.
         const noBurnCaptions = Boolean(flags['no-burn-captions']);
-        const res = await renderFinal(m, await transcriptsOf(), path.resolve(dest), {
-          burnCaptions: Boolean(flags['burn-captions']),
-          noBurnCaptions,
-          preset: presetRaw as 'youtube' | 'shorts' | 'x' | undefined,
-          noRepair: Boolean(flags['no-repair']),
-          fastLoudnorm: Boolean(flags['fast-loudnorm']),
-          ...(motionSpecs ? { motionSpecs } : {}),
-        });
+        const noRepair = Boolean(flags['no-repair']);
+        const fastLoudnorm = Boolean(flags['fast-loudnorm']);
+        const renderOptions = { preset: presetRaw, noBurnCaptions, noRepair, fastLoudnorm };
+        let res;
+        try {
+          res = await renderFinal(m, await transcriptsOf(), path.resolve(dest), {
+            burnCaptions: Boolean(flags['burn-captions']),
+            noBurnCaptions,
+            preset: presetRaw as 'youtube' | 'shorts' | 'x' | undefined,
+            noRepair,
+            fastLoudnorm,
+            ...(motionSpecs ? { motionSpecs } : {}),
+          });
+        } catch (e: any) {
+          await recordExportResult(dir, { kind: 'render', file: dest, ok: false, revision: m.revision, options: renderOptions, error: e?.message ?? String(e) });
+          throw e;
+        }
         if (res.captionsBurned) {
           console.error(`字幕を焼き込み(${res.captionCueCount} cues)`);
         } else if (noBurnCaptions) {
@@ -1848,35 +1897,67 @@ async function main() {
         if (res.dialogueBurned) {
           console.error(`セリフを焼き込み(${res.dialogueCount}件)`);
         }
+        await recordExportResult(dir, {
+          kind: 'render', file: dest, ok: true, revision: m.revision, options: renderOptions,
+          ...(res.warnings.length ? { warnings: res.warnings } : {}),
+          captionsBurned: res.captionsBurned, captionCueCount: res.captionCueCount,
+          dialogueBurned: res.dialogueBurned, dialogueCount: res.dialogueCount,
+        });
         return out({ ok: true, file: dest, ...(res.warnings.length ? { warnings: res.warnings } : {}) });
       }
       if (kind === 'fcp7xml') {
         const otioTmp = path.resolve(dest) + '.otio';
-        await writeOtio(m, otioTmp);
         try {
-          await run('uvx', ['--from', 'opentimelineio', '--with', 'otio-fcp-adapter', 'otioconvert', '-i', otioTmp, '-o', path.resolve(dest)]);
+          await writeOtio(m, otioTmp);
+          try {
+            await run('uvx', ['--from', 'opentimelineio', '--with', 'otio-fcp-adapter', 'otioconvert', '-i', otioTmp, '-o', path.resolve(dest)]);
+          } catch (e: any) {
+            throw new Error(`fcp7xml conversion failed (needs uv + python): ${e.message}\nThe .otio file was written to ${otioTmp}; Resolve can import it directly.`);
+          }
+          await fs.rm(otioTmp, { force: true });
+          const warnings: string[] = [];
+          if (hasReframe(m)) {
+            const w = 'Resolve 側でリフレームは再現されません(メタデータとして記録)';
+            console.error(w);
+            warnings.push(w);
+          }
+          await recordExportResult(dir, { kind: 'fcp7xml', file: dest, ok: true, revision: m.revision, ...(warnings.length ? { warnings } : {}) });
+          return out({ ok: true, file: dest, hint: 'Premiere: File > Import (FCP7 XML)' });
         } catch (e: any) {
-          fail(`fcp7xml conversion failed (needs uv + python): ${e.message}\nThe .otio file was written to ${otioTmp}; Resolve can import it directly.`);
+          await recordExportResult(dir, { kind: 'fcp7xml', file: dest, ok: false, revision: m.revision, error: e?.message ?? String(e) });
+          fail(e?.message ?? String(e));
         }
-        await fs.rm(otioTmp, { force: true });
-        if (hasReframe(m)) console.error('Resolve 側でリフレームは再現されません(メタデータとして記録)');
-        return out({ ok: true, file: dest, hint: 'Premiere: File > Import (FCP7 XML)' });
       }
       if (kind === 'srt') {
-        await writeSrt(m, await transcriptsOf(), path.resolve(dest));
-        return out({ ok: true, file: dest });
+        try {
+          await writeSrt(m, await transcriptsOf(), path.resolve(dest));
+          await recordExportResult(dir, { kind: 'srt', file: dest, ok: true, revision: m.revision });
+          return out({ ok: true, file: dest });
+        } catch (e: any) {
+          await recordExportResult(dir, { kind: 'srt', file: dest, ok: false, revision: m.revision, error: e?.message ?? String(e) });
+          throw e;
+        }
       }
       if (kind === 'ass') {
-        let kit = null;
-        if (m.kit) {
-          try {
-            kit = await readKitFile(m.kit.path);
-          } catch (e: any) {
-            console.error(`警告: kit: ${e?.message ?? e} — キットスタイルなしで書き出します`);
+        try {
+          let kit = null;
+          const warnings: string[] = [];
+          if (m.kit) {
+            try {
+              kit = await readKitFile(m.kit.path);
+            } catch (e: any) {
+              const w = `kit: ${e?.message ?? e} — キットスタイルなしで書き出します`;
+              console.error(`警告: ${w}`);
+              warnings.push(w);
+            }
           }
+          await fs.writeFile(path.resolve(dest), toAss(m, await transcriptsOf(), kit));
+          await recordExportResult(dir, { kind: 'ass', file: dest, ok: true, revision: m.revision, ...(warnings.length ? { warnings } : {}) });
+          return out({ ok: true, file: dest });
+        } catch (e: any) {
+          await recordExportResult(dir, { kind: 'ass', file: dest, ok: false, revision: m.revision, error: e?.message ?? String(e) });
+          throw e;
         }
-        await fs.writeFile(path.resolve(dest), toAss(m, await transcriptsOf(), kit));
-        return out({ ok: true, file: dest });
       }
       fail(`unknown export kind: ${kind}`);
       return;
@@ -1896,7 +1977,16 @@ async function main() {
       // them from this file instead; without it, thumbnail extraction is
       // skipped and thumbnailsSkipped (below) explains why.
       const renderedFile = flags.render ? path.resolve(String(flags.render)) : undefined;
-      const res = await publishPack(p, m, transcripts, outdir, { thumbs, renderedFile });
+      const options = { thumbs, ...(renderedFile ? { renderedFile } : {}) };
+      let res;
+      try {
+        res = await publishPack(p, m, transcripts, outdir, { thumbs, renderedFile });
+      } catch (e: any) {
+        await recordExportResult(dir, { kind: 'publish-pack', file: outdir, ok: false, revision: m.revision, options, error: e?.message ?? String(e) });
+        throw e;
+      }
+      const warnings = [res.chaptersReason, res.thumbnailsReason].filter((w): w is string => Boolean(w));
+      await recordExportResult(dir, { kind: 'publish-pack', file: outdir, ok: true, revision: m.revision, options, ...(warnings.length ? { warnings } : {}) });
       return out({
         ok: true,
         outdir,
