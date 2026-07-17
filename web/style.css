@@ -3,198 +3,379 @@
 [hidden] { display: none !important; }
 
 /* ---------------------------------------------------------------------------
- * Design tokens — "ステージと書斎" (W-UI redesign)
+ * W-DESIGN — Claude Design ハンドオフ(design_handoff_vedit_nle_redesign/
+ * README.md, 「vedit Pro v2.dc.html」)の実装。無彩色(achromatic)の単一
+ * ダークパレット — 旧「ステージと書斎」二領域案(暖色/寒色の使い分け)は
+ * 廃止し、ヘッダー/サイドパネル/ステージが同じトークンを共有する。
  *
- * Two zones, one vocabulary: the preview + timeline ("ステージ") stay an
- * achromatic neutral dark so they never bias color judgment of the footage;
- * the side panel + header ("書斎") carry a faint warm cast for a more human
- * "相棒の書斎" feel. Both zones share the same text/accent tokens — only the
- * background/surface/border hue differs, via the --zone-* custom properties
- * that `header, aside` override below (CSS custom properties inherit down
- * the DOM tree, so any component styled against var(--zone-*) automatically
- * picks up whichever zone it's actually rendered in). Elements mounted
- * directly on <body> (toast, dialogs, the D&D overlay, the floating "show"
- * cards) get the root/stage default — they float over the stage visually,
- * so that's the more consistent read.
- *
- * Amber (--tally) is reserved EXCLUSIVELY for "要確認/保留/警告" (the
- * inbox's pending-review badges, warning rows, and the one-shot show/shown
- * highlight pulse) — never used decoratively elsewhere, so its meaning
- * stays unambiguous at a glance. Track-type accent colors on the timeline
- * (B-roll teal, motion purple, music green, sprite pink, dialogue white)
- * are a separate, pre-existing functional vocabulary (distinguishing row
- * *kinds*, not drawing attention) and are kept, minus the one row that used
- * to double-book amber (background-cut row, recolored to steel-blue below).
+ * 意味色は3つだけに絞る(装飾グラデーション・カラーピル禁止):
+ *   --pending(琥珀) = 確認待ち・警告 専用
+ *   --ok(緑)        = 接続状態 専用
+ *   --danger(赤茶)  = 破壊的操作(タイムラインから外す 等) 専用
+ * それ以外の操作アクセントは --link(青灰)、状態を持たない中立アクションは
+ * --wash。トラック識別色(B-roll/テロップ/モーション/BGM)は行の種類を見分ける
+ * ための別語彙で、この3トークンとは独立(下の「タイムライン」節を参照)。
  * --------------------------------------------------------------------- */
 :root {
-  /* ステージ: no-hue neutral dark */
-  --stage-bg: #17181a;
-  --stage-surface: #1e2023;
-  --stage-border: #2a2d31;
-  /* 書斎: faintly warm dark */
-  --study-bg: #211d18;
-  --study-panel: #2a251e;
-  --study-panel-2: #322c24;
-  --study-border: #3a342b;
+  --bg: #131315;           /* アプリ全体の背景 */
+  --panel: #1b1b1e;        /* ヘッダー/サイドパネル/ガター */
+  --card: #202024;         /* カード・入力・クリップ */
+  --card-2: #26262b;       /* ユーザーバブル・active タブ/ツール */
+  --raised: #2e2e33;       /* セグメントactive・カットボタン(hover: #37373d) */
+  --timeline-bg: #18181b;  /* タイムライン(ツールバー+トラック本体)の背景 */
 
-  /* shared text scale */
-  --text: #eae5db;
-  --text-dim: #98907f;
-  --text-faint: #6b655c;
+  --border: rgba(255, 255, 255, 0.08);
+  --border-soft: rgba(255, 255, 255, 0.06);
+  --border-hover: rgba(255, 255, 255, 0.2);
 
-  /* shared semantic accents */
-  --tally: #e8a03c;       /* 要確認・保留・警告 専用 — do not reuse decoratively */
-  --tally-hover: #f2b45c;
-  --keep: #8fb996;        /* 承認・成功 */
-  --reject: #c97b6b;      /* 却下・破壊的 */
-  --link: #8fa8c9;        /* 情報・フォーカス・操作アクセント */
-  --wash: #6f6858;        /* 弱色 — 状態色を持たないニュートラルなアクション用アウトライン(例: 候補カードの「残す」) */
+  --text: #ececee;
+  --text-2: #b9b9bf;
+  --text-3: #9b9ba3;
+  --text-dim: #616167;
+  --text-cut: #57575d;
+
+  --primary: #e8e8ea;      /* 白プライマリ(書き出し・適用・5件すべて適用) */
+  --primary-text: #17171a;
+  --primary-hover: #ffffff;
+
+  --link: #8fb4dd;         /* テキストリンク/情報・フォーカス・busyドット */
+  --pending: #d9a45f;      /* 確認待ち/警告 専用 */
+  --pending-hover: #e6b578;
+  --ok: #6fbe8b;           /* 接続ドット 専用 */
+  --danger: #c98a80;       /* 破壊的操作 専用 */
+  --danger-border: rgba(201, 123, 107, 0.4);
+  --wash: #6f6f76;         /* 状態色を持たないニュートラルなアクション用(「残す」等) */
 
   --radius: 6px;
-  --font-jp: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Yu Gothic", Meiryo, sans-serif;
-  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  --radius-sm: 4px;
+  --radius-lg: 8px;
+  --radius-pill: 999px;
 
-  /* type scale: 11 / 12.5 / 14 / 16 / 20 */
+  /* W-DESIGN: Google Fonts(IBM Plex Sans JP / IBM Plex Mono)+ 未読み込み時の
+     システムフォールバック(index.html の <link> が失敗しても崩れない)。 */
+  --font-jp: 'IBM Plex Sans JP', -apple-system, BlinkMacSystemFont, 'Hiragino Sans', 'Hiragino Kaku Gothic ProN', 'Yu Gothic', Meiryo, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace;
+
+  /* type scale (README「デザイントークン」): 10/10.5/11/11.5/12/12.5(基準)/13/14/16 */
+  --fs-2xs: 10px;
   --fs-xs: 11px;
-  --fs-sm: 12.5px;
-  --fs-md: 14px;
-  --fs-lg: 16px;
-  --fs-xl: 20px;
+  --fs-sm: 11.5px;
+  --fs-base: 12.5px;
+  --fs-md: 13px;
+  --fs-lg: 14px;
+  --fs-xl: 16px;
 
-  /* zone defaults = ステージ; header/aside override to 書斎 below */
-  --zone-bg: var(--stage-bg);
-  --zone-surface: var(--stage-surface);
-  --zone-surface-2: var(--stage-surface);
-  --zone-border: var(--stage-border);
+  /* legacy alias names kept so every pre-existing component rule below still
+     resolves without having to touch each call site individually — same
+     values as the zone tokens above (the study/stage split no longer exists,
+     so header/aside no longer override these; see the removed override
+     note below). */
+  --zone-bg: var(--panel);
+  --zone-surface: var(--card);
+  --zone-surface-2: var(--card-2);
+  --zone-border: var(--border);
+  --text-faint: var(--text-dim);
+  --tally: var(--pending);
+  --keep: var(--ok);
+  --reject: var(--danger);
 
   /* ---- W8 kit palette injection (unchanged mechanism — see ensureKitFontFace/
      renderCaption in app.js) ---- */
   --kit-text: #fff; --kit-outline: transparent; --kit-box: rgba(0,0,0,0.55); --kit-box-opacity: 1;
-}
-header, aside {
-  --zone-bg: var(--study-bg);
-  --zone-surface: var(--study-panel);
-  --zone-surface-2: var(--study-panel-2);
-  --zone-border: var(--study-border);
 }
 .sr-only {
   position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
   overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0;
 }
 @media (prefers-reduced-motion: reduce) {
-  .mo-chapter-card, .mo-lower-third, .mo-callout, .mo-cta, .badge.tallyPulse { animation: none !important; }
+  .mo-chapter-card, .mo-lower-third, .mo-callout, .mo-cta, .badge.tallyPulse, .claudeStatus.busy .claudeDot { animation: none !important; }
 }
 html, body { height: 100%; }
 body {
-  background: var(--stage-bg); color: var(--text);
-  font: var(--fs-sm)/1.5 var(--font-jp);
+  background: var(--bg); color: var(--text);
+  font: var(--fs-base)/1.55 var(--font-jp);
   display: flex; flex-direction: column; overflow: hidden;
+  min-width: 1360px;
 }
-/* 波2.5 P3(a): 狭幅(Claude Desktop の隣に置く=現実の利用形態、~700px)で
-   タイトル+タイムコード(.hdrIdentity)が Claude 状態チップと重なっていた
-   バグの根本原因は2つの合わせ技 — (1) header に flex-wrap が無く、
-   全項目が常に1行に押し込まれようとしていた、(2) .hdrIdentity 自身は
-   min-width:0 でどこまでも縮んでいいのに、中の #projName/#headerTc は
-   縮んだ分の省略(ellipsis)もラップも一切していなかったので、縮んだ枠から
-   はみ出した文字がそのまま隣の #stat/.claudeStatus に重なって描画されて
-   いた。修正: header を折返し可にし、.hdrIdentity は「中身が丸ごと収まる
-   幅より縮まない」(min-width の初期値 auto に戻す=このルールの削除)。
-   これで狭幅では独自の行に折り返すだけになり、崩れた省略や重なりが起きない。 */
+
+/* =============================================================================
+ * ヘッダー(46px 相当。パディング込みで実測とほぼ一致 — README: bg#1b1b1e,
+ * border-bottom rgba(255,255,255,0.08))
+ * ========================================================================== */
 header {
-  display: flex; align-items: center; gap: 12px; flex-wrap: wrap; row-gap: 4px;
-  padding: 8px 14px; border-bottom: 1px solid var(--zone-border); background: var(--zone-bg);
+  display: flex; align-items: center; gap: 14px; min-height: 46px;
+  padding: 6px 14px; border-bottom: 1px solid var(--border); background: var(--panel);
+  flex-wrap: wrap; row-gap: 4px; flex: none;
 }
-.hdrIdentity { display: flex; align-items: baseline; gap: 10px; }
-#projName { font-weight: 600; font-size: var(--fs-md); white-space: nowrap; }
-/* タイムコード・フレーム数・秒数値だけ monospace + tabular-nums (design tokens'
-   doc above) — every numeric readout in the timeline/inbox/media-pool UI
-   shares this one rule rather than repeating font-family per component. */
-.mono, #headerTc, #tc, #rangeInfo, #revLabel, #minGapVal,
-.cand .srcTag, .cand .dur, .srcDur, .srcUsageLabel, .btn-sceneSeek,
+.hdrIdentity { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.hdrLogo {
+  width: 20px; height: 20px; border-radius: 5px; background: #35353b;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--text); font-weight: 700; font-size: 12px; flex: none;
+}
+.hdrAppName { font-weight: 600; font-size: var(--fs-md); letter-spacing: 0.01em; white-space: nowrap; }
+.hdrSep { width: 1px; height: 14px; background: rgba(255, 255, 255, 0.1); flex: none; }
+#projName { font-weight: 500; color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.hdrRevLabel { color: var(--text-dim); font-size: var(--fs-xs); white-space: nowrap; }
+/* 既存機能: ヘッダー常設のライブタイムコード。v2.dc.html には無いが機能温存のため
+   小さく残す(W-DESIGN 既知差分 — 詳細は最終報告参照)。 */
+.hdrTc { color: var(--text-dim); font-size: var(--fs-xs); }
+/* W-UI redesign §1: 出力解像度/素材スペック/fps の弱い二次情報。v2.dc.html
+   には無い要素だが既存の有用な情報を失わないため残す(W-DESIGN 既知差分)。 */
+#stat.hdrSecondary {
+  color: var(--text-dim); font-size: var(--fs-2xs);
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.hdrCenter { flex: 1; display: flex; justify-content: center; min-width: 0; }
+.hdrRight { display: flex; align-items: center; gap: 10px; flex: none; }
+
+/* Claude 状態ピル(README: bg#202024, border rgba(255,255,255,0.08),
+   radius 999px, padding 4px 14px)。ドット7px: idle=#616167 /
+   waiting=#d9a45f / busy=#8fb4dd(1.2s opacity パルス、prefers-reduced-motion
+   では静止 — 上の @media ルールで除外)。 */
+.claudeStatus {
+  display: flex; align-items: center; gap: 8px; padding: 4px 14px; border-radius: var(--radius-pill);
+  background: var(--card); border: 1px solid var(--border); max-width: 100%; cursor: default;
+}
+.claudeStatus .claudeDot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--text-dim); }
+.claudeStatus .claudeText {
+  font-weight: 500; font-size: var(--fs-sm); color: var(--text-2);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.claudeStatus.waiting .claudeDot { background: var(--pending); }
+.claudeStatus.busy .claudeDot { background: var(--link); animation: claudeBusyPulse 1.2s ease-in-out infinite; }
+@keyframes claudeBusyPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+
+.reframeCtl { display: flex; align-items: center; gap: 6px; color: var(--text-3); font-size: var(--fs-sm); white-space: nowrap; }
+.reframeCtl select { font-size: var(--fs-sm); padding: 3px 6px; }
+.spacer { flex: 1; }
+.btnIcon {
+  width: 25px; height: 25px; border-radius: var(--radius); background: transparent;
+  color: var(--text-3); border: 1px solid var(--border); padding: 0; font-size: 12px;
+}
+.btnIcon:hover { color: var(--text); border-color: var(--border-hover); }
+/* W-UI redesign §1: connection state is a small dot + title tooltip, not a
+   text label — the color alone (+ title/aria-label for a11y) carries it. */
+.connDot { color: var(--danger); font-size: 10px; line-height: 1; cursor: default; }
+.connDot.up { color: var(--ok); }
+.btnPrimary {
+  background: var(--primary); color: var(--primary-text); border: 0; border-radius: var(--radius);
+  padding: 6px 16px; font-size: var(--fs-base); font-weight: 600;
+}
+.btnPrimary:hover { background: var(--primary-hover); }
+.btnPrimary:disabled { opacity: 0.4; }
+.btnGhost {
+  background: transparent; color: var(--text-2); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 3px 11px; font-size: var(--fs-xs); white-space: nowrap;
+}
+.btnGhost:hover { color: var(--text); border-color: var(--border-hover); }
+.btnBack {
+  background: none; color: var(--text-3); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 3px 10px; font-size: var(--fs-xs);
+}
+.btnBack:hover { color: var(--text); }
+
+button {
+  background: var(--card-2); color: var(--text); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 4px 10px; cursor: pointer; font: inherit;
+  white-space: nowrap; flex-shrink: 0;
+}
+button:hover { border-color: var(--border-hover); }
+button:disabled { opacity: 0.4; cursor: default; }
+button:focus-visible, [tabindex]:focus-visible, a:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
+input[type="range"], input[type="checkbox"] { accent-color: var(--text-3); }
+input[type="range"]:disabled, input[type="checkbox"]:disabled { opacity: 0.5; }
+select, input[type="text"], input[type="number"] {
+  background: var(--card); color: var(--text); border: 1px solid var(--border-hover);
+  border-radius: var(--radius); font: inherit; padding: 3px 6px;
+}
+/* タイムコード・フレーム数・秒数値だけ monospace + tabular-nums — every
+   numeric readout in the timeline/inbox/media-pool UI shares this one rule
+   rather than repeating font-family per component. */
+.mono, .hdrTc, #tc, #rangeInfo, .hdrRevLabel, #minGapVal,
+.cand .srcTag, .cand .dur, .srcDur, .srcUsageLabel, .btn-sceneSeek, .frameLabel,
 dialog#shortcutsDialog td:first-child {
   font-family: var(--font-mono); font-variant-numeric: tabular-nums;
 }
-#headerTc { color: var(--text-dim); font-size: var(--fs-sm); }
-/* W-UI redesign §1: output res / material spec / fps / duration — a small,
-   dim secondary readout (never competes with project name + live timecode),
-   full text also lives in the title attribute for hover discovery. */
-#stat.hdrSecondary {
-  color: var(--text-faint); font-size: var(--fs-xs);
-  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-/* W-UI IA v2 §1: 「現在の版 N」— ヘッダー右端の弱表示(旧#transport内から
-   移設。#revLabel 自体の mono/tabular-nums は上のセレクタリストで既に付与)。 */
-.hdrRevLabel { color: var(--text-faint); font-size: var(--fs-xs); white-space: nowrap; }
-/* W-UI IA v2 波2 §3: Claude 状態の常設表示(renderClaudeStatus in app.js)。
-   --link=待機中・確認待ち共通の落ち着いた色、busy のときだけ動きを付ける
-   (prefers-reduced-motion では静止のまま — 上の @media ルールで除外)。 */
-.claudeStatus { font-size: var(--fs-xs); font-weight: 600; white-space: nowrap; padding: 2px 8px; border-radius: 999px; }
-.claudeStatus.idle { color: var(--text-faint); background: transparent; }
-.claudeStatus.waiting { color: var(--tally); background: rgba(232, 160, 60, 0.14); }
-.claudeStatus.busy { color: var(--link); background: rgba(143, 168, 201, 0.14); }
-.claudeStatus.busy::before { content: '● '; animation: claudeBusyPulse 1.2s ease-in-out infinite; }
-@keyframes claudeBusyPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
-@media (prefers-reduced-motion: reduce) { .claudeStatus.busy::before { animation: none; } }
-/* 波2 追補#2: 出力比率変更セレクト — ヘッダーの弱い操作系として revLabel と
-   同じ弱色トーン。 */
-.reframeCtl { display: flex; align-items: center; gap: 4px; color: var(--text-faint); font-size: var(--fs-xs); white-space: nowrap; }
-.reframeCtl select { font-size: var(--fs-xs); padding: 1px 4px; }
-.spacer { flex: 1; }
-/* W-UI redesign §1: connection state is a small dot + title tooltip, not a
-   text label — the color alone (+ title/aria-label for a11y) carries it. */
-.connDot { color: var(--reject); font-size: var(--fs-md); line-height: 1; cursor: default; }
-.connDot.up { color: var(--keep); }
-button {
-  background: var(--zone-surface-2); color: var(--text); border: 1px solid var(--zone-border);
-  border-radius: var(--radius); padding: 4px 10px; cursor: pointer; font: inherit;
-  /* self-critique pass: flex-parented buttons (panelbars, header) were
-     wrapping their Japanese label mid-word under space pressure — buttons
-     should shrink the row, never their own text. Pre-existing, not
-     redesign-introduced; fixed opportunistically since it's a one-line,
-     zero-risk change. */
-  white-space: nowrap; flex-shrink: 0;
-}
-button:hover { border-color: var(--link); }
-button:disabled { opacity: 0.4; cursor: default; }
-button:focus-visible, [tabindex]:focus-visible, a:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
-/* 波2.5 P3(b): input[type=range]/checkbox の既定の青(ブラウザネイティブ)を
-   トークンへ — --link(「情報・フォーカス・操作アクセント」、design tokens
-   の doc 参照)。プロジェクト全体のスライダー/チェックボックス共通。 */
-input[type="range"], input[type="checkbox"] { accent-color: var(--link); }
-input[type="range"]:disabled, input[type="checkbox"]:disabled { opacity: 0.5; }
 
+/* =============================================================================
+ * レイアウト本体: 左パネル 300px / 中央(プレビュー+タイムライン) / 右パネル 344px
+ * ========================================================================== */
 main { flex: 1; display: flex; min-height: 0; }
-#stage { flex: 1.6; display: flex; flex-direction: column; padding: 12px; gap: 8px; min-width: 0; }
-/* #videoWrap is ALWAYS the flexible stage area (flex:1 1 0; min-height:0) so
-   it only ever claims the space left over after #transport/#timeline take
-   what they need — it must never grow to consume #stage's full height.
-   #videoBox is the inner box sized to the actual video/output aspect ratio
-   and centered within #videoWrap by the latter's flex align/justify.
-   Captions/motion overlays are positioned against #videoBox (not
-   #videoWrap) so they track the cropped preview exactly. */
+
+/* ---- 左パネル(素材 / 文字起こし) ---- */
+#leftPanel {
+  width: 300px; flex: none; border-right: 1px solid var(--border); background: var(--panel);
+  display: flex; flex-direction: column; min-height: 0;
+}
+/* ---- 右パネル(Claude) ---- */
+#rightPanel {
+  width: var(--aside-w, 344px); min-width: 260px; max-width: 70vw;
+  border-left: 1px solid var(--border); background: var(--panel);
+  display: flex; flex-direction: column; min-height: 0;
+}
+#paneDivider {
+  flex: none; width: 6px; cursor: col-resize; background: transparent;
+  transition: background 0.15s;
+}
+#paneDivider:hover, #paneDivider.dragging { background: var(--link); }
+#paneDivider:focus-visible { outline: 2px solid var(--link); outline-offset: -2px; }
+
+/* 下線式タブ(左パネル素材/文字起こし、README: active 2px solid #ececee
+   text#ececee 600 / inactive #616167) */
+.tabs { display: flex; }
+.leftTabs { padding: 0 14px; border-bottom: 1px solid var(--border); }
+.tab {
+  border: 0; border-radius: 0; background: none; padding: 9px 4px 10px; margin-right: 18px;
+  color: var(--text-dim); font-size: var(--fs-base); font-weight: 500;
+  border-bottom: 2px solid transparent;
+}
+.tab:last-child { margin-right: 0; }
+.tab.active { color: var(--text); font-weight: 600; border-bottom-color: var(--text); }
+.tab:focus-visible { outline: 2px solid var(--link); outline-offset: -2px; }
+.panel { display: none; flex: 1; min-height: 0; overflow: auto; flex-direction: column; }
+.panel.active { display: flex; }
+.panelbar {
+  display: flex; gap: 8px; align-items: center; padding: 8px;
+  border-bottom: 1px solid var(--border-soft); position: sticky; top: 0; background: var(--panel); z-index: 2;
+}
+.hintText { color: var(--text-dim); font-size: var(--fs-xs); }
+
+/* ---- 素材パネル ---- */
+#leftPanel .panelbar button { font-size: var(--fs-xs); padding: 3px 9px; }
+.kitStatus {
+  margin: 10px 12px 0; padding: 6px 10px; border-radius: var(--radius);
+  background: var(--card); border: 1px solid var(--border);
+  color: var(--text-dim); font-size: var(--fs-xs);
+  display: flex; flex-direction: column; align-items: flex-start; gap: 6px;
+}
+.kitStatus > span { white-space: normal; }
+.audioPanel { margin: 10px 12px 0; border-top: 1px solid var(--border-soft); padding-top: 4px; }
+.audioPanel summary {
+  cursor: pointer; padding: 6px 2px; color: var(--text-3); font-size: var(--fs-xs);
+  font-weight: 600; letter-spacing: 0.06em; list-style: revert;
+}
+.audioPanel summary:hover { color: var(--text); }
+.audioPanelBody { padding: 4px 2px 4px; display: flex; flex-direction: column; gap: 10px; }
+.audioField { display: flex; flex-direction: column; gap: 4px; }
+.audioField label { font-size: var(--fs-sm); color: var(--text-3); display: flex; justify-content: space-between; gap: 6px; }
+.audioField select { align-self: stretch; min-width: 0; }
+.audioField input[type="range"] { width: 100%; }
+.audioCheck { display: flex; align-items: center; gap: 6px; font-size: var(--fs-sm); color: var(--text-3); }
+.exportOnlyBadge {
+  align-self: flex-start; font-size: 10px; padding: 1px 6px; border-radius: var(--radius-pill);
+  background: transparent; border: 1px solid var(--wash); color: var(--text-dim); cursor: help;
+}
+.musicAddForm { display: flex; flex-direction: column; gap: 6px; padding: 8px; border-radius: var(--radius); background: var(--card); border: 1px solid var(--border); }
+.musicAddForm label { display: flex; flex-direction: column; gap: 4px; font-size: var(--fs-xs); color: var(--text-dim); }
+.musicAddForm input[type="text"] { padding: 4px 6px; }
+.musicAddActions { display: flex; gap: 6px; justify-content: flex-end; }
+
+/* README「素材」: 2列グリッドのカード(radius6, bg#202024, outline白7%、
+   サムネ16:9、右下に時間チップ mono10px bg黒70%)。カード下: 名前11.5px 500 +
+   メタ行10.5px #616167(警告時#d9a45f)。既存の mediaRow() が作る row/img/
+   info/actions の DOM構造は無変更 — グリッド化とサムネ縦横比だけを CSS で。 */
+#mediaList { padding: 12px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; align-content: start; overflow-y: auto; }
+.srcRow {
+  grid-column: span 2; display: flex; gap: 10px; align-items: center; padding: 7px 9px; cursor: pointer;
+  background: var(--card); border: 0; outline: 1px solid var(--border-soft); border-radius: var(--radius);
+}
+/* 通常表示(詳細を開いていない)のときだけ縦積みの2列カードに — 詳細
+   (badges/usage/シーン)を開くと横1列に戻り、情報が窮屈にならないようにする。 */
+.srcRow:not(:has(.srcBadges)) { grid-column: span 1; flex-direction: column; align-items: stretch; padding: 0; overflow: hidden; }
+.srcRow:not(:has(.srcBadges)) .srcThumb { width: 100%; height: auto; aspect-ratio: 16/9; border-radius: 0; }
+.srcRow:not(:has(.srcBadges)) .srcInfo { padding: 7px 9px 2px; }
+.srcRow:not(:has(.srcBadges)) .srcActions { flex-direction: row; flex-wrap: wrap; padding: 0 9px 8px; }
+.srcRow:hover { outline-color: var(--border-hover); }
+.srcRow:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
+.srcRow.previewing { outline-color: var(--link); box-shadow: 0 0 0 1px var(--link); }
+.srcThumb {
+  width: 72px; height: 40px; object-fit: cover; border-radius: var(--radius-sm);
+  background: #0a0c10; flex: none;
+}
+.srcInfo { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.srcNameRow { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.srcName { font-size: var(--fs-sm); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.srcDur { color: var(--text-dim); font-size: var(--fs-2xs); flex: none; }
+.srcBadges { display: flex; gap: 4px; flex-wrap: wrap; }
+.badge {
+  font-size: 10px; padding: 1px 6px; border-radius: var(--radius-pill); background: var(--card-2); border: 1px solid var(--border); color: var(--text);
+}
+.badge.ok { background: rgba(111, 190, 139, 0.18); border-color: transparent; color: var(--ok); }
+.badge.warn { background: rgba(217, 164, 95, 0.18); border-color: transparent; color: var(--pending); }
+.srcUsage { display: flex; align-items: center; gap: 8px; }
+.srcUsageBar { display: block; flex: 1 1 auto; height: 6px; min-width: 40px; border-radius: var(--radius-pill); background: var(--border); overflow: hidden; }
+.srcUsageFill { display: block; height: 100%; background: var(--link); }
+.srcUsageLabel { color: var(--text-dim); font-size: 10px; white-space: nowrap; flex: none; }
+.srcActions { display: flex; flex-direction: column; gap: 4px; flex: none; }
+.srcActions button { padding: 2px 8px; font-size: var(--fs-xs); white-space: nowrap; }
+
+.sceneGrid {
+  grid-column: span 2; display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 6px;
+  padding: 2px 2px 4px; margin-top: -4px;
+}
+.sceneItem {
+  display: flex; flex-direction: column; gap: 4px; padding: 6px; border-radius: var(--radius);
+  background: var(--card); border: 1px solid var(--border);
+}
+.sceneItem:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
+.sceneItem.review-keep { border-color: var(--ok); box-shadow: 0 0 0 1px var(--ok); }
+.sceneItem.review-reject { border-color: var(--danger); opacity: 0.55; }
+.btn-sceneSeek, .btn-sceneAdd { font-size: var(--fs-xs); padding: 2px 6px; }
+.sceneNote { color: var(--text-dim); font-size: var(--fs-xs); font-style: italic; overflow-wrap: break-word; }
+.sceneReview { display: flex; gap: 4px; }
+.btn-sceneKeep, .btn-sceneReject { font-size: var(--fs-xs); padding: 1px 8px; line-height: 1.4; }
+.btn-sceneKeep[aria-pressed="true"] { background: var(--ok); border-color: var(--ok); color: #06210f; }
+.btn-sceneReject[aria-pressed="true"] { background: var(--danger); border-color: var(--danger); color: #2a0505; }
+.cullBadge { background: var(--card-2); }
+
+/* ---- 文字起こしパネル(README: 13px/2.1行間) ---- */
+#words { padding: 14px 16px; user-select: none; overflow-y: auto; font-size: var(--fs-md); line-height: 2.1; }
+.transcribeStatusList { padding: 8px 8px 0; display: flex; flex-direction: column; gap: 4px; }
+.transcribeStatusRow { display: flex; align-items: center; justify-content: space-between; gap: 8px; line-height: 1.6; }
+.btn-transcribeSource { font-size: var(--fs-xs); padding: 2px 8px; flex: none; }
+.srcHeading {
+  color: var(--text-dim); font-size: var(--fs-2xs); font-weight: 600; letter-spacing: 0.08em;
+  padding: 10px 0 8px; margin-top: 6px; border-bottom: 1px solid var(--border-soft);
+}
+.srcHeading:first-child { margin-top: 0; }
+.w { cursor: pointer; border-radius: 3px; padding: 1px 1px; }
+.w:hover { background: rgba(255, 255, 255, 0.08); }
+.w:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
+.w.cut { color: var(--text-cut); text-decoration: line-through; }
+.w.ignored { color: var(--text-3); text-decoration: none; border-bottom: 1px dotted var(--text-dim); }
+.w.sel { background: rgba(255, 255, 255, 0.14); outline: 1px solid rgba(255, 255, 255, 0.3); outline-offset: -1px; }
+.w.active { background: rgba(255, 255, 255, 0.14); outline: 1px solid rgba(255, 255, 255, 0.3); outline-offset: -1px; }
+/* W-UI §0 "show words" — Claude pointing at specific words; a distinct
+   highlight from .sel. One-shot attention cue -> --pending (tally exception). */
+.w.shown { outline: 2px solid var(--pending); outline-offset: 1px; border-radius: 3px; }
+.gap { color: var(--text-cut); font-size: var(--fs-xs); margin: 0 2px; }
+
+/* =============================================================================
+ * 中央: プレビュー + トランスポート + タイムライン
+ * ========================================================================== */
+#stage { flex: 1; display: flex; flex-direction: column; min-width: 0; background: var(--bg); }
+/* README: プレビューは padding 20px 28px 10px、比率は常に manifest.output に
+   追従(16:9固定にしない — W-DESIGN ディレクター適応3)。既存の updateFraming/
+   .customAspect/--out-ar 機構(app.js)をそのまま使う。 */
 #videoWrap {
-  position: relative; flex: 1 1 0; min-height: 0; background: #000;
-  border-radius: 8px; overflow: hidden; display: flex; align-items: center; justify-content: center;
+  position: relative; flex: 1 1 0; min-height: 0; margin: 20px 28px 0;
+  background: #000; border-radius: var(--radius); overflow: hidden;
+  outline: 1px solid rgba(255, 255, 255, 0.06);
+  display: flex; align-items: center; justify-content: center;
 }
 #videoBox { position: relative; width: 100%; height: 100%; }
 #videoBox video { width: 100%; height: 100%; object-fit: contain; }
 /* manifest.output present and its aspect differs from the source: lock the
    inner box to the OUTPUT aspect (letterboxed within #videoWrap) so the
-   preview matches the framing the export will actually produce. No output ->
+   preview matches the framing the export will actually produce — a 9:16
+   project renders as a tall box, not a fixed 16:9 rectangle. No output ->
    plain letterboxing (videoBox fills videoWrap). */
 #videoWrap.customAspect #videoBox { width: auto; height: 100%; max-width: 100%; aspect-ratio: var(--out-ar, 16/9); margin: 0 auto; }
 #videoWrap.customAspect #videoBox video { object-fit: cover; }
-/* B-roll V2 preview (W3): a second <video> stacked over #video, shown only
-   while the playhead is inside an active overlay's resolved [tlStart,tlEnd)
-   (see syncOverlayVideo in app.js) — a full-frame replace, not a PiP. Placed
-   before captionLayer/motionLayer in the DOM so captions/motion still draw
-   on top of it, matching render.ts's compositing order. */
 #videoOverlay { position: absolute; inset: 0; z-index: 1; background: #000; pointer-events: none; }
 
-/* W-ANIME: composition background/ambient layer (see applyCompositionMode/
-   renderCompositionBackground in app.js) — hidden for a normal
-   (source-driven) project; #video itself is hidden in composition mode
-   instead (mutually exclusive, so no z-index tug-of-war between them). */
+/* W-ANIME: composition background/ambient layer */
 #compBgLayer { position: absolute; inset: 0; overflow: hidden; background: #000; pointer-events: none; }
 .compBgMedia { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
 .compAmbientMedia { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; opacity: 0.35; mix-blend-mode: screen; }
@@ -203,35 +384,24 @@ main { flex: 1; display: flex; min-height: 0; }
   text-align: center; padding: 24px; color: var(--text-dim); font-size: var(--fs-sm); background: #14161c;
 }
 
-/* W8 kit sprites: absolute-positioned <img>s (see renderSprites in app.js),
-   placed BELOW captions (matches render.ts: sprites composite before the
-   ASS caption burn) but above the video/B-roll layers. Percent-based
-   left/top/width/height so it tracks reframe/letterboxing the same way
-   captionLayer/motionLayer do (all three are children of #videoBox, sized
-   to the OUTPUT aspect). */
 #spriteLayer { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
 .spriteImg { position: absolute; }
 
-/* ---- Rendered-video preview layers (captions/motion/dialogue): these
-   approximate the ACTUAL burned-in export (see export/render.ts's toAss and
-   the motion-graphics templates) — their colors/sizes are content, not UI
-   chrome, and are deliberately NOT reskinned to the --tally/--keep/--link
-   token vocabulary above. Only interaction affordances (focus rings, the
-   drag guideline, the "edited" marker) are UI and do use it. ---- */
+/* ---- Rendered-video preview layers (captions/motion/dialogue): approximate
+   the ACTUAL burned-in export — deliberately NOT reskinned to the UI token
+   vocabulary above (see export/render.ts's toAss / motion-graphics
+   templates). Only interaction affordances (focus rings, drag guideline)
+   use --link. The .cue base rule is also shared by the caption-style view's
+   live preview box (.capPreview .cue — see below) via a combined selector,
+   so both stay pixel-identical automatically. ---- */
 #captionLayer {
   position: absolute; left: 0; right: 0; text-align: center; pointer-events: none;
-  /* W-CAP: overrides.position.v (0=top,1=bottom of the box's bottom edge —
-     see startCaptionDrag/renderCaption in app.js and the matching ASS
-     MarginV formula in export/render.ts's toAss). Default 0.94 reproduces
-     the pre-W-CAP hardcoded `bottom: 6%` exactly. */
   bottom: calc((1 - var(--cap-position-v, 0.94)) * 100%);
 }
-#captionLayer .cue {
-  display: inline-block; padding: 0.2em 0.7em; border-radius: 6px;
-  background: rgba(0,0,0,0.55); color: #fff; font-weight: 700;
+#captionLayer .cue, .capPreview .cue {
+  display: inline-block; padding: 0.25em 0.8em; border-radius: var(--radius);
+  background: rgba(0,0,0,0.6); color: #fff; font-weight: 700;
   font-size: clamp(14px, 2.6vw, 26px); text-shadow: 0 1px 3px #000;
-  /* W-CAP: cues are clickable (style popover) / draggable (position) /
-     double-clickable (inline text edit) — see renderCaption in app.js. */
   pointer-events: auto; cursor: pointer; position: relative;
 }
 #captionLayer .cue:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
@@ -239,42 +409,22 @@ main { flex: 1; display: flex; min-height: 0; }
   cursor: text; outline: 2px dashed var(--link); outline-offset: 2px;
   -webkit-user-select: text; user-select: text;
 }
-#captionLayer.style-bold .cue { background: #000; color: #ffe45c; }
-/* W-CAP overrides.palette.box / overrides.bgOpacity: applyCueOverrideStyles
-   in app.js sets the `background` (a color-mix() referencing --cap-box/
-   --cap-box-opacity) directly as an INLINE style rather than through a
-   stylesheet class here — an inline style always wins regardless of
-   specificity, which a class-only rule would NOT reliably do against
-   #captionLayer.style-kit .cue's own ID-selector background rule below. */
-/* W-CAP "✎修正済み" marker (caption-text override active on this cue) —
-   hover/focus shows the original transcript text via the native title
-   tooltip (see buildCueEl in app.js). An informational marker, not a
-   warning — link-colored, not tally. */
+#captionLayer.style-bold .cue, .capPreview.style-bold .cue { background: #000; color: #ffe45c; }
 .cueEditedMark {
   display: inline-block; margin-left: 0.5em; font-size: 0.6em; font-weight: 400;
   color: var(--link); vertical-align: middle; cursor: help;
 }
-/* W-CAP vertical-drag guideline, shown only while dragging a caption box. */
 #captionDragGuide {
   position: absolute; left: 0; right: 0; height: 0; border-top: 1px dashed var(--link);
   pointer-events: none; z-index: 4;
 }
-/* W8 kit style (captions --style <kitStyleId>): approximation of the ASS
-   palette/font toAss's kitAssStyle burns in — see renderCaption in app.js,
-   which sets these custom properties from the linked kit's style. */
-#captionLayer.style-kit .cue {
+#captionLayer.style-kit .cue, .capPreview.style-kit .cue {
   background: color-mix(in srgb, var(--kit-box, #000) calc(var(--kit-box-opacity, 1) * 100%), transparent);
   color: var(--kit-text, #fff);
   -webkit-text-stroke: 1px var(--kit-outline, transparent);
   font-family: var(--kit-font, inherit);
 }
 
-/* W-ANIME: speech-bubble dialogue layer (see renderDialogueBubbles in
-   app.js) — bubbles are centered on their computed anchor point (a sprite's
-   head, or a fixed top-center default), with a small CSS triangle "tail"
-   pointing toward the referenced sprite (see speechBubbleTailDirectionJS).
-   Empty <div> for every project without dialogue items — no visual
-   footprint, full regression. */
 #dialogueLayer { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
 .dialogueBubble {
   position: absolute; transform: translate(-50%, -100%);
@@ -329,647 +479,523 @@ main { flex: 1; display: flex; min-height: 0; }
 .spin { width: 16px; height: 16px; border: 2px solid #555; border-top-color: #fff; border-radius: 50%; animation: sp 0.8s linear infinite; }
 @keyframes sp { to { transform: rotate(360deg) } }
 
-/* Persistent stage-center states for empty/failed project loads — not a
-   toast, since the user needs this to stay visible until resolved. */
 #stageEmpty {
-  position: absolute; inset: 0; display: flex; flex-direction: column; gap: 12px;
+  position: absolute; inset: 0; display: flex; flex-direction: column; gap: 14px;
   align-items: center; justify-content: center; text-align: center; padding: 24px;
-  background: rgba(10,12,16,0.94); color: var(--text-dim);
+  background: var(--bg); color: var(--text-dim);
 }
-/* W-UI IA v2 §5a: #stageEmptyMsg holds up to 3 stacked <p> lines (see
-   renderStageState in app.js) — the empty-project state's 3-line onboarding
-   message. .stageEmptyLead (the first line, "最初の動画を追加") reads as the
-   actual call-to-action; the rest stay the plain dim supporting-text size. */
 #stageEmptyMsg {
   display: flex; flex-direction: column; gap: 8px;
-  max-width: 360px; font-size: var(--fs-sm); line-height: 1.6; white-space: pre-wrap;
+  max-width: 380px; font-size: var(--fs-base); line-height: 1.7; white-space: pre-wrap;
 }
-#stageEmptyMsg .stageEmptyLead { font-size: var(--fs-lg); font-weight: 600; color: var(--text); }
+#stageEmptyMsg .stageEmptyLead { font-size: var(--fs-xl); font-weight: 600; color: var(--text); }
 
-#transport { display: flex; align-items: center; gap: 10px; }
-#tc { color: var(--text-dim); font-size: var(--fs-sm); }
+/* ---- トランスポート(README: 左タイムコード mono14px、中央 ⏮▶⏭、右 f番号+fps mono10.5px) ---- */
+#transport { display: flex; align-items: center; gap: 14px; padding: 8px 28px 12px; flex: none; }
+.tcMain { font-family: var(--font-mono); font-size: var(--fs-lg); color: var(--text); font-variant-numeric: tabular-nums; }
+.tcDim, #tcTotal { color: var(--text-dim); }
+.transportControls { display: flex; align-items: center; gap: 8px; }
+.btnTransportSm {
+  width: 28px; height: 28px; border-radius: var(--radius); background: transparent; border: 0;
+  color: var(--text-3); font-size: 12px; padding: 0;
+}
+.btnTransportSm:hover { color: #fff; }
+.btnTransportPlay {
+  width: 34px; height: 34px; border-radius: var(--radius-lg); background: var(--primary); border: 0;
+  color: var(--primary-text); font-size: 13px; padding: 0;
+}
+.btnTransportPlay:hover { background: var(--primary-hover); }
+.btnTransportPlay:disabled { opacity: 0.35; }
+.frameLabel { font-size: 10.5px; color: var(--text-dim); }
 #rateLabel {
-  font-size: var(--fs-xs); font-weight: 700; color: #04101f; background: var(--link);
-  padding: 1px 6px; border-radius: 999px;
+  font-size: var(--fs-2xs); font-weight: 700; color: #04101f; background: var(--link);
+  padding: 1px 6px; border-radius: var(--radius-pill);
 }
 
-/* W-UI IA v2 波2 §2: トラックラベルガター + 時間目盛り。#timeline 自体は
-   もはやトラック行の直接の position:absolute 基準ではなく、外枠(ルーラー+
-   ガター+トラック本体を並べる器)になる — トラック行は #timelineTracks の
-   中にそのまま移設済みで、その内部の left/top/width/height の% 計算は
-   一切変更していない(#timelineTracks が新しい絶対配置の基準になるだけ)。
-   高さは元の 92px のトラック本体 + 18px のルーラー + T1 テロップ行ぶんの
-   12px を足した 122px(#timelineTracks 自体は 104px)。 */
-#timeline {
-  position: relative; height: 122px; background: var(--stage-surface);
-  border: 1px solid var(--stage-border); border-radius: var(--radius); overflow: hidden; cursor: crosshair;
-  flex: none;
+/* ---- タイムラインツールバー(README: 36px、選択/スナップcheckbox/拡大
+   スライダー/全体表示のみ — 分割・テキストツールは実装しない) ---- */
+.tlToolbar {
+  display: flex; align-items: center; gap: 8px; height: 36px; padding: 0 12px;
+  background: var(--timeline-bg); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border-soft);
+  flex: none; margin: 10px 28px 0;
 }
+.tlTool {
+  background: none; color: var(--text-3); border: 0; border-radius: var(--radius);
+  padding: 4px 12px; font-size: var(--fs-sm);
+}
+.tlTool.active { background: var(--card-2); color: var(--text); }
+.tlToolbarSep { width: 1px; height: 14px; background: rgba(255, 255, 255, 0.1); flex: none; }
+.tlSnapCheck { display: flex; align-items: center; gap: 5px; font-size: var(--fs-sm); color: var(--text-3); cursor: pointer; }
+.tlZoomLabel { font-size: 10.5px; color: var(--text-dim); }
+#tlZoomRange { width: 110px; }
+#tlFitBtn { background: none; color: var(--text-3); border: 1px solid var(--border-hover); border-radius: var(--radius); padding: 2px 9px; font-size: var(--fs-xs); }
+#tlFitBtn:hover { color: var(--text); }
+
+/* ---- タイムライン本体 ----
+ * README のピクセル座標をそのまま採用: ガター96px / ルーラー24px。
+ * コア5行(B-ROLL/本編/テロップ/モーション/BGM)は #timelineTracks 内の
+ * 絶対座標で v2.dc.html と同じ top/height。W8スプライト・W-ANIME紙芝居/
+ * セリフの3行は hifi のデモに現れない機能(このプロジェクトでは空)だが、
+ * 「機能を1つも壊さない」を優先し #timeline.tl-extra 修飾クラスで必要な
+ * ときだけ下に伸ばして確保する(通常プロジェクトは常に206px、hifi と一致
+ * — 詳細は最終報告の既知差分を参照)。
+ */
+#timeline {
+  position: relative; height: 206px; background: var(--timeline-bg);
+  border-bottom: 1px solid var(--border); overflow: hidden; cursor: crosshair;
+  flex: none; margin: 0 28px 12px;
+}
+#timeline.tl-extra { height: 276px; }
 #timeRuler {
-  position: absolute; left: 56px; right: 0; top: 0; height: 18px;
-  border-bottom: 1px solid var(--stage-border); pointer-events: none;
+  position: absolute; left: 96px; right: 0; top: 0; height: 24px;
+  border-bottom: 1px solid var(--border-soft); pointer-events: none;
 }
 .rulerTick {
-  position: absolute; top: 0; height: 100%; padding-left: 3px;
-  border-left: 1px solid var(--zone-border); color: var(--text-faint);
-  font-size: 9px; font-family: var(--font-mono); font-variant-numeric: tabular-nums;
-  white-space: nowrap; line-height: 18px;
+  position: absolute; top: 0; height: 100%; padding-left: 4px;
+  border-left: 1px solid rgba(255, 255, 255, 0.06); color: var(--text-dim);
+  font-size: 9.5px; font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+  white-space: nowrap; line-height: 24px;
 }
-/* トラックラベルガター: 各ラベルは対応する行と同じ top/height(または
-   bottom/height)を使うので、行が増減しても常にピクセル単位で揃う(renderTrackGutter in app.js)。 */
 #trackGutter {
-  position: absolute; left: 0; top: 18px; bottom: 0; width: 56px;
-  border-right: 1px solid var(--stage-border); background: var(--zone-surface);
+  position: absolute; left: 0; top: 24px; bottom: 0; width: 96px;
+  background: var(--panel);
 }
 .gutterLabel {
   position: absolute; left: 0; right: 0; display: flex; align-items: center;
-  padding: 0 6px; font-size: 9px; color: var(--text-faint); white-space: nowrap;
-  overflow: hidden; text-overflow: ellipsis;
+  gap: 6px; padding: 0 8px; font-size: 10px; color: var(--text-3); font-weight: 500;
+  letter-spacing: 0.04em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-#timelineTracks { position: absolute; left: 56px; right: 0; top: 18px; bottom: 0; }
+.gutterLabel::before { content: ''; width: 2px; border-radius: 1px; align-self: stretch; background: var(--gutter-color, var(--text-3)); }
+#timelineTracks { position: absolute; left: 96px; right: 0; top: 24px; bottom: 0; }
 #wave { position: absolute; inset: 0; width: 100%; height: 100%; }
-/* B-roll V2 row (W3): thin strip ABOVE the clip row per spec, teal so it
-   reads as a distinct layer from the A-roll clips/scene marks below it.
-   Track-type colors (teal/purple/green/pink/white here and below) are a
-   functional row-kind vocabulary, independent of the --tally/--keep/
-   --reject/--link semantic tokens — kept as-is except the one row that used
-   to double-book amber (#bgRow, below). */
-#overlayRow { position: absolute; left: 0; right: 0; top: 0; height: 12%; }
+
+/* B-roll V2 row: top:4px height:22px (README ピクセル値そのまま) */
+#overlayRow { position: absolute; left: 0; right: 0; top: 4px; height: 22px; }
 .ovBlock {
-  position: absolute; top: 0; height: 100%; border-radius: 3px;
-  background: rgba(45, 197, 191, 0.85); font-size: 9px; color: #04101f;
-  overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0 3px; cursor: grab;
+  position: absolute; top: 0; height: 100%; border-radius: var(--radius-sm);
+  background: #283332; color: #8fbdb9; box-shadow: inset 2px 0 0 #4d8d88;
+  font-size: 10px; line-height: 22px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0 7px; cursor: grab;
 }
-/* Orphaned overlay (anchor cut away): fixed-width warning chips stacked at
-   the row's left edge, since there's no resolved timeline position to place
-   them at — click shows the reason as a toast. This IS a warning -> tally. */
 .ovBlock.orphan {
-  width: 12px; background: var(--tally); color: #241a05;
-  text-align: center; font-weight: 700; cursor: pointer;
+  width: 12px; background: var(--pending); color: #241a05; box-shadow: none;
+  text-align: center; font-weight: 700; cursor: pointer; line-height: 22px; padding: 0;
 }
-#clips { position: absolute; left: 0; right: 0; top: 12%; height: 50%; }
-#sceneMarks { position: absolute; left: 0; right: 0; top: 12%; height: 50%; pointer-events: none; }
+
+/* 本編(A/V1, フィルムストリップ+波形): top:30px height:58px */
+#clips { position: absolute; left: 0; right: 0; top: 30px; height: 58px; }
+#sceneMarks { position: absolute; left: 0; right: 0; top: 30px; height: 58px; pointer-events: none; }
 .sceneMark {
   position: absolute; top: 0; width: 1px; height: 100%;
   background: rgba(255, 255, 255, 0.4); pointer-events: auto; cursor: pointer;
 }
 .sceneMark:hover { background: var(--link); width: 2px; }
-/* W-INTENT: thin protected-region band, underlining the clip row rather than
-   covering it, so it never competes with clip drag/trim pointer targets
-   (only the thin bar itself re-enables pointer-events, for the hover title
-   tooltip — see intentZoneTimelineRanges/renderIntentZoneRow in app.js).
-   Informational ("this is protected"), not a warning -> link, not tally. */
-#intentZoneRow { position: absolute; left: 0; right: 0; top: 12%; height: 50%; pointer-events: none; }
+#intentZoneRow { position: absolute; left: 0; right: 0; top: 30px; height: 58px; pointer-events: none; }
 .intentZoneBlock {
   position: absolute; bottom: 0; height: 4px; border-radius: 2px;
   background: rgba(143, 168, 201, 0.6); pointer-events: auto; cursor: pointer;
 }
 .intentZoneBlock.hold { background: rgba(122, 92, 208, 0.65); }
 .intentZoneBlock:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
-/* Clip fill: a neutral steel-blue base so the (optional) filmstrip
-   thumbnails tiled on top (.clipThumb below) still read as "this is a clip"
-   even before/without real frames — e.g. sources with no scene data yet. */
 .clip {
-  position: absolute; top: 8%; height: 84%; cursor: grab; overflow: hidden;
-  background: #23384e; border: 1px solid #526c8b; border-left: 1px solid rgba(255,255,255,0.22);
-  border-radius: 4px;
+  position: absolute; top: 0; height: 100%; cursor: grab; overflow: hidden;
+  background: var(--card); border-radius: var(--radius-sm); outline: 1px solid var(--border);
 }
-.clip.alt { background: #1e3348; }
-.clip.sel { border-color: var(--link); box-shadow: 0 0 0 1px var(--link); }
-/* W-UI redesign §2 "フィルムストリップ": real-frame scene thumbnails tiled
-   inside the clip (see sceneThumbTilesFor/renderTimeline in app.js) — a
-   background layer only (pointer-events:none), so drag/trim/click handling
-   on the parent .clip is entirely unaffected. Slightly less than fully
-   opaque so the clip's own fill still tints the strip a touch and any gaps
-   between tiles (a source with sparse scene coverage) don't show raw black. */
+.clip.alt { background: #1c1c20; }
+.clip.sel { outline: 1.5px solid #fff; box-shadow: 0 0 0 1px #fff; }
+/* README「本編」: 上68%フィルムストリップ、下32% rgba(10,10,12,0.75)+波形。 */
 .clipThumb {
-  position: absolute; top: 0; bottom: 0; background-size: cover; background-position: center;
+  position: absolute; top: 0; height: 68%; background-size: cover; background-position: center;
   background-color: rgba(0,0,0,0.3); opacity: 0.92; pointer-events: none;
 }
-/* W-UI §2: direct timeline manipulation drag feedback. */
+.clip::after {
+  content: ''; position: absolute; left: 0; right: 0; bottom: 0; height: 32%;
+  background: rgba(10, 10, 12, 0.75); pointer-events: none;
+}
 .clip.dragging, .moBlock.dragging, .muBlock.dragging, .ovBlock.dragging, .spBlock.dragging {
   opacity: 0.55; box-shadow: 0 0 0 1px var(--link); cursor: grabbing;
 }
-/* W-UI IA v2 波2 §1: 選択ハイライト — 選んだブロックが光る(selectItem/
-   renderTimeline in app.js が該当ブロックにこのクラスを付ける)。 */
 .moBlock.sel, .muBlock.sel, .ovBlock.sel, .spBlock.sel, .dlBlock.sel {
   outline: 2px solid var(--link); outline-offset: 1px; z-index: 2;
 }
-/* Codex 統合レビュー P1-2: クリップ/B-roll/モーション/BGM/スプライト/セリフ
-   ブロックにキーボード到達性(tabIndex/role/keydown, makeBlockKeyboardActivatable
-   in app.js)を追加 — フォーカスリングは既存トークン(--link)そのまま。 */
 .clip:focus-visible, .moBlock:focus-visible, .muBlock:focus-visible,
 .ovBlock:focus-visible, .spBlock:focus-visible, .dlBlock:focus-visible {
   outline: 2px solid var(--link); outline-offset: 1px;
 }
+/* README「選択」オーバーレイ: 1.5px白ボーダー+左右5px白ハンドル(v2.dc.html
+   の selOverlayStyle)。クリップ自体の .sel 枠と重ねて、ハンドルの見た目だけ
+   このレイヤーで足す。 */
+.clip.sel::before, .clip.sel::after { z-index: 1; }
 #dropIndicator {
-  position: absolute; top: 12%; height: 50%; width: 2px; background: var(--link);
+  position: absolute; top: 30px; height: 58px; width: 2px; background: var(--link);
   pointer-events: none; z-index: 3;
 }
-/* W-UI §0 "show range": Claude pointing at a spot on the timeline — a
-   one-shot attention cue, so it's the one non-badge place --tally is
-   sanctioned for (see the design tokens' doc above). Separate from
-   #rangeSel (the I/O delete-range selection, which also surfaces a "この
-   範囲を削除" action bar we don't want to imply here). */
 #showHighlight {
-  position: absolute; top: 0; bottom: 0; background: rgba(232, 160, 60, 0.18);
-  border-left: 1px solid var(--tally); border-right: 1px solid var(--tally); pointer-events: none;
+  position: absolute; top: 0; bottom: 0; background: rgba(217, 164, 95, 0.18);
+  border-left: 1px solid var(--pending); border-right: 1px solid var(--pending); pointer-events: none;
 }
-/* W-UI IA v2 波2 §5: bottom offsets +12px vs pre-波2 (2/18/32/46/60) to make
-   room for the new #captionRow lane at bottom:0 — #timelineTracks grew by
-   exactly that 12px (see #timeline/#timelineTracks above), so these 5 rows
-   keep the exact same on-screen appearance/spacing relative to each other,
-   just shifted down as a block to leave the bottom slot free. */
-#motionRow { position: absolute; left: 0; right: 0; bottom: 14px; height: 14px; }
-.moBlock {
-  position: absolute; height: 100%; border-radius: 3px; cursor: grab;
-  background: rgba(122, 92, 208, 0.85); font-size: 9px; color: #fff;
-  overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0 3px;
-}
-#musicRow { position: absolute; left: 0; right: 0; bottom: 30px; height: 12px; }
-.muBlock {
-  position: absolute; height: 100%; border-radius: 3px; cursor: grab;
-  background: rgba(63, 185, 107, 0.8); font-size: 9px; color: #04101f;
-  overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0 3px;
-}
-/* W8 kit sprite row: thin strip just above musicRow, pink so it reads as
-   distinct from B-roll (teal, #overlayRow) and music (green). Orphan chips
-   mirror .ovBlock.orphan (tally — see its doc). */
-#spriteRow { position: absolute; left: 0; right: 0; bottom: 44px; height: 12px; }
-.spBlock {
-  position: absolute; top: 0; height: 100%; border-radius: 3px;
-  background: rgba(214, 90, 200, 0.85); font-size: 9px; color: #04101f;
-  overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0 3px; cursor: grab;
-}
-.spBlock.orphan {
-  width: 12px; background: var(--tally); color: #241a05;
-  text-align: center; font-weight: 700; cursor: pointer;
-}
-/* W-ANIME: background-cut ("紙芝居") + dialogue rows, stacked above
-   spriteRow. Both stay empty (no visual footprint) for every project that
-   isn't a composition / has no dialogue items — full regression. Click-to-
-   seek only (no drag — these aren't anchor-based, see renderBgRow/
-   renderDialogueRow in app.js), so `cursor: pointer` rather than `grab`.
-   Steel-blue rather than the row palette's original amber — amber is
-   reserved for tally (see the design tokens' doc above). */
-#bgRow { position: absolute; left: 0; right: 0; bottom: 58px; height: 12px; }
-.bgBlock {
-  position: absolute; top: 0; height: 100%; border-radius: 3px;
-  background: rgba(92, 134, 168, 0.85); font-size: 9px; color: #04101f;
-  overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0 3px; cursor: pointer;
-}
-#dialogueRow { position: absolute; left: 0; right: 0; bottom: 72px; height: 12px; }
-.dlBlock {
-  position: absolute; top: 0; height: 100%; border-radius: 3px;
-  background: rgba(255, 255, 255, 0.85); font-size: 9px; color: #04101f;
-  overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0 3px; cursor: pointer;
-}
-/* W-UI IA v2 波2 §5: T1 テロップ行 — 常設のクリック入口(cue が無くても/
-   字幕オフでも消えない、renderCaptionRow in app.js)。#timelineTracks を
-   92px→104px に広げた分、ちょうど最下段の新しいレーンに収まる。 */
-#captionRow { position: absolute; left: 0; right: 0; bottom: 0; height: 12px; }
-/* 波2.5 P3(c): 元は rgba(232,160,60,*) = --tally そのもの(要確認・保留・
-   警告 専用のはずの色)を cue バーの装飾に流用していて、タリー琥珀(inbox
-   バッジ・警告行・showHighlight)と紛らわしかった。--wash(状態色を持たない
-   ニュートラル)ベースに変更 — design tokens のドキュメント(このファイル
-   冒頭)が定める「amber は警告専用」を cue バーにも適用しただけで、
-   .capRowOff/.capRowEmpty(既に zone-surface-2 で正しい)は変更不要。 */
+
+/* テロップ(T1): top:94px height:20px */
+#captionRow { position: absolute; left: 0; right: 0; top: 94px; height: 20px; }
 .capRowBlock {
-  position: absolute; top: 0; height: 100%; border-radius: 3px;
-  background: rgba(111, 104, 88, 0.85); font-size: 9px; color: var(--text);
-  overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0 3px; cursor: pointer;
+  position: absolute; top: 0; height: 100%; border-radius: var(--radius-sm);
+  background: #2b3040; color: #9daac7; box-shadow: inset 2px 0 0 #6d7f9e;
+  font-size: 10px; line-height: 20px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0 6px; cursor: pointer;
 }
 .capRowBlock.capRowOff, .capRowBlock.capRowEmpty {
-  left: 0; width: 100%; background: var(--zone-surface-2); color: var(--text-dim);
-  border: 1px dashed var(--zone-border); text-align: center;
+  left: 0; width: 100%; background: var(--card-2); color: var(--text-dim); box-shadow: none;
+  border: 1px dashed var(--border-hover); text-align: center;
 }
 .capRowBlock:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
+
+/* モーション(M1): top:120px height:20px */
+#motionRow { position: absolute; left: 0; right: 0; top: 120px; height: 20px; }
+.moBlock {
+  position: absolute; height: 100%; border-radius: var(--radius-sm); cursor: grab;
+  background: #322e3d; color: #a89dc4; box-shadow: inset 2px 0 0 #7d70a3;
+  font-size: 10px; line-height: 20px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0 6px;
+}
+.moBlock .exportSkipBadge {
+  display: inline-block; margin-left: 3px; padding: 0 3px; border-radius: 2px;
+  background: rgba(0,0,0,0.35); color: #e7e2d8; font-size: 8px; font-weight: 700;
+}
+
+/* BGM(A2): top:146px height:26px */
+#musicRow { position: absolute; left: 0; right: 0; top: 146px; height: 26px; }
+.muBlock {
+  position: absolute; height: 100%; border-radius: var(--radius-sm); cursor: grab; overflow: hidden;
+  background: #243029; box-shadow: inset 2px 0 0 #52886a;
+  font-size: 10px; color: #87b598; white-space: nowrap; text-overflow: ellipsis; padding: 0 8px; line-height: 26px;
+}
+
+/* ---- W8 スプライト/W-ANIME 紙芝居・セリフ(hifi デモには無い行 — 空のときは
+   視覚的に何も表示されないので #timeline は通常206pxのまま。実際に使う
+   プロジェクトでは JS 側が #timeline に .tl-extra を付けて下に伸ばす)。 ---- */
+#spriteRow { position: absolute; left: 0; right: 0; top: 178px; height: 18px; }
+.spBlock {
+  position: absolute; top: 0; height: 100%; border-radius: var(--radius-sm);
+  background: rgba(214, 90, 200, 0.85); font-size: 10px; color: #04101f;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0 6px; line-height: 18px; cursor: grab;
+}
+.spBlock.orphan {
+  width: 12px; background: var(--pending); color: #241a05;
+  text-align: center; font-weight: 700; cursor: pointer; padding: 0;
+}
+#bgRow { position: absolute; left: 0; right: 0; top: 202px; height: 18px; }
+.bgBlock {
+  position: absolute; top: 0; height: 100%; border-radius: var(--radius-sm);
+  background: rgba(92, 134, 168, 0.85); font-size: 10px; color: #04101f;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0 6px; line-height: 18px; cursor: pointer;
+}
+#dialogueRow { position: absolute; left: 0; right: 0; top: 226px; height: 18px; }
+.dlBlock {
+  position: absolute; top: 0; height: 100%; border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.85); font-size: 10px; color: #04101f;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0 6px; line-height: 18px; cursor: pointer;
+}
+
 #playhead {
-  position: absolute; top: 0; bottom: 0; width: 1px; background: #ff5252; pointer-events: none;
+  position: absolute; top: 0; bottom: 0; width: 1px; background: #fff; pointer-events: none;
+}
+#playhead::before {
+  content: ''; position: absolute; top: 0; left: -4.5px; width: 10px; height: 12px;
+  background: #fff; border-radius: 2px 2px 5px 5px;
 }
 #rangeSel {
   position: absolute; top: 0; bottom: 0; background: rgba(143, 168, 201, 0.22);
   border-left: 1px solid var(--link); border-right: 1px solid var(--link); pointer-events: none;
 }
-/* Source preview mode: the timeline strip goes semi-transparent while #video
-   plays a raw source proxy instead of the timeline mix (see enterSourcePreview
-   in app.js). Interacting with the strip (or Esc) exits back to it. */
 #timeline.previewing { opacity: 0.35; transition: opacity 0.15s ease; }
 #previewBanner {
-  display: flex; align-items: center; gap: 10px; padding: 6px 10px;
-  background: var(--stage-surface); border: 1px solid var(--link); border-radius: var(--radius);
-  color: var(--text); font-size: var(--fs-sm); margin-top: -2px;
+  display: flex; align-items: center; gap: 10px; padding: 6px 10px; margin: 0 28px 8px;
+  background: var(--card); border: 1px solid var(--link); border-radius: var(--radius);
+  color: var(--text); font-size: var(--fs-base);
 }
-#previewBannerExit {
-  padding: 0 6px; border-radius: 4px; line-height: 1; margin-left: auto;
-}
+#previewBannerExit { padding: 0 6px; border-radius: var(--radius-sm); line-height: 1; margin-left: auto; }
 #rangeBar {
-  display: flex; align-items: center; gap: 10px; padding: 6px 10px;
-  background: var(--stage-surface); border: 1px solid var(--link); border-radius: var(--radius);
+  display: flex; align-items: center; gap: 10px; padding: 6px 10px; margin: 0 28px 10px;
+  background: var(--card); border: 1px solid var(--link); border-radius: var(--radius);
 }
 #rangeInfo { color: var(--text); }
 
-/* ---- W-UI IA v2 波2 §1: 選択インスペクタ(旧 #clipInspector を右ペインへ昇格) ---- */
-#inspectorView { display: flex; flex-direction: column; min-height: 0; flex: 1; }
-.inspectorHeader {
-  display: flex; align-items: center; gap: 8px; padding: 8px;
-  border-bottom: 1px solid var(--zone-border); position: sticky; top: 0; background: var(--zone-bg); z-index: 2;
-}
-#inspectorBack { color: var(--link); border-color: var(--link); font-size: var(--fs-xs); padding: 3px 8px; }
-#inspectorTitle { font-weight: 600; font-size: var(--fs-sm); color: var(--text); }
-#inspectorBody { padding: 10px 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
-.inspField { display: flex; flex-direction: column; gap: 4px; }
-.inspField label { font-size: var(--fs-xs); color: var(--text-dim); display: flex; justify-content: space-between; gap: 6px; }
-.inspRow { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-.inspTrimRow { display: flex; align-items: center; gap: 6px; }
-.inspTrimRow button { font-size: var(--fs-xs); padding: 2px 8px; }
-.inspLabel { color: var(--text); font-weight: 600; font-size: var(--fs-sm); word-break: break-word; }
-.inspMeta { color: var(--text-dim); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; }
-.inspDivider { border-top: 1px solid var(--zone-border); margin: 2px 0; }
-#inspectorBody .btn-reject { align-self: flex-start; }
-/* 波2 §4/§6: プレビュー未反映を明示するバッジ(嘘をつかない — --wash系、
-   色警告等の tally とは区別)。 */
-.exportOnlyBadge {
-  align-self: flex-start; font-size: 10px; padding: 1px 6px; border-radius: 999px;
-  background: transparent; border: 1px solid var(--wash); color: var(--text-dim); cursor: help;
-}
+/* =============================================================================
+ * 右パネル(Claude): claude / clip / caption / export の4ビュー排他表示
+ * ========================================================================== */
+#claudeView, #inspectorView, #captionView, #exportView { display: flex; flex-direction: column; min-height: 0; flex: 1; }
 
-aside {
-  width: var(--aside-w, 340px); min-width: 240px; max-width: 70vw; border-left: 1px solid var(--zone-border); background: var(--zone-bg);
-  display: flex; flex-direction: column; min-height: 0;
+/* ---- ヘッダー(README: アバター26px円 bg#2a2a2e border白10%「✳」+
+   名前/サブライン+セグメント切替) ---- */
+.claudeHeader { display: flex; align-items: center; gap: 10px; padding: 11px 14px; border-bottom: 1px solid var(--border); flex: none; }
+.claudeAvatar {
+  width: 26px; height: 26px; border-radius: 50%; background: #2a2a2e; border: 1px solid rgba(255, 255, 255, 0.1);
+  display: flex; align-items: center; justify-content: center; color: var(--text-2); font-size: 12px; flex: none;
 }
-/* #inspectorView と #tabsView は排他的に切り替わる、aside の中身そのもの
-   (renderInspector in app.js が hidden を切り替える)。 */
-#tabsView { display: flex; flex-direction: column; min-height: 0; flex: 1; }
-.tabs { display: flex; border-bottom: 1px solid var(--zone-border); }
-.tab {
-  flex: 1; border: 0; border-radius: 0; background: none; padding: 8px; color: var(--text-dim); font-size: var(--fs-sm);
-  display: flex; align-items: center; justify-content: center; gap: 6px;
+.claudeHeaderText { display: flex; flex-direction: column; min-width: 0; }
+.claudeName { font-weight: 600; font-size: var(--fs-base); }
+.claudeSubline { font-size: 10.5px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.segTabs { display: flex; gap: 2px; background: var(--card); border-radius: 7px; padding: 2px; flex: none; }
+.segTabs .tab {
+  border-radius: var(--radius); padding: 3px 12px; margin: 0; font-size: var(--fs-sm); font-weight: 400;
+  border-bottom: 0; color: var(--text-3); display: flex; align-items: center; gap: 5px;
 }
-.tab.active { color: var(--text); box-shadow: inset 0 -2px var(--link); }
-.tab:focus-visible { outline: 2px solid var(--link); outline-offset: -2px; }
-.panel { display: none; flex: 1; min-height: 0; overflow: auto; flex-direction: column; }
-.panel.active { display: flex; }
-.panelbar {
-  display: flex; gap: 8px; align-items: center; padding: 8px;
-  border-bottom: 1px solid var(--zone-border); position: sticky; top: 0; background: var(--zone-bg); z-index: 2;
-}
-.hintText { color: var(--text-dim); font-size: var(--fs-xs); }
-
-/* ---- W-UI IA v2 §2/§3: "確認" タブ = Claude presence strip + 「Claude の
-   編集提案」+「対応が必要」の2群。「履歴」タブは別(下の方の #historyPanel
-   まわりのルールを参照)。 ---- */
-.claudeStrip {
-  display: flex; align-items: center; gap: 8px; padding: 8px 12px;
-  background: rgba(143, 168, 201, 0.12); border-bottom: 1px solid var(--zone-border);
-  color: var(--link); font-size: var(--fs-sm);
-}
-/* W-UI IA v2 §5a: プロジェクトが空のときの確認タブ全体の代替表示 — 2群の
-   代わりにこの1文だけを大きめ・中央寄りに見せる。 */
-.confirmEmptyProject { padding: 32px 16px; text-align: center; font-size: var(--fs-sm); }
-/* 波2 追補#5: 保護区間(intent zones) — 構造編集(解除)は会話側、という
-   案内。--tally は使わない(警告ではない)。 */
-.intentZonesInfo { padding: 8px 12px 2px; display: flex; flex-direction: column; gap: 6px; }
-.intentZoneInfoRow {
-  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-  padding: 6px 8px; border-radius: var(--radius); background: var(--zone-surface-2); border: 1px solid var(--zone-border);
-  font-size: var(--fs-xs); color: var(--text-dim);
-}
-/* Same fix as .kitStatus's doc: without this, CJK text with no spaces can
-   get squeezed and wrap one character per line before the row itself wraps
-   onto a new line. flex-shrink:0 forces "wrap as a whole unit or not at
-   all", never "shrink into a sliver first". */
-.intentZoneInfoRow > span { flex-shrink: 0; }
-/* 波2.5: 「最後の書き出し」カード — read-only の結果表示なので
-   intentZoneInfoRow と同じ中立トーンの箱(--zone-surface-2)。ok=false のみ
-   --reject の左ボーダーで区別(--tally は「古い版」警告行だけに残す — その
-   行自体は inboxWarningRow をそのまま再利用しているので追加ルール不要)。 */
-.exportResultCard { padding: 8px 12px 2px; display: flex; flex-direction: column; gap: 6px; }
-.exportResultRow {
-  display: flex; flex-direction: column; gap: 2px;
-  padding: 6px 8px; border-radius: var(--radius); background: var(--zone-surface-2);
-  border: 1px solid var(--zone-border); border-left: 2px solid var(--wash);
-}
-.exportResultRow.fail { border-left-color: var(--reject); }
-.exportResultWarning { color: var(--tally); }
-.inboxGroup + .inboxGroup { border-top: 1px solid var(--zone-border); margin-top: 4px; }
-.inboxHeading {
-  display: flex; align-items: center; gap: 8px; padding: 10px 12px 2px;
-  font-size: var(--fs-sm); font-weight: 600; color: var(--text);
-}
-.inboxHeading .hintText { font-weight: 400; }
-/* W-UI polish: tab の件数バッジ — a "tally lamp" that only lights up while
-   there's something pending across BOTH groups (renderInbox in app.js only
-   un-hides it when count > 0). Lives on the tab button itself now (W-UI IA
-   v2 §2: タブバッジ=2群合計), not inside a panel heading. The `[hidden]` ->
-   visible transition is a display:none -> flex change, which browsers
-   already treat as a fresh animation start, so the short pulse below
-   replays each time the inbox goes from empty to non-empty with no extra JS
-   bookkeeping needed. Reduced-motion users still get the amber fill/text
-   (that's state, not motion) — only the pulse itself is suppressed, via the
-   existing `.badge.tallyPulse` rule up top. */
+.segTabs .tab.active { background: var(--raised); color: var(--text); font-weight: 600; }
+.segTabs .tab:focus-visible { outline: 2px solid var(--link); outline-offset: -2px; }
+/* タブの件数バッジ(会話タブに琥珀「N」) */
 #inboxCount.badge {
-  background: rgba(232, 160, 60, 0.18); border-color: transparent; color: var(--tally); font-weight: 700;
+  background: rgba(217, 164, 95, 0.18); border-color: transparent; color: var(--pending); font-weight: 700;
+  font-size: 10px; padding: 0 5px; border-radius: var(--radius-pill);
 }
 #inboxCount.badge.tallyPulse { animation: tallyPulse 0.6s ease-out; }
 @keyframes tallyPulse {
-  from { box-shadow: 0 0 0 0 rgba(232, 160, 60, 0.55); }
-  to { box-shadow: 0 0 0 5px rgba(232, 160, 60, 0); }
+  from { box-shadow: 0 0 0 0 rgba(217, 164, 95, 0.55); }
+  to { box-shadow: 0 0 0 5px rgba(217, 164, 95, 0); }
 }
-/* W-UI IA v2 §3: 検出条件 — 候補グループ内の折りたたみ(しきい値+再検出)。
-   デフォルトは閉じた <details>、候補ゼロのときは要素ごと hidden(renderInbox
-   in app.js)。 */
+
+#nowPanel, #historyPanel { padding: 0; }
+.claudeStrip {
+  display: flex; align-items: center; gap: 8px; padding: 8px 14px;
+  background: rgba(143, 180, 221, 0.1); border-bottom: 1px solid var(--border-soft);
+  color: var(--link); font-size: var(--fs-base);
+}
+.confirmEmptyProject { padding: 32px 16px; text-align: center; font-size: var(--fs-base); }
+.intentZonesInfo { padding: 10px 14px 2px; display: flex; flex-direction: column; gap: 6px; }
+.intentZoneInfoRow {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 6px 8px; border-radius: var(--radius); background: var(--card); border: 1px solid var(--border);
+  font-size: var(--fs-xs); color: var(--text-dim);
+}
+.intentZoneInfoRow > span { flex-shrink: 0; }
+
+/* ---- W-DESIGN: Cowork 会話の合成表示(README 69行目 — revision log の
+   actor=Claude から合成)。既存の revision データのみを使い、実在しない
+   ユーザー発言はでっち上げない(候補件数・削減秒数・字幕件数など実数のみ)。 ---- */
+.claudeConversation { padding: 12px 14px 4px; display: flex; flex-direction: column; gap: 10px; }
+.coworkCaption { align-self: center; font-size: 10px; color: var(--text-dim); letter-spacing: 0.04em; padding: 2px 0; }
+.claudeBubble {
+  display: flex; gap: 8px; align-items: flex-start; max-width: 100%;
+}
+.claudeBubble .claudeAvatarSm {
+  width: 20px; height: 20px; border-radius: 50%; background: #2a2a2e; border: 1px solid rgba(255, 255, 255, 0.1);
+  display: flex; align-items: center; justify-content: center; color: var(--text-2); font-size: 10px; flex: none; margin-top: 2px;
+}
+.claudeBubble .bubbleText {
+  flex: 1; min-width: 0; background: var(--card); border-radius: 3px 12px 12px 12px;
+  padding: 8px 13px; font-size: var(--fs-base); color: var(--text-2); line-height: 1.65;
+}
+.claudeBubble .bubbleText b { color: var(--text); }
+
+.inboxGroup + .inboxGroup { border-top: 1px solid var(--border-soft); margin-top: 4px; }
+.inboxHeading {
+  display: flex; align-items: center; gap: 8px; padding: 10px 14px 4px;
+  font-size: var(--fs-xs); font-weight: 600; color: var(--text-3); letter-spacing: 0.04em;
+}
+.inboxHeading .hintText { font-weight: 400; }
 .detectSettings { margin: 2px 8px 4px; }
-.detectSettings summary {
-  cursor: pointer; padding: 4px 4px; color: var(--text-dim); font-size: var(--fs-xs);
-  list-style: revert;
-}
+.detectSettings summary { cursor: pointer; padding: 4px 4px; color: var(--text-dim); font-size: var(--fs-xs); list-style: revert; }
 .detectSettings summary:hover { color: var(--text); }
 .detectSettings[open] summary { color: var(--text); margin-bottom: 2px; }
 .detectSettingsBar { flex-wrap: wrap; position: static; border-bottom: 0; padding: 6px 4px; }
-.inboxEmpty { padding: 4px 12px 12px; }
-#inboxList { padding: 4px 8px 10px; display: flex; flex-direction: column; gap: 6px; }
-/* The one place amber is a background/border fill rather than a small dot —
-   this whole row IS the "対応が必要" content, so it earns it (see the design
-   tokens' doc above). */
+.inboxEmpty { padding: 4px 14px 12px; }
+#inboxList { padding: 2px 12px 10px; display: flex; flex-direction: column; gap: 10px; }
 .inboxWarn {
-  padding: 6px 8px; border-radius: var(--radius); background: rgba(232, 160, 60, 0.1);
-  border: 1px solid rgba(232, 160, 60, 0.4); color: var(--tally); font-size: var(--fs-sm); line-height: 1.5;
+  padding: 7px 8px; border-radius: var(--radius); background: rgba(217, 164, 95, 0.1);
+  border: 1px solid rgba(217, 164, 95, 0.4); color: var(--pending); font-size: var(--fs-base); line-height: 1.5;
 }
 .inboxWarn[role="button"] { cursor: pointer; }
-.inboxWarn[role="button"]:hover { background: rgba(232, 160, 60, 0.18); }
+.inboxWarn[role="button"]:hover { background: rgba(217, 164, 95, 0.18); }
 .inboxWarn:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
-#warningsList { padding: 4px 8px 10px; display: flex; flex-direction: column; gap: 6px; }
+#warningsList { padding: 2px 12px 10px; display: flex; flex-direction: column; gap: 8px; }
 
-/* ---- W-UI IA v2 §1: 「履歴」タブ(旧「いま」タブの変更履歴セクションを移設) ---- */
-#activityFeed { padding: 6px 8px 12px; display: flex; flex-direction: column; gap: 6px; }
-.activityCard {
-  padding: 6px 8px; border-radius: var(--radius); border-left: 2px solid var(--zone-border);
-  background: var(--zone-surface-2); display: flex; flex-direction: column; gap: 4px;
+/* README「提案カード」: bg#202024 radius8 outline白6%。1行目: 提案文12.5px
+   #d6d6da + 右端 mono #9b9ba3。2行目: 時刻mono#616167/「前後を再生」/
+   右に「残す」(ゴースト=--wash)「カット」(bg#2e2e33 600)。 */
+.cand {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 8px; padding: 10px 12px;
+  background: var(--card); outline: 1px solid var(--border-soft); border: 0; border-radius: var(--radius-lg); cursor: pointer;
 }
-.activityInfo { font-size: var(--fs-sm); color: var(--text-dim); line-height: 1.5; }
+.cand:hover { outline-color: rgba(255, 255, 255, 0.16); }
+.cand .kind { display: none; } /* README のカードは種別バッジを見出し側だけに出す(グループ見出しの .kind は表示、行内は非表示) */
+.cand .lbl { flex: 1 1 auto; min-width: 60px; color: #d6d6da; font-size: var(--fs-base); line-height: 1.55; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cand .srcTag { color: var(--text-3); font-size: 10px; white-space: nowrap; order: 2; flex: 1 0 100%; }
+.cand .dur { color: var(--text-3); font-size: var(--fs-xs); flex: none; }
+.cand:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
+.candActions { display: flex; align-items: center; gap: 8px; flex: 1 0 100%; }
+.cand button { padding: 3px 12px; white-space: nowrap; }
+.btn-preview { background: none; border: 0; color: var(--text-3); font-size: var(--fs-xs); padding: 0; }
+.btn-preview:hover { color: var(--text); }
+.btn-approve, .btn-reject, .btn-wash, .btn-preview { font-size: var(--fs-xs); }
+/* README「意味色規律」: カット/残すの単体アクションは無彩色(装飾グラデー
+   ション・カラーピル禁止) — btn-approve は raised(カット)、btn-wash は
+   ゴースト(残す)。btn-reject は「タイムラインから外す」「削除」「リセット」
+   のような本当に破壊的な操作 専用(--danger)。 */
+.cand .candActions { justify-content: flex-end; }
+.btn-approve { background: var(--raised); color: var(--text); border-color: var(--border); font-weight: 600; }
+.btn-approve:hover { background: #37373d; }
+.btn-wash { background: none; color: var(--text-3); border-color: var(--border-hover); }
+.btn-wash:hover { color: var(--text); border-color: rgba(255, 255, 255, 0.4); }
+.btn-reject { background: none; color: var(--danger); border-color: var(--danger-border); }
+.btn-reject:hover { background: rgba(201, 138, 128, 0.1); }
+
+.candGroup { display: flex; flex-direction: column; gap: 8px; margin-bottom: 4px; }
+.candGroupHeader {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; padding: 4px 2px;
+}
+.candGroupHeader .kind { font-size: 11px; font-weight: 600; color: var(--text-3); letter-spacing: 0.04em; background: none; border: 0; padding: 0; }
+/* README「まとめてカット」: テキストリンク(--link)、装飾ボタンにしない。
+   「まとめて残す」は候補カードの「残す」と同じ btn-wash クラスへ統一
+   (app.js の候補行/グループヘッダの「残す」ボタン — 意味色規律を1箇所に)。 */
+.candGroupHeader button.btn-approve, .candGroupHeader button.btn-wash {
+  background: none; border: 0; color: var(--link); font-size: var(--fs-xs); padding: 0; font-weight: 400;
+}
+.candGroupHeader button.btn-wash { color: var(--text-dim); }
+.candGroupHeader button.btn-approve:hover, .candGroupHeader button.btn-wash:hover { color: var(--text); }
+/* README「5件すべて適用(−3.5秒)」: 白プライマリ、全種別まとめて — button
+   本体は renderInbox が動的に足す(#candidatesSection の末尾)。 */
+.btn-applyAllCandidates {
+  align-self: stretch; background: var(--primary); color: var(--primary-text); border: 0;
+  border-radius: var(--radius); padding: 7px; font-size: var(--fs-base); font-weight: 600; margin-top: 2px;
+}
+.btn-applyAllCandidates:hover { background: var(--primary-hover); }
+
+/* ---- 履歴タブ ---- */
+#activityFeed { padding: 6px 12px 12px; display: flex; flex-direction: column; gap: 6px; }
+.activityCard {
+  padding: 6px 8px; border-radius: var(--radius); border-left: 2px solid var(--border);
+  background: var(--card-2); display: flex; flex-direction: column; gap: 4px;
+}
+.activityInfo { font-size: var(--fs-base); color: var(--text-dim); line-height: 1.5; }
 .activityInfo b { color: var(--text); }
 .activityActor { color: var(--link); }
 .activityActions { display: flex; gap: 6px; flex-wrap: wrap; }
 .activityActions button { font-size: var(--fs-xs); padding: 2px 8px; }
 .btn-activityShow { color: var(--link); border-color: var(--link); }
 
-/* ---- W-UI §0: floating "show" cards (candidate / compare) + D&D ingest flow card ---- */
-.showCard {
-  position: absolute; right: 16px; bottom: 16px; max-width: 340px; min-width: 220px;
-  background: var(--stage-surface); border: 1px solid var(--link); border-radius: 10px;
-  padding: 14px 16px; box-shadow: 0 8px 30px rgba(0,0,0,0.5); z-index: 5;
-  color: var(--text); font-size: var(--fs-sm);
+/* ---- フッター(README: 緑ドット+「Claude Cowork と接続中」+「Cowork を開く」) ---- */
+.claudeFooter {
+  flex: none; padding: 10px 14px; border-top: 1px solid var(--border); display: flex; align-items: center; gap: 8px;
 }
-.showCardLbl { font-weight: 600; margin: 6px 0; line-height: 1.5; }
-/* W-INTENT/W11: takes card is a stack of rows (one per detected take), so it
-   needs more breathing room than the single-fact candidate/compare cards. */
-.showCard.wide { max-width: 420px; max-height: 70vh; overflow-y: auto; }
-.cardClose {
-  position: absolute; top: 6px; right: 6px; padding: 0 6px; line-height: 1.4;
-  border-radius: 4px; background: none; border: 1px solid var(--stage-border);
-}
-.compareOps { list-style: none; margin-top: 8px; display: flex; flex-direction: column; gap: 4px; max-height: 160px; overflow-y: auto; }
-.compareOps li { font-size: var(--fs-xs); color: var(--text-dim); border-left: 2px solid var(--stage-border); padding-left: 6px; }
-.compareOps li b { color: var(--text); }
-.takeRow {
-  padding: 8px; margin-top: 8px; border-radius: var(--radius); border: 1px solid var(--stage-border); background: var(--stage-surface);
-}
-.takeRow.recommended { border-color: var(--keep); }
-.takeRow .showCardLbl { margin: 0 0 4px; font-weight: 500; }
-.ingestFlowCard { position: fixed; z-index: 20; }
+.footerDot { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); flex: none; }
+.footerText { flex: 1; font-size: var(--fs-xs); color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-#words { padding: 10px 12px; user-select: none; overflow-y: auto; }
-/* W-UI IA v2 §5b: 文字起こし未実行(または一部未実行)のときの素材別ステータス
-   一覧 — renderTranscriptEmptyState/renderTranscript in app.js. */
-.transcribeStatusList { padding: 8px 8px 0; display: flex; flex-direction: column; gap: 4px; }
-.transcribeStatusRow { display: flex; align-items: center; justify-content: space-between; gap: 8px; line-height: 1.6; }
-.btn-transcribeSource { font-size: var(--fs-xs); padding: 2px 8px; flex: none; }
-.srcHeading {
-  color: var(--text); font-size: var(--fs-xs); font-weight: 600; letter-spacing: 0.02em;
-  padding: 10px 0 4px; margin-top: 4px; border-bottom: 1px solid var(--zone-border);
+/* ---- 汎用: 右パネルの一時ビュー(← 戻る + タイトル)のヘッダー ---- */
+.rightViewHeader {
+  display: flex; align-items: center; gap: 10px; padding: 11px 14px; border-bottom: 1px solid var(--border); flex: none;
 }
-.srcHeading:first-child { margin-top: 0; }
-.w { cursor: pointer; border-radius: 3px; padding: 1px 1px; }
-.w:hover { background: rgba(143, 168, 201, 0.16); }
-.w:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
-.w.cut { color: #9a7b82; text-decoration: line-through; }
-.w.ignored { color: var(--text-dim); text-decoration: none; border-bottom: 1px dotted var(--text-dim); }
-.w.sel { background: rgba(143, 168, 201, 0.32); outline: 1px solid var(--link); outline-offset: -1px; }
-.w.active { background: rgba(143, 168, 201, 0.5); outline: 1px solid var(--link); outline-offset: -1px; }
-/* W-UI §0 "show words" — Claude pointing at specific words; a distinct
-   highlight from .sel (no delete-selection side effect). One-shot attention
-   cue, same tally exception as #showHighlight above. */
-.w.shown { outline: 2px solid var(--tally); outline-offset: 1px; border-radius: 3px; }
-.gap { color: var(--text-dim); font-size: var(--fs-xs); margin: 0 2px; }
+.rightViewTitle { font-weight: 600; font-size: var(--fs-base); }
+.rightViewBody { flex: 1; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 14px; }
 
-.thresholdCtl { display: flex; align-items: center; gap: 6px; color: var(--text-dim); font-size: var(--fs-xs); white-space: nowrap; }
-.thresholdCtl input[type="range"] { width: 90px; }
-#minGapVal { color: var(--text); font-variant-numeric: tabular-nums; min-width: 3em; }
+/* ---- クリップ/B-roll/モーション/スプライト/セリフ/BGM 選択インスペクタ ---- */
+#inspectorBody { gap: 10px; }
+.inspField { display: flex; flex-direction: column; gap: 4px; }
+.inspField label { font-size: var(--fs-xs); color: var(--text-dim); display: flex; justify-content: space-between; gap: 6px; }
+.inspRow { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.inspTrimRow { display: flex; align-items: center; gap: 6px; }
+.inspTrimRow button { font-size: var(--fs-xs); padding: 2px 8px; }
+.inspLabel { color: var(--text); font-weight: 600; font-size: var(--fs-base); word-break: break-word; }
+.inspMeta { color: var(--text-3); font-size: var(--fs-xs); font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.inspDivider { border-top: 1px solid var(--border-soft); margin: 2px 0; }
+#inspectorBody .btn-reject { align-self: flex-start; }
 
-.candGroup { display: flex; flex-direction: column; gap: 6px; margin-bottom: 4px; }
-.candGroupHeader {
-  /* self-critique pass: kind badge + 2 action buttons don't fit one row at
-     the default aside width once buttons refuse to shrink (see the base
-     `button` rule's doc) — wrap the row instead of squeezing text, same
-     pattern .detectSettingsBar uses above. */
-  display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; padding: 4px 2px;
-  border-bottom: 1px solid var(--zone-border);
+/* ---- 字幕スタイル(README: プレビュー枠→プリセット→フォント/色3種/サイズ/
+   縁/透過/最大文字数→リセット・キャンセル・適用) ---- */
+.capPreview {
+  border-radius: var(--radius); background: #111113; padding: 18px 10px; text-align: center;
+  outline: 1px solid var(--border-soft); flex: none;
 }
-.candGroupHeader button { padding: 2px 8px; font-size: var(--fs-xs); }
-.cand {
-  display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; padding: 6px 8px;
-  background: var(--zone-surface-2); border: 1px solid var(--zone-border); border-radius: var(--radius); cursor: pointer;
+.capEnabledRow { display: flex; flex-direction: row !important; align-items: center; gap: 6px; font-size: var(--fs-sm); color: var(--text-2); }
+.capField { display: flex; flex-direction: column; gap: 4px; }
+.capField label { font-size: var(--fs-sm); color: var(--text-3); display: flex; justify-content: space-between; gap: 6px; }
+.capField select, .capField input[type="range"] { width: 100%; }
+.capField input[type="color"] {
+  width: 100%; height: 26px; padding: 0; border: 1px solid var(--border-hover); border-radius: var(--radius);
+  background: transparent; cursor: pointer;
 }
-.cand .lbl, .cand .srcTag, .cand .dur { flex: none; }
-.cand .lbl { flex: 1 1 auto; min-width: 60px; }
-.candActions { display: flex; gap: 6px; flex: 1 0 100%; justify-content: flex-end; }
-.cand .kind { font-size: 10px; padding: 1px 6px; border-radius: 999px; background: var(--zone-surface-2); border: 1px solid var(--zone-border); white-space: nowrap; flex-shrink: 0; }
-.cand .kind.filler { color: #d0a878; }
-.cand .kind.retake { color: #b79ce0; }
-.cand .kind.low-energy { color: #8fb08f; }
-.cand .lbl { flex: 1; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cand .srcTag { color: var(--text-dim); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.cand .dur { color: var(--text-dim); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; }
-.cand:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
-.cand button { padding: 2px 8px; white-space: nowrap; }
-.btn-preview { color: var(--text); font-size: var(--fs-xs); }
-.btn-approve, .btn-reject, .btn-preview { font-size: var(--fs-xs); }
-.btn-approve { color: var(--keep); border-color: var(--keep); }
-.btn-approve:hover { background: rgba(143, 185, 150, 0.12); }
-.btn-reject { color: var(--reject); border-color: var(--reject); }
-.btn-reject:hover { background: rgba(201, 123, 107, 0.12); }
-/* 候補カード(#candidateCard)の「残す」— declining a cut candidate isn't a
-   destructive act (nothing is lost, the footage just stays put), so it
-   doesn't earn a semantic status color at all; neutral --wash outline
-   instead. Kept distinct from .btn-reject, which still colors the いま
-   タブ・inbox row's per-row/bulk 却下 buttons. */
-.btn-wash { color: var(--text-dim); border-color: var(--wash); }
-.btn-wash:hover { border-color: var(--text-dim); background: rgba(255, 255, 255, 0.05); }
+.capColorRow { display: flex; gap: 8px; }
+.capColorRow .capField { flex: 1; }
+.capActions { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+#capResetBtn { color: var(--danger); border-color: var(--danger-border); }
+#capResetBtn:hover { background: rgba(201, 138, 128, 0.1); }
 
-/* ---- media pool ("素材") panel ---- */
-/* W-UI IA v2 波2 §7: キットのリンク状態(素材タブ先頭、未リンク時は要素ごと
-   hidden — renderKitStatus in app.js)。 */
-.kitStatus {
-  margin: 8px 8px 0; padding: 6px 10px; border-radius: var(--radius);
-  background: var(--zone-surface-2); border: 1px solid var(--zone-border);
-  color: var(--text-dim); font-size: var(--fs-xs);
-  /* column, not row: a row flex context with no explicit basis on the text
-     span let the flex algorithm squeeze it down to a sliver next to the
-     chip button, and CJK text has no spaces to break on — it wrapped one
-     character per line in that sliver. Stacking avoids the whole class of
-     "flex child got squeezed" wrapping bugs for any future 2nd chip too. */
-  display: flex; flex-direction: column; align-items: flex-start; gap: 6px;
+/* ---- 書き出しビュー(README ディレクター適応1) ---- */
+.exportResultCard { display: flex; flex-direction: column; gap: 8px; }
+.exportResultRow {
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 8px 10px; border-radius: var(--radius); background: var(--card);
+  border: 1px solid var(--border); border-left: 2px solid var(--wash);
 }
-.kitStatus > span { white-space: normal; }
-/* W-UI IA v2 波2 §4: 音声パネル(プロジェクト全体設定 — BGM 単体の調整は
-   選択インスペクタ側)。既定は閉じた <details>、他の折りたたみ(検出条件)と
-   同じ語彙。 */
-.audioPanel { margin: 8px 8px 0; border: 1px solid var(--zone-border); border-radius: var(--radius); background: var(--zone-surface-2); }
-.audioPanel summary {
-  cursor: pointer; padding: 8px 10px; color: var(--text); font-size: var(--fs-sm); font-weight: 600; list-style: revert;
-}
-.audioPanelBody { padding: 4px 10px 12px; display: flex; flex-direction: column; gap: 8px; }
-.audioField { display: flex; flex-direction: column; gap: 4px; }
-.audioField label { font-size: var(--fs-xs); color: var(--text-dim); display: flex; justify-content: space-between; gap: 6px; }
-.audioField select { align-self: flex-start; min-width: 140px; }
-.audioField input[type="range"] { width: 100%; }
-.audioCheck { display: flex; align-items: center; gap: 6px; font-size: var(--fs-xs); color: var(--text-dim); }
-.musicAddForm { display: flex; flex-direction: column; gap: 6px; padding: 8px; border-radius: var(--radius); background: var(--zone-surface); border: 1px solid var(--zone-border); }
-.musicAddForm label { display: flex; flex-direction: column; gap: 4px; font-size: var(--fs-xs); color: var(--text-dim); }
-.musicAddForm input[type="text"] { padding: 4px 6px; background: var(--zone-surface-2); border: 1px solid var(--zone-border); border-radius: 4px; color: var(--text); }
-.musicAddActions { display: flex; gap: 6px; justify-content: flex-end; }
-#mediaList { padding: 8px; display: flex; flex-direction: column; gap: 6px; overflow-y: auto; }
-.srcRow {
-  display: flex; gap: 10px; align-items: center; padding: 6px; cursor: pointer;
-  background: var(--zone-surface-2); border: 1px solid var(--zone-border); border-radius: var(--radius);
-}
-.srcRow:hover { border-color: var(--link); }
-.srcRow:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
-.srcRow.previewing { border-color: var(--link); box-shadow: 0 0 0 1px var(--link); }
-.srcThumb {
-  width: 72px; height: 40px; object-fit: cover; border-radius: 4px;
-  background: #0a0c10; flex: none;
-}
-.srcInfo { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
-.srcNameRow { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
-.srcName {
-  font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
-}
-.srcDur { color: var(--text-dim); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; flex: none; }
-.srcBadges { display: flex; gap: 4px; flex-wrap: wrap; }
-.badge {
-  font-size: 10px; padding: 1px 6px; border-radius: 999px; background: var(--zone-surface-2); border: 1px solid var(--zone-border); color: var(--text);
-}
-.badge.ok { background: rgba(143, 185, 150, 0.18); border-color: transparent; color: var(--keep); }
-.badge.warn { background: rgba(232, 160, 60, 0.18); border-color: transparent; color: var(--tally); }
-.srcUsage { display: flex; align-items: center; gap: 8px; }
-.srcUsageBar {
-  display: block; flex: 1 1 auto; height: 6px; min-width: 40px; border-radius: 999px;
-  background: var(--zone-border); overflow: hidden;
-}
-.srcUsageFill { display: block; height: 100%; background: var(--link); }
-.srcUsageLabel { color: var(--text-dim); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; flex: none; }
-.srcActions { display: flex; flex-direction: column; gap: 4px; flex: none; }
-.srcActions button { padding: 2px 8px; font-size: var(--fs-xs); white-space: nowrap; }
+.exportResultRow.fail { border-left-color: var(--danger); }
+.exportResultWarning { color: var(--pending); }
+.exportAskRow { display: flex; flex-direction: column; gap: 8px; padding-top: 4px; border-top: 1px solid var(--border-soft); }
 
-.sceneGrid {
-  display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 6px;
-  padding: 4px 4px 4px 20px; margin-top: -2px;
-}
-.sceneItem {
-  display: flex; flex-direction: column; gap: 4px; padding: 6px; border-radius: var(--radius);
-  background: var(--zone-surface); border: 1px solid var(--zone-border);
-}
-.sceneItem:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
-.sceneItem.review-keep { border-color: var(--keep); box-shadow: 0 0 0 1px var(--keep); }
-.sceneItem.review-reject { border-color: var(--reject); opacity: 0.55; }
-.btn-sceneSeek, .btn-sceneAdd { font-size: var(--fs-xs); padding: 2px 6px; }
-.btn-sceneSeek { font-variant-numeric: tabular-nums; }
-.sceneNote { color: var(--text-dim); font-size: var(--fs-xs); font-style: italic; overflow-wrap: break-word; }
-.sceneReview { display: flex; gap: 4px; }
-.btn-sceneKeep, .btn-sceneReject { font-size: var(--fs-xs); padding: 1px 8px; line-height: 1.4; }
-.btn-sceneKeep[aria-pressed="true"] { background: var(--keep); border-color: var(--keep); color: #06210f; }
-.btn-sceneReject[aria-pressed="true"] { background: var(--reject); border-color: var(--reject); color: #2a0505; }
-.cullBadge { background: var(--zone-surface-2); }
-
-/* ---- W-UI §4: window-wide drag-and-drop ingest ---- */
-#dropOverlay {
-  position: fixed; inset: 0; z-index: 30; display: flex; align-items: center; justify-content: center;
-  background: rgba(20, 30, 40, 0.6);
-}
-.dropOverlayInner {
-  padding: 24px 40px; background: var(--stage-surface); border: 3px dashed var(--link); border-radius: 12px;
-  font-size: var(--fs-lg); font-weight: 600; color: var(--text); box-shadow: 0 8px 40px rgba(0,0,0,0.5);
-}
-
-#toast {
-  position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
-  background: var(--stage-surface); border: 1px solid var(--stage-border); padding: 8px 16px; border-radius: var(--radius);
-  box-shadow: 0 4px 20px rgba(0,0,0,0.5); z-index: 10;
-  display: flex; align-items: center; gap: 10px; max-width: 60vw; font-size: var(--fs-sm);
-}
-#toast[role="alert"] { border-color: var(--reject); }
-/* mutate 応答の warning フィールド(例: BGM のダッキングが保護区間と重なる)
-   — エラーではないが読み流されては困るので amber + 手動close、既存の
-   自動消滅トーストより長め(app.js の toast(msg,{type:'warn'}) 呼び出し)。 */
-#toast[data-variant="warn"] { border-color: var(--tally); }
-.toastClose {
-  padding: 0 6px; border-radius: 4px; line-height: 1; flex: none;
-  background: none; border: 1px solid var(--stage-border);
-}
-/* ---- W-UI IA v2 波2 §8: 「Claude に頼む」チップ — 行き止まりで精密な
-   依頼文をクリップボードへコピーする(askClaudeChip in app.js)。構造系は
-   会話へ、という製品の賭けの実装(タリー琥珀は使わない — 警告ではなく案内)。 ---- */
+/* ---- W-UI IA v2 波2 §8: 「Cowork に頼む」チップ ---- */
 .askChip {
   display: inline-flex; align-items: center; gap: 4px; font-size: var(--fs-xs);
   color: var(--text-dim); border-color: var(--wash); padding: 2px 8px; margin-top: 2px;
 }
 .askChip:hover { color: var(--text); border-color: var(--text-dim); }
 .askChip::before { content: '💬'; font-size: 10px; }
-/* 波2 追補#1: custom-html モーションは書き出し時に焼き込まれない(プレビュー
-   だけの演出) — 常時バッジで明示。tally(警告)ではなく --wash(中立の注意
-   書き)。 */
-.moBlock .exportSkipBadge {
-  display: inline-block; margin-left: 3px; padding: 0 3px; border-radius: 2px;
-  background: rgba(0,0,0,0.35); color: #e7e2d8; font-size: 8px; font-weight: 700;
+
+/* ---- 破壊的操作(README「タイムラインから外す」: color#c98a80,
+   border rgba(201,123,107,0.4)) ---- */
+#inspectorBody .btn-reject, #capResetBtn {
+  background: none; color: var(--danger); border-color: var(--danger-border);
+}
+#inspectorBody .btn-reject:hover { background: rgba(201, 138, 128, 0.1); }
+
+/* =============================================================================
+ * フローティングカード(候補/比較/テイク/取り込み確認)・トースト・ダイアログ
+ * ========================================================================== */
+.showCard {
+  position: absolute; right: 16px; bottom: 16px; max-width: 340px; min-width: 220px;
+  background: var(--card); border: 1px solid var(--link); border-radius: 10px;
+  padding: 14px 16px; box-shadow: 0 8px 30px rgba(0,0,0,0.5); z-index: 5;
+  color: var(--text); font-size: var(--fs-base);
+}
+.showCardLbl { font-weight: 600; margin: 6px 0; line-height: 1.5; }
+.showCard.wide { max-width: 420px; max-height: 70vh; overflow-y: auto; }
+.cardClose {
+  position: absolute; top: 6px; right: 6px; padding: 0 6px; line-height: 1.4;
+  border-radius: var(--radius-sm); background: none; border: 1px solid var(--border-hover);
+}
+.compareOps { list-style: none; margin-top: 8px; display: flex; flex-direction: column; gap: 4px; max-height: 160px; overflow-y: auto; }
+.compareOps li { font-size: var(--fs-xs); color: var(--text-dim); border-left: 2px solid var(--border-hover); padding-left: 6px; }
+.compareOps li b { color: var(--text); }
+.takeRow { padding: 8px; margin-top: 8px; border-radius: var(--radius); border: 1px solid var(--border-hover); background: var(--card); }
+.takeRow.recommended { border-color: var(--ok); }
+.takeRow .showCardLbl { margin: 0 0 4px; font-weight: 500; }
+.ingestFlowCard { position: fixed; z-index: 20; }
+
+#dropOverlay {
+  position: fixed; inset: 0; z-index: 30; display: flex; align-items: center; justify-content: center;
+  background: rgba(19, 19, 21, 0.75);
+}
+.dropOverlayInner {
+  padding: 24px 40px; background: var(--card); border: 3px dashed var(--link); border-radius: 12px;
+  font-size: var(--fs-xl); font-weight: 600; color: var(--text); box-shadow: 0 8px 40px rgba(0,0,0,0.5);
 }
 
+#toast {
+  position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+  background: var(--card); border: 1px solid var(--border-hover); padding: 8px 16px; border-radius: var(--radius);
+  box-shadow: 0 4px 20px rgba(0,0,0,0.5); z-index: 10;
+  display: flex; align-items: center; gap: 10px; max-width: 60vw; font-size: var(--fs-base);
+}
+#toast[role="alert"] { border-color: var(--danger); }
+#toast[data-variant="warn"] { border-color: var(--pending); }
+.toastClose { padding: 0 6px; border-radius: var(--radius-sm); line-height: 1; flex: none; background: none; border: 1px solid var(--border-hover); }
+
+/* 自己レビュー: グローバルの `* { margin: 0 }` リセット(このファイル冒頭)が
+   <dialog> のUA既定 `margin: auto`(showModal() 時の中央寄せ)を上書きして
+   しまい、ダイアログが画面左上に張り付く既存バグがあった — margin: auto を
+   明示的に戻す(この修正はプリexisting、W-DESIGN固有の問題ではない)。 */
 dialog#shortcutsDialog {
-  background: var(--stage-surface); color: var(--text); border: 1px solid var(--stage-border); border-radius: 10px;
-  padding: 20px 24px; min-width: 320px; max-width: 480px; box-shadow: 0 8px 40px rgba(0,0,0,0.6);
+  margin: auto;
+  background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 10px;
+  padding: 22px 26px; min-width: 340px; max-width: 480px; box-shadow: 0 16px 60px rgba(0,0,0,0.6);
 }
-dialog#shortcutsDialog::backdrop { background: rgba(0,0,0,0.6); }
-dialog#shortcutsDialog h2 { font-size: var(--fs-lg); font-weight: 600; margin-bottom: 12px; }
+dialog#shortcutsDialog::backdrop { background: rgba(0,0,0,0.65); }
+dialog#shortcutsDialog h2 { font-size: var(--fs-lg); font-weight: 600; margin-bottom: 14px; }
 dialog#shortcutsDialog table { border-collapse: collapse; width: 100%; margin-bottom: 14px; }
-dialog#shortcutsDialog td { padding: 4px 8px; font-size: var(--fs-sm); border-bottom: 1px solid var(--stage-border); }
-dialog#shortcutsDialog td:first-child { color: var(--link); font-family: var(--font-mono); white-space: nowrap; font-weight: 600; }
-dialog#shortcutsDialog td:last-child { color: var(--text); }
+dialog#shortcutsDialog td { padding: 6px 2px; font-size: var(--fs-sm); border-bottom: 1px solid var(--border-soft); }
+dialog#shortcutsDialog td:first-child { color: var(--text-2); min-width: 130px; font-weight: 600; }
+dialog#shortcutsDialog td:last-child { color: var(--text-3); }
 dialog#shortcutsDialog .hintText { display: block; margin-bottom: 14px; }
-
-/* ---- W-CAP: caption style popover ---- */
-dialog#captionStyleDialog {
-  background: var(--stage-surface); color: var(--text); border: 1px solid var(--stage-border); border-radius: 10px;
-  padding: 18px 22px; min-width: 280px; max-width: 360px; box-shadow: 0 8px 40px rgba(0,0,0,0.6);
-}
-dialog#captionStyleDialog::backdrop { background: rgba(0,0,0,0.6); }
-dialog#captionStyleDialog h2 { font-size: var(--fs-lg); font-weight: 600; margin-bottom: 14px; }
-.capEnabledRow { flex-direction: row !important; align-items: center; gap: 8px; font-size: var(--fs-sm); color: var(--text); }
-.capField { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
-.capField label { font-size: var(--fs-xs); color: var(--text-dim); display: flex; justify-content: space-between; gap: 6px; }
-.capField select, .capField input[type="range"] { width: 100%; }
-.capField input[type="color"] {
-  width: 100%; height: 26px; padding: 0; border: 1px solid var(--stage-border); border-radius: 4px;
-  background: transparent; cursor: pointer;
-}
-.capColorRow { display: flex; gap: 10px; }
-.capColorRow .capField { flex: 1; margin-bottom: 10px; }
-.capActions { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
-#capResetBtn { color: var(--reject); border-color: var(--reject); }
-
-#paneDivider {
-  flex: none; width: 6px; cursor: col-resize; background: var(--zone-border);
-  transition: background 0.15s;
-}
-#paneDivider:hover, #paneDivider.dragging { background: var(--link); }
-#paneDivider:focus-visible { outline: 2px solid var(--link); outline-offset: -2px; }

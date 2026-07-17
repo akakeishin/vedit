@@ -4,39 +4,122 @@
 <meta charset="utf-8">
 <title>vedit</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- W-DESIGN: Claude Design ハンドオフ(design_handoff_vedit_nle_redesign/README.md)の
+     フォント指定。IBM Plex 系が読み込めない環境向けのフォールバックは style.css の
+     --font-jp/--font-mono 側で担保(このlinkが失敗しても崩れない)。 -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+JP:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <header>
   <div class="hdrIdentity">
+    <span class="hdrLogo" aria-hidden="true">v</span>
+    <span class="hdrAppName">vedit</span>
+    <span class="hdrSep" aria-hidden="true"></span>
     <span id="projName">vedit</span>
-    <span id="headerTc" class="mono">0:00.0</span>
+    <!-- W-UI IA v2 §1: 「現在の版 N」+ 自動保存の弱表示(renderAll in app.js)。 -->
+    <span id="revLabel" class="hdrRevLabel"></span>
+    <!-- 既存: ヘッダー常設のライブタイムコード(tick/tickComposition in app.js)。
+         v2.dc.html のヘッダーには無いが、既存機能を壊さないため縮小して維持
+         (W-DESIGN 既知差分)。 -->
+    <span id="headerTc" class="mono hdrTc">0:00.0</span>
+    <!-- W-UI redesign §1: 出力解像度/素材スペック/fps の弱い二次情報
+         (renderStat in app.js)。v2.dc.html には無い要素だが、既存の有用な
+         情報を失わないため小さく残す(W-DESIGN 既知差分)。 -->
+    <span id="stat" class="hdrSecondary"></span>
   </div>
-  <span id="stat" class="hdrSecondary"></span>
-  <!-- W-UI IA v2 波2 §3: Claude 状態の常設表示(WS 活動+保留候補数から導出。
-       renderClaudeStatus in app.js)。 -->
-  <span id="claudeStatus" class="claudeStatus idle" aria-live="polite"></span>
-  <span class="spacer"></span>
-  <!-- 波2 追補#2: 出力比率の変更入口(表示のみだった #stat の出力比率に対応する
-       編集手段 — op:'reframe'、focus は center 既定。renderReframeSelect/
-       reframeSelect.onchange in app.js)。 -->
-  <label class="reframeCtl" title="出力の縦横比を変更します(クロップ位置は後から調整できます)">
-    比率
-    <select id="reframeSelect" aria-label="出力の縦横比を変更">
-      <option value="">変更しない</option>
-      <option value="16:9">16:9</option>
-      <option value="9:16">9:16</option>
-      <option value="1:1">1:1</option>
-    </select>
-  </label>
-  <!-- W-UI IA v2 §1: 「現在の版 N」— ヘッダー右端の弱表示(旧#transport内から移設)。
-       波2 §7: 「自動保存」を明示(renderAll in app.js が textContent を組み立てる)。 -->
-  <span id="revLabel" class="hdrRevLabel"></span>
-  <button id="shortcutsBtn" title="ショートカット一覧 (?)" aria-label="ショートカット一覧を開く">?</button>
-  <span id="conn" class="connDot" title="接続待ち" aria-label="接続状態: 接続待ち">●</span>
+  <div class="hdrCenter">
+    <!-- W-UI IA v2 波2 §3: Claude 状態の常設表示(WS 活動+保留候補数から導出。
+         renderClaudeStatus in app.js)。 -->
+    <span id="claudeStatus" class="claudeStatus idle" aria-live="polite"><span class="claudeDot" aria-hidden="true"></span><span class="claudeText"></span></span>
+  </div>
+  <div class="hdrRight">
+    <!-- 波2 追補#2: 出力比率の変更入口(op:'reframe')。 -->
+    <label class="reframeCtl" title="出力の縦横比を変更します(クロップ位置は後から調整できます)">
+      比率
+      <select id="reframeSelect" aria-label="出力の縦横比を変更">
+        <option value="">変更しない</option>
+        <option value="16:9">16:9</option>
+        <option value="9:16">9:16</option>
+        <option value="1:1">1:1</option>
+      </select>
+    </label>
+    <button id="shortcutsBtn" class="btnIcon" title="ショートカット一覧 (?)" aria-label="ショートカット一覧を開く">?</button>
+    <span id="conn" class="connDot" title="接続待ち" aria-label="接続状態: 接続待ち">●</span>
+    <!-- W-DESIGN ディレクター適応1: 実行はしない。クリックで右パネルに
+         「書き出し」ビューを開く(openExportView in app.js)。 -->
+    <button id="exportBtn" class="btnPrimary" aria-label="書き出しビューを開く">書き出し</button>
+  </div>
 </header>
 
 <main>
+  <!-- W-DESIGN: 左パネル 300px(素材 / 文字起こし)。旧右 aside の #mediaPanel /
+       #transcriptPanel をそのまま移設(内部構造・IDは無変更)。 -->
+  <aside id="leftPanel" aria-label="素材と文字起こし">
+    <div class="tabs leftTabs" role="tablist" aria-label="左パネル切替">
+      <button class="tab active" id="tab-mediaPanel" role="tab" aria-selected="true" aria-controls="mediaPanel" data-panel="mediaPanel" tabindex="0">素材</button>
+      <button class="tab" id="tab-transcriptPanel" role="tab" aria-selected="false" aria-controls="transcriptPanel" data-panel="transcriptPanel" tabindex="-1">文字起こし</button>
+    </div>
+    <div id="mediaPanel" class="panel active" role="tabpanel" aria-labelledby="tab-mediaPanel" tabindex="0">
+      <div class="panelbar">
+        <button id="buildSelectsBtn" hidden>採用シーンで仮編集を作る(戻せます)</button>
+        <button id="takesCheckBtn">言い直しを確認</button>
+      </div>
+      <!-- W-UI IA v2 波2 §7: キットのリンク状態(未リンク時は非表示 —
+           renderKitStatus in app.js)。 -->
+      <div id="kitStatus" class="kitStatus" hidden></div>
+      <!-- W-UI IA v2 波2 §4: 音声パネル(プロジェクト全体の設定)。BGM 単体の
+           gain/フェード/ダッキングは右パネルの選択インスペクタ(BGM選択時)側。
+           renderAudioPanel in app.js。W-DESIGN: v2.dc.html の「オーディオ」
+           セクションに合わせ既定で開いた状態にする(機能・IDは無変更)。 -->
+      <details id="audioPanel" class="audioPanel" open>
+        <summary>オーディオ</summary>
+        <div class="audioPanelBody">
+          <div class="audioField">
+            <label for="audioRepairPreset">会話リペア(声を整える)</label>
+            <select id="audioRepairPreset">
+              <option value="off">オフ</option>
+              <option value="outdoor">屋外</option>
+              <option value="indoor">屋内</option>
+              <option value="wireless">ワイヤレスマイク</option>
+            </select>
+          </div>
+          <label class="audioCheck"><input type="checkbox" id="audioRepairDeess"> 歯擦音を抑制(デエッサー)</label>
+          <span class="exportOnlyBadge" title="このリペア効果はプレビューに反映されません。実際の仕上がりは書き出しで確認してください">書き出しで確認</span>
+          <div class="audioField">
+            <label for="audioMixDuck">BGMのダッキング量 <span id="audioMixDuckVal" class="mono"></span></label>
+            <input type="range" id="audioMixDuck" min="-40" max="0" step="1">
+          </div>
+          <div class="audioField">
+            <label for="audioMixLufs">全体の目標ラウドネス <span id="audioMixLufsVal" class="mono"></span></label>
+            <input type="range" id="audioMixLufs" min="-40" max="-5" step="1">
+            <span class="exportOnlyBadge" title="最終ミックスの音量正規化はプレビューに反映されません。実際の音量は書き出しで確認してください">書き出しで確認</span>
+          </div>
+          <button id="musicAddBtn">BGMを追加</button>
+          <div id="musicAddForm" class="musicAddForm" hidden>
+            <label>ファイルのパス<input type="text" id="musicAddPath" placeholder="/path/to/music.mp3" aria-label="BGM/SEファイルのパス"></label>
+            <label class="audioCheck"><input type="checkbox" id="musicAddSfx"> 効果音として追加(SFX — ダッキングしない)</label>
+            <div class="musicAddActions">
+              <button id="musicAddCancel">キャンセル</button>
+              <button id="musicAddSubmit">追加</button>
+            </div>
+            <p class="hintText">ファイルをこのフォームにドロップしても構いません。位置は現在の再生位置です。</p>
+          </div>
+        </div>
+      </details>
+      <div id="mediaList" role="listbox" aria-label="素材"></div>
+    </div>
+    <div id="transcriptPanel" class="panel" role="tabpanel" aria-labelledby="tab-transcriptPanel" tabindex="0">
+      <div class="panelbar">
+        <button id="removeSelBtn" disabled>選択を削除</button>
+        <span id="selStatus" role="status" class="sr-only"></span>
+      </div>
+      <div id="words" role="listbox" aria-label="文字起こし" aria-multiselectable="true"></div>
+    </div>
+  </aside>
+
   <section id="stage" aria-label="プレビュー">
     <div id="videoWrap">
       <div id="videoBox">
@@ -59,7 +142,7 @@
         </div>
       </div>
       <!-- W-UI §0: candidate/compare "show" cards float over the stage,
-           front-and-center, independent of the 確認 tab's inbox list. -->
+           front-and-center, independent of the 会話 tab's inbox list. -->
       <div id="candidateCard" class="showCard" hidden role="dialog" aria-label="候補カード">
         <button class="cardClose" id="candidateCardClose" aria-label="閉じる">×</button>
         <div id="candidateCardBody"></div>
@@ -75,11 +158,33 @@
       </div>
     </div>
     <div id="transport">
-      <button id="playBtn" aria-label="再生" aria-pressed="false">▶</button>
-      <span id="tc">0:00.0 (f0) / 0:00.0 (f0)</span>
+      <span id="tc" class="tcMain"><span id="tcNow">0:00.0</span> <span id="tcTotal" class="tcDim">/ 0:00.0</span></span>
+      <span class="spacer"></span>
+      <div class="transportControls">
+        <button id="jumpBackBtn" class="btnTransportSm" title="2秒巻き戻して再生 (J)" aria-label="2秒巻き戻して再生">⏮</button>
+        <button id="playBtn" class="btnTransportPlay" aria-label="再生" aria-pressed="false">▶</button>
+        <button id="cycleRateBtn" class="btnTransportSm" title="再生 1x→1.5x→2x (L)" aria-label="再生速度を切り替え">⏭</button>
+      </div>
       <span id="rateLabel" hidden></span>
       <span class="spacer"></span>
+      <span id="frameLabel" class="frameLabel mono"></span>
     </div>
+
+    <!-- W-DESIGN: タイムラインツールバー。「選択」ツールのみ実装(分割/テキストは
+         作らない)。スナップは実際にトリム/移動ドラッグへ効く実機能
+         (S.snapEnabled, startTrimDrag 等 in app.js)。拡大は既存にズーム機構が
+         無いため disabled+title「今後対応」— 嘘の機能を置かない。全体表示は
+         タイムラインが常に全区間表示のため実質つねに満たされている状態。 -->
+    <div class="tlToolbar">
+      <button class="tlTool active" id="tlToolSelect" type="button" aria-pressed="true" title="選択ツール(現在の唯一のツール)">選択</button>
+      <span class="tlToolbarSep" aria-hidden="true"></span>
+      <label class="tlSnapCheck"><input type="checkbox" id="snapToggle" checked> スナップ</label>
+      <span class="spacer"></span>
+      <span class="tlZoomLabel">拡大</span>
+      <input type="range" id="tlZoomRange" min="0" max="100" value="100" disabled title="今後対応">
+      <button id="tlFitBtn" type="button" title="タイムラインは常に全区間を表示しています">全体表示</button>
+    </div>
+
     <!-- W-UI IA v2 波2 §2: トラックラベルガター(#trackGutter, 存在する行だけ
          renderTrackGutter が表示)+簡素な時間目盛り(#timeRuler,
          renderRuler)を追加。既存の行はすべて #timelineTracks の中へそのまま
@@ -123,142 +228,166 @@
   </section>
 
   <div id="paneDivider" role="separator" aria-orientation="vertical" tabindex="0"
-       aria-label="サイドパネルの幅を調整(ドラッグ / ←→キー / ダブルクリックでリセット)"
+       aria-label="Claude パネルの幅を調整(ドラッグ / ←→キー / ダブルクリックでリセット)"
        title="ドラッグで幅調整 / ダブルクリックでリセット"></div>
 
-  <aside>
-    <!-- W-UI IA v2 波2 §1: 選択インスペクタ。クリップ/B-roll/モーション/
-         スプライト/セリフ/BGM を選択すると #tabsView を隠し、右ペインが
-         一時的にこちらへ遷移する(← 確認に戻る で復帰、selectItem/
-         renderInspector in app.js)。字幕 cue は既存の captionStyleDialog
-         (スタイルインスペクタ)へ直接遷移するため、ここには含めない。 -->
-    <div id="inspectorView" hidden>
-      <div class="inspectorHeader">
-        <button id="inspectorBack">← 確認に戻る</button>
-        <span id="inspectorTitle"></span>
-      </div>
-      <div id="inspectorBody"></div>
-    </div>
-    <div id="tabsView">
-    <div class="tabs" role="tablist" aria-label="パネル切替">
-      <button class="tab active" id="tab-nowPanel" role="tab" aria-selected="true" aria-controls="nowPanel" data-panel="nowPanel" tabindex="0">確認<span id="inboxCount" class="badge cullBadge tallyPulse" hidden></span></button>
-      <button class="tab" id="tab-transcriptPanel" role="tab" aria-selected="false" aria-controls="transcriptPanel" data-panel="transcriptPanel" tabindex="-1">文字起こし</button>
-      <button class="tab" id="tab-mediaPanel" role="tab" aria-selected="false" aria-controls="mediaPanel" data-panel="mediaPanel" tabindex="-1">素材</button>
-      <button class="tab" id="tab-historyPanel" role="tab" aria-selected="false" aria-controls="historyPanel" data-panel="historyPanel" tabindex="-1">履歴</button>
-    </div>
-
-    <!-- W-UI IA v2 §2: 確認タブ = 「Claude の編集提案」(candidates) + 「対応が必要」
-         (アンカー切れ・色警告・聞き取り確認・QC) の2群。旧「すべて承認」は廃止
-         — 一括操作はグループヘッダの結果明示ボタン1箇所だけ(renderInbox/
-         renderCandidatesGroup/renderWarningsGroup in app.js)。 -->
-    <div id="nowPanel" class="panel active" role="tabpanel" aria-labelledby="tab-nowPanel" tabindex="0">
-      <div id="claudeStrip" class="claudeStrip" hidden aria-live="polite">
-        <div class="spin"></div><span id="claudeStripText"></span>
-      </div>
-
-      <!-- 波2 追補#5: 保護区間(intent zones)は構造編集(intent-remove)の対象
-           — 「Claude に頼む」チップの置き場所(renderIntentZonesInfo in app.js)。
-           ゾーンが無いプロジェクトでは要素ごと hidden。 -->
-      <div id="intentZonesInfo" class="intentZonesInfo" hidden></div>
-
-      <!-- 波2.5: 「最後の書き出し」カード(GET /api/export-results, 実装済み —
-           read-only。実行系のボタンはここに作らない)。レコード0件・
-           プロジェクト空のいずれでも非表示(renderExportResultCard/
-           fetchExportResults in app.js)。 -->
-      <div id="exportResultCard" class="exportResultCard" hidden></div>
-
-      <!-- W-UI IA v2 §5a: プロジェクトが空(素材ゼロ)のときだけ表示し、
-           下の2群は隠す(renderInbox の isProjectEmpty() 分岐)。 -->
-      <div id="confirmEmptyProject" class="hintText confirmEmptyProject" hidden>確認するものはまだありません</div>
-
-      <div id="candidatesSection" class="inboxGroup">
-        <div class="inboxHeading">
-          <span>Claude の編集提案</span><span id="candidatesCount" class="hintText"></span>
+  <!-- W-DESIGN: 右パネル 344px。mode: 'claude' | 'clip' | 'caption' | 'export'
+       の4値排他表示(renderRightPanel in app.js が hidden を切り替える)。 -->
+  <aside id="rightPanel" aria-label="Claude パネル">
+    <div id="claudeView">
+      <div class="claudeHeader">
+        <div class="claudeAvatar" aria-hidden="true">✳</div>
+        <div class="claudeHeaderText">
+          <span class="claudeName">Claude</span>
+          <span id="claudeSubline" class="claudeSubline"></span>
         </div>
-        <details id="detectSettings" class="detectSettings" hidden>
-          <summary>検出条件</summary>
-          <div class="panelbar detectSettingsBar">
-            <label class="thresholdCtl">無音として候補にする最短時間
-              <input type="range" id="minGapRange" min="0.3" max="2.0" step="0.1" value="0.7">
-              <span id="minGapVal">0.7s</span>
-            </label>
-            <button id="redetectBtn">この条件で候補を作り直す</button>
-          </div>
-        </details>
-        <div id="inboxList"></div>
-      </div>
-
-      <div id="warningsSection" class="inboxGroup">
-        <div class="inboxHeading">
-          <span>対応が必要</span><span id="warningsCount" class="hintText"></span>
+        <span class="spacer"></span>
+        <div class="segTabs tabs" role="tablist" aria-label="Claude パネル切替">
+          <button class="tab active" id="tab-nowPanel" role="tab" aria-selected="true" aria-controls="nowPanel" data-panel="nowPanel" tabindex="0">会話<span id="inboxCount" class="badge cullBadge tallyPulse" hidden></span></button>
+          <button class="tab" id="tab-historyPanel" role="tab" aria-selected="false" aria-controls="historyPanel" data-panel="historyPanel" tabindex="-1">履歴</button>
         </div>
-        <div id="warningsEmpty" class="hintText inboxEmpty" hidden>✓ 対応が必要な項目はありません</div>
-        <div id="warningsList"></div>
       </div>
-    </div>
 
-    <div id="transcriptPanel" class="panel" role="tabpanel" aria-labelledby="tab-transcriptPanel" tabindex="0">
-      <div class="panelbar">
-        <button id="removeSelBtn" disabled>選択を削除</button>
-        <span id="selStatus" role="status" class="sr-only"></span>
-      </div>
-      <div id="words" role="listbox" aria-label="文字起こし" aria-multiselectable="true"></div>
-    </div>
-    <div id="mediaPanel" class="panel" role="tabpanel" aria-labelledby="tab-mediaPanel" tabindex="0">
-      <div class="panelbar">
-        <button id="buildSelectsBtn" hidden>採用シーンで仮編集を作る(戻せます)</button>
-        <button id="takesCheckBtn">言い直しを確認</button>
-      </div>
-      <!-- W-UI IA v2 波2 §7: キットのリンク状態(未リンク時は非表示 —
-           renderKitStatus in app.js)。 -->
-      <div id="kitStatus" class="kitStatus" hidden></div>
-      <!-- W-UI IA v2 波2 §4: 音声パネル(プロジェクト全体の設定)。BGM 単体の
-           gain/フェード/ダッキングは #inspectorView(BGM選択時)側。
-           renderAudioPanel in app.js。 -->
-      <details id="audioPanel" class="audioPanel">
-        <summary>音声</summary>
-        <div class="audioPanelBody">
-          <div class="audioField">
-            <label for="audioRepairPreset">会話リペア(声を整える)</label>
-            <select id="audioRepairPreset">
-              <option value="off">オフ</option>
-              <option value="outdoor">屋外</option>
-              <option value="indoor">屋内</option>
-              <option value="wireless">ワイヤレスマイク</option>
-            </select>
+      <!-- W-UI IA v2 §2: 会話タブ = Cowork 会話の合成表示 + 「Claude の編集提案」
+           (candidates) + 「対応が必要」(アンカー切れ・色警告・聞き取り確認・QC)
+           の2群。旧「すべて承認」は廃止 — 一括操作はグループヘッダの結果明示
+           ボタン1箇所だけ(renderInbox/renderCandidatesGroup/renderWarningsGroup
+           in app.js)。 -->
+      <div id="nowPanel" class="panel active" role="tabpanel" aria-labelledby="tab-nowPanel" tabindex="0">
+        <!-- W-DESIGN: Cowork 会話の合成表示(README 69行目: revision log の
+             actor=Claude から合成)。renderClaudeConversation in app.js。 -->
+        <div id="claudeConversation" class="claudeConversation"></div>
+
+        <div id="claudeStrip" class="claudeStrip" hidden aria-live="polite">
+          <div class="spin"></div><span id="claudeStripText"></span>
+        </div>
+
+        <!-- 波2 追補#5: 保護区間(intent zones)は構造編集(intent-remove)の対象
+             — 「Cowork に頼む」チップの置き場所(renderIntentZonesInfo in app.js)。
+             ゾーンが無いプロジェクトでは要素ごと hidden。 -->
+        <div id="intentZonesInfo" class="intentZonesInfo" hidden></div>
+
+        <!-- W-UI IA v2 §5a: プロジェクトが空(素材ゼロ)のときだけ表示し、
+             下の2群は隠す(renderInbox の isProjectEmpty() 分岐)。 -->
+        <div id="confirmEmptyProject" class="hintText confirmEmptyProject" hidden>まだ提案はありません</div>
+
+        <div id="candidatesSection" class="inboxGroup">
+          <div class="inboxHeading">
+            <span>Claude の編集提案</span><span id="candidatesCount" class="hintText"></span>
           </div>
-          <label class="audioCheck"><input type="checkbox" id="audioRepairDeess"> 歯擦音を抑制(デエッサー)</label>
-          <span class="exportOnlyBadge" title="このリペア効果はプレビューに反映されません。実際の仕上がりは書き出しで確認してください">書き出しで確認</span>
-          <div class="audioField">
-            <label for="audioMixDuck">BGMのダッキング量 <span id="audioMixDuckVal" class="mono"></span></label>
-            <input type="range" id="audioMixDuck" min="-40" max="0" step="1">
-          </div>
-          <div class="audioField">
-            <label for="audioMixLufs">全体の目標ラウドネス <span id="audioMixLufsVal" class="mono"></span></label>
-            <input type="range" id="audioMixLufs" min="-40" max="-5" step="1">
-            <span class="exportOnlyBadge" title="最終ミックスの音量正規化はプレビューに反映されません。実際の音量は書き出しで確認してください">書き出しで確認</span>
-          </div>
-          <button id="musicAddBtn">BGMを追加</button>
-          <div id="musicAddForm" class="musicAddForm" hidden>
-            <label>ファイルのパス<input type="text" id="musicAddPath" placeholder="/path/to/music.mp3" aria-label="BGM/SEファイルのパス"></label>
-            <label class="audioCheck"><input type="checkbox" id="musicAddSfx"> 効果音として追加(SFX — ダッキングしない)</label>
-            <div class="musicAddActions">
-              <button id="musicAddCancel">キャンセル</button>
-              <button id="musicAddSubmit">追加</button>
+          <details id="detectSettings" class="detectSettings" hidden>
+            <summary>検出条件</summary>
+            <div class="panelbar detectSettingsBar">
+              <label class="thresholdCtl">無音として候補にする最短時間
+                <input type="range" id="minGapRange" min="0.3" max="2.0" step="0.1" value="0.7">
+                <span id="minGapVal">0.7s</span>
+              </label>
+              <button id="redetectBtn">この条件で候補を作り直す</button>
             </div>
-            <p class="hintText">ファイルをこのフォームにドロップしても構いません。位置は現在の再生位置です。</p>
-          </div>
+          </details>
+          <div id="inboxList"></div>
         </div>
-      </details>
-      <div id="mediaList" role="listbox" aria-label="素材"></div>
+
+        <div id="warningsSection" class="inboxGroup">
+          <div class="inboxHeading">
+            <span>対応が必要</span><span id="warningsCount" class="hintText"></span>
+          </div>
+          <div id="warningsEmpty" class="hintText inboxEmpty" hidden>✓ 対応が必要な項目はありません</div>
+          <div id="warningsList"></div>
+        </div>
+      </div>
+
+      <!-- W-UI IA v2 §1: 独立した「履歴」タブ — 旧「いま」タブの変更履歴セクションを
+           丸ごと移設(#activityFeed の中身/humanizeRevision は流用)。 -->
+      <div id="historyPanel" class="panel" role="tabpanel" aria-labelledby="tab-historyPanel" tabindex="0">
+        <div class="inboxHeading"><span>編集履歴</span></div>
+        <div id="activityFeed"></div>
+      </div>
+
+      <div class="claudeFooter">
+        <span class="footerDot" aria-hidden="true"></span>
+        <span class="footerText">Claude Cowork と接続中 — 依頼は Cowork の会話から</span>
+        <button id="openCoworkBtn" class="btnGhost">Cowork を開く</button>
+      </div>
     </div>
-    <!-- W-UI IA v2 §1: 独立した「履歴」タブ — 旧「いま」タブの変更履歴セクションを
-         丸ごと移設(#activityFeed の中身/humanizeRevision は流用、見出しのみ
-         「変更履歴」→「編集履歴」)。 -->
-    <div id="historyPanel" class="panel" role="tabpanel" aria-labelledby="tab-historyPanel" tabindex="0">
-      <div class="inboxHeading"><span>編集履歴</span></div>
-      <div id="activityFeed"></div>
+
+    <!-- W-UI IA v2 波2 §1: 選択インスペクタ。クリップ/B-roll/モーション/
+         スプライト/セリフ/BGM を選択すると右パネルが一時的にこちらへ遷移する
+         (← 会話に戻る で復帰、selectItem/renderInspector in app.js)。 -->
+    <div id="inspectorView" hidden>
+      <div class="rightViewHeader">
+        <button id="inspectorBack" class="btnBack">← 戻る</button>
+        <span id="inspectorTitle" class="rightViewTitle"></span>
+      </div>
+      <div id="inspectorBody" class="rightViewBody"></div>
     </div>
+
+    <!-- W-CAP: caption style view (font/palette/size/outline/background) —
+         opened by clicking a caption cue in the stage or the T1 row; position
+         is changed by dragging the cue instead (see startCaptionDrag in
+         app.js), and text by double-clicking it (inline contenteditable).
+         W-DESIGN: 旧 <dialog id="captionStyleDialog"> を右パネルの常設ビュー
+         へ移植(openCaptionStylePopover/closeCaptionStylePopover in app.js)。 -->
+    <div id="captionView" hidden>
+      <div class="rightViewHeader">
+        <button id="captionBackBtn" class="btnBack">← 戻る</button>
+        <span class="rightViewTitle">字幕スタイル</span>
+        <span class="spacer"></span>
+        <label class="capEnabledRow"><input type="checkbox" id="capEnabledToggle"> 表示</label>
+      </div>
+      <div class="rightViewBody">
+        <div class="capPreview"><span id="capPreviewCue" class="capPreviewCue"></span></div>
+        <div class="capField">
+          <label for="capStylePreset">プリセット</label>
+          <select id="capStylePreset"></select>
+        </div>
+        <div class="capField">
+          <label for="capMaxChars">1行の最大文字数</label>
+          <input type="number" id="capMaxChars" min="1" max="60" step="1">
+        </div>
+        <div class="capField">
+          <label for="capFont">フォント</label>
+          <select id="capFont"><option value="">(既定のフォント)</option></select>
+        </div>
+        <div class="capColorRow">
+          <div class="capField"><label for="capTextColor">文字色</label><input type="color" id="capTextColor"></div>
+          <div class="capField"><label for="capOutlineColor">縁色</label><input type="color" id="capOutlineColor"></div>
+          <div class="capField"><label for="capBoxColor">背景色</label><input type="color" id="capBoxColor"></div>
+        </div>
+        <div class="capField">
+          <label for="capSizeScale">サイズ <span id="capSizeScaleVal"></span></label>
+          <input type="range" id="capSizeScale" min="0.5" max="2" step="0.05">
+        </div>
+        <div class="capField">
+          <label for="capOutlineWidth">縁の太さ <span id="capOutlineWidthVal"></span></label>
+          <input type="range" id="capOutlineWidth" min="0" max="10" step="0.5">
+        </div>
+        <div class="capField">
+          <label for="capBgOpacity">背景の透過 <span id="capBgOpacityVal"></span></label>
+          <input type="range" id="capBgOpacity" min="0" max="1" step="0.05">
+        </div>
+        <div class="capActions">
+          <button id="capResetBtn" aria-label="このスタイル変更をすべてリセット">リセット</button>
+          <span class="spacer"></span>
+          <button id="capCancelBtn">キャンセル</button>
+          <button id="capApplyBtn" class="btnPrimary">適用</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- W-DESIGN ディレクター適応1: ヘッダー「書き出し」ボタンから開く。
+         実行系のボタンはここに作らない(GET /api/export-results, 実装済み —
+         read-only)。既存の書き出し結果ポーリングを流用(openExportView/
+         fetchExportResults in app.js)。 -->
+    <div id="exportView" hidden>
+      <div class="rightViewHeader">
+        <button id="exportBackBtn" class="btnBack">← 戻る</button>
+        <span class="rightViewTitle">書き出し</span>
+      </div>
+      <div class="rightViewBody">
+        <div id="exportResultCard" class="exportResultCard" hidden></div>
+        <div id="exportAskRow" class="exportAskRow"></div>
+      </div>
     </div>
   </aside>
 </main>
@@ -284,66 +413,16 @@
     <tr><td>Shift+← / Shift+→</td><td>±1フレーム</td></tr>
     <tr><td>, / .</td><td>±1フレーム</td></tr>
     <tr><td>I / O</td><td>選択レンジの開始点(IN) / 終了点(OUT)を設定</td></tr>
-    <tr><td>Esc</td><td>レンジ選択を解除</td></tr>
+    <tr><td>Esc</td><td>レンジ選択 / 右パネルの一時ビューを解除</td></tr>
     <tr><td>?</td><td>このヘルプの表示/非表示</td></tr>
   </table>
   <p class="hintText">文字起こし欄: ドラッグ、またはクリック→Shift+クリックで単語選択。クリックでシーク。フォーカス中は←/→で移動、Spaceで選択トグル、Shift+←/→で範囲拡張、Enterでシーク、Deleteで削除。</p>
-  <p class="hintText">タイムライン: クリップ本体をドラッグで並べ替え、端(6px)をドラッグでトリム、B-roll/スプライト/モーション/BGM のブロックをドラッグで移動できます。ファイルやフォルダをウィンドウにドロップすると取り込みます。</p>
+  <p class="hintText">タイムライン: クリップ本体をドラッグで並べ替え、端(6px)をドラッグでトリム、B-roll/スプライト/モーション/BGM のブロックをドラッグで移動できます。スナップを有効にすると近くのクリップ境界/再生位置に吸着します。ファイルやフォルダをウィンドウにドロップすると取り込みます。</p>
   <p class="hintText">字幕: クリックでスタイル編集、ドラッグで縦位置変更、ダブルクリックでテキスト修正。</p>
   <p class="hintText">素材: クリックで詳細表示、サムネイルで再生、↑↓で移動。シーン格子内: ←→で移動、K=採用、X=不採用、U=解除。</p>
   <button id="shortcutsCloseBtn">閉じる</button>
 </dialog>
 
-<!-- W-CAP: caption style popover (font/palette/size/outline/background) —
-     opened by clicking a caption cue in the stage; position is changed by
-     dragging the cue instead (see startCaptionDrag in app.js), and text by
-     double-clicking it (inline contenteditable). -->
-<dialog id="captionStyleDialog" aria-labelledby="captionStyleTitle">
-  <h2 id="captionStyleTitle">字幕スタイル</h2>
-  <!-- W-UI IA v2 波2 §5: 字幕の常設入口+デッドロック解消 — enabled トグル
-       ・プリセット選択・maxChars を追加。cue が無くても(字幕オフでも)
-       T1 行/インスペクタからこのダイアログへ到達できる(renderCaptionRow
-       等 in app.js)。この3項目はプロジェクト設定そのものなので、変更した
-       瞬間に mutate() で確定する(下の overrides ドラフトとは別系統)。 -->
-  <label class="capField capEnabledRow">
-    <input type="checkbox" id="capEnabledToggle"> 字幕を表示する
-  </label>
-  <div class="capField">
-    <label for="capStylePreset">プリセット</label>
-    <select id="capStylePreset"></select>
-  </div>
-  <div class="capField">
-    <label for="capMaxChars">1行の最大文字数</label>
-    <input type="number" id="capMaxChars" min="1" max="60" step="1">
-  </div>
-  <div class="capField">
-    <label for="capFont">フォント</label>
-    <select id="capFont"><option value="">(既定のフォント)</option></select>
-  </div>
-  <div class="capColorRow">
-    <div class="capField"><label for="capTextColor">文字色</label><input type="color" id="capTextColor"></div>
-    <div class="capField"><label for="capOutlineColor">縁色</label><input type="color" id="capOutlineColor"></div>
-    <div class="capField"><label for="capBoxColor">背景色</label><input type="color" id="capBoxColor"></div>
-  </div>
-  <div class="capField">
-    <label for="capSizeScale">サイズ <span id="capSizeScaleVal"></span></label>
-    <input type="range" id="capSizeScale" min="0.5" max="2" step="0.05">
-  </div>
-  <div class="capField">
-    <label for="capOutlineWidth">縁の太さ <span id="capOutlineWidthVal"></span></label>
-    <input type="range" id="capOutlineWidth" min="0" max="10" step="0.5">
-  </div>
-  <div class="capField">
-    <label for="capBgOpacity">背景の透過 <span id="capBgOpacityVal"></span></label>
-    <input type="range" id="capBgOpacity" min="0" max="1" step="0.05">
-  </div>
-  <div class="capActions">
-    <button id="capResetBtn" aria-label="このスタイル変更をすべてリセット">リセット</button>
-    <span class="spacer"></span>
-    <button id="capCancelBtn">キャンセル</button>
-    <button id="capApplyBtn">適用</button>
-  </div>
-</dialog>
 <script type="module" src="app.js"></script>
 </body>
 </html>

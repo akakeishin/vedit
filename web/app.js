@@ -62,6 +62,11 @@ const S = {
   // selectItem/renderInspector). Caption cues are NOT tracked here — they
   // open the existing captionStyleDialog directly (see buildCueEl).
   selection: null,
+  // W-DESIGN: 右パネルの排他表示モード — 'claude'(会話/履歴セグメント) |
+  // 'clip'(選択インスペクタ) | 'caption'(字幕スタイル) | 'export'(書き出し)。
+  // selectItem/openCaptionStylePopover/openExportView/closeExportView/
+  // handleShowDirective が更新し、renderInspector が hidden を切り替える。
+  rightMode: 'claude',
   // W-UI IA v2 波2 §9/追補#3, 波2.5: revision a mutate() response's
   // `warning` field (or a committed-but-refresh-failed notice) was already
   // surfaced for, via toast — connectWs()'s generic "変更 #N" confirmation
@@ -370,7 +375,7 @@ function tickComposition() {
     setPlayBtnState(false);
   }
   $('playhead').style.left = `${(tl / Math.max(1e-6, S.duration)) * 100}%`;
-  $('tc').textContent = `${fmtF(tl)} / ${fmtF(S.duration)}`;
+  renderTimecode(tl, S.duration);
   $('headerTc').textContent = fmt(tl);
   renderCompositionBackground(tl);
   renderMotion(tl);
@@ -406,7 +411,7 @@ function tick() {
     // relation to S.segments/S.currentSeg, so skip all timeline-linked
     // rendering (playhead, captions, motion, word highlight) and just show
     // the source-relative timecode.
-    $('tc').textContent = `${fmtF(video.currentTime)} / ${fmtF(video.duration || 0)}`;
+    renderTimecode(video.currentTime, video.duration || 0);
     $('headerTc').textContent = fmt(video.currentTime);
     syncMusicPlayback(null); // source-preview mode plays a raw source proxy, not the timeline mix
     syncOverlayVideo(null); // source preview owns the stage; hide the B-roll overlay video too
@@ -445,7 +450,7 @@ function tick() {
     }
     const tl = tlNow();
     $('playhead').style.left = `${(tl / S.duration) * 100}%`;
-    $('tc').textContent = `${fmtF(tl)} / ${fmtF(S.duration)}`;
+    renderTimecode(tl, S.duration);
     $('headerTc').textContent = fmt(tl);
     renderCaption(tl);
     renderMotion(tl);
@@ -473,11 +478,18 @@ function fmt(t) {
   const m = Math.floor(t / 60);
   return `${m}:${(t % 60).toFixed(1).padStart(4, '0')}`;
 }
-// Frame-accurate timecode, e.g. "0:06.9 (f207)".
-function fmtF(t) {
+// W-DESIGN: README のトランスポート行は主時計("00:12.3 / 04:12.5")と、右端の
+// 小さなフレーム/fps読み(f369 / f7575 · 30fps)を別要素に分ける — 旧
+// #tc.textContent の単一文字列(fmtF 併記)を tcNow/tcTotal/frameLabel の
+// 3要素へ分配するだけで、フォーマット自体(fmt)は無変更。
+function renderTimecode(tl, dur) {
   const fps = S.manifest?.fps ?? 30;
-  const frame = Math.round(t * fps);
-  return `${fmt(t)} (f${frame})`;
+  const now = $('tcNow');
+  const total = $('tcTotal');
+  const frame = $('frameLabel');
+  if (now) now.textContent = fmt(tl);
+  if (total) total.textContent = `/ ${fmt(dur)}`;
+  if (frame) frame.textContent = `f${Math.round(tl * fps)} / f${Math.round(dur * fps)} · ${Math.round(fps)}fps`;
 }
 
 function setPlaybackRate(rate) {
@@ -557,6 +569,24 @@ $('playBtn').onclick = () => {
   else startPlayback();
 };
 
+// W-DESIGN: README のトランスポートに ⏮(J: 2秒巻き戻して再生)/⏭(L: 再生速度
+// 切り替え)の実クリックボタンを追加 — ロジックは既存のキーボードショート
+// カット(下の keydown ハンドラ)から抽出した共有関数で、挙動は完全に同一。
+function jumpBackPlay() {
+  if (!canPlayTimeline()) return; // 波2 §7: don't lie about playback starting when the timeline is empty
+  S.rateIdx = 0;
+  setPlaybackRate(1);
+  seekTl(tlNow() - 2, { play: true });
+  S.playing = true;
+  setPlayBtnState(true);
+}
+function cycleRate() {
+  if (!S.playing) { S.rateIdx = 0; setPlaybackRate(PLAY_RATES[0]); startPlayback(); }
+  else { S.rateIdx = (S.rateIdx + 1) % PLAY_RATES.length; setPlaybackRate(PLAY_RATES[S.rateIdx]); }
+}
+$('jumpBackBtn').onclick = jumpBackPlay;
+$('cycleRateBtn').onclick = cycleRate;
+
 // ---------- 波2 追補#2: 出力比率の変更入口(reframe) ----------
 // The header's #stat readout has always SHOWN the output aspect (when
 // manifest.output is set) with no way to change it — reframe existed on the
@@ -590,22 +620,8 @@ document.addEventListener('keydown', (e) => {
   if (e.code === 'ArrowRight') { seekTl(tlNow() + (e.shiftKey ? 1 / S.manifest.fps : 1)); return; }
   const key = e.key.toLowerCase();
   if (key === 'k') { e.preventDefault(); stopPlayback(); return; }
-  if (key === 'l') {
-    e.preventDefault();
-    if (!S.playing) { S.rateIdx = 0; setPlaybackRate(PLAY_RATES[0]); startPlayback(); }
-    else { S.rateIdx = (S.rateIdx + 1) % PLAY_RATES.length; setPlaybackRate(PLAY_RATES[S.rateIdx]); }
-    return;
-  }
-  if (key === 'j') {
-    e.preventDefault();
-    if (!canPlayTimeline()) return; // 波2 §7: don't lie about playback starting when the timeline is empty
-    S.rateIdx = 0;
-    setPlaybackRate(1);
-    seekTl(tlNow() - 2, { play: true });
-    S.playing = true;
-    setPlayBtnState(true);
-    return;
-  }
+  if (key === 'l') { e.preventDefault(); cycleRate(); return; }
+  if (key === 'j') { e.preventDefault(); jumpBackPlay(); return; }
   if (e.key === ',') { e.preventDefault(); seekTl(tlNow() - 1 / S.manifest.fps); return; }
   if (e.key === '.') { e.preventDefault(); seekTl(tlNow() + 1 / S.manifest.fps); return; }
   if (key === 'i') { e.preventDefault(); setRangePoint('in'); return; }
@@ -614,6 +630,12 @@ document.addEventListener('keydown', (e) => {
   if (e.code === 'Escape') {
     e.preventDefault();
     if (S.sourcePreview) { exitSourcePreview(); return; }
+    // W-DESIGN: 右パネルの一時ビュー(字幕スタイル/書き出し/選択インスペクタ)
+    // も Esc で会話ビューへ戻れるようにする — 旧 <dialog> の Esc-to-close を
+    // 右パネル常設ビューへ移した後も同じ到達性を保つ。
+    if (S.rightMode === 'caption') { closeCaptionStylePopover(); return; }
+    if (S.rightMode === 'export') { closeExportView(); return; }
+    if (S.selection) { deselect(); return; }
     clearRange();
     return;
   }
@@ -801,6 +823,28 @@ function startClipReorderDrag(e, seg, clipEl) {
   window.addEventListener('pointerup', onUp);
 }
 
+// W-DESIGN: タイムラインツールバーの「スナップ」checkbox(#snapToggle)。
+// 現状スナップの効くドラッグは「トリム」のみ(クリップ並べ替え/B-roll・
+// モーション・BGM移動は対象外 — 既存の複雑な再アンカー計算に手を入れる
+// リスクを避けた、意図したスコープ限定。最終報告に既知の範囲として明記)。
+function snapEnabled() {
+  return $('snapToggle')?.checked ?? true;
+}
+/** `value`(秒)を `candidates`(秒の配列)のうち画面上 `thresholdPx` 以内に
+ * 最も近いものへ吸着させる。スナップ無効、または該当候補が無ければ
+ * `value` をそのまま返す。 */
+function applySnap(value, candidates, pxPerSecond, thresholdPx = 8) {
+  if (!snapEnabled() || !(pxPerSecond > 0)) return value;
+  const thresholdSeconds = thresholdPx / pxPerSecond;
+  let best = value;
+  let bestDist = thresholdSeconds;
+  for (const c of candidates) {
+    const d = Math.abs(c - value);
+    if (d < bestDist) { bestDist = d; best = c; }
+  }
+  return best;
+}
+
 /** Clip edge (6px) drag: preview-only stretch while dragging, one `trim` call on drop. */
 function startTrimDrag(e, seg, edge, clipEl) {
   e.stopPropagation(); // never also trigger the strip's own scrub-seek
@@ -810,6 +854,14 @@ function startTrimDrag(e, seg, edge, clipEl) {
   const fps = S.manifest?.fps ?? 30;
   selectClip(seg.clipId);
   let moved = false;
+  let snappedDeltaSeconds = 0;
+  // Snap targets: every OTHER segment's own tlStart/tlEnd, plus the current
+  // playhead position — the two reference points a trim most commonly wants
+  // to land exactly on.
+  const snapPoints = [
+    ...S.segments.filter((s) => s !== seg).flatMap((s) => [s.tlStart, s.tlEnd]),
+    tlNow(),
+  ];
 
   const onMove = (ev) => {
     const dx = ev.clientX - startX;
@@ -817,7 +869,11 @@ function startTrimDrag(e, seg, edge, clipEl) {
     moved = true;
     S.timelineDrag = { kind: 'trim', clipId: seg.clipId, edge };
     const live = document.querySelector(`#clips [data-clip-id="${CSS.escape(seg.clipId)}"]`) ?? clipEl;
-    const deltaPct = (dx / rect.width) * 100;
+    const rawDeltaSeconds = dx / pxPerSecond;
+    const edgeAbs = edge === 'out' ? seg.tlEnd + rawDeltaSeconds : seg.tlStart + rawDeltaSeconds;
+    const snappedAbs = applySnap(edgeAbs, snapPoints, pxPerSecond);
+    snappedDeltaSeconds = edge === 'out' ? snappedAbs - seg.tlEnd : snappedAbs - seg.tlStart;
+    const deltaPct = (snappedDeltaSeconds / S.duration) * 100;
     if (edge === 'out') {
       const w = ((seg.tlEnd - seg.tlStart) / S.duration) * 100 + deltaPct;
       if (w > 0) live.style.width = `${w}%`;
@@ -830,13 +886,12 @@ function startTrimDrag(e, seg, edge, clipEl) {
       }
     }
   };
-  const onUp = async (ev) => {
+  const onUp = async () => {
     window.removeEventListener('pointermove', onMove);
     window.removeEventListener('pointerup', onUp);
     S.timelineDrag = null;
     if (!moved) return;
-    const deltaSeconds = (ev.clientX - startX) / pxPerSecond;
-    const op = trimDragOp(seg.clipId, edge, deltaSeconds, fps);
+    const op = trimDragOp(seg.clipId, edge, snappedDeltaSeconds, fps);
     if (!op) { renderTimeline(); return; } // rounds to 0 frames: snap the preview stretch back
     const { ok } = await mutate(op, { conflictMessage: 'トリムは反映されませんでした。最新状態を確認してもう一度実行してください' });
     if (!ok) renderTimeline();
@@ -1350,31 +1405,39 @@ function renderRuler() {
 // (T1/A2, anchored to the bottom of the now-104px-tall #timelineTracks) are
 // copied 1:1 from #captionRow/#musicRow's own bottom/height. Only rendered
 // when the underlying row actually has something in it (存在する行のみ).
+// W-DESIGN: README のピクセル座標(ガター96px/ルーラー24px)に合わせて再実装。
+// コア5行(B-ROLL/本編/テロップ/モーション/BGM)は v2.dc.html と同じ
+// top/heightのラベルを常設(データがある行だけ — 既存の「行が無ければラベルも
+// 出さない」ルールは維持)。hifi のデモには現れないスプライト/紙芝居/セリフの
+// 3行は、実際に使うプロジェクトでだけ #timeline に .tl-extra を付けて下へ
+// 伸ばす(通常プロジェクトは常に206pxのまま — hifi と一致)。
 function renderTrackGutter() {
   const el = $('trackGutter');
   if (!el) return;
   el.innerHTML = '';
   const composition = isComposition();
-  const addLabel = (text, style) => {
+  const addLabel = (text, color, style) => {
     const d = document.createElement('div');
     d.className = 'gutterLabel';
     d.textContent = text;
+    d.style.setProperty('--gutter-color', color);
     Object.assign(d.style, style);
     el.appendChild(d);
   };
-  if (S.overlays.length > 0) addLabel('V2 B-roll', { top: '0%', height: '12%' });
-  // Codex 統合レビュー P2-8: 非compositionプロジェクトで V1/A1/T1 を常時
-  // 表示していた(素材ゼロの真新しいプロジェクトでもラベルだけ出る)。他の
-  // 行(V2/A2)と同じ「データがある行だけ出す」ルールに揃える — T1 は
-  // captionRow 自体が字幕オフでも常設の入口として残る(renderCaptionRow の
-  // doc参照)ため、ここではガターの「T1」ラベルだけを字幕有効時に絞る。
+  if (S.overlays.length > 0) addLabel('B-ROLL', '#4d8d88', { top: '4px', height: '22px' });
   const hasClips = S.segments.length > 0;
-  if (!composition && hasClips) {
-    addLabel('V1 本編', { top: '12%', height: '25%' });
-    addLabel('A1 音声', { top: '37%', height: '25%' });
-  }
-  if (!composition && S.manifest?.captions?.enabled) addLabel('T1 テロップ', { bottom: '0px', height: '12px' });
-  if ((S.manifest?.timeline.music ?? []).length > 0) addLabel('A2 BGM', { bottom: '30px', height: '12px' });
+  if (!composition && hasClips) addLabel('本編', '#8f8f96', { top: '30px', height: '58px' });
+  if (!composition && S.manifest?.captions?.enabled) addLabel('テロップ', '#6d7f9e', { top: '94px', height: '20px' });
+  if ((S.manifest?.timeline.motion ?? []).length > 0) addLabel('モーション', '#7d70a3', { top: '120px', height: '20px' });
+  if ((S.manifest?.timeline.music ?? []).length > 0) addLabel('BGM', '#52886a', { top: '146px', height: '26px' });
+
+  const hasSprites = S.sprites.length > 0;
+  const hasBg = composition && S.backgroundIntervals.length > 0;
+  const hasDialogue = (S.dialogue ?? []).length > 0;
+  $('timeline')?.classList.toggle('tl-extra', hasSprites || hasBg || hasDialogue);
+  if (hasSprites) addLabel('スプライト', '#d65ac8', { top: '178px', height: '18px' });
+  if (hasBg) addLabel('紙芝居', '#5c86a8', { top: '202px', height: '18px' });
+  if (hasDialogue) addLabel('セリフ', '#ffffff', { top: '226px', height: '18px' });
 }
 
 function drawWave() {
@@ -2046,6 +2109,10 @@ $('buildSelectsBtn').onclick = async () => {
 // dialog's font/palette/position controls into the narrow aside.
 function selectItem(kind, id) {
   S.selection = id ? { kind, id } : null;
+  // W-DESIGN: 右パネルの4モード('claude'|'clip'|'caption'|'export')のうち
+  // 選択があれば 'clip'、無ければ('caption'/'export' 以外なら)'claude' へ。
+  if (S.selection) S.rightMode = 'clip';
+  else if (S.rightMode === 'clip') S.rightMode = 'claude';
   renderTimeline(); // updates .sel highlight classes on the timeline blocks
   renderInspector();
 }
@@ -2342,22 +2409,30 @@ const INSPECTOR_BUILDERS = {
 };
 const INSPECTOR_TITLE = { clip: 'クリップ', broll: 'B-roll', motion: 'モーション', sprite: 'キャラクター', dialogue: 'セリフ', music: 'BGM/SE' };
 
+// W-DESIGN: 右パネルの4モード('claude'|'clip'|'caption'|'export')を排他
+// 表示する。旧実装は #inspectorView/#tabsView の2択だったが、字幕スタイル
+// (旧 <dialog>)と書き出しビュー(新設)を同じ排他機構に統合した — 呼び出し元
+// (selectItem/openCaptionStylePopover/closeCaptionStylePopover/
+// openExportView/closeExportView)は S.rightMode を設定してからこれを呼ぶ。
 function renderInspector() {
-  const view = $('inspectorView');
-  const tabsView = $('tabsView');
-  if (!S.selection) {
-    view.hidden = true;
-    tabsView.hidden = false;
-    return;
+  const views = { claude: $('claudeView'), clip: $('inspectorView'), caption: $('captionView'), export: $('exportView') };
+  for (const [mode, el] of Object.entries(views)) {
+    if (el) el.hidden = mode !== S.rightMode;
   }
-  tabsView.hidden = true;
-  view.hidden = false;
-  $('inspectorTitle').textContent = INSPECTOR_TITLE[S.selection.kind] ?? S.selection.kind;
-  const body = $('inspectorBody');
-  body.innerHTML = '';
-  const builder = INSPECTOR_BUILDERS[S.selection.kind];
-  if (builder) builder(body, S.selection.id);
-  else deselect();
+  if (S.rightMode === 'clip') {
+    if (!S.selection) { S.rightMode = 'claude'; renderInspector(); return; }
+    $('inspectorTitle').textContent = INSPECTOR_TITLE[S.selection.kind] ?? S.selection.kind;
+    const body = $('inspectorBody');
+    body.innerHTML = '';
+    const builder = INSPECTOR_BUILDERS[S.selection.kind];
+    if (builder) builder(body, S.selection.id);
+    else deselect();
+  } else if (S.rightMode === 'caption') {
+    syncCaptionPopoverControls();
+  } else if (S.rightMode === 'export') {
+    renderExportAskRow();
+    renderExportResultCard();
+  }
 }
 
 // ---------- W8 kit: caption style palette/font + sprite stage rendering ----------
@@ -2739,6 +2814,36 @@ let captionApplied = false;
 function previewCaptionOverrides() {
   S.manifest.captions.overrides = captionResetRequested ? undefined : captionOverridesDraft;
   renderCaption(tlNow());
+  updateCapPreview();
+}
+
+// W-DESIGN: 右パネル「字幕スタイル」ビューのプレビュー枠(README「プレビュー
+// 枠」)。#captionLayer の実描画ロジック(renderCaption/applyCueOverrideStyles)
+// をそのまま再利用し、ドラフト中のオーバーライドを常に反映する — 別実装を
+// 増やして見た目がズレるのを避ける。
+let captionPreviewText = null; // 実際にクリックされた cue のテキスト(あれば) — updateCapPreview のプレビュー文言に使う
+function updateCapPreview() {
+  const box = document.querySelector('.capPreview');
+  const el = $('capPreviewCue');
+  if (!box || !el) return;
+  const styleId = S.manifest?.captions.style ?? 'clean';
+  const kitStyle = kitStyleFor(styleId);
+  if (kitStyle) {
+    box.className = 'capPreview style-kit';
+    const p = kitStyle.palette ?? {};
+    box.style.setProperty('--kit-text', p.text || '#fff');
+    box.style.setProperty('--kit-outline', p.outline || 'transparent');
+    box.style.setProperty('--kit-box', p.box || 'rgba(0,0,0,0.55)');
+    const bgOpacity = kitStyle.caption?.background_opacity;
+    box.style.setProperty('--kit-box-opacity', bgOpacity != null ? String(bgOpacity) : '1');
+    if (kitStyle.caption?.font) box.style.setProperty('--kit-font', `'${ensureKitFontFace(kitStyle.caption.font)}'`);
+    else box.style.removeProperty('--kit-font');
+  } else {
+    box.className = `capPreview style-${styleId}`;
+  }
+  el.className = 'cue capPreviewCue';
+  el.textContent = captionPreviewText || S.cues[0]?.text || 'サンプル字幕テキスト';
+  applyCueOverrideStyles(el, captionOverridesDraft);
 }
 
 function syncCaptionPopoverControls() {
@@ -2746,7 +2851,7 @@ function syncCaptionPopoverControls() {
   // (captions.enabled/.style/.maxChars), not part of the overrides draft —
   // they always reflect S.manifest.captions directly and commit immediately
   // on change (see the 3 onchange handlers below), independent of this
-  // dialog's 適用/キャンセル flow for the overrides fields.
+  // view's 適用/キャンセル flow for the overrides fields.
   $('capEnabledToggle').checked = Boolean(S.manifest.captions.enabled);
   populateCaptionStylePresetSelect($('capStylePreset'), S.manifest.captions.style);
   $('capMaxChars').value = String(S.manifest.captions.maxChars ?? 24);
@@ -2764,22 +2869,39 @@ function syncCaptionPopoverControls() {
   const bgOpacity = d.bgOpacity ?? 0.55;
   $('capBgOpacity').value = String(bgOpacity);
   $('capBgOpacityVal').textContent = `${Math.round(bgOpacity * 100)}%`;
+  updateCapPreview();
 }
 
+// W-DESIGN: 旧 <dialog id="captionStyleDialog"> を右パネルの常設ビューへ移植
+// — showModal()/close() の代わりに S.rightMode を切り替えて renderInspector()
+// (右パネルの4モード排他表示)へ委ねる。ドラフト/リセット/適用/キャンセルの
+// ロジック自体(captionOverridesDraft 等)は無変更。
 function openCaptionStylePopover(cue) {
-  const dlg = $('captionStyleDialog');
-  if (dlg.open) return;
+  captionPreviewText = cue?.text ?? null;
+  if (S.rightMode === 'caption') { syncCaptionPopoverControls(); return; } // 別の cue を続けてクリック: ドラフトは維持したまま更新のみ
   captionOverridesOriginal = S.manifest.captions.overrides;
   captionOverridesDraft = cloneCaptionOverrides(captionOverridesOriginal);
   captionResetRequested = false;
   captionApplied = false;
   captionPopoverInvoker = document.activeElement;
-  syncCaptionPopoverControls();
-  dlg.showModal();
+  S.selection = null; // クリップ選択中に字幕へ遷移しても選択インスペクタが裏に残らないように
+  S.rightMode = 'caption';
+  renderTimeline();
+  renderInspector();
 }
 function closeCaptionStylePopover() {
-  const dlg = $('captionStyleDialog');
-  if (dlg.open) dlg.close();
+  if (S.rightMode !== 'caption') return;
+  if (!captionApplied) {
+    // Esc、← 戻る、キャンセル — revert the live preview back to whatever was
+    // actually saved (mutate() on 適用 already reloads, so this branch only
+    // ever needs to undo a NOT-applied draft).
+    S.manifest.captions.overrides = captionOverridesOriginal;
+    renderCaption(tlNow());
+  }
+  S.rightMode = 'claude';
+  renderInspector();
+  captionPopoverInvoker?.focus?.();
+  captionPopoverInvoker = null;
 }
 $('capFont').onchange = (e) => {
   captionResetRequested = false;
@@ -2846,6 +2968,7 @@ $('capResetBtn').onclick = () => {
   previewCaptionOverrides();
 };
 $('capCancelBtn').onclick = () => closeCaptionStylePopover();
+$('captionBackBtn').onclick = () => closeCaptionStylePopover();
 $('capApplyBtn').onclick = async () => {
   // Nothing actually changed (opened, looked, closed without touching
   // anything) — skip the round trip / no-op revision entirely.
@@ -2861,20 +2984,6 @@ $('capApplyBtn').onclick = async () => {
     { conflictMessage: '字幕スタイルの変更は反映されませんでした。最新状態を確認してもう一度実行してください' },
   );
 };
-$('captionStyleDialog').addEventListener('click', (e) => {
-  if (e.target === $('captionStyleDialog')) closeCaptionStylePopover();
-});
-$('captionStyleDialog').addEventListener('close', () => {
-  if (!captionApplied) {
-    // Esc, backdrop click, or キャンセル — revert the live preview back to
-    // whatever was actually saved (mutate() on 適用 already reloads, so this
-    // branch only ever needs to undo a NOT-applied draft).
-    S.manifest.captions.overrides = captionOverridesOriginal;
-    renderCaption(tlNow());
-  }
-  captionPopoverInvoker?.focus?.();
-  captionPopoverInvoker = null;
-});
 
 // Absolute-positioned <img> per resolved (non-orphan) sprite active at `tl`
 // — a JS port of ops.ts's spriteGeometry (pure math kept in sync by hand;
@@ -3665,8 +3774,10 @@ function candRow(c) {
   ok.textContent = 'カットする';
   ok.setAttribute('aria-label', `${label} をカットする`);
   ok.onclick = async (e) => { e.stopPropagation(); await decide([c.id], 'approve'); };
+  // W-DESIGN: 意味色規律 — 「残す」はカット候補を却下する非破壊操作なので
+  // 危険色(--danger)ではなく候補カードと同じ中立ゴースト(btn-wash)に統一。
   const ng = document.createElement('button');
-  ng.className = 'btn-reject';
+  ng.className = 'btn-wash';
   ng.textContent = '残す';
   ng.setAttribute('aria-label', `${label} を残す`);
   ng.onclick = async (e) => { e.stopPropagation(); await decide([c.id], 'reject'); };
@@ -3776,13 +3887,30 @@ function renderCandidatesGroup(el) {
     approveBtn.textContent = `${KIND_CANDIDATE_NOUN[kind] ?? `${KIND_LABEL[kind] ?? kind}候補`}${list.length}件をカット(−${totalDur.toFixed(1)}秒)`;
     approveBtn.onclick = () => decide(list.map((c) => c.id), 'approve');
     const rejectBtn = document.createElement('button');
-    rejectBtn.className = 'btn-reject';
+    rejectBtn.className = 'btn-wash';
     rejectBtn.textContent = 'まとめて残す';
     rejectBtn.onclick = () => decide(list.map((c) => c.id), 'reject');
     header.append(approveBtn, rejectBtn);
     group.appendChild(header);
     for (const c of list) group.appendChild(candRow(c));
     el.appendChild(group);
+  }
+  // W-DESIGN: README「5件すべて適用(−3.5秒)」— 全種別まとめての白プライマリ
+  // ボタン。旧「すべて承認」は種別ごとの結果明示ボタンに置き換えられていた
+  // (誤って全部まとめて承認してしまう事故を避けるため)が、hifi はこの一括
+  // ボタンを明示的に要求しているので、破壊的操作として confirm() を挟んだ
+  // 上で復活させる(decide() は既存の承認フローそのもの、2件以上のときだけ
+  // 表示 — 1件なら候補行自体のボタンで足りる)。
+  if (kinds.length > 1 || candCount > 1) {
+    const totalDurAll = S.candidates.reduce((sum, c) => sum + Math.max(0, c.t1 - c.t0), 0);
+    const allBtn = document.createElement('button');
+    allBtn.className = 'btn-applyAllCandidates';
+    allBtn.textContent = `${candCount}件すべて適用(−${totalDurAll.toFixed(1)}秒)`;
+    allBtn.onclick = async () => {
+      if (!confirm(`Claude の編集提案${candCount}件をすべてカットします(合計 −${totalDurAll.toFixed(1)}秒)。よろしいですか？`)) return;
+      await decide(S.candidates.map((c) => c.id), 'approve');
+    };
+    el.appendChild(allBtn);
   }
   const parts = kinds.map((k) => `${KIND_LABEL[k] ?? k}${byKind.get(k).length}`);
   $('candidatesCount').textContent = `${candCount}件(${parts.join('・')})`;
@@ -3972,11 +4100,85 @@ function renderExportResultCard() {
     el.appendChild(stale);
   }
 }
+// W-DESIGN ディレクター適応1: ヘッダー「書き出し」ボタンは実行しない —
+// クリックで右パネルに「書き出し」ビューを開き、既存の最後の書き出しカード
+// (renderExportResultCard、read-only)+「Cowork に頼む」コピーチップ(古い版
+// 警告は exportResultCard 側に既にある)を見せるだけ。既存の30秒ポーリングの
+// 発火条件を「確認タブが active」から「S.rightMode==='export'」へ差し替える
+// (setInterval のガードは下の起動処理を参照)。
+function renderExportAskRow() {
+  const el = $('exportAskRow');
+  if (!el) return;
+  el.innerHTML = '';
+  const label = document.createElement('span');
+  label.className = 'hintText';
+  label.textContent = '書き出すには、Cowork の会話で頼んでください';
+  el.appendChild(label);
+  el.appendChild(askClaudeChip('MP4を書き出して'));
+}
+function openExportView() {
+  if (S.selection) deselect();
+  if (S.rightMode === 'caption') closeCaptionStylePopover();
+  S.rightMode = 'export';
+  renderInspector();
+  fetchExportResults().catch(() => {});
+}
+function closeExportView() {
+  if (S.rightMode !== 'export') return;
+  S.rightMode = 'claude';
+  renderInspector();
+}
+$('exportBtn').onclick = openExportView;
+$('exportBackBtn').onclick = closeExportView;
+// 「Cowork を開く」— OS/アプリ間の連携APIが無いため、実際にCoworkアプリを
+// 起動することはできない(嘘の機能を置かない)。案内トーストのみ。
+$('openCoworkBtn').onclick = () => toast('Cowork アプリ側でこの続きを伝えてください');
+
+// W-DESIGN: 会話タブ冒頭の Cowork 会話合成表示(README 69行目 —
+// revision log の actor=Claude から合成でよい)。実在しないユーザー発言は
+// でっち上げず、実数(候補件数・削減秒数・字幕件数)だけから短い要約を組む。
+function renderClaudeConversation() {
+  const el = $('claudeConversation');
+  if (!el) return;
+  el.innerHTML = '';
+  if (isProjectEmpty()) return;
+  const hasClaudeRevision = S.revisions.some((r) => r.actor === 'claude');
+  if (!hasClaudeRevision && S.candidates.length === 0) return;
+
+  const caption = document.createElement('div');
+  caption.className = 'coworkCaption';
+  caption.textContent = 'COWORK セッション';
+  el.appendChild(caption);
+
+  const bits = [];
+  if (S.manifest.captions.enabled && S.cues.length > 0) bits.push(`字幕を${S.cues.length}件付けました`);
+  if (S.candidates.length > 0) {
+    const totalDur = S.candidates.reduce((sum, c) => sum + Math.max(0, c.t1 - c.t0), 0);
+    bits.push(`カットできそうな箇所が${S.candidates.length}件(合計 −${totalDur.toFixed(1)}秒)見つかったので、確認してください`);
+  } else if (hasClaudeRevision) {
+    bits.push('提案はすべて確認済みです');
+  }
+  if (bits.length === 0) return;
+
+  const bubble = document.createElement('div');
+  bubble.className = 'claudeBubble';
+  const avatar = document.createElement('div');
+  avatar.className = 'claudeAvatarSm';
+  avatar.setAttribute('aria-hidden', 'true');
+  avatar.textContent = '✳';
+  const text = document.createElement('div');
+  text.className = 'bubbleText';
+  text.textContent = `${bits.join('。')}。`;
+  bubble.append(avatar, text);
+  el.appendChild(bubble);
+}
+
 function renderInbox() {
   // W-UI IA v2 §5a: a brand-new (zero-source) project has nothing to review
   // yet — the whole 確認 tab collapses to one sentence instead of showing
   // two empty groups + detection controls that don't apply yet.
   const projectEmpty = isProjectEmpty();
+  renderClaudeConversation();
   $('confirmEmptyProject').hidden = !projectEmpty;
   $('candidatesSection').hidden = projectEmpty;
   $('warningsSection').hidden = projectEmpty;
@@ -4461,44 +4663,49 @@ function askClaudeChip(promptText) {
   btn.className = 'askChip';
   // Codex 統合レビュー 受け入れ基準残差#3: 「Claude への導線」が title だけに
   // 頼っていた(可視ラベルは「『依頼文』をコピー」で誰に頼むのか不明瞭) —
-  // 固定プレフィックスで可視化する。
-  btn.textContent = `Claude に頼む: 「${promptText}」をコピー`;
-  btn.title = 'クリックでこの依頼文をクリップボードにコピーします。Claude に伝えてください';
+  // 固定プレフィックスで可視化する。W-DESIGN: デザインの用語(Cowork 常設)に
+  // 合わせ「Claude に頼む」→「Cowork に頼む」に改称(README ディレクター
+  // 適応欄の許可どおり)。
+  btn.textContent = `Cowork に頼む: 「${promptText}」をコピー`;
+  btn.title = 'クリックでこの依頼文をクリップボードにコピーします。Cowork に伝えてください';
   btn.onclick = (e) => { e.stopPropagation(); copyToClipboard(promptText); };
   return btn;
 }
 
 // ---------- tabs (WAI-ARIA Tabs pattern: automatic activation) ----------
-const tabList = document.querySelector('.tabs');
-const tabs = [...document.querySelectorAll('.tab')];
+// W-DESIGN: 旧UIは .tabs が1グループだけだったが、新レイアウトは左パネル
+// (素材/文字起こし)と右パネルのセグメント切替(会話/履歴)の2グループに
+// 分かれる — active/panel の切り替えと ←→/Home/End のキーボード操作を
+// closest('.tabs') で自分のグループだけに閉じるよう汎化する。
+function tabsInGroup(tab) {
+  return [...(tab.closest('.tabs')?.querySelectorAll('.tab') ?? [])];
+}
 function activateTab(tab, { focus = true } = {}) {
-  for (const tEl of tabs) {
+  const group = tabsInGroup(tab);
+  for (const tEl of group) {
     const selected = tEl === tab;
     tEl.classList.toggle('active', selected);
     tEl.setAttribute('aria-selected', String(selected));
     tEl.tabIndex = selected ? 0 : -1;
   }
-  document.querySelectorAll('.panel').forEach((p) => p.classList.remove('active'));
-  $(tab.dataset.panel).classList.add('active');
+  for (const tEl of group) $(tEl.dataset.panel)?.classList.remove('active');
+  $(tab.dataset.panel)?.classList.add('active');
   if (focus) tab.focus();
-  // 波2.5: 確認タブが表示されるたび「最後の書き出し」カードを最新化(30秒
-  // ポーリングの他に、タブを開いた瞬間も反映されるようにする一手 — see
-  // fetchExportResults's doc).
-  if (tab.dataset.panel === 'nowPanel') fetchExportResults().catch(() => {});
 }
-for (const tab of tabs) {
+for (const tab of document.querySelectorAll('.tab')) {
   tab.onclick = () => activateTab(tab, { focus: false });
 }
-// Left/right (and Home/End) move + activate a tab, scoped to the tablist so
-// they never fall through to the global seek shortcuts.
-tabList.addEventListener('keydown', (e) => {
-  const idx = tabs.indexOf(document.activeElement);
-  if (idx < 0) return;
-  if (e.key === 'ArrowRight') { e.preventDefault(); activateTab(tabs[(idx + 1) % tabs.length]); }
-  else if (e.key === 'ArrowLeft') { e.preventDefault(); activateTab(tabs[(idx - 1 + tabs.length) % tabs.length]); }
-  else if (e.key === 'Home') { e.preventDefault(); activateTab(tabs[0]); }
-  else if (e.key === 'End') { e.preventDefault(); activateTab(tabs[tabs.length - 1]); }
-});
+for (const tabList of document.querySelectorAll('.tabs')) {
+  tabList.addEventListener('keydown', (e) => {
+    const group = tabsInGroup(document.activeElement);
+    const idx = group.indexOf(document.activeElement);
+    if (idx < 0 || !tabList.contains(document.activeElement)) return;
+    if (e.key === 'ArrowRight') { e.preventDefault(); activateTab(group[(idx + 1) % group.length]); }
+    else if (e.key === 'ArrowLeft') { e.preventDefault(); activateTab(group[(idx - 1 + group.length) % group.length]); }
+    else if (e.key === 'Home') { e.preventDefault(); activateTab(group[0]); }
+    else if (e.key === 'End') { e.preventDefault(); activateTab(group[group.length - 1]); }
+  });
+}
 
 // ---------- W-UI companion channel (show directives) — W-UI §0 ----------
 // Claude calls `vedit show <kind> ...`, which POSTs /api/show and broadcasts
@@ -4515,7 +4722,12 @@ function handleShowDirective(d) {
   // ユーザーへの割り込みとして最優先 — 選択を解除してインスペクタを閉じ、
   // #tabsView を表示してから各 kind のハンドラ(activateTab 等)に委ねる。
   // 選択中だった対象を show 後に再選択する必要はない。
+  // W-DESIGN: 右パネルが字幕スタイル/書き出しビューのときも同じ優先度で
+  // 会話ビューへ戻す(4モード化に伴う拡張、旧来のインスペクタ優先ルールと
+  // 同じ精神)。
   if (S.selection) deselect();
+  if (S.rightMode === 'caption') closeCaptionStylePopover();
+  if (S.rightMode === 'export') closeExportView();
   if (d.kind === 'range') return showRangeDirective(d);
   if (d.kind === 'words') return showWordsDirective(d);
   if (d.kind === 'candidate') return showCandidateDirective(d);
@@ -4596,7 +4808,7 @@ function renderCandidateCard(c) {
   ok.textContent = 'カットする';
   ok.onclick = async () => { await decide([c.id], 'approve'); };
   const ng = document.createElement('button');
-  ng.className = 'btn-wash'; // 候補カード: 残すは状態色ではなくニュートラル(--wash) — 「カットする」は現状の --keep のまま
+  ng.className = 'btn-wash'; // 候補カード: 残すは状態色ではなくニュートラル(--wash)。「カットする」(btn-approve)も raised(#2e2e33)の無彩色 — W-DESIGN 意味色規律
   ng.textContent = '残す';
   ng.onclick = async () => { await decide([c.id], 'reject'); };
   actions.append(preview, ok, ng);
@@ -4739,26 +4951,50 @@ function setClaudeTask(label) {
 // あなたの確認待ち; otherwise 待機中. Reads the badge AFTER renderInbox() has
 // run (see renderAll) rather than recomputing the same anchor/color/
 // low-confidence/QC scan a second time here.
+// W-DESIGN: README のピル(ドット+文言、bg#202024 radius999)へ再構成 —
+// 同じ3値の導出ロジックのまま、出力先を el.textContent 単独から
+// .claudeDot/.claudeText の2要素+右パネルのサブライン(#claudeSubline、
+// 「Cowork 接続中 · ...」)へ広げる。
 function renderClaudeStatus() {
   const el = $('claudeStatus');
   if (!el) return;
+  const textEl = el.querySelector('.claudeText');
+  const subEl = $('claudeSubline');
+  const empty = isProjectEmpty();
+  let state, label, title, subline;
   if (S.activeTask) {
-    el.textContent = 'Claude: 編集中';
-    el.className = 'claudeStatus busy';
-    el.title = S.activeTask.label;
-    return;
-  }
-  const badge = $('inboxCount');
-  const pending = badge && !badge.hidden ? Number(badge.textContent || '0') : 0;
-  if (pending > 0) {
-    el.textContent = 'Claude: あなたの確認待ち';
-    el.className = 'claudeStatus waiting';
-    el.title = `${pending}件の確認待ち — 確認タブを開いてください`;
+    state = 'busy';
+    label = `Claude · 編集中 — ${S.activeTask.label}`;
+    title = S.activeTask.label;
+    subline = 'Cowork 接続中 · 編集中…';
   } else {
-    el.textContent = 'Claude: 待機中';
-    el.className = 'claudeStatus idle';
-    el.title = '';
+    const badge = $('inboxCount');
+    const pending = badge && !badge.hidden ? Number(badge.textContent || '0') : 0;
+    if (empty) {
+      state = 'idle';
+      label = 'Claude · 待機中 — 動画を取り込むと編集を始められます';
+      title = '';
+      subline = 'Cowork 接続中 · 待機中';
+    } else if (pending > 0) {
+      // 「pending」は編集提案(候補)+対応が必要(警告)の合算(旧 renderClaudeStatus
+      // と同じ導出 — README「claudeStatus...旧 renderClaudeStatus と同じ導出」)。
+      // 警告だけでも表示されうるため、v2.dc.html の固定コピー「N件の編集提案」を
+      // そのまま流用せず、実際の内訳に即した中立な言い回しにする。
+      state = 'waiting';
+      label = `Claude · ${pending}件 — 確認待ち`;
+      title = `${pending}件の確認待ち — 会話タブを開いてください`;
+      subline = `Cowork 接続中 · 確認待ち ${pending}件`;
+    } else {
+      state = 'idle';
+      label = 'Claude · 待機中';
+      title = '';
+      subline = 'Cowork 接続中 · 待機中';
+    }
   }
+  el.className = `claudeStatus ${state}`;
+  el.title = title;
+  if (textEl) textEl.textContent = label;
+  if (subEl) subEl.textContent = subline;
 }
 
 // ---------- websocket live updates ----------
@@ -5135,13 +5371,14 @@ window.addEventListener('resize', () => { drawWave(); renderRuler(); });
 // opened later (via `vedit open`) instead of being stuck until a manual
 // browser refresh.
 connectWs();
-// 波2.5: 確認タブは既定で最初から表示されている(index.html の .tab.active)
-// ので、activateTab を経由しない初回だけここで明示的に1回フェッチする。
-// その後は 30秒ごとに確認タブが表示中のときだけポーリング(「軽い」— 他の
-// タブを見ている間は叩かない)。
+// 波2.5: 起動直後に1回フェッチしておく(exportResultCard 自体は書き出し
+// ビューを開くまで非表示だが、renderInbox からも呼ばれるので DOM は先に
+// 埋めておく)。その後は30秒ごとに書き出しビューが表示中のときだけポーリング
+// (「軽い」— 他のビューを見ている間は叩かない。W-DESIGN ディレクター適応1:
+// ガード条件を旧「確認タブ active」から S.rightMode==='export' へ差し替え)。
 fetchExportResults().catch(() => {});
 setInterval(() => {
-  if ($('tab-nowPanel')?.classList.contains('active')) fetchExportResults().catch(() => {});
+  if (S.rightMode === 'export') fetchExportResults().catch(() => {});
 }, 30000);
 requestAnimationFrame(tick);
 reload().then(() => {
@@ -5153,8 +5390,12 @@ reload().then(() => {
   const divider = $('paneDivider');
   if (!divider) return;
   const KEY = 'vedit.asideW';
-  const DEFAULT_W = 340;
-  const clampW = (w) => Math.max(240, Math.min(window.innerWidth * 0.7, w));
+  // W-DESIGN: README のデフォルト幅は344px(旧340pxから変更)。左右2枚の
+  // <aside> に分かれたため、リサイズ対象は右の Claude パネル(#rightPanel)
+  // だけを明示的に指す(旧 document.querySelector('aside') は左パネルに
+  // ヒットしてしまい壊れる)。
+  const DEFAULT_W = 344;
+  const clampW = (w) => Math.max(260, Math.min(window.innerWidth * 0.7, w));
   const apply = (w) => {
     document.documentElement.style.setProperty('--aside-w', `${clampW(w)}px`);
     drawWave(); // timeline canvas depends on stage width
@@ -5162,7 +5403,7 @@ reload().then(() => {
   };
   const saved = Number(localStorage.getItem(KEY));
   if (saved) apply(saved);
-  const current = () => document.querySelector('aside').getBoundingClientRect().width;
+  const current = () => $('rightPanel').getBoundingClientRect().width;
 
   divider.addEventListener('pointerdown', (e) => {
     e.preventDefault();
