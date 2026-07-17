@@ -1414,6 +1414,43 @@ describe('spriteGeometry (ground-anchor placement, scale, flip, defaults)', () =
     expect(geo.anchorX - geo.x).toBeCloseTo(0.5 * geo.width); // anchor.x fallback = 0.5
     expect(geo.anchorY - geo.y).toBeCloseTo(1.0 * geo.height); // anchor.y fallback = 1 (bottom)
   });
+
+  // Investigated as part of the "emote 差分の二重表示+巨大化" report: a
+  // sitting-pose expression PNG can have a MUCH tighter visible_bounds_
+  // normalized (a lot more transparent padding) than its base/canonical
+  // asset — e.g. real ponshasu kit data has visibleHeightFrac 0.85 for the
+  // canonical pose vs 0.56 for the smile pose. The suspicion was that
+  // rendering an emote diff at the sprite's shared `scale` would then read
+  // visibly BIGGER than the base (scale applied to the differently-padded
+  // full image, not normalized to a shared visible height). It does not:
+  // spriteGeometry's `displayHeight = scale * outputHeight` is defined in
+  // terms of the VISIBLE region specifically so this cancels out — this
+  // locks that contract in across differently-padded assets, not just
+  // within one asset (the existing 'scale sets the displayed height of the
+  // VISIBLE region' test above only checks a single asset against itself).
+  it('two assets with very different amounts of transparent padding around the character render the SAME visible height at the same scale (emote-diff size-consistency contract)', () => {
+    const tightlyPadded = {
+      // visible region is the full image (no padding) — e.g. a canonical pose.
+      width: 660, height: 430,
+      visible_bounds_normalized: { x0: 0.12, y0: 0.05, x1: 0.89, y1: 0.9 }, // visibleHeightFrac = 0.85
+      ground_anchor_normalized: { x: 0.5, y: 0.9 },
+    };
+    const looselyPadded = {
+      // same character, but exported with a lot more transparent margin
+      // around it (a rounder/sitting pose silhouette) — e.g. an emote diff.
+      width: 1254, height: 1254,
+      visible_bounds_normalized: { x0: 0.15, y0: 0.2, x1: 0.85, y1: 0.76 }, // visibleHeightFrac = 0.56, much tighter
+      ground_anchor_normalized: { x: 0.5, y: 0.76 },
+    };
+    const scale = 0.28;
+    const geoA = spriteGeometry(tightlyPadded, { x: 0.5, y: 0.9 }, scale, outputWH);
+    const geoB = spriteGeometry(looselyPadded, { x: 0.5, y: 0.9 }, scale, outputWH);
+    const visibleHeightA = geoA.height * (tightlyPadded.visible_bounds_normalized.y1 - tightlyPadded.visible_bounds_normalized.y0);
+    const visibleHeightB = geoB.height * (looselyPadded.visible_bounds_normalized.y1 - looselyPadded.visible_bounds_normalized.y0);
+    expect(visibleHeightA).toBeCloseTo(scale * outputWH.height);
+    expect(visibleHeightB).toBeCloseTo(scale * outputWH.height);
+    expect(visibleHeightA).toBeCloseTo(visibleHeightB); // <- the size-consistency contract itself
+  });
 });
 
 // ---- intent zones ("静寂スコア" protection zones — W-INTENT) ----

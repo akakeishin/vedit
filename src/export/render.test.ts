@@ -834,6 +834,75 @@ describe('buildCompositionFilterGraph', () => {
     expect(built.loopInputIndices).toEqual([]);
   });
 
+  // Regression for "背景が真っ黒" (composition background going literal black
+  // partway through): a background-typed kit asset is NOT guaranteed fully
+  // opaque (e.g. a PNG authored/exported with a transparent surround, rather
+  // than a genuine full-bleed room illustration) — and nothing downstream of
+  // [bgAll] (concat, then the final yuv420p encode) preserves alpha, so a
+  // bare scale/crop/trim chain would silently keep whatever RGB the source
+  // stored under its transparent pixels (frequently (0,0,0) — a literal
+  // black hole) once that alpha is dropped. Every image/video background
+  // segment must flatten onto a real opaque backdrop via an alpha-aware
+  // overlay instead of trusting the source to already be opaque.
+  it('a kit-asset background is always flattened onto an opaque black backdrop via an alpha-aware overlay (not just scale/crop)', () => {
+    let m = compManifest();
+    m = setBackgroundAt(m, 0, { type: 'asset', assetId: 'room' });
+    const built = buildCompositionFilterGraph(m, {
+      kitAssets: new Map([['room', fakeAsset('room', { path: 'assets/backgrounds/room.png', absPath: '/kit/assets/backgrounds/room.png' })]]),
+    });
+    expect(built.graph).toContain(
+      '[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,trim=duration=20,setpts=PTS-STARTPTS,fps=30,format=rgba[bgraw0]',
+    );
+    expect(built.graph).toContain('color=c=black:s=1080x1920:d=20:r=30[bgbase0]');
+    expect(built.graph).toContain('[bgbase0][bgraw0]overlay=x=0:y=0:format=auto[bgc0]');
+  });
+
+  it('a looping video background is ALSO flattened onto an opaque backdrop (same alpha risk as an image)', () => {
+    let m = compManifest();
+    m = setBackgroundAt(m, 0, { type: 'video', path: '/media/loop.mp4' });
+    const built = buildCompositionFilterGraph(m);
+    expect(built.graph).toContain(',format=rgba[bgraw0]');
+    expect(built.graph).toContain('[bgbase0][bgraw0]overlay=x=0:y=0:format=auto[bgc0]');
+  });
+
+  it('a color background needs no flattening (never had alpha to begin with) — byte-for-byte the pre-fix chain', () => {
+    const built = buildCompositionFilterGraph(compManifest());
+    expect(built.graph).toContain('color=c=#000000:s=1080x1920:d=20:r=30[bgc0]');
+    expect(built.graph).not.toContain('bgbase');
+    expect(built.graph).not.toContain('bgraw');
+  });
+
+  it('a background asset whose visible_bounds_normalized does not cover the full canvas warns (looks like a sprite/expression PNG, not a full-bleed background) — a full-bleed asset warns nothing', () => {
+    let m = compManifest();
+    m = setBackgroundAt(m, 0, { type: 'asset', assetId: 'notReallyBg' });
+    const notFullBleed = buildCompositionFilterGraph(m, {
+      kitAssets: new Map([[
+        'notReallyBg',
+        fakeAsset('notReallyBg', {
+          path: 'assets/backgrounds/notReallyBg.png',
+          absPath: '/kit/assets/backgrounds/notReallyBg.png',
+          visible_bounds_normalized: { x0: 0.17, y0: 0.25, x1: 0.8, y1: 0.74 }, // tight alpha bbox — real ponshasu/hiruma.png shape
+        }),
+      ]]),
+    });
+    expect(notFullBleed.warnings).toEqual([expect.stringContaining('background asset "notReallyBg"')]);
+    expect(notFullBleed.warnings[0]).toContain('not a full-bleed background image');
+
+    const fullBleed = buildCompositionFilterGraph(m, {
+      kitAssets: new Map([['notReallyBg', fakeAsset('notReallyBg', { path: 'assets/backgrounds/notReallyBg.png', absPath: '/kit/assets/backgrounds/notReallyBg.png' })]]), // default fakeAsset bounds = {0,0,1,1}
+    });
+    expect(fullBleed.warnings).toEqual([]);
+  });
+
+  it('an unresolved background asset (missing from kitAssets) still degrades to plain black — no flatten chain, no non-full-bleed warning (a different code path)', () => {
+    let m = compManifest();
+    m = setBackgroundAt(m, 0, { type: 'asset', assetId: 'ghost' });
+    const built = buildCompositionFilterGraph(m, { kitAssets: new Map() });
+    expect(built.graph).toContain('color=c=black:s=1080x1920:d=20:r=30[bgc0]');
+    expect(built.graph).not.toContain('bgbase');
+    expect(built.warnings).toEqual([]);
+  });
+
   it('the ambient layer composites over the background at a fixed low opacity, only when both an ambientAssetId AND a resolving kitAssets entry are given', () => {
     const kitAssets = new Map([['amb1', fakeAsset('amb1', { path: 'assets/ambient/dust.mp4', absPath: '/kit/assets/ambient/dust.mp4' })]]);
     const withAmbient = buildCompositionFilterGraph(compManifest(), { kitAssets, ambientAssetId: 'amb1' });
@@ -933,6 +1002,53 @@ describe('buildCompositionFilterGraph', () => {
     // layers, not the base.
     expect(base).not.toContain('st=2.85');
     expect(base).not.toContain('st=4.85');
+  });
+
+  // Investigated as part of the "二重表示+巨大化" report: verifies
+  // emote-to-emote (not base-to-emote) window boundaries are TRUE
+  // simultaneous crossfades — the outgoing layer's fade=out st/d exactly
+  // matches the incoming layer's fade=in st/d, and their `enable` windows
+  // are exactly adjacent (no gap that would show neither layer, no overlap
+  // that would show both at once). ops.ts's emoteWindows() already
+  // guarantees non-overlapping, contiguous [t0,t1) windows; this pins the
+  // render.ts side (the fade-clause math built from those windows) to the
+  // same contract for every consecutive pair, not just the first one.
+  it('every emote-to-emote window boundary is a symmetric crossfade: outgoing fade=out and incoming fade=in share identical st/d, with no gap or overlap between enable windows', () => {
+    let m = compManifest({ duration: 40 });
+    m = addSprite(m, 'char1', {
+      id: 'sp1', anchor: { sourceId: COMP_SOURCE_ID, srcTime: 0 }, duration: 40,
+      motion: { emoteAt: [{ t: 2, assetId: 'happy' }, { t: 10, assetId: 'sad' }, { t: 11, assetId: 'surprised' }, { t: 30, assetId: 'calm' }] },
+    });
+    const built = buildCompositionFilterGraph(m, {
+      kitAssets: new Map([
+        ['char1', fakeAsset('char1')], ['happy', fakeAsset('happy')], ['sad', fakeAsset('sad')],
+        ['surprised', fakeAsset('surprised')], ['calm', fakeAsset('calm')],
+      ]),
+    });
+    // 4 emoteAt entries -> 4 [spec0_N] emote overlay layers, each with its
+    // own `enable='between(t,absT0,absT1)'` window (the base sprite's own
+    // [spc0] overlay is enabled for the FULL sprite lifetime and excluded by
+    // this [spec0_N] pattern — its alpha, not `enable`, is what hides it).
+    const windows = [...built.graph.matchAll(/enable='between\(t,([\d.]+),([\d.]+)\)'\[spec0_(\d+)]/g)]
+      .sort((a, b) => Number(a[3]) - Number(b[3]))
+      .map((mm) => ({ t0: Number(mm[1]), t1: Number(mm[2]) }));
+    expect(windows).toEqual([{ t0: 2, t1: 10 }, { t0: 10, t1: 11 }, { t0: 11, t1: 30 }, { t0: 30, t1: 40 }]);
+    // Adjacent windows share their boundary exactly (t1 of one == t0 of the next) — no gap, no overlap.
+    for (let i = 0; i + 1 < windows.length; i++) expect(windows[i].t1).toBe(windows[i + 1].t0);
+
+    // Every [speN] layer's own fade=in:st=<t0> and fade=out:st+d=<t1> must
+    // land exactly on ITS window's boundaries (fd = min(0.15, width/2)) — the
+    // very thing that makes the neighboring layer's matching fade read as one
+    // continuous crossfade rather than two independently-timed fades that
+    // merely happen to be close.
+    for (const seg of built.graph.split(';')) {
+      const m2 = seg.match(/fade=t=in:st=([\d.]+):d=[\d.]+:alpha=1,fade=t=out:st=([\d.]+):d=([\d.]+):alpha=1\[spe0_(\d+)]$/);
+      if (!m2) continue;
+      const [, inSt, outSt, outD, idx] = m2;
+      const win = windows[Number(idx)];
+      expect(Number(inSt)).toBeCloseTo(win.t0);
+      expect(Number(outSt) + Number(outD)).toBeCloseTo(win.t1);
+    }
   });
 
   it('dialogue voice clips form a "spoken" track ([acVoice]) that duck=true background music sidechains against', () => {

@@ -612,6 +612,8 @@ export interface CompositionFilterGraphBuild {
   graph: string;
   videoLabel: string;
   audioLabel: string;
+  /** Non-fatal issues surfaced during graph construction (e.g. a background-typed kit asset that isn't actually full-bleed opaque). */
+  warnings: string[];
 }
 
 /**
@@ -625,8 +627,13 @@ export interface CompositionFilterGraphBuild {
  * `color` generator, a `-loop 1` kit image, or a `-stream_loop -1` looping
  * video — all scaled/cropped "cover"-style to the exact output canvas, no
  * source-dimension probing needed since `force_original_aspect_ratio=
- * increase`+`crop` works from whatever ffmpeg actually decodes) and the
- * intervals are concatenated end-to-end. Ambient: the kit's first
+ * increase`+`crop` works from whatever ffmpeg actually decodes). An image/
+ * video chain is then ALWAYS flattened onto an opaque black backdrop via a
+ * real alpha-aware `overlay` (see flattenOpaque below) — a "background"-
+ * typed kit asset is not guaranteed fully opaque, and nothing downstream of
+ * [bgAll] preserves alpha, so skipping this would let a transparent asset's
+ * under-alpha RGB (often literal black) leak straight through. The intervals
+ * are concatenated end-to-end. Ambient: the kit's first
  * `type:'ambient'` asset (opts.ambientAssetId), looped for the WHOLE
  * duration at a fixed low opacity, composited over the background —
  * entirely absent when the kit has none (opts.ambientAssetId undefined).
@@ -680,6 +687,28 @@ export function buildCompositionFilterGraph(
   const intervals = backgroundIntervals(m);
   const parts: string[] = [];
   const bgLabels: string[] = [];
+  const warnings: string[] = [];
+  const warnedNonBleedIds = new Set<string>();
+  /** kit-scan's alpha-bbox tolerance for "no transparent margin at all". */
+  const FULL_BLEED_EPS = 0.01;
+  // A background-typed kit asset (or a --to <video path> cut) is NOT
+  // guaranteed fully opaque — a kit's "backgrounds/" PNG can still carry an
+  // alpha channel (e.g. authored/exported with a transparent surround,
+  // rather than a genuine full-bleed room illustration). Nothing downstream
+  // of [bgAll] (concat, then the final yuv420p encode) preserves alpha, so a
+  // raw `scale,crop,trim` chain silently keeps whatever RGB the source
+  // happened to store under its transparent pixels once that alpha is
+  // dropped — frequently (0,0,0), which reads as a literal black hole rather
+  // than a neutral fill. Flatten with a real alpha-aware `overlay` onto an
+  // opaque black backdrop (the same pattern sprite/ambient layers already
+  // use) so the result is deterministic regardless of what garbage RGB sits
+  // under alpha=0 in the source — harmless no-op for a genuinely opaque
+  // asset (the backdrop is fully occluded), corrective for one that isn't.
+  const flattenOpaque = (rawLabel: string, label: string, i: number, dur: number): void => {
+    const backdrop = `[bgbase${i}]`;
+    parts.push(`color=c=black:s=${output.width}x${output.height}:d=${dur}:r=${fps}${backdrop}`);
+    parts.push(`${backdrop}${rawLabel}overlay=x=0:y=0:format=auto${label}`);
+  };
   intervals.forEach((iv, i) => {
     const dur = Math.max(1 / fps, iv.t1 - iv.t0);
     const label = `[bgc${i}]`;
@@ -693,12 +722,34 @@ export function buildCompositionFilterGraph(
         // degrades to black rather than failing the whole render.
         parts.push(`color=c=black:s=${output.width}x${output.height}:d=${dur}:r=${fps}${label}`);
       } else {
+        // kit-scan writes visible_bounds_normalized from the asset's actual
+        // alpha bounding box; a background asset with no transparency at all
+        // scans as the full canvas ({x0:0,y0:0,x1:1,y1:1} — see
+        // resolveKitAssets/kit-scan). Anything tighter means the source has
+        // a transparent margin — i.e. it's not a genuine full-bleed
+        // background — which flattenOpaque below will silently paper over
+        // with black rather than failing, so surface it as a warning instead
+        // (same "don't fail the whole render, but don't stay silent either"
+        // contract as resolveKitAssets' own warnings).
+        const vb = asset.visible_bounds_normalized;
+        if (vb && (vb.x0 > FULL_BLEED_EPS || vb.y0 > FULL_BLEED_EPS || vb.x1 < 1 - FULL_BLEED_EPS || vb.y1 < 1 - FULL_BLEED_EPS)) {
+          if (!warnedNonBleedIds.has(iv.ref.assetId)) {
+            warnedNonBleedIds.add(iv.ref.assetId);
+            warnings.push(
+              `background asset "${iv.ref.assetId}": only x[${vb.x0.toFixed(2)},${vb.x1.toFixed(2)}] y[${vb.y0.toFixed(2)},${vb.y1.toFixed(2)}] of the canvas is opaque — likely not a full-bleed background image (looks more like a sprite/expression PNG); the transparent margin renders as black`,
+            );
+          }
+        }
         const idx = addImageInput(asset.absPath);
-        parts.push(`[${idx}:v]${coverScale},trim=duration=${dur},setpts=PTS-STARTPTS,fps=${fps}${label}`);
+        const rawLabel = `[bgraw${i}]`;
+        parts.push(`[${idx}:v]${coverScale},trim=duration=${dur},setpts=PTS-STARTPTS,fps=${fps},format=rgba${rawLabel}`);
+        flattenOpaque(rawLabel, label, i, dur);
       }
     } else {
       const idx = addVideoLoopInput(iv.ref.path);
-      parts.push(`[${idx}:v]${coverScale},trim=duration=${dur},setpts=PTS-STARTPTS,fps=${fps}${label}`);
+      const rawLabel = `[bgraw${i}]`;
+      parts.push(`[${idx}:v]${coverScale},trim=duration=${dur},setpts=PTS-STARTPTS,fps=${fps},format=rgba${rawLabel}`);
+      flattenOpaque(rawLabel, label, i, dur);
     }
     bgLabels.push(label);
   });
@@ -867,7 +918,7 @@ export function buildCompositionFilterGraph(
   parts.push(`${audioLabel}${loudnormClause(targetLufs, opts.loudnorm ?? {})}[final]`);
   audioLabel = '[final]';
 
-  return { inputPaths, loopInputIndices, streamLoopInputIndices, graph: parts.join(';'), videoLabel, audioLabel };
+  return { inputPaths, loopInputIndices, streamLoopInputIndices, graph: parts.join(';'), videoLabel, audioLabel, warnings };
 }
 
 /**
@@ -1458,6 +1509,7 @@ export async function renderComposition(
   }
 
   const built = buildCompositionFilterGraph(m, { kitAssets, ambientAssetId });
+  warnings.push(...built.warnings);
   let graph = built.graph;
   const inputs = ffmpegInputArgs(built.inputPaths, built.loopInputIndices, built.streamLoopInputIndices);
 
