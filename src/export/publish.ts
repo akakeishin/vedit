@@ -1,6 +1,15 @@
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
-import { cropGeometry, keptWords, segments, sourceTimeToTimeline, timelineDuration } from '../core/ops.js';
+import {
+  backgroundIntervals,
+  COMP_SOURCE_ID,
+  cropGeometry,
+  keptWords,
+  resolvedActiveSprites,
+  segments,
+  sourceTimeToTimeline,
+  timelineDuration,
+} from '../core/ops.js';
 import { captionCues } from '../core/captions.js';
 import type { Manifest, SceneFile, Transcript } from '../core/types.js';
 import type { Peaks } from '../core/detect.js';
@@ -91,10 +100,18 @@ export function assembleChapterLines(entries: ChapterEntry[]): AssembledChapters
 
 export interface ThumbPoint {
   tlTime: number;
+  /**
+   * The source to extract this frame from — a real Manifest.sources[] id,
+   * or (W-ANIME) the COMP_SOURCE_ID sentinel for a composition project,
+   * which has no A-roll source at all. For a sentinel point, `srcTime` IS
+   * the absolute timeline time (same convention as sourceTimeToTimeline's
+   * `__comp__` branch) and extraction must come from a rendered file
+   * (publishPack's `opts.renderedFile`) rather than an original source path.
+   */
   sourceId: string;
   srcTime: number;
   crop?: { x?: number; y?: number };
-  reason: 'chapter' | 'energy';
+  reason: 'chapter' | 'energy' | 'composition';
 }
 
 /**
@@ -106,6 +123,14 @@ export interface ThumbPoint {
  * a peak inside footage that got cut away is never a candidate. Pure: given
  * the same manifest + peaks, always returns the same points — actual JPG
  * extraction (ffmpeg) happens in publishPack.
+ *
+ * A composition project (W-ANIME, `m.composition` set — see
+ * selectCompositionThumbnailPoints below) never populates `timeline.video`,
+ * so `segments(m)` is always empty and there is no waveform-energy signal
+ * tied to an A-roll; it gets its own candidate logic entirely. Every
+ * existing (source-driven) project is unaffected — `m.composition` is unset
+ * for those, so this branch never activates and the rest of the function is
+ * byte-for-byte unchanged.
  */
 export function selectThumbnailPoints(
   m: Manifest,
@@ -113,8 +138,11 @@ export function selectThumbnailPoints(
   peaksBySource: Record<string, Peaks>,
   count: number,
 ): ThumbPoint[] {
+  if (count <= 0) return [];
+  if (m.composition) return selectCompositionThumbnailPoints(m, chapterTimes, count);
+
   const segs = segments(m);
-  if (segs.length === 0 || count <= 0) return [];
+  if (segs.length === 0) return [];
   const total = segs[segs.length - 1].tlEnd;
 
   const tlToPoint = (tl: number, reason: ThumbPoint['reason']): ThumbPoint | null => {
@@ -155,6 +183,60 @@ export function selectThumbnailPoints(
       if (tooClose(s.tlTime)) continue;
       const pt = tlToPoint(s.tlTime, 'energy');
       if (pt) chosen.push(pt);
+    }
+  }
+
+  return chosen.sort((a, b) => a.tlTime - b.tlTime);
+}
+
+/**
+ * Composition-mode (W-ANIME) thumbnail candidates — see selectThumbnailPoints
+ * above. There is no A-roll and no waveform-energy signal to rank on, so the
+ * candidate pool is every moment something visually changes: background-track
+ * cut points (t=0 plus each `backgroundIntervals()` boundary — the "紙芝居"
+ * scene changes) unioned with every resolved sprite's entrance time
+ * (`resolvedActiveSprites()`'s tlStart). Chapter times (from motion
+ * chapter-cards — the same list the source-driven path receives) still take
+ * priority when present, using the same spacing/dedup rule (`minGap`) so
+ * picks don't cluster. Every point is stamped `sourceId: COMP_SOURCE_ID`,
+ * `srcTime: tlTime` — the same "srcTime IS absolute timeline time" sentinel
+ * convention as `sourceTimeToTimeline` — since there is no per-source origin
+ * to extract from; publishPack routes these to ffmpeg against a rendered
+ * file (`opts.renderedFile`) instead of an original source path, or reports
+ * a reason instead of silently producing zero thumbnails when none was
+ * given. Pure, same contract as selectThumbnailPoints.
+ */
+function selectCompositionThumbnailPoints(m: Manifest, chapterTimes: number[], count: number): ThumbPoint[] {
+  const duration = m.composition!.duration;
+  if (!(duration > 0)) return [];
+
+  const toPoint = (tl: number, reason: ThumbPoint['reason']): ThumbPoint => {
+    const clampedTl = Math.min(Math.max(tl, 0), duration - 1e-6);
+    return { tlTime: clampedTl, sourceId: COMP_SOURCE_ID, srcTime: clampedTl, reason };
+  };
+
+  const minGap = Math.max(0.5, duration / Math.max(1, count * 4));
+  const chosen: ThumbPoint[] = [];
+  const tooClose = (tl: number) => chosen.some((c) => Math.abs(c.tlTime - tl) < minGap);
+
+  for (const tl of [...chapterTimes].sort((a, b) => a - b)) {
+    if (chosen.length >= count) break;
+    if (tl < 0 || tl >= duration) continue;
+    if (tooClose(tl)) continue;
+    chosen.push(toPoint(tl, 'chapter'));
+  }
+
+  const remaining = count - chosen.length;
+  if (remaining > 0) {
+    const boundaryTimes = backgroundIntervals(m).map((iv) => iv.t0);
+    const spriteTimes = resolvedActiveSprites(m).map((r) => r.tlStart);
+    const candidateTimes = [...new Set([...boundaryTimes, ...spriteTimes])]
+      .filter((t) => t >= 0 && t < duration)
+      .sort((a, b) => a - b);
+    for (const tl of candidateTimes) {
+      if (chosen.length >= count) break;
+      if (tooClose(tl)) continue;
+      chosen.push(toPoint(tl, 'composition'));
     }
   }
 
@@ -204,22 +286,38 @@ export interface PublishPackResult {
   chaptersFile: string | null;
   chaptersReason?: string;
   thumbnails: string[];
+  /**
+   * Set (with `thumbnails` empty) when a composition project (W-ANIME) had
+   * thumbnail candidates but no `opts.renderedFile` was given to extract
+   * them from — guidance, not a failure: the rest of the pack (chapters,
+   * materials.json) is still written normally. Unset for every
+   * source-driven project (there's always an original source to extract
+   * from) and for a composition pack that DID receive a renderedFile.
+   */
+  thumbnailsReason?: string;
   materialsFile: string;
 }
 
 /**
  * Full publish-pack pipeline: chapters (motion chapter-cards, else annotated
- * scenes) -> thumbnail candidate selection -> full-res JPG extraction from
- * ORIGINAL sources (never proxies, so publish-quality stills) -> materials.json.
- * Entirely read-only with respect to the project (no manifest mutation, no
- * --base needed).
+ * scenes) -> thumbnail candidate selection -> full-res JPG extraction ->
+ * materials.json. For a source-driven project, thumbnails are extracted from
+ * ORIGINAL sources (never proxies, so publish-quality stills). A composition
+ * project (W-ANIME, `m.composition` set) has no source to extract from at
+ * all — its candidate points are stamped with the COMP_SOURCE_ID sentinel
+ * (see selectCompositionThumbnailPoints) and are extracted from
+ * `opts.renderedFile` (an already-rendered output file, timeline-aligned by
+ * construction) when given; when it's not given, thumbnail extraction is
+ * skipped and `thumbnailsReason` explains why instead of silently producing
+ * zero thumbnails. Entirely read-only with respect to the project (no
+ * manifest mutation, no --base needed).
  */
 export async function publishPack(
   project: Project,
   m: Manifest,
   transcripts: Transcript[],
   outdir: string,
-  opts: { thumbs?: number } = {},
+  opts: { thumbs?: number; renderedFile?: string } = {},
 ): Promise<PublishPackResult> {
   const thumbsCount = opts.thumbs ?? 6;
   await fs.mkdir(outdir, { recursive: true });
@@ -266,8 +364,36 @@ export async function publishPack(
   const srcById = new Map(m.sources.map((s) => [s.id, s]));
   const output = m.output;
   const thumbnails: string[] = [];
+  let thumbnailsReason: string | undefined;
   for (let i = 0; i < points.length; i++) {
     const pt = points[i];
+    // W-ANIME composition points have no original source to extract from at
+    // all (see selectCompositionThumbnailPoints) — extract from a rendered
+    // file when given, otherwise skip with an explicit reason rather than a
+    // silent no-op. `thumbsCount` may legitimately mix in a `false`
+    // opts.renderedFile with zero composition points (e.g. an empty
+    // composition), so the reason is only ever set once we actually had a
+    // point to skip.
+    if (pt.sourceId === COMP_SOURCE_ID) {
+      if (!opts.renderedFile) {
+        thumbnailsReason ??=
+          'コンポジション(スプライトアニメ)プロジェクトのサムネイル抽出にはレンダー済みファイルが必要です。' +
+          '`vedit publish-pack <outdir> --render <file>` のように、書き出し済みファイルのパスを指定してください。';
+        continue;
+      }
+      const dest = path.join(thumbsDir, `thumb-${String(i + 1).padStart(2, '0')}-t${pt.tlTime.toFixed(1)}.jpg`);
+      await run('ffmpeg', [
+        '-y', '-v', 'error',
+        '-ss', String(pt.srcTime),
+        '-i', opts.renderedFile,
+        '-frames:v', '1',
+        '-q:v', '2',
+        dest,
+      ]);
+      thumbnails.push(dest);
+      files.push(dest);
+      continue;
+    }
     const src = srcById.get(pt.sourceId);
     if (!src) continue;
     const geo = output ? cropGeometry(src.width, src.height, output.width, output.height, pt.crop) : null;
@@ -291,5 +417,5 @@ export async function publishPack(
   await fs.writeFile(materialsFile, JSON.stringify(materials, null, 2));
   files.push(materialsFile);
 
-  return { outdir, files, chaptersFile, chaptersReason, thumbnails, materialsFile };
+  return { outdir, files, chaptersFile, chaptersReason, thumbnails, thumbnailsReason, materialsFile };
 }

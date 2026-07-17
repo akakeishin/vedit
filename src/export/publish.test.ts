@@ -3,8 +3,9 @@ import { mkdtempSync } from 'node:fs';
 import { promises as fs } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import type { Manifest, SceneFile, Transcript } from '../core/types.js';
+import type { BackgroundRef, Manifest, SceneFile, SpriteItem, Transcript } from '../core/types.js';
 import type { Peaks } from '../core/detect.js';
+import { COMP_SOURCE_ID } from '../core/ops.js';
 
 // publishPack's thumbnail extraction shells out via run(); stub it so the
 // integration tests below only assert on the constructed argv, without
@@ -40,6 +41,45 @@ function baseManifest(opts: { srcDuration?: number; clipOut?: number } = {}): Ma
     sources: [{ id: 's1', path: '/media/a.mp4', duration: srcDuration, fps: 30, width: 1920, height: 1080, hasAudio: true }],
     timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: clipOut }], motion: [] },
     captions: { enabled: true, style: 'clean', maxChars: 24 },
+  };
+}
+
+// W-ANIME composition ("コンポジション/スプライトアニメ") fixture: no A-roll
+// source at all — see Manifest.composition's doc. `sprites`/`backgroundTrack`
+// let each test control the candidate pool (background cuts + sprite
+// entrances) that selectThumbnailPoints/publishPack must derive.
+function compositionManifest(opts: {
+  duration?: number;
+  backgroundTrack?: { t: number; ref: BackgroundRef }[];
+  sprites?: SpriteItem[];
+} = {}): Manifest {
+  return {
+    version: 1,
+    name: 't-comp',
+    revision: 0,
+    fps: 30,
+    width: 1080,
+    height: 1920,
+    sources: [],
+    timeline: { video: [], motion: [], sprites: opts.sprites ?? [] },
+    captions: { enabled: true, style: 'clean', maxChars: 24 },
+    composition: {
+      duration: opts.duration ?? 60,
+      background: { type: 'color', hex: '#000000' },
+      ...(opts.backgroundTrack ? { backgroundTrack: opts.backgroundTrack } : {}),
+    },
+  };
+}
+
+function sprite(id: string, srcTime: number, duration = 5): SpriteItem {
+  return {
+    id,
+    assetId: 'char-a',
+    anchor: { sourceId: COMP_SOURCE_ID, srcTime },
+    duration,
+    position: { x: 0.5, y: 0.9 },
+    scale: 0.4,
+    opacity: 1,
   };
 }
 
@@ -183,6 +223,85 @@ describe('selectThumbnailPoints', () => {
     const points = selectThumbnailPoints(m, [0, 5, 10, 15, 20, 25, 30, 35], {}, 3);
     expect(points.length).toBeLessThanOrEqual(3);
   });
+
+  // ---- composition (W-ANIME) — regression bug: this used to always return
+  // [] because segments(m) is always empty for a composition project (no
+  // A-roll), and the guard at the top of the function bailed out before any
+  // composition-aware candidate logic ran at all.
+  describe('composition projects', () => {
+    it('candidates are background-track cut points (plus t=0) unioned with sprite entrance times, deduped', () => {
+      const m = compositionManifest({
+        duration: 60,
+        backgroundTrack: [
+          { t: 20, ref: { type: 'color', hex: '#111111' } },
+          { t: 40, ref: { type: 'color', hex: '#222222' } },
+        ],
+        sprites: [sprite('sp1', 10)],
+      });
+      const points = selectThumbnailPoints(m, [], {}, 6);
+      expect(points.map((p) => p.tlTime)).toEqual([0, 10, 20, 40]);
+      expect(points.every((p) => p.sourceId === COMP_SOURCE_ID)).toBe(true);
+      expect(points.every((p) => p.reason === 'composition')).toBe(true);
+      // srcTime IS absolute timeline time for the COMP_SOURCE_ID sentinel —
+      // same convention as sourceTimeToTimeline's `__comp__` branch.
+      expect(points.every((p) => p.srcTime === p.tlTime)).toBe(true);
+    });
+
+    it('a background cut and a sprite entrance landing on the same instant collapse to one candidate, not two', () => {
+      const m = compositionManifest({
+        duration: 60,
+        backgroundTrack: [{ t: 10, ref: { type: 'color', hex: '#111111' } }],
+        sprites: [sprite('sp1', 10)],
+      });
+      const points = selectThumbnailPoints(m, [], {}, 6);
+      expect(points.map((p) => p.tlTime)).toEqual([0, 10]);
+    });
+
+    it('chapter times still take priority, filling remaining budget from background/sprite candidates', () => {
+      const m = compositionManifest({
+        duration: 60,
+        backgroundTrack: [{ t: 40, ref: { type: 'color', hex: '#111111' } }],
+        sprites: [],
+      });
+      const points = selectThumbnailPoints(m, [5], {}, 6);
+      expect(points.map((p) => ({ tlTime: p.tlTime, reason: p.reason }))).toEqual([
+        { tlTime: 0, reason: 'composition' },
+        { tlTime: 5, reason: 'chapter' },
+        { tlTime: 40, reason: 'composition' },
+      ]);
+    });
+
+    it('never exceeds the requested count', () => {
+      const m = compositionManifest({
+        duration: 60,
+        backgroundTrack: [
+          { t: 10, ref: { type: 'color', hex: '#111111' } },
+          { t: 20, ref: { type: 'color', hex: '#222222' } },
+          { t: 30, ref: { type: 'color', hex: '#333333' } },
+        ],
+        sprites: [sprite('sp1', 5), sprite('sp2', 45)],
+      });
+      const points = selectThumbnailPoints(m, [], {}, 2);
+      expect(points.length).toBeLessThanOrEqual(2);
+      // minGap at count=2 is duration/(2*4)=7.5s, so the t=5 sprite entrance
+      // (only 5s after t=0) is rejected as too close; t=10 is the next pick.
+      expect(points.map((p) => p.tlTime)).toEqual([0, 10]);
+    });
+
+    it('an "empty" composition (no background cuts, no sprites) still yields the base t=0 candidate', () => {
+      const m = compositionManifest({ duration: 60 });
+      const points = selectThumbnailPoints(m, [], {}, 6);
+      expect(points).toHaveLength(1);
+      expect(points[0]).toMatchObject({ tlTime: 0, sourceId: COMP_SOURCE_ID, reason: 'composition' });
+    });
+
+    it('returns an empty list for a zero-duration composition or a non-positive count', () => {
+      const m = compositionManifest({ duration: 0 });
+      expect(selectThumbnailPoints(m, [], {}, 6)).toEqual([]);
+      const m2 = compositionManifest({ duration: 60 });
+      expect(selectThumbnailPoints(m2, [], {}, 0)).toEqual([]);
+    });
+  });
 });
 
 // ---- buildMaterials ----
@@ -282,5 +401,50 @@ describe('publishPack', () => {
     expect(result.chaptersFile).toBeNull();
     expect(result.chaptersReason).toBeTruthy();
     await expect(fs.access(path.join(outdir, 'chapters.txt'))).rejects.toThrow();
+  });
+
+  // ---- composition (W-ANIME) — regression bug: publish-pack always
+  // produced 0 thumbnails for a composition project, silently, because
+  // selectThumbnailPoints bailed out before any composition-aware candidate
+  // logic ran (segments(m) is always [] for a composition — no A-roll).
+  it('reports a clear reason (not silence, not an error) when a composition project has thumbnail candidates but no rendered file was given', async () => {
+    runMock.mockClear();
+    const project = await makeProject();
+    const m = compositionManifest({ duration: 30, sprites: [sprite('sp1', 5)] });
+    const outdir = path.join(project.dir, 'pack-out');
+    const result = await publishPack(project, m, [], outdir, { thumbs: 6 });
+
+    expect(result.thumbnails).toEqual([]);
+    expect(result.thumbnailsReason).toBeTruthy();
+    expect(result.thumbnailsReason).toMatch(/レンダー済み/);
+    // Materials/chapters pipeline is unaffected by the missing render.
+    expect(result.materialsFile).toBe(path.join(outdir, 'materials.json'));
+    await expect(fs.access(result.materialsFile)).resolves.toBeUndefined();
+    // ffmpeg was never invoked — there's nothing to extract from.
+    expect(runMock).not.toHaveBeenCalled();
+  });
+
+  it('extracts composition thumbnails from opts.renderedFile (never the nonexistent original source) when one is given', async () => {
+    runMock.mockClear();
+    const project = await makeProject();
+    const m = compositionManifest({
+      duration: 30,
+      backgroundTrack: [{ t: 15, ref: { type: 'color', hex: '#111111' } }],
+      sprites: [sprite('sp1', 5)],
+    });
+    const outdir = path.join(project.dir, 'pack-out');
+    const renderedFile = '/renders/final.mp4';
+    const result = await publishPack(project, m, [], outdir, { thumbs: 6, renderedFile });
+
+    expect(result.thumbnailsReason).toBeUndefined();
+    expect(result.thumbnails.length).toBeGreaterThan(0);
+    expect(result.thumbnails).toHaveLength(3); // t=0, 5, 15
+
+    for (const call of runMock.mock.calls) {
+      const [cmd, args] = call as [string, string[]];
+      expect(cmd).toBe('ffmpeg');
+      expect(args).toContain(renderedFile);
+      expect(args).not.toContain('-vf'); // no cropGeometry for a rendered-file extraction
+    }
   });
 });
