@@ -881,6 +881,60 @@ describe('buildCompositionFilterGraph', () => {
     expect(built.graph).toMatch(/enable='between\(t,2,5\)'\[spec0_0\]/);
   });
 
+  // Regression for "emoteAt が二重描画になる" (ぽんしゃすが複数出てきた): the
+  // base sprite must NOT keep rendering underneath the emote layer once an
+  // emoteAt window starts — it needs its own alpha fade-out, timed to exactly
+  // match the emote layer's fade-in (a real simultaneous crossfade).
+  function baseSpvChain(graph: string): string {
+    const seg = graph.split(';').find((s) => s.endsWith('[spv0]'));
+    if (!seg) throw new Error('no [spv0] segment found in graph');
+    return seg;
+  }
+
+  it('emoteAt fades the BASE sprite out in sync with the emote layer fading in (no double-drawn character)', () => {
+    let m = compManifest();
+    m = addSprite(m, 'char1', {
+      id: 'sp1', anchor: { sourceId: COMP_SOURCE_ID, srcTime: 0 }, duration: 5,
+      motion: { emoteAt: [{ t: 2, assetId: 'happy' }] },
+    });
+    const built = buildCompositionFilterGraph(m, {
+      kitAssets: new Map([['char1', fakeAsset('char1')], ['happy', fakeAsset('happy')]]),
+    });
+    const base = baseSpvChain(built.graph);
+    // Same st/d as the emote layer's own fade=in (st=2:d=0.15) — simultaneous, not sequential.
+    expect(base).toContain('fade=t=out:st=2:d=0.15:alpha=1');
+    // The base overlay itself stays enabled for the whole sprite lifetime (only its alpha drops to 0) —
+    // the emote layer is what visually takes over.
+    expect(built.graph).toContain("enable='between(t,0,5)'[spc0]");
+  });
+
+  it('a sprite with NO emoteAt gets no extra base fade clause (regression: byte-identical to pre-fix base chain)', () => {
+    let m = compManifest();
+    m = addSprite(m, 'char1', { id: 'sp1', anchor: { sourceId: COMP_SOURCE_ID, srcTime: 0 }, duration: 5 });
+    const built = buildCompositionFilterGraph(m, { kitAssets: new Map([['char1', fakeAsset('char1')]]) });
+    const base = baseSpvChain(built.graph);
+    expect(base).not.toContain('fade=');
+  });
+
+  it('multiple emoteAt entries only fade the base out ONCE (at the first window) — later transitions are emote-to-emote, not base-involving', () => {
+    let m = compManifest();
+    m = addSprite(m, 'char1', {
+      id: 'sp1', anchor: { sourceId: COMP_SOURCE_ID, srcTime: 0 }, duration: 5,
+      motion: { emoteAt: [{ t: 1, assetId: 'happy' }, { t: 3, assetId: 'sad' }] },
+    });
+    const built = buildCompositionFilterGraph(m, {
+      kitAssets: new Map([['char1', fakeAsset('char1')], ['happy', fakeAsset('happy')], ['sad', fakeAsset('sad')]]),
+    });
+    const base = baseSpvChain(built.graph);
+    const fadeOutCount = (base.match(/fade=t=out/g) ?? []).length;
+    expect(fadeOutCount).toBe(1);
+    expect(base).toContain('fade=t=out:st=1:d=0.15:alpha=1');
+    // The second window's own fade timings (happy's exit at 2.85, sad's exit at 4.85) live in the EMOTE
+    // layers, not the base.
+    expect(base).not.toContain('st=2.85');
+    expect(base).not.toContain('st=4.85');
+  });
+
   it('dialogue voice clips form a "spoken" track ([acVoice]) that duck=true background music sidechains against', () => {
     const voice = { id: 'mu1', path: '/voice.mp3', tlStart: 1, duration: 2, srcIn: 0, gain: 0, fadeIn: 0.05, fadeOut: 0.05, duck: false };
     const bgm = { id: 'mu2', path: '/bgm.mp3', tlStart: 0, duration: 20, srcIn: 0, gain: -18, fadeIn: 1, fadeOut: 1, duck: true };

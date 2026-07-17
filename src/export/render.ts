@@ -733,6 +733,16 @@ export function buildCompositionFilterGraph(
       const geo = spriteGeometry(asset, sp.position, sp.scale, output, { flip: sp.flip });
       const plan = spriteMotionPlan(sp.motion, geo, r.tlStart, r.tlEnd);
       const idx = addImageInput(asset.absPath);
+      // emoteWindows() windows are always CONTIGUOUS through to the sprite's
+      // own duration end (each entry's window runs until the next entry's t,
+      // or duration — see ops.ts's emoteWindows doc), so once the first
+      // window starts, the base sprite is never shown again for the rest of
+      // its lifetime; only ONE base->first-emote transition ever needs a
+      // fade. Without this, the base kept rendering underneath every emote
+      // layer for the sprite's whole life, which is the "ぽんしゃすが複数
+      // 出てきた" bug — a base silhouette peeking out from behind a
+      // differently-shaped emote reads as a second character.
+      const windows = emoteWindows(sp.motion?.emoteAt, sp.duration);
       // breathe is scale-only: its pulse lives in eval=frame w/h expressions
       // (plan.breathe), which a static `scale=W:H` would silently discard —
       // the preset must animate in the render exactly like the web preview.
@@ -745,6 +755,14 @@ export function buildCompositionFilterGraph(
       chain.push('format=rgba');
       if (sp.opacity < 0.999) chain.push(`colorchannelmixer=aa=${sp.opacity}`);
       chain.push(...plan.fadeClauses);
+      if (windows.length > 0) {
+        const first = windows[0];
+        const hideAt = r.tlStart + first.t0;
+        const hideFd = Math.min(SPRITE_EMOTE_CROSSFADE_SECONDS, (first.t1 - first.t0) / 2);
+        // Same st/d as the first emote layer's own fade=in below — a real
+        // simultaneous crossfade, not a sequential fade-out-then-in.
+        chain.push(`fade=t=out:st=${hideAt}:d=${hideFd}:alpha=1`);
+      }
       const svLabel = `[spv${n}]`;
       parts.push(`[${idx}:v]${chain.join(',')}${svLabel}`);
       const composited = `[spc${n}]`;
@@ -753,7 +771,6 @@ export function buildCompositionFilterGraph(
       );
       videoLabel = composited;
 
-      const windows = emoteWindows(sp.motion?.emoteAt, sp.duration);
       windows.forEach((w, wi) => {
         const emoteAsset = opts.kitAssets!.get(w.assetId);
         if (!emoteAsset) return; // unresolved emote asset — skip this window (warning already surfaced upstream by resolveKitAssets)

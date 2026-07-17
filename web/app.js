@@ -3038,6 +3038,7 @@ function spriteGeometryJS(asset, position, scale, outputWH, flip) {
 // per the spec's "タイミングのみ一致保証" contract.
 const SPRITE_TRANSITION_SECONDS = 0.35;
 const SPRITE_BREATHE_AMPLITUDE = 0.012;
+const SPRITE_EMOTE_CROSSFADE_SECONDS = 0.15;
 function spriteMotionOffsetJS(motion, tl, tlStart, tlEnd, geo) {
   let dx = 0, dy = 0, alpha = 1, scaleMul = 1;
   const D = SPRITE_TRANSITION_SECONDS;
@@ -3087,6 +3088,42 @@ function activeSpriteAssetId(sp, tl, tlStart) {
     else break;
   }
   return active;
+}
+
+// W-ANIME "表情差分" crossfade approximation — a JS port of render.ts's
+// buildCompositionFilterGraph emote fade=alpha clauses. The preview only
+// ever shows ONE <img> per sprite (activeSpriteAssetId above swaps `src`
+// on a hard cut), so a true two-layer alpha blend isn't possible here; this
+// returns an extra 0..1 opacity multiplier so that image switch reads as a
+// quick fade-through-transparent rather than an instant pop — "見た目近似"
+// per this file's motion-offset convention, timing only (not curve-for-
+// curve) matched to the render pipeline. The base sprite fades out exactly
+// as the FIRST emoteAt window's own asset fades in (a real simultaneous
+// crossfade, same as render.ts); every window after that only fades its
+// own asset in/out at ITS OWN boundaries — emoteWindows() windows are
+// always contiguous through to the sprite's own duration end, so the base
+// itself is never shown again once the first window starts (see render.ts's
+// comment on the same fix for the "ぽんしゃすが複数出てきた" bug).
+function spriteEmoteFadeAlphaJS(sp, localT) {
+  const emoteAt = sp.motion?.emoteAt;
+  if (!emoteAt || emoteAt.length === 0) return 1;
+  const sorted = [...emoteAt]
+    .filter((e) => Number.isFinite(e.t) && e.t >= 0 && e.t < sp.duration)
+    .sort((a, b) => a.t - b.t);
+  if (sorted.length === 0 || localT < sorted[0].t) return 1; // before any emoteAt fires — base at full alpha
+  // Find the active window's [start, end) — mirrors ops.ts's emoteWindows.
+  let start = sorted[0].t;
+  let end = sp.duration;
+  for (let i = 0; i < sorted.length; i++) {
+    const t0 = sorted[i].t;
+    const t1 = i + 1 < sorted.length ? Math.min(sorted[i + 1].t, sp.duration) : sp.duration;
+    if (localT >= t0 && localT < t1) { start = t0; end = t1; break; }
+  }
+  const fd = Math.min(SPRITE_EMOTE_CROSSFADE_SECONDS, (end - start) / 2);
+  if (fd <= 0) return 1;
+  if (localT < start + fd) return Math.max(0, Math.min(1, (localT - start) / fd));
+  if (localT >= end - fd) return Math.max(0, Math.min(1, (end - localT) / fd));
+  return 1;
 }
 
 function renderSprites(tl) {
@@ -3142,7 +3179,7 @@ function renderSprites(tl) {
     entry.img.style.top = `${(y / out.height) * 100}%`;
     entry.img.style.width = `${(w / out.width) * 100}%`;
     entry.img.style.height = `${(h / out.height) * 100}%`;
-    entry.img.style.opacity = String(sp.opacity * off.alpha);
+    entry.img.style.opacity = String(sp.opacity * off.alpha * spriteEmoteFadeAlphaJS(sp, tl - tlStart));
     entry.img.style.transform = sp.flip ? 'scaleX(-1)' : '';
   }
 }
