@@ -112,6 +112,36 @@ UI は確認・承認・微調整)を壊さずに借りること。
 **UI 内の第二 AI チャット**(主導権が二つになる)、タイムライン先行の
 オンボーディング(教えるのは「頼む→光る→確認→戻せる」の一巡)。
 
+## 波2 追加項目(2026-07-17 到達可能性・parity 総点検より)
+
+- **字幕のデッドロック解消**: captions.enabled の常設トグル+プリセット
+  (style)選択+maxChars をスタイルインスペクタに追加(enabled=false だと
+  cue が消えて字幕 UI への入口ごと消滅する現行構造の解消)。
+- **音声パネル拡張**: audio-mix(目標ラウドネス・duckAmount)も対象に
+  (duckAmount はプレビューが常時参照しているのに変更手段がない)。
+- **add/remove の対称化**: motion-add(4プリセットのみ)・music-add の
+  追加ボタン、選択インスペクタに削除(motion/music/broll)。
+  sprite/dialogue/compose 系の追加 UI はコンポジション UI 波(波3)へ。
+- **color-adjust のプレビュー近似**: exposure→CSS brightness、
+  saturation→saturate で近似反映。WB は「書き出しで確認」の注記を表示
+  (嘘の近似はしない)。
+- **セリフの通常プロジェクト・プレビュー描画**(tick から
+  renderDialogueBubbles を呼ぶ — レンダー側は既定焼き込みに修正済み)。
+- **再生ボタンの嘘を直す**: セグメント0のとき pressed 化しない+
+  disabled+理由 title。
+- **保護区間行**: クリックでシーク+「Claude が守っている無音」の title。
+- **QC kit-asset-missing** を確認タブ「対応が必要」群に追加(現在
+  どの経路でも不可視)。
+- **「言い直しを確認」ボタン**(GET /api/takes → 既存 takesCard を
+  ユーザー起点で開く — 現在は Claude の show directive 経由のみ)。
+- **キットのリンク状態表示**(素材タブ先頭に「キット: 名前」+スタイル/
+  アセット数。未リンクなら非表示)。
+- **自動保存の明示**: ヘッダーの版表示に「自動保存」を添える
+  (「保存」という語が UI に一度も出ない現状の解消)。
+- 別枠(波3以降・要設計): 書き出しの UI 到達(daemon に export ルートが
+  構造的に無い。会話主導原則と整合する形 — 最低限 custom-html 警告等の
+  結果カード表出 — を Fable が設計してから)。コンポジション編集 UI。
+
 ## 実装ノート
 
 - 既存資産を移設で使う: #clipInspector(index.html:93)、#claudeStrip
