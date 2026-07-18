@@ -1,0 +1,828 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>vedit — D3v2 マスター(精緻版)</title>
+<style>
+  :root{
+    --font-ui: system-ui, -apple-system, "Hiragino Kaku Gothic ProN", "Hiragino Sans", sans-serif;
+    --font-mono: ui-monospace, "SF Mono", Menlo, monospace;
+    --bg:#0F1013;
+    --surface:#16181D;
+    --surface-sunk:#0B0C0F;
+    --hair:#262A31;
+    --hair-soft:#1D2026;
+    --text:#F2F4F7;
+    --weak:#8A919C;
+    --faint:#575D68;
+    --amber:#D9A45F;
+    --green:#6FBE8B;
+  }
+
+  *{margin:0;padding:0;box-sizing:border-box;}
+
+  html,body{
+    width:1440px;
+    height:900px;
+    background:var(--bg);
+    color:var(--text);
+    font-family:var(--font-ui);
+    overflow:hidden;
+    -webkit-font-smoothing:antialiased;
+  }
+
+  .mono{
+    font-family:var(--font-mono);
+    font-variant-numeric:tabular-nums;
+    font-feature-settings:"tnum" 1;
+  }
+
+  /* ---------- precision grid background ---------- */
+  .app{
+    position:relative;
+    width:1440px;
+    height:900px;
+    display:flex;
+    flex-direction:column;
+    background-image:
+      linear-gradient(to right, var(--hair-soft) 1px, transparent 1px),
+      linear-gradient(to bottom, var(--hair-soft) 1px, transparent 1px);
+    background-size:24px 24px;
+    background-position:-1px -1px;
+  }
+  .app::before{
+    content:"";
+    position:absolute;
+    inset:0;
+    background:var(--bg);
+    opacity:0.55;
+    pointer-events:none;
+  }
+  .app > *{ position:relative; z-index:1; }
+
+  /* ---------- plate label (nameplate) ---------- */
+  .plate{
+    display:flex;
+    align-items:center;
+    gap:6px;
+    font-family:var(--font-mono);
+    font-size:9px;
+    letter-spacing:0.14em;
+    color:var(--faint);
+    line-height:1;
+  }
+  .plate .plate-mark{
+    width:5px;
+    height:5px;
+    border:1px solid var(--faint);
+  }
+
+  /* ---------- tally lamp (8px circle + 1px outer ring) ---------- */
+  .tally{
+    width:8px;
+    height:8px;
+    border-radius:50%;
+    border:1px solid var(--hair);
+    position:relative;
+    flex:none;
+  }
+  .tally::after{
+    content:"";
+    position:absolute;
+    inset:2px;
+    border-radius:50%;
+    background:var(--faint);
+  }
+  .tally.lit.amber{ border-color:#5A4324; }
+  .tally.lit.amber::after{ background:var(--amber); }
+  .tally.lit.green{ border-color:#2C4A3A; }
+  .tally.lit.green::after{ background:var(--green); }
+
+  /* =========================================================
+     HEADER
+     ========================================================= */
+  .header{
+    height:60px;
+    flex:none;
+    background:var(--surface);
+    border-bottom:1px solid var(--hair);
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    padding:0 28px;
+  }
+  .header-left{ display:flex; align-items:baseline; gap:16px; }
+  .proj-name{
+    font-size:16px;
+    font-weight:600;
+    letter-spacing:0.01em;
+  }
+  .proj-meta{
+    font-size:11px;
+    color:var(--weak);
+    letter-spacing:0.02em;
+  }
+  .header-right{ display:flex; align-items:center; gap:28px; }
+  .header-stat{
+    display:flex;
+    flex-direction:column;
+    align-items:flex-end;
+    gap:2px;
+  }
+  .header-stat .stat-label{
+    font-size:9px;
+    letter-spacing:0.12em;
+    color:var(--faint);
+    font-family:var(--font-mono);
+  }
+  .header-stat .stat-value{
+    font-size:13px;
+    font-weight:500;
+  }
+  .header-divider{
+    width:1px;
+    height:28px;
+    background:var(--hair);
+  }
+  .claude-status{
+    display:flex;
+    align-items:center;
+    gap:8px;
+    font-size:12px;
+    color:var(--text);
+    background:var(--surface-sunk);
+    border:1px solid var(--hair);
+    padding:6px 12px;
+    border-radius:2px;
+  }
+  .claude-status b{ color:var(--amber); font-weight:600; font-family:var(--font-mono); }
+
+  /* =========================================================
+     MAIN BODY
+     ========================================================= */
+  .body{
+    flex:1;
+    display:flex;
+    min-height:0;
+    border-bottom:1px solid var(--hair);
+  }
+
+  /* ---- monitor / preview column ---- */
+  .monitor-col{
+    width:338px;
+    flex:none;
+    border-right:1px solid var(--hair);
+    background:var(--surface);
+    display:flex;
+    flex-direction:column;
+    padding:13px 20px 13px;
+    gap:8px;
+  }
+
+  .stage-wrap{
+    flex:1;
+    display:flex;
+    justify-content:center;
+    align-items:stretch;
+    min-height:0;
+    overflow:hidden;
+  }
+  .stage{
+    position:relative;
+    aspect-ratio:9/16;
+    width:auto;
+    max-width:100%;
+    background:#0A0B0D;
+    border:1px solid var(--hair);
+    overflow:hidden;
+  }
+  .stage .sky{
+    position:absolute;
+    top:0; left:0; right:0;
+    height:62%;
+    background:#101319;
+  }
+  .stage .ground{
+    position:absolute;
+    bottom:0; left:0; right:0;
+    height:38%;
+    background:#17191F;
+  }
+  .stage .skyline{
+    position:absolute;
+    left:0; right:0;
+    bottom:38%;
+    height:96px;
+    background:#0A0B0D;
+    clip-path:polygon(0% 100%,0% 55%,6% 55%,6% 30%,13% 30%,13% 62%,20% 62%,20% 10%,27% 10%,27% 48%,35% 48%,35% 70%,42% 70%,42% 22%,50% 22%,50% 58%,58% 58%,58% 40%,65% 40%,65% 75%,73% 75%,73% 18%,80% 18%,80% 62%,88% 62%,88% 46%,100% 46%,100% 100%);
+  }
+  .stage .frame-corners span{
+    position:absolute;
+    width:12px;
+    height:12px;
+    border-color:var(--weak);
+    opacity:0.7;
+  }
+  .stage .c-tl{ top:8px; left:8px; border-top:1px solid; border-left:1px solid; }
+  .stage .c-tr{ top:8px; right:8px; border-top:1px solid; border-right:1px solid; }
+  .stage .c-bl{ bottom:8px; left:8px; border-bottom:1px solid; border-left:1px solid; }
+  .stage .c-br{ bottom:8px; right:8px; border-bottom:1px solid; border-right:1px solid; }
+  .stage .safe-label{
+    position:absolute;
+    top:14px; left:50%;
+    transform:translateX(-50%);
+    font-family:var(--font-mono);
+    font-size:9px;
+    letter-spacing:0.14em;
+    color:var(--faint);
+  }
+  .stage .aspect-label{
+    position:absolute;
+    bottom:14px; left:50%;
+    transform:translateX(-50%);
+    font-family:var(--font-mono);
+    font-size:9px;
+    letter-spacing:0.1em;
+    color:var(--faint);
+  }
+  .stage .frame-number{
+    position:absolute;
+    top:9px;
+    right:26px;
+    font-family:var(--font-mono);
+    font-size:9.5px;
+    letter-spacing:0.08em;
+    color:var(--faint);
+  }
+
+  /* ---- transport readout ---- */
+  .transport{
+    flex:none;
+    display:flex;
+    flex-direction:column;
+    gap:6px;
+  }
+  .readout{
+    background:var(--surface-sunk);
+    border:1px solid var(--hair);
+    border-radius:2px;
+    box-shadow:inset 0 1px 3px rgba(0,0,0,0.55), inset 0 0 0 1px rgba(0,0,0,0.15);
+    padding:8px 12px 6px;
+    display:flex;
+    flex-direction:column;
+    gap:4px;
+  }
+  .readout-row{
+    display:flex;
+    align-items:baseline;
+    gap:6px;
+  }
+  .tc-current{
+    font-size:23px;
+    font-weight:500;
+    letter-spacing:0.01em;
+    color:var(--text);
+  }
+  .tc-sep{
+    font-size:13px;
+    color:var(--faint);
+    padding:0 2px;
+  }
+  .tc-total{
+    font-size:13px;
+    color:var(--weak);
+  }
+  .readout-sub{
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+  }
+  .frame-count{
+    font-size:10.5px;
+    color:var(--weak);
+    letter-spacing:0.02em;
+  }
+  .frame-count .fps{
+    color:var(--faint);
+  }
+  .transport-controls{
+    display:flex;
+    align-items:center;
+    gap:8px;
+  }
+  .play-btn{
+    width:22px;
+    height:22px;
+    border:1px solid var(--hair);
+    border-radius:2px;
+    background:var(--surface);
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    flex:none;
+  }
+  .play-btn .tri{
+    width:0; height:0;
+    border-top:5px solid transparent;
+    border-bottom:5px solid transparent;
+    border-left:8px solid var(--text);
+    margin-left:2px;
+  }
+  .scrub{
+    flex:1;
+    height:2px;
+    background:var(--hair);
+    position:relative;
+  }
+  .scrub::after{
+    content:"";
+    position:absolute;
+    left:0; top:0; bottom:0;
+    width:57.5%;
+    background:var(--weak);
+  }
+  .scrub .scrub-head{
+    position:absolute;
+    left:57.5%;
+    top:50%;
+    transform:translate(-50%,-50%);
+    width:9px; height:9px;
+    border-radius:50%;
+    background:var(--text);
+    border:2px solid var(--surface-sunk);
+  }
+
+  /* ---- right side: proposal + transcript ---- */
+  .side-col{
+    flex:1;
+    display:flex;
+    flex-direction:column;
+    min-width:0;
+  }
+
+  .panel-head{
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    margin-bottom:12px;
+  }
+
+  /* proposal panel — the single "loupe light" card */
+  .proposal-panel{
+    flex:none;
+    border-bottom:1px solid var(--hair);
+    padding:18px 28px 20px;
+  }
+  .proposal-card{
+    position:relative;
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:24px;
+    border:1px solid var(--hair);
+    border-radius:2px;
+    background:var(--surface);
+    padding:16px 20px;
+    /* single, low-opacity, wide-radius amber glow — the only warm accent on screen */
+    box-shadow:0 0 70px 14px rgba(217,164,95,0.13);
+  }
+  .proposal-text{
+    font-size:14px;
+    line-height:1.7;
+    color:var(--text);
+    max-width:440px;
+  }
+  .proposal-text .quote{
+    font-weight:600;
+  }
+  .proposal-text .delta{
+    font-family:var(--font-mono);
+    color:var(--text);
+    font-weight:600;
+  }
+  .proposal-actions{
+    display:flex;
+    gap:8px;
+    flex:none;
+  }
+  .btn{
+    font-family:var(--font-ui);
+    font-size:12.5px;
+    padding:8px 16px;
+    border-radius:2px;
+    border:1px solid var(--hair);
+    background:transparent;
+    color:var(--text);
+    cursor:default;
+    white-space:nowrap;
+  }
+  .btn-primary{
+    background:var(--text);
+    color:var(--bg);
+    border-color:var(--text);
+    font-weight:600;
+  }
+  .btn-secondary{
+    color:var(--weak);
+  }
+
+  /* transcript panel — dark manuscript */
+  .transcript-panel{
+    flex:1;
+    min-height:0;
+    padding:20px 28px 22px;
+    display:flex;
+    flex-direction:column;
+  }
+  .transcript-lines{
+    display:flex;
+    flex-direction:column;
+  }
+  .t-line{
+    display:flex;
+    gap:20px;
+    align-items:baseline;
+    padding:9px 0;
+    border-bottom:1px solid var(--hair-soft);
+  }
+  .t-line:last-child{ border-bottom:none; }
+  .t-time{
+    font-family:var(--font-mono);
+    font-size:10.5px;
+    color:var(--faint);
+    flex:none;
+    width:58px;
+    padding-top:3px;
+    letter-spacing:0.02em;
+  }
+  .t-text{
+    font-size:14.5px;
+    line-height:2.05;
+    color:var(--weak);
+    max-width:590px;
+  }
+  .t-line.active .t-text{ color:var(--text); }
+  .hl{
+    background:rgba(242,244,247,0.10);
+    border-bottom:1px solid var(--text);
+    color:var(--text);
+    padding:1px 3px;
+    border-radius:2px;
+    font-weight:500;
+  }
+
+  /* =========================================================
+     TIMELINE
+     ========================================================= */
+  .timeline{
+    height:180px;
+    flex:none;
+    background:var(--surface);
+    display:flex;
+    flex-direction:column;
+    border-bottom:1px solid var(--hair);
+  }
+  .timeline-head{
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    padding:9px 24px 0;
+  }
+  .timeline-grid{
+    flex:1;
+    min-height:0;
+    position:relative;
+    padding:6px 24px 10px;
+    display:grid;
+    grid-template-columns:56px 1fr;
+    row-gap:6px;
+    align-content:center;
+  }
+  .ruler-spacer{ grid-column:1; }
+  .ruler-ticks{
+    grid-column:2;
+    display:flex;
+    align-items:flex-end;
+    justify-content:space-between;
+    padding-bottom:5px;
+    margin-bottom:1px;
+    border-bottom:1px solid var(--hair-soft);
+  }
+  .ruler-tick{
+    font-family:var(--font-mono);
+    font-size:9px;
+    letter-spacing:0.04em;
+    color:var(--faint);
+  }
+  .track-label{
+    grid-column:1;
+    display:flex;
+    align-items:center;
+    font-size:11px;
+    font-weight:600;
+    color:var(--weak);
+    letter-spacing:0.02em;
+  }
+  .track-body{
+    grid-column:2;
+    height:34px;
+    position:relative;
+    background:var(--surface-sunk);
+    border:1px solid var(--hair-soft);
+    border-radius:2px;
+    display:flex;
+    align-items:center;
+    overflow:hidden;
+  }
+  .clip{
+    height:calc(100% - 8px);
+    margin-left:4px;
+    background:#1D2026;
+    border:1px solid var(--hair);
+    border-radius:1px;
+    flex:none;
+    display:flex;
+  }
+  .clip + .clip{ margin-left:2px; }
+  .clip .thumb{
+    width:34px;
+    height:100%;
+    border-right:1px solid var(--hair);
+    background:repeating-linear-gradient(135deg, #2C3038 0 6px, #191C21 6px 12px);
+    flex:none;
+  }
+  .clip:nth-child(3n+2) .thumb{
+    background:repeating-linear-gradient(135deg, #343945 0 6px, #1B1E24 6px 12px);
+  }
+  .clip:nth-child(3n+3) .thumb{
+    background:repeating-linear-gradient(135deg, #262A31 0 6px, #131519 6px 12px);
+  }
+  .track-body.captions .clip{
+    background:transparent;
+    border:1px dashed var(--hair);
+    align-items:center;
+    justify-content:center;
+    padding:0 8px;
+  }
+  .track-body.captions .clip span{
+    font-size:9.5px;
+    color:var(--weak);
+    font-family:var(--font-mono);
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+  }
+  .track-body.bgm .waveform{
+    flex:1;
+    height:100%;
+    display:flex;
+    align-items:center;
+    gap:2px;
+    padding:0 6px;
+  }
+  .track-body.bgm .waveform i{
+    width:2px;
+    background:var(--faint);
+    border-radius:1px;
+    flex:none;
+  }
+  .playhead{
+    position:absolute;
+    top:0;
+    bottom:0;
+    width:1px;
+    background:var(--text);
+    left:calc(56px + (100% - 56px) * 0.575);
+    z-index:3;
+  }
+  .playhead::before{
+    content:"";
+    position:absolute;
+    top:-5px;
+    left:50%;
+    transform:translateX(-50%);
+    width:0; height:0;
+    border-left:5px solid transparent;
+    border-right:5px solid transparent;
+    border-top:6px solid var(--text);
+  }
+
+  /* =========================================================
+     FOOTER
+     ========================================================= */
+  .footer{
+    height:32px;
+    flex:none;
+    background:var(--surface);
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    padding:0 24px;
+  }
+  .conn{
+    display:flex;
+    align-items:center;
+    gap:8px;
+    font-size:11.5px;
+    color:var(--weak);
+  }
+  .footer-btn{
+    font-family:var(--font-ui);
+    font-size:11.5px;
+    color:var(--text);
+    background:transparent;
+    border:1px solid var(--hair);
+    border-radius:2px;
+    padding:5px 14px;
+  }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- HEADER -->
+  <header class="header">
+    <div class="header-left">
+      <div class="proj-name">shibuya-final</div>
+      <div class="proj-meta">現在の版 23 ・ 自動保存</div>
+    </div>
+    <div class="header-right">
+      <div class="header-stat">
+        <div class="stat-label">出力</div>
+        <div class="stat-value mono">1080×1920 <span style="color:var(--weak); font-weight:400;">(9:16)</span></div>
+      </div>
+      <div class="header-divider"></div>
+      <div class="claude-status">
+        <span class="tally lit amber"></span>
+        <span>確認待ち <b>1</b>件</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- MAIN BODY -->
+  <div class="body">
+
+    <!-- MONITOR COLUMN -->
+    <div class="monitor-col">
+      <div class="plate"><span class="plate-mark"></span>モニター</div>
+      <div class="stage-wrap">
+        <div class="stage">
+          <div class="sky"></div>
+          <div class="skyline"></div>
+          <div class="ground"></div>
+          <div class="safe-label">プレビュー</div>
+          <div class="frame-number mono">23A</div>
+          <div class="frame-corners">
+            <span class="c-tl"></span><span class="c-tr"></span>
+            <span class="c-bl"></span><span class="c-br"></span>
+          </div>
+          <div class="aspect-label">9:16</div>
+        </div>
+      </div>
+
+      <div class="transport">
+        <div class="readout">
+          <div class="readout-row">
+            <span class="tc-current mono">0:08.4</span>
+            <span class="tc-sep mono">/</span>
+            <span class="tc-total mono">0:14.6</span>
+          </div>
+          <div class="readout-sub">
+            <div class="frame-count mono">f252 / f439 ・ <span class="fps">30fps</span></div>
+          </div>
+        </div>
+        <div class="transport-controls">
+          <div class="play-btn"><div class="tri"></div></div>
+          <div class="scrub"><div class="scrub-head"></div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- SIDE COLUMN -->
+    <div class="side-col">
+
+      <!-- PROPOSAL -->
+      <div class="proposal-panel">
+        <div class="panel-head">
+          <div class="plate"><span class="plate-mark"></span>提案</div>
+          <span class="tally lit amber"></span>
+        </div>
+        <div class="proposal-card">
+          <div class="proposal-text">
+            <span class="quote">「かった」</span>の後の無音 <span class="delta">0.6秒</span> — 詰めると <span class="delta">−0.3秒</span>
+          </div>
+          <div class="proposal-actions">
+            <button class="btn btn-primary">カットする</button>
+            <button class="btn btn-secondary">残す</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- TRANSCRIPT -->
+      <div class="transcript-panel">
+        <div class="panel-head">
+          <div class="plate"><span class="plate-mark"></span>文字起こし</div>
+        </div>
+        <div class="transcript-lines">
+          <div class="t-line">
+            <span class="t-time mono">00:04.2</span>
+            <span class="t-text">今日はちょっと寄り道して、</span>
+          </div>
+          <div class="t-line">
+            <span class="t-time mono">00:05.6</span>
+            <span class="t-text">駅前のパン屋さんに寄ったんです。</span>
+          </div>
+          <div class="t-line">
+            <span class="t-time mono">00:06.1</span>
+            <span class="t-text">結局、新作のクリームパンを</span>
+          </div>
+          <div class="t-line active">
+            <span class="t-time mono">00:07.8</span>
+            <span class="t-text">3つも<span class="hl">かった</span>んだよね、我慢できなくて。</span>
+          </div>
+          <div class="t-line">
+            <span class="t-time mono">00:09.4</span>
+            <span class="t-text">レジのおばちゃんに「食べ過ぎだよ」って</span>
+          </div>
+          <div class="t-line">
+            <span class="t-time mono">00:10.6</span>
+            <span class="t-text">笑われちゃったんだけど、</span>
+          </div>
+          <div class="t-line">
+            <span class="t-time mono">00:11.2</span>
+            <span class="t-text">明日からダイエットするから、今日だけは許して。</span>
+          </div>
+          <div class="t-line">
+            <span class="t-time mono">00:13.0</span>
+            <span class="t-text">とても美味しくて、大満足でした。</span>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- TIMELINE -->
+  <div class="timeline">
+    <div class="timeline-head">
+      <div class="plate"><span class="plate-mark"></span>タイムライン</div>
+    </div>
+    <div class="timeline-grid">
+      <div class="playhead"></div>
+
+      <div class="ruler-spacer"></div>
+      <div class="ruler-ticks">
+        <span class="ruler-tick mono">0:00</span>
+        <span class="ruler-tick mono">0:05</span>
+        <span class="ruler-tick mono">0:10</span>
+        <span class="ruler-tick mono">0:14.6</span>
+      </div>
+
+      <div class="track-label">本編</div>
+      <div class="track-body">
+        <div class="clip" style="width:170px;"><div class="thumb"></div></div>
+        <div class="clip" style="width:120px;"><div class="thumb"></div></div>
+        <div class="clip" style="width:200px;"><div class="thumb"></div></div>
+        <div class="clip" style="width:90px;"><div class="thumb"></div></div>
+        <div class="clip" style="width:150px;"><div class="thumb"></div></div>
+        <div class="clip" style="width:130px;"><div class="thumb"></div></div>
+      </div>
+
+      <div class="track-label">テロップ</div>
+      <div class="track-body captions">
+        <div class="clip" style="width:150px; margin-left:20px;"><span>結局、駅前のパン屋で…</span></div>
+        <div class="clip" style="width:180px; margin-left:8px;"><span>3つもかったんだよね</span></div>
+        <div class="clip" style="width:210px; margin-left:8px;"><span>明日からダイエットするから</span></div>
+      </div>
+
+      <div class="track-label">BGM</div>
+      <div class="track-body bgm">
+        <div class="waveform" id="wave"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- FOOTER -->
+  <footer class="footer">
+    <div class="conn"><span class="tally lit green"></span>接続中</div>
+    <button class="footer-btn">Cowork を開く</button>
+  </footer>
+
+</div>
+
+<script>
+  (function(){
+    var el = document.getElementById('wave');
+    var seed = 7;
+    function rnd(){ seed = (seed * 16807) % 2147483647; return seed / 2147483647; }
+    var bars = '';
+    for (var i = 0; i < 340; i++){
+      var h = 20 + Math.round(rnd() * 60);
+      bars += '<i style="height:' + h + '%"></i>';
+    }
+    el.innerHTML = bars;
+  })();
+</script>
+
+</body>
+</html>

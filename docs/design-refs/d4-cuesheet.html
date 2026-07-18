@@ -1,0 +1,732 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>vedit — D4 キューシート(暗室×紙)</title>
+<style>
+  :root{
+    --font-ui: system-ui, -apple-system, "Hiragino Kaku Gothic ProN", "Hiragino Sans", sans-serif;
+    --font-mono: ui-monospace, "SF Mono", Menlo, monospace;
+    --bg:#0F1013;
+    --surface:#16181D;
+    --surface-sunk:#0B0C0F;
+    --hair:#262A31;
+    --hair-soft:#1D2026;
+    --text:#F2F4F7;
+    --weak:#8A919C;
+    --faint:#575D68;
+    --amber:#D9A45F;
+    --green:#6FBE8B;
+
+    /* paper (cue sheet) tokens */
+    --paper-bg:#F5EFE3;
+    --paper-rule:#DCD3C0;
+    --paper-rule-soft:#E6DFCF;
+    --paper-ink:#211E1A;
+    --paper-weak:#8A8071;
+    --paper-red:#B5493A;
+    --paper-pressed:#3F3A33;
+  }
+
+  *{margin:0;padding:0;box-sizing:border-box;}
+
+  html,body{
+    width:1440px;
+    height:900px;
+    background:var(--bg);
+    color:var(--text);
+    font-family:var(--font-ui);
+    overflow:hidden;
+    -webkit-font-smoothing:antialiased;
+  }
+
+  .mono{
+    font-family:var(--font-mono);
+    font-variant-numeric:tabular-nums;
+    font-feature-settings:"tnum" 1;
+  }
+
+  /* ---------- precision grid background (the room) ---------- */
+  .app{
+    position:relative;
+    width:1440px;
+    height:900px;
+    display:flex;
+    flex-direction:column;
+    background-image:
+      linear-gradient(to right, var(--hair-soft) 1px, transparent 1px),
+      linear-gradient(to bottom, var(--hair-soft) 1px, transparent 1px);
+    background-size:24px 24px;
+    background-position:-1px -1px;
+  }
+  .app::before{
+    content:"";
+    position:absolute;
+    inset:0;
+    background:var(--bg);
+    opacity:0.55;
+    pointer-events:none;
+  }
+  .app > *{ position:relative; z-index:1; }
+
+  /* ---------- plate label (nameplate) ---------- */
+  .plate{
+    display:flex;
+    align-items:center;
+    gap:6px;
+    font-family:var(--font-mono);
+    font-size:9px;
+    letter-spacing:0.14em;
+    color:var(--faint);
+    line-height:1;
+  }
+  .plate .plate-mark{
+    width:5px;
+    height:5px;
+    border:1px solid var(--faint);
+  }
+
+  /* ---------- tally lamp ---------- */
+  .tally{
+    width:8px;
+    height:8px;
+    border-radius:50%;
+    border:1px solid var(--hair);
+    position:relative;
+    flex:none;
+  }
+  .tally::after{
+    content:"";
+    position:absolute;
+    inset:2px;
+    border-radius:50%;
+    background:var(--faint);
+  }
+  .tally.lit.amber{ border-color:#5A4324; }
+  .tally.lit.amber::after{ background:var(--amber); }
+  .tally.lit.green{ border-color:#2C4A3A; }
+  .tally.lit.green::after{ background:var(--green); }
+
+  /* =========================================================
+     HEADER
+     ========================================================= */
+  .header{
+    height:60px;
+    flex:none;
+    background:var(--surface);
+    border-bottom:1px solid var(--hair);
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    padding:0 28px;
+  }
+  .header-left{ display:flex; align-items:baseline; gap:16px; }
+  .proj-name{ font-size:16px; font-weight:600; letter-spacing:0.01em; }
+  .proj-meta{ font-size:11px; color:var(--weak); letter-spacing:0.02em; }
+  .header-right{ display:flex; align-items:center; gap:28px; }
+  .header-stat{ display:flex; flex-direction:column; align-items:flex-end; gap:2px; }
+  .header-stat .stat-label{
+    font-size:9px; letter-spacing:0.12em; color:var(--faint); font-family:var(--font-mono);
+  }
+  .header-stat .stat-value{ font-size:13px; font-weight:500; }
+  .header-divider{ width:1px; height:28px; background:var(--hair); }
+  .claude-status{
+    display:flex; align-items:center; gap:8px;
+    font-size:12px; color:var(--text);
+    background:var(--surface-sunk); border:1px solid var(--hair);
+    padding:6px 12px; border-radius:2px;
+  }
+  .claude-status b{ color:var(--amber); font-weight:600; font-family:var(--font-mono); }
+
+  /* =========================================================
+     MAIN BODY (3 columns)
+     ========================================================= */
+  .body{
+    flex:1;
+    display:flex;
+    min-height:0;
+    border-bottom:1px solid var(--hair);
+  }
+
+  /* ---------- LEFT: material panel ---------- */
+  .material-col{
+    width:300px;
+    flex:none;
+    border-right:1px solid var(--hair);
+    background:var(--surface);
+    display:flex;
+    flex-direction:column;
+    padding:20px 22px;
+    gap:16px;
+    min-height:0;
+    overflow:hidden;
+  }
+
+  .source-list{ display:flex; flex-direction:column; }
+  .source-card{
+    display:flex;
+    gap:11px;
+    padding:10px 0;
+    border-bottom:1px solid var(--hair-soft);
+    align-items:center;
+  }
+  .source-list .source-card:last-child{ border-bottom:none; }
+  .source-thumb{
+    width:60px; height:38px; flex:none;
+    border:1px solid var(--hair);
+    background:repeating-linear-gradient(135deg, #2C3038 0 6px, #191C21 6px 12px);
+  }
+  .source-thumb.b{
+    background:repeating-linear-gradient(135deg, #343945 0 6px, #1B1E24 6px 12px);
+  }
+  .source-info{ flex:1; min-width:0; display:flex; flex-direction:column; gap:3px; }
+  .source-title{ font-size:12.5px; color:var(--text); font-weight:500; }
+  .source-sub{ font-size:10.5px; color:var(--faint); letter-spacing:0.01em; }
+  .source-dur{ font-size:11px; color:var(--weak); flex:none; }
+
+  .col-divider{ height:1px; background:var(--hair); flex:none; margin:0 -22px; width:calc(100% + 44px); }
+
+  .audio-fields{ display:flex; flex-direction:column; gap:16px; }
+  .field{ display:flex; flex-direction:column; gap:7px; }
+  .field-label-row{ display:flex; align-items:baseline; justify-content:space-between; }
+  .field-label{ font-size:11px; color:var(--weak); letter-spacing:0.02em; }
+  .field-value{ font-size:11px; color:var(--text); }
+
+  .field-select{
+    display:flex; align-items:center; justify-content:space-between;
+    border:1px solid var(--hair); background:var(--surface-sunk);
+    border-radius:2px; padding:8px 11px;
+    font-size:12px; color:var(--text);
+  }
+  .field-select .chev{ color:var(--faint); font-size:9px; }
+
+  .mini-slider{ height:2px; background:var(--hair); position:relative; border-radius:1px; margin-top:2px; }
+  .mini-slider .fill{ position:absolute; left:0; top:0; bottom:0; background:var(--weak); border-radius:1px; }
+  .mini-slider .head{
+    position:absolute; top:50%;
+    width:9px; height:9px; border-radius:50%;
+    background:var(--text); border:2px solid var(--surface);
+    transform:translate(-50%,-50%);
+  }
+
+  /* ---------- CENTER: monitor + instrument stack ---------- */
+  .center-col{
+    flex:1;
+    min-width:0;
+    border-right:1px solid var(--hair);
+    background:var(--surface);
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    padding:18px 24px 18px;
+    gap:14px;
+  }
+  .center-col .plate{ width:100%; }
+
+  .stage-wrap{
+    flex:1;
+    display:flex;
+    justify-content:center;
+    align-items:stretch;
+    min-height:0;
+    overflow:hidden;
+  }
+  .stage{
+    position:relative;
+    aspect-ratio:9/16;
+    height:100%;
+    width:auto;
+    max-width:100%;
+    background:#0A0B0D;
+    border:1px solid var(--hair);
+    overflow:hidden;
+  }
+  .stage .sky{ position:absolute; top:0; left:0; right:0; height:62%; background:#101319; }
+  .stage .ground{ position:absolute; bottom:0; left:0; right:0; height:38%; background:#17191F; }
+  .stage .skyline{
+    position:absolute; left:0; right:0; bottom:38%; height:34%;
+    background:#0A0B0D;
+    clip-path:polygon(0% 100%,0% 55%,6% 55%,6% 30%,13% 30%,13% 62%,20% 62%,20% 10%,27% 10%,27% 48%,35% 48%,35% 70%,42% 70%,42% 22%,50% 22%,50% 58%,58% 58%,58% 40%,65% 40%,65% 75%,73% 75%,73% 18%,80% 18%,80% 62%,88% 62%,88% 46%,100% 46%,100% 100%);
+  }
+  .stage .frame-corners span{ position:absolute; width:14px; height:14px; border-color:var(--weak); opacity:0.7; }
+  .stage .c-tl{ top:10px; left:10px; border-top:1px solid; border-left:1px solid; }
+  .stage .c-tr{ top:10px; right:10px; border-top:1px solid; border-right:1px solid; }
+  .stage .c-bl{ bottom:10px; left:10px; border-bottom:1px solid; border-left:1px solid; }
+  .stage .c-br{ bottom:10px; right:10px; border-bottom:1px solid; border-right:1px solid; }
+  .stage .safe-label{
+    position:absolute; top:16px; left:50%; transform:translateX(-50%);
+    font-family:var(--font-mono); font-size:9.5px; letter-spacing:0.14em; color:var(--faint);
+  }
+  .stage .aspect-label{
+    position:absolute; bottom:16px; left:50%; transform:translateX(-50%);
+    font-family:var(--font-mono); font-size:9.5px; letter-spacing:0.1em; color:var(--faint);
+  }
+  .stage .frame-number{
+    position:absolute; top:10px; right:30px;
+    font-family:var(--font-mono); font-size:10px; letter-spacing:0.08em; color:var(--faint);
+  }
+
+  .instrument-row{
+    flex:none;
+    display:flex;
+    align-items:center;
+    gap:12px;
+  }
+  .readout{
+    background:var(--surface-sunk);
+    border:1px solid var(--hair);
+    border-radius:2px;
+    box-shadow:inset 0 1px 3px rgba(0,0,0,0.55), inset 0 0 0 1px rgba(0,0,0,0.15);
+    padding:9px 16px 7px;
+    display:flex;
+    flex-direction:column;
+    gap:4px;
+  }
+  .readout-row{ display:flex; align-items:baseline; gap:6px; }
+  .tc-current{ font-size:24px; font-weight:500; letter-spacing:0.01em; color:var(--text); }
+  .tc-sep{ font-size:13px; color:var(--faint); padding:0 2px; }
+  .tc-total{ font-size:13px; color:var(--weak); }
+  .frame-count{ font-size:10.5px; color:var(--weak); letter-spacing:0.02em; }
+  .frame-count .fps{ color:var(--faint); }
+
+  .play-btn{
+    width:38px; height:38px; flex:none;
+    border:1px solid var(--hair); border-radius:2px; background:var(--surface-sunk);
+    display:flex; align-items:center; justify-content:center;
+  }
+  .play-btn .tri{
+    width:0; height:0;
+    border-top:6px solid transparent; border-bottom:6px solid transparent;
+    border-left:10px solid var(--text); margin-left:2px;
+  }
+
+  .compare-btn{
+    flex:none;
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    gap:2px;
+    height:38px;
+    padding:0 16px;
+    border:1px solid var(--hair); border-radius:2px;
+    background:transparent;
+  }
+  .compare-btn .cb-label{ display:flex; align-items:center; gap:8px; font-size:12px; color:var(--text); }
+  .compare-btn .cb-icon{ position:relative; width:14px; height:11px; flex:none; }
+  .compare-btn .cb-icon i{
+    position:absolute; width:10px; height:8px; border:1px solid var(--weak); border-radius:1px; background:var(--surface);
+  }
+  .compare-btn .cb-icon i:first-child{ top:0; left:0; }
+  .compare-btn .cb-icon i:last-child{ top:3px; left:4px; background:var(--surface-sunk); }
+  .compare-btn .cb-hint{ font-size:8.5px; color:var(--faint); letter-spacing:0.04em; }
+
+  /* =========================================================
+     RIGHT: paper cue sheet in the dark room
+     ========================================================= */
+  .paper-col{
+    width:344px;
+    flex:none;
+    display:flex;
+    align-items:flex-start;
+    justify-content:center;
+    padding:22px 22px;
+  }
+
+  .cue-sheet{
+    position:relative;
+    width:100%;
+    background:var(--paper-bg);
+    box-shadow:
+      0 26px 46px -16px rgba(0,0,0,0.60),
+      0 6px 14px -4px rgba(0,0,0,0.45),
+      0 0 0 1px rgba(33,30,26,0.06);
+    color:var(--paper-ink);
+    font-family:var(--font-ui);
+  }
+  .cue-sheet::before{
+    content:"";
+    position:absolute; inset:0;
+    background:
+      linear-gradient(180deg, rgba(217,164,95,0.13) 0%, rgba(217,164,95,0.05) 90px, rgba(217,164,95,0) 190px),
+      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='matrix' values='0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.05 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    pointer-events:none;
+    z-index:0;
+  }
+  .cue-content{
+    position:relative; z-index:1;
+    display:flex; flex-direction:column;
+    padding:22px 24px 22px;
+  }
+
+  .cue-eyebrow{
+    font-family:var(--font-mono); font-size:10.5px; letter-spacing:0.18em;
+    color:var(--paper-weak);
+  }
+
+  .cue-divider{
+    display:flex; align-items:center; gap:9px;
+    color:var(--paper-weak); font-size:11px; letter-spacing:0.03em;
+    margin:16px 0 16px;
+  }
+  .cue-divider::before, .cue-divider::after{ content:""; flex:1; height:1px; background:var(--paper-rule); }
+
+  /* proposal card (the graded / awaiting-review item) */
+  .proposal-card{
+    position:relative;
+    background:#FFFDF8;
+    border:1px solid var(--paper-rule);
+    padding:15px 17px 15px 19px;
+  }
+  .proposal-card::before{
+    content:""; position:absolute; left:0; top:0; bottom:0; width:3px; background:var(--paper-red);
+  }
+  .proposal-head{ display:flex; align-items:center; justify-content:space-between; margin-bottom:9px; }
+  .proposal-pillar{
+    font-family:var(--font-mono); font-size:10.5px; color:var(--paper-weak); letter-spacing:0.04em;
+  }
+  .tag-pending{
+    display:inline-flex; align-items:center; gap:6px;
+    border:1px solid var(--paper-red); color:var(--paper-red);
+    background:rgba(181,73,58,0.07);
+    font-size:10.5px; padding:3px 9px 3px 8px; letter-spacing:0.02em;
+  }
+  .tag-pending .dot{ width:5px; height:5px; border-radius:50%; background:var(--paper-red); }
+  .proposal-body{
+    font-size:13.5px; line-height:1.85; color:var(--paper-ink);
+  }
+  .mark{
+    text-decoration:underline; text-decoration-color:var(--paper-red);
+    text-decoration-thickness:2px; text-underline-offset:3px; font-weight:600;
+  }
+  .num{ font-family:var(--font-mono); font-variant-numeric:tabular-nums; }
+  .num-strong{ color:var(--paper-red); font-weight:600; }
+  .proposal-actions{ display:flex; gap:9px; margin-top:13px; }
+  .cbtn{
+    font-family:var(--font-ui); font-size:12px; font-weight:500;
+    padding:8px 16px; letter-spacing:0.03em;
+    border:1px solid var(--paper-ink); background:transparent; color:var(--paper-ink);
+  }
+  .cbtn-primary{ background:var(--paper-pressed); border-color:var(--paper-pressed); color:var(--paper-bg); }
+  .cbtn-secondary{ background:transparent; border-color:var(--paper-rule); color:var(--paper-ink); }
+
+  /* executed log */
+  .done-list{ display:flex; flex-direction:column; gap:9px; margin-top:18px; }
+  .done-item{ display:flex; align-items:baseline; gap:9px; font-size:12px; color:var(--paper-weak); }
+  .done-item .chk{ font-weight:300; color:var(--paper-weak); }
+
+  /* listen-back warning */
+  .warn-line{
+    display:flex; align-items:flex-start; gap:8px;
+    font-size:12px; color:var(--paper-ink);
+    margin-top:16px; padding-top:15px;
+    border-top:1px dotted var(--paper-rule);
+    line-height:1.6;
+  }
+  .warn-line .dot{ width:6px; height:6px; border-radius:50%; background:var(--paper-red); flex:none; margin-top:4px; }
+
+  .cue-foot{
+    display:flex; align-items:center; justify-content:space-between;
+    margin-top:26px;
+    padding-top:14px; border-top:1px solid var(--paper-rule);
+  }
+  .cue-tabs{ display:flex; gap:16px; }
+  .cue-tab{ font-size:12px; color:var(--paper-weak); padding-bottom:3px; border-bottom:2px solid transparent; }
+  .cue-tab.active{ color:var(--paper-ink); font-weight:600; border-bottom-color:var(--paper-ink); }
+  .cue-cowork{
+    font-family:var(--font-ui); font-size:11.5px; font-weight:500;
+    color:var(--paper-ink); background:transparent; border:1px solid var(--paper-ink);
+    padding:7px 13px; letter-spacing:0.02em;
+  }
+
+  /* =========================================================
+     TIMELINE
+     ========================================================= */
+  .timeline{
+    height:168px;
+    flex:none;
+    background:var(--surface);
+    display:flex;
+    flex-direction:column;
+    border-bottom:1px solid var(--hair);
+  }
+  .timeline-head{ display:flex; align-items:center; justify-content:space-between; padding:8px 24px 0; }
+  .timeline-grid{
+    flex:1; min-height:0; position:relative;
+    padding:5px 24px 9px;
+    display:grid; grid-template-columns:56px 1fr;
+    row-gap:5px; align-content:center;
+  }
+  .ruler-spacer{ grid-column:1; }
+  .ruler-ticks{
+    grid-column:2; display:flex; align-items:flex-end; justify-content:space-between;
+    padding-bottom:5px; margin-bottom:1px; border-bottom:1px solid var(--hair-soft);
+  }
+  .ruler-tick{ font-family:var(--font-mono); font-size:9px; letter-spacing:0.04em; color:var(--faint); }
+  .track-label{
+    grid-column:1; display:flex; align-items:center;
+    font-size:11px; font-weight:600; color:var(--weak); letter-spacing:0.02em;
+  }
+  .track-body{
+    grid-column:2; height:30px; position:relative;
+    background:var(--surface-sunk); border:1px solid var(--hair-soft); border-radius:2px;
+    display:flex; align-items:center; overflow:hidden;
+  }
+  .clip{
+    height:calc(100% - 8px); margin-left:4px; background:#1D2026;
+    border:1px solid var(--hair); border-radius:1px; flex:none; display:flex;
+  }
+  .clip + .clip{ margin-left:2px; }
+  .clip .thumb{
+    width:34px; height:100%; border-right:1px solid var(--hair);
+    background:repeating-linear-gradient(135deg, #2C3038 0 6px, #191C21 6px 12px); flex:none;
+  }
+  .clip:nth-child(3n+2) .thumb{ background:repeating-linear-gradient(135deg, #343945 0 6px, #1B1E24 6px 12px); }
+  .clip:nth-child(3n+3) .thumb{ background:repeating-linear-gradient(135deg, #262A31 0 6px, #131519 6px 12px); }
+  .track-body.captions .clip{
+    background:transparent; border:1px dashed var(--hair);
+    align-items:center; justify-content:center; padding:0 8px;
+  }
+  .track-body.captions .clip span{
+    font-size:9.5px; color:var(--weak); font-family:var(--font-mono);
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  }
+  .track-body.bgm .waveform{ flex:1; height:100%; display:flex; align-items:center; gap:2px; padding:0 6px; }
+  .track-body.bgm .waveform i{ width:2px; background:var(--faint); border-radius:1px; flex:none; }
+  .playhead{
+    position:absolute; top:0; bottom:0; width:1px; background:var(--text);
+    left:calc(56px + (100% - 56px) * 0.575); z-index:3;
+  }
+  .playhead::before{
+    content:""; position:absolute; top:-5px; left:50%; transform:translateX(-50%);
+    width:0; height:0; border-left:5px solid transparent; border-right:5px solid transparent;
+    border-top:6px solid var(--text);
+  }
+
+  /* =========================================================
+     FOOTER
+     ========================================================= */
+  .footer{
+    height:32px; flex:none; background:var(--surface);
+    display:flex; align-items:center; justify-content:space-between; padding:0 24px;
+  }
+  .conn{ display:flex; align-items:center; gap:8px; font-size:11.5px; color:var(--weak); }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- HEADER -->
+  <header class="header">
+    <div class="header-left">
+      <div class="proj-name">shibuya-final</div>
+      <div class="proj-meta">現在の版 23 ・ 自動保存</div>
+    </div>
+    <div class="header-right">
+      <div class="header-stat">
+        <div class="stat-label">出力</div>
+        <div class="stat-value mono">1080×1920 <span style="color:var(--weak); font-weight:400;">(9:16)</span></div>
+      </div>
+      <div class="header-divider"></div>
+      <div class="claude-status">
+        <span class="tally lit amber"></span>
+        <span>確認待ち <b>1</b>件</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- MAIN BODY -->
+  <div class="body">
+
+    <!-- LEFT: MATERIAL COLUMN -->
+    <div class="material-col">
+      <div class="plate"><span class="plate-mark"></span>素材</div>
+      <div class="source-list">
+        <div class="source-card">
+          <div class="source-thumb"></div>
+          <div class="source-info">
+            <div class="source-title">素材1</div>
+            <div class="source-sub">店内・レジ前</div>
+          </div>
+          <div class="source-dur mono">2:47</div>
+        </div>
+        <div class="source-card">
+          <div class="source-thumb b"></div>
+          <div class="source-info">
+            <div class="source-title">素材2</div>
+            <div class="source-sub">通り・道すがら</div>
+          </div>
+          <div class="source-dur mono">24:12</div>
+        </div>
+      </div>
+
+      <div class="col-divider"></div>
+
+      <div class="plate"><span class="plate-mark"></span>オーディオ</div>
+      <div class="audio-fields">
+        <div class="field">
+          <div class="field-label-row"><span class="field-label">会話リペア</span></div>
+          <div class="field-select"><span>標準</span><span class="chev">▾</span></div>
+        </div>
+        <div class="field">
+          <div class="field-label-row">
+            <span class="field-label">BGMダッキング</span>
+            <span class="field-value mono">−8dB</span>
+          </div>
+          <div class="mini-slider"><div class="fill" style="width:34%;"></div><div class="head" style="left:34%;"></div></div>
+        </div>
+        <div class="field">
+          <div class="field-label-row">
+            <span class="field-label">ラウドネス</span>
+            <span class="field-value mono">−14 LUFS</span>
+          </div>
+          <div class="mini-slider"><div class="fill" style="width:58%;"></div><div class="head" style="left:58%;"></div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- CENTER: MONITOR + INSTRUMENTS -->
+    <div class="center-col">
+      <div class="plate"><span class="plate-mark"></span>モニター</div>
+      <div class="stage-wrap">
+        <div class="stage">
+          <div class="sky"></div>
+          <div class="skyline"></div>
+          <div class="ground"></div>
+          <div class="safe-label">プレビュー</div>
+          <div class="frame-number mono">23A</div>
+          <div class="frame-corners">
+            <span class="c-tl"></span><span class="c-tr"></span>
+            <span class="c-bl"></span><span class="c-br"></span>
+          </div>
+          <div class="aspect-label">9:16</div>
+        </div>
+      </div>
+
+      <div class="instrument-row">
+        <div class="readout">
+          <div class="readout-row">
+            <span class="tc-current mono">0:08.4</span>
+            <span class="tc-sep mono">/</span>
+            <span class="tc-total mono">0:14.6</span>
+          </div>
+          <div class="frame-count mono">f252 / f439 ・ <span class="fps">30fps</span></div>
+        </div>
+        <div class="play-btn"><div class="tri"></div></div>
+        <div class="compare-btn">
+          <div class="cb-label">
+            <span class="cb-icon"><i></i><i></i></span>
+            <span>直前と比べる</span>
+          </div>
+          <span class="cb-hint">長押し</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- RIGHT: PAPER CUE SHEET -->
+    <div class="paper-col">
+      <div class="cue-sheet">
+        <div class="cue-content">
+          <div class="cue-eyebrow">キューシート</div>
+
+          <div class="cue-divider">前回の確認から</div>
+
+          <div class="proposal-card">
+            <div class="proposal-head">
+              <span class="proposal-pillar">提案</span>
+              <span class="tag-pending"><span class="dot"></span>確認待ち</span>
+            </div>
+            <div class="proposal-body">
+              「<span class="mark">かった</span>」の後の無音
+              <span class="num">0.6秒</span> —
+              詰めると <span class="num num-strong">−0.3秒</span>
+            </div>
+            <div class="proposal-actions">
+              <button class="cbtn cbtn-primary">カットする</button>
+              <button class="cbtn cbtn-secondary">残す</button>
+            </div>
+          </div>
+
+          <div class="done-list">
+            <div class="done-item"><span class="chk">✓</span><span>字幕を5件付けました(版22)</span></div>
+            <div class="done-item"><span class="chk">✓</span><span>BGM を −3dB に調整(版21)</span></div>
+          </div>
+
+          <div class="warn-line">
+            <span class="dot"></span>
+            <span>聞き取りを確認したい箇所: 素材2・21:29 に3語</span>
+          </div>
+
+          <div class="cue-foot">
+            <div class="cue-tabs">
+              <span class="cue-tab active">確認</span>
+              <span class="cue-tab">履歴</span>
+            </div>
+            <button class="cue-cowork">Cowork を開く</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- TIMELINE -->
+  <div class="timeline">
+    <div class="timeline-head">
+      <div class="plate"><span class="plate-mark"></span>タイムライン</div>
+    </div>
+    <div class="timeline-grid">
+      <div class="playhead"></div>
+
+      <div class="ruler-spacer"></div>
+      <div class="ruler-ticks">
+        <span class="ruler-tick mono">0:00</span>
+        <span class="ruler-tick mono">0:05</span>
+        <span class="ruler-tick mono">0:10</span>
+        <span class="ruler-tick mono">0:14.6</span>
+      </div>
+
+      <div class="track-label">本編</div>
+      <div class="track-body">
+        <div class="clip" style="width:170px;"><div class="thumb"></div></div>
+        <div class="clip" style="width:120px;"><div class="thumb"></div></div>
+        <div class="clip" style="width:200px;"><div class="thumb"></div></div>
+        <div class="clip" style="width:90px;"><div class="thumb"></div></div>
+        <div class="clip" style="width:150px;"><div class="thumb"></div></div>
+        <div class="clip" style="width:130px;"><div class="thumb"></div></div>
+      </div>
+
+      <div class="track-label">テロップ</div>
+      <div class="track-body captions">
+        <div class="clip" style="width:150px; margin-left:20px;"><span>結局、駅前のパン屋で…</span></div>
+        <div class="clip" style="width:180px; margin-left:8px;"><span>3つもかったんだよね</span></div>
+        <div class="clip" style="width:210px; margin-left:8px;"><span>明日からダイエットするから</span></div>
+      </div>
+
+      <div class="track-label">BGM</div>
+      <div class="track-body bgm">
+        <div class="waveform" id="wave"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- FOOTER -->
+  <footer class="footer">
+    <div class="conn"><span class="tally lit green"></span>接続中</div>
+  </footer>
+
+</div>
+
+<script>
+  (function(){
+    var el = document.getElementById('wave');
+    var seed = 7;
+    function rnd(){ seed = (seed * 16807) % 2147483647; return seed / 2147483647; }
+    var bars = '';
+    for (var i = 0; i < 340; i++){
+      var h = 20 + Math.round(rnd() * 60);
+      bars += '<i style="height:' + h + '%"></i>';
+    }
+    el.innerHTML = bars;
+  })();
+</script>
+
+</body>
+</html>
