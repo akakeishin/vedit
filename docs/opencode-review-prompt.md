@@ -27,7 +27,9 @@ Claude(Cowork/Code)が会話で編集を代行し、ユーザー(週次で作る
 
 ## 読む順序
 
-1. docs/HANDOFF.md — 全体像・運用原則・自己申告済みの盲点(§5)・作法(§6)
+1. docs/HANDOFF.md — 全体像・運用原則・**意図的未実装の一覧(§4 —
+   ショートカット等はあなたの再検討待ちで止めている。欠陥と数えないこと。
+   ただしその仕様自体への批評は歓迎)**・自己申告済みの盲点(§5)・作法(§6)
 2. docs/superpowers/specs/2026-07-18-vedit-ia-v3.md — 現行 UI の統合仕様
 3. docs/superpowers/specs/2026-07-18-vedit-nle-operability.md — NLE級直接操作の方針
 4. docs/product-bet-sensory-vs-structural.md — 製品の賭け(冒頭に改訂注記)

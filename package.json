@@ -11,6 +11,7 @@
     "build": "tsc -p .",
     "smoke:export": "node scripts/smoke-export.mjs",
     "smoke:compose": "npm run build && node scripts/smoke-compose.mjs",
+    "smoke:overlay": "node scripts/smoke-overlay-stack.mjs",
     "test:e2e": "playwright test"
   },
   "keywords": [],

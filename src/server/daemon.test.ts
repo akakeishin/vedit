@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import http, { type Server } from 'node:http';
 import { WebSocket } from 'ws';
-import { Project } from '../core/project.js';
+import { Project, resolveRedoTarget, resolveUndoTarget } from '../core/project.js';
 import { startDaemon } from './daemon.js';
 import { writeKitFile } from '../core/kit.js';
 import { appendExportResult, type ExportResultRecord } from '../core/exportResults.js';
@@ -71,6 +71,28 @@ const { listSystemFontsMock, scanKitFontsMock } = vi.hoisted(() => ({
 vi.mock('../core/fonts.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../core/fonts.js')>();
   return { ...actual, listSystemFonts: listSystemFontsMock, scanKitFonts: scanKitFontsMock };
+});
+
+// GET /media/thumb/<sourceId> shells out to ffmpeg via run() (src/ingest/run.ts)
+// to extract a poster frame — stub it so the "daemon: GET /media/thumb" suite
+// is deterministic and doesn't need real ffmpeg/media files. The mock records
+// the args it was invoked with (so a test can assert the -ss value chosen for
+// an image vs. a video source) and writes a tiny placeholder file to the
+// requested output path (ffmpeg's last positional arg), mirroring real
+// ffmpeg's contract of "produces a file there" so the route's downstream
+// createReadStream still succeeds. No other suite in this file hits
+// /media/thumb, so this stub can't affect them.
+const { runMock } = vi.hoisted(() => ({
+  runMock: vi.fn(async (_cmd: string, args: string[]) => {
+    const outPath = args[args.length - 1];
+    const { promises: fs } = await import('node:fs');
+    await fs.writeFile(outPath, Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+    return '';
+  }),
+}));
+vi.mock('../ingest/run.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../ingest/run.js')>();
+  return { ...actual, run: runMock };
 });
 
 function wordsFor(prefix: string, count: number, spacing = 1, dur = 0.8): Word[] {
@@ -4104,5 +4126,429 @@ describe('daemon: GET /api/notes', () => {
   it('does not leak into /api/state (no write route exists for this data)', async () => {
     const { body } = await getJson(BASE, '/api/state');
     expect(body).not.toHaveProperty('notes');
+  });
+});
+
+// ---- E-1 (波E NLE操作性パック): split / duplicate ----
+describe('daemon: split / duplicate ops (E-1)', () => {
+  const PORT = 18258;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-splitdup-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'splitdup');
+    await project.commit(0, 'system', 'setup', {}, 'seed sources', (m) => ({
+      ...m,
+      fps: 30,
+      sources: [{ id: 's1', path: '/media/one.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: true }],
+      timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 30 }], motion: [] },
+    }));
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('split rejects an unknown clip id', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'split', clipId: 'nope', at: 10 });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/unknown clip/);
+  });
+
+  it('split rejects a point too close to the clip\'s own edge', async () => {
+    let state = (await getJson(BASE, '/api/state')).body;
+    let r = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'split', clipId: 'c1', at: 0 });
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/too close/);
+
+    state = (await getJson(BASE, '/api/state')).body;
+    r = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'split', clipId: 'c1', at: 30 });
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/too close/);
+  });
+
+  let rightClipId: string;
+
+  it('split divides one clip into two contiguous pieces, content and total duration unchanged', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'split', clipId: 'c1', at: 10 });
+    expect(status).toBe(200);
+    expect(body.newClipId).toBeTruthy();
+    expect(body.newClipId).not.toBe('c1');
+    rightClipId = body.newClipId;
+
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.timeline.video).toHaveLength(2);
+    expect(project.manifest.timeline.video[0]).toMatchObject({ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 10 });
+    expect(project.manifest.timeline.video[1]).toMatchObject({ id: rightClipId, sourceId: 's1', srcIn: 10, srcOut: 30 });
+    expect(project.duration).toBeCloseTo(30); // boundary added, no content lost
+  });
+
+  it('duplicate splices an identical copy immediately after the original, extending the timeline', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'duplicate', clipId: 'c1' });
+    expect(status).toBe(200);
+    expect(body.newClipId).toBeTruthy();
+    expect(body.newClipId).not.toBe('c1');
+    const dupId = body.newClipId;
+
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.timeline.video.map((c: any) => c.id)).toEqual(['c1', dupId, rightClipId]);
+    expect(project.manifest.timeline.video[1]).toMatchObject({ sourceId: 's1', srcIn: 0, srcOut: 10 });
+    expect(project.duration).toBeCloseTo(40); // +10s from the duplicated clip
+  });
+
+  it('duplicate rejects an unknown clip id', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'duplicate', clipId: 'nope' });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/unknown clip/);
+  });
+});
+
+// ---- オーバーレイ・スタック: overlay-add/-update/-remove (generalizes broll-*
+// into N layers + image sources + rect/opacity/fade — see
+// docs/superpowers/specs/2026-07-18-vedit-overlay-stack.md) ----
+describe('daemon: overlay-add / overlay-update / overlay-remove ops', () => {
+  const PORT = 18259;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let overlayId: string;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-overlaystack-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'overlaystack');
+    await project.commit(0, 'system', 'setup', {}, 'seed sources', (m) => ({
+      ...m,
+      fps: 30,
+      sources: [
+        { id: 's1', path: '/media/aroll.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: true },
+        { id: 's2', path: '/media/broll.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: true },
+        { id: 's3', path: '/media/logo.png', duration: 86400, fps: 0, width: 800, height: 450, hasAudio: false, kind: 'image' },
+      ],
+      timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 30 }], motion: [] },
+    }));
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('overlay-add rejects a missing anchor', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'overlay-add', sourceId: 's2', in: 0, out: 4,
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/anchor/);
+  });
+
+  it('overlay-add creates a layer-1 overlay with rect/opacity/fade passed through to addOverlay', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'overlay-add', sourceId: 's2', in: 0, out: 4,
+      anchor: { sourceId: 's1', srcTime: 2 }, layer: 1, rect: { x: 0, y: 0.1, w: 0.5 }, opacity: 0.8, fade: { in: 0.5 },
+    });
+    expect(status).toBe(200);
+    overlayId = body.id;
+    expect(overlayId).toMatch(/^ov/);
+
+    const project = (await getJson(BASE, '/api/project')).body;
+    const resolved = project.overlays.find((r: any) => r.overlay.id === overlayId);
+    expect(resolved.tlStart).toBeCloseTo(2);
+    expect(resolved.overlay).toMatchObject({
+      sourceId: 's2', srcIn: 0, srcOut: 4, layer: 1, rect: { x: 0, y: 0.1, w: 0.5 }, opacity: 0.8, fade: { in: 0.5 },
+    });
+  });
+
+  it('overlay-add on the same layer overlapping an existing overlay is rejected', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'overlay-add', sourceId: 's2', in: 0, out: 2,
+      anchor: { sourceId: 's1', srcTime: 3 }, // resolved tl[3,5) overlaps the existing layer-1 [2,6)
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/overlaps existing overlay/);
+  });
+
+  let imageOverlayId: string;
+
+  it('overlay-add on a DIFFERENT layer at the same moment stacks instead of conflicting (image source)', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'overlay-add', sourceId: 's3', in: 0, out: 4,
+      anchor: { sourceId: 's1', srcTime: 2 }, layer: 2, rect: { x: 0.6, y: 0.1, w: 0.3 },
+    });
+    expect(status).toBe(200);
+    imageOverlayId = body.id;
+    expect(body.state.overlays).toBe(2);
+  });
+
+  it('overlay-update patches layer/rect/opacity, moving the first overlay off layer 1', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'overlay-update', id: overlayId, layer: 3, opacity: 0.4,
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    const resolved = project.overlays.find((r: any) => r.overlay.id === overlayId);
+    expect(resolved.overlay).toMatchObject({ layer: 3, opacity: 0.4, rect: { x: 0, y: 0.1, w: 0.5 } }); // rect untouched
+  });
+
+  it('overlay-update with rect/opacity/fade set to null clears them back to defaults', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'overlay-update', id: overlayId, rect: null, opacity: null, fade: null,
+    });
+    expect(status).toBe(200);
+    const project = (await getJson(BASE, '/api/project')).body;
+    const resolved = project.overlays.find((r: any) => r.overlay.id === overlayId);
+    expect(resolved.overlay.rect).toBeUndefined();
+    expect(resolved.overlay.opacity).toBeUndefined();
+    expect(resolved.overlay.fade).toBeUndefined();
+    expect(resolved.overlay.layer).toBe(3); // untouched by this patch
+  });
+
+  it('overlay-update rejects an unknown id', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'overlay-update', id: 'nope', opacity: 0.5,
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/unknown overlay/);
+  });
+
+  it('overlay-update rejects a malformed anchor', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'overlay-update', id: overlayId, anchor: { sourceId: 's1' },
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/anchor/);
+  });
+
+  it('overlay-remove rejects an unknown id', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'overlay-remove', id: 'nope',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/unknown overlay/);
+  });
+
+  it('overlay-remove removes both overlays', async () => {
+    let state = (await getJson(BASE, '/api/state')).body;
+    let r = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'overlay-remove', id: overlayId });
+    expect(r.status).toBe(200);
+
+    state = (await getJson(BASE, '/api/state')).body;
+    r = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'overlay-remove', id: imageOverlayId });
+    expect(r.status).toBe(200);
+
+    const finalState = (await getJson(BASE, '/api/state')).body;
+    expect(finalState.overlays).toBe(0);
+  });
+});
+
+// ---- E-1: restore `cause` forwarding (undo/redo tag) — regression coverage
+// for the real "連続 undo がバウンスする" bug: /api/edit's 'restore' branch
+// used to call p.restore(rev, actor, baseRev) WITHOUT the 4th `cause`
+// argument, so every restore — even one the CLI's `vedit undo`/`redo`
+// requested with cause:'undo'/'redo' — landed on revisions.jsonl as a bare
+// {rev} restore (indistinguishable from a manual jump). resolveUndoTarget
+// (core/project.ts) then replayed it as an ORDINARY edit on the next call,
+// so a second `vedit undo` recomputed the same "one before current" target
+// and bounced right back to the state the first undo had just left, instead
+// of walking further back. This suite proves the fix end-to-end over HTTP,
+// using the exact same resolveUndoTarget/resolveRedoTarget the CLI itself
+// uses to compute the next target from GET /api/revisions. ----
+describe('daemon: restore cause forwarding + consecutive undo (E-1 regression)', () => {
+  const PORT = 18260;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-undo-regress-'));
+    const dir = path.join(root, 'proj');
+    await Project.create(dir, 'undo-regress');
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('a cause:"undo" restore persists the cause tag on the revision log entry', async () => {
+    // Three ordinary edits (rev1/2/3), each independently identifiable by
+    // captions.maxCps.
+    await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: 0, op: 'captions', patch: { maxCps: 5 } });
+    await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: 1, op: 'captions', patch: { maxCps: 10 } });
+    await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: 2, op: 'captions', patch: { maxCps: 15 } });
+
+    const revs1 = (await getJson(BASE, '/api/revisions')).body;
+    const target1 = resolveUndoTarget(revs1);
+    expect(target1).toBe(2); // one step back from rev3: the state right after edit 2
+
+    const r = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: 3, op: 'restore', rev: target1, cause: 'undo' });
+    expect(r.status).toBe(200);
+
+    const revsAfter = (await getJson(BASE, '/api/revisions')).body;
+    const last = revsAfter.at(-1);
+    expect(last.op).toBe('restore');
+    expect(last.params).toMatchObject({ rev: target1, cause: 'undo' }); // the regression: this used to be bare {rev} with no cause
+
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.captions.maxCps).toBe(10);
+  });
+
+  it('a second consecutive undo walks FURTHER back (to rev1), not back to rev3 ("undo of undo" ping-pong)', async () => {
+    const revs2 = (await getJson(BASE, '/api/revisions')).body;
+    const target2 = resolveUndoTarget(revs2);
+    expect(target2).toBe(1); // must NOT be 3 (that would be the ping-pong bug)
+
+    const state = (await getJson(BASE, '/api/state')).body;
+    const r = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'restore', rev: target2, cause: 'undo' });
+    expect(r.status).toBe(200);
+
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.captions.maxCps).toBe(5); // NOT 15 — proves the walk went further back, not backwards-and-forwards
+  });
+
+  it('redo brings back the state the second undo just left (rev2\'s content, maxCps=10)', async () => {
+    const revs3 = (await getJson(BASE, '/api/revisions')).body;
+    const target3 = resolveRedoTarget(revs3);
+
+    const state = (await getJson(BASE, '/api/state')).body;
+    const r = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'restore', rev: target3, cause: 'redo' });
+    expect(r.status).toBe(200);
+
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.captions.maxCps).toBe(10);
+  });
+});
+
+// ---- E-1: POST /api/undo and POST /api/redo (thin routing over
+// Project.undo()/redo(), for a caller — the web UI's Cmd+Z/Shift+Cmd+Z — that
+// wants a single request instead of resolving the target client-side like
+// cli.ts's `vedit undo`/`redo` do). ----
+describe('daemon: POST /api/undo and /api/redo', () => {
+  const PORT = 18261;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-undoredo-route-'));
+    const dir = path.join(root, 'proj');
+    await Project.create(dir, 'undoredo-route');
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('POST /api/undo without baseRev is rejected for actor=claude', async () => {
+    const { status, body } = await postJson(BASE, '/api/undo', { actor: 'claude' });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/baseRev is required/);
+  });
+
+  it('POST /api/undo on a pristine project returns a Japanese "nothing to undo" 400', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/undo', { actor: 'claude', baseRev: state.revision });
+    expect(status).toBe(400);
+    expect(body.error).toBe('戻す対象がありません');
+  });
+
+  it('POST /api/redo with no prior undo returns a Japanese "nothing to redo" 400', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/redo', { actor: 'claude', baseRev: state.revision });
+    expect(status).toBe(400);
+    expect(body.error).toBe('やり直す対象がありません');
+  });
+
+  it('after two edits, /api/undo restores the state before the second edit, and /api/redo brings it back', async () => {
+    await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: 0, op: 'captions', patch: { maxCps: 7 } });
+    await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: 1, op: 'captions', patch: { maxCps: 9 } });
+
+    let state = (await getJson(BASE, '/api/state')).body;
+    let r = await postJson(BASE, '/api/undo', { actor: 'claude', baseRev: state.revision });
+    expect(r.status).toBe(200);
+    let project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.captions.maxCps).toBe(7);
+
+    state = (await getJson(BASE, '/api/state')).body;
+    r = await postJson(BASE, '/api/redo', { actor: 'claude', baseRev: state.revision });
+    expect(r.status).toBe(200);
+    project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.captions.maxCps).toBe(9);
+  });
+
+  it('POST /api/undo defaults baseRev from the current revision for a non-claude actor (e.g. "ui")', async () => {
+    // One more ordinary edit gives undo a fresh, valid (non-zero) target.
+    const state0 = (await getJson(BASE, '/api/state')).body;
+    await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state0.revision, op: 'captions', patch: { maxCps: 11 } });
+
+    const { status } = await postJson(BASE, '/api/undo', { actor: 'ui' }); // no baseRev
+    expect(status).toBe(200);
+  });
+});
+
+// ---- 画像サムネ特例: GET /media/thumb/<sourceId> must never try to seek 30s
+// into a still image (Source.kind==='image' carries the 24h
+// IMAGE_SOURCE_DURATION sentinel, not a real duration — see the fix's doc
+// comment in daemon.ts). run() is stubbed (see this file's top) so this
+// suite is deterministic without real ffmpeg/media. ----
+describe('daemon: GET /media/thumb (image-kind -ss fix)', () => {
+  const PORT = 18262;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+
+  beforeAll(async () => {
+    runMock.mockClear();
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-thumb-image-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'thumb-image');
+    await project.commit(0, 'system', 'setup', {}, 'seed sources', (m) => ({
+      ...m,
+      sources: [
+        { id: 's1', path: '/media/long.mp4', duration: 300, fps: 30, width: 1920, height: 1080, hasAudio: true },
+        { id: 's2', path: '/media/short.mp4', duration: 40, fps: 30, width: 1920, height: 1080, hasAudio: true },
+        { id: 's3', path: '/media/logo.png', duration: 86400, fps: 0, width: 800, height: 450, hasAudio: false, kind: 'image' },
+      ],
+    }));
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('seeks to 0 for an image-kind source, not 30s (the min(duration*0.25, 30) heuristic would land on 30 for the 86400s sentinel)', async () => {
+    const res = await fetch(`${BASE}/media/thumb/s3`);
+    expect(res.status).toBe(200);
+    const call = runMock.mock.calls.at(-1)!;
+    const args = call[1] as string[];
+    const ssIdx = args.indexOf('-ss');
+    expect(args[ssIdx + 1]).toBe('0');
+  });
+
+  it('keeps the existing 25%-of-duration heuristic for a real video source (uncapped case)', async () => {
+    const res = await fetch(`${BASE}/media/thumb/s2`); // duration 40 -> 40*0.25=10, under the 30s cap
+    expect(res.status).toBe(200);
+    const call = runMock.mock.calls.at(-1)!;
+    const args = call[1] as string[];
+    const ssIdx = args.indexOf('-ss');
+    expect(args[ssIdx + 1]).toBe('10');
+  });
+
+  it('keeps the existing 30s cap for a long video source', async () => {
+    const res = await fetch(`${BASE}/media/thumb/s1`); // duration 300 -> 300*0.25=75, capped at 30
+    expect(res.status).toBe(200);
+    const call = runMock.mock.calls.at(-1)!;
+    const args = call[1] as string[];
+    const ssIdx = args.indexOf('-ss');
+    expect(args[ssIdx + 1]).toBe('30');
   });
 });

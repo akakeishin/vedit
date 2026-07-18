@@ -17,6 +17,7 @@ import {
   buildSelectsTimeline,
   COLOR_WARNING_MESSAGE,
   cullingStats,
+  duplicateClip,
   expandWordIds,
   intentZonesForSource,
   moveClip,
@@ -51,6 +52,7 @@ import {
   setTranscriptionGlossary,
   shiftComposition,
   sourceRangeToTimeline,
+  splitClip,
   timelineDuration,
   trimClip,
   updateDialogue,
@@ -1238,6 +1240,29 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         );
         return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
       }
+      // ---- E-1 (波E NLE操作性パック): split/duplicate. Neither splitClip
+      // nor duplicateClip (core/ops.ts) accepts a caller-supplied id for the
+      // new clip they splice in (freshId('c') is generated inside), so the
+      // new clip's id is recovered here by diffing timeline.video before vs.
+      // after the commit — same trick as `updated.timeline.music.find(...)`
+      // a few branches below for music-add's warning lookup, just against
+      // the id set instead of a known id. ----
+      if (b.op === 'split') {
+        const beforeIds = new Set(m0.timeline.video.map((c) => c.id));
+        const updated = await mutate(p, actor, baseRev, 'split', b, `split ${b.clipId} at ${b.at}s`, (m) =>
+          splitClip(m, b.clipId, b.at),
+        );
+        const newClipId = updated.timeline.video.map((c) => c.id).find((id) => !beforeIds.has(id));
+        return json(res, 200, { newClipId, state: await stateSummary(p, ctx.transcribeJobs) });
+      }
+      if (b.op === 'duplicate') {
+        const beforeIds = new Set(m0.timeline.video.map((c) => c.id));
+        const updated = await mutate(p, actor, baseRev, 'duplicate', b, `duplicate ${b.clipId}`, (m) =>
+          duplicateClip(m, b.clipId),
+        );
+        const newClipId = updated.timeline.video.map((c) => c.id).find((id) => !beforeIds.has(id));
+        return json(res, 200, { newClipId, state: await stateSummary(p, ctx.transcribeJobs) });
+      }
       if (b.op === 'captions') {
         // maxCps is a recognized, validated patch field (CLI integration
         // support) — everything else stays an unvalidated passthrough merge
@@ -1466,6 +1491,51 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
           return json(res, 400, { error: `unknown overlay: ${b.id}` });
         }
         await mutate(p, actor, baseRev, 'broll-remove', b, `broll-remove ${b.id}`, (m) => removeOverlay(m, b.id));
+        return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
+      }
+      // ---- オーバーレイ・スタック (docs/superpowers/specs/2026-07-18-vedit-overlay-stack.md):
+      // generalizes broll-add/-update/-remove above into N layers + image
+      // sources + rect/opacity/fade. broll-* stay untouched (they always
+      // produce/target layer-1 overlays — "layer 1 の別名") and keep working
+      // exactly as before; these ops just pass layer/rect/opacity/fade
+      // through to the same addOverlay/updateOverlay/removeOverlay (ops.ts)
+      // those branches already call, so validation (layer range, rect
+      // bounds, opacity 0..1, fade shape, same-layer-overlap) is identical. ----
+      if (b.op === 'overlay-add') {
+        if (!b.anchor || typeof b.anchor.sourceId !== 'string' || typeof b.anchor.srcTime !== 'number') {
+          return json(res, 400, { error: 'overlay-add: anchor {sourceId, srcTime} is required' });
+        }
+        const id = freshId('ov');
+        await mutate(
+          p, actor, baseRev, 'overlay-add', b,
+          `overlay-add ${b.sourceId} [${b.in}-${b.out}] anchor ${b.anchor.sourceId}@${Number(b.anchor.srcTime).toFixed(2)}${b.layer !== undefined ? ` layer=${b.layer}` : ''}`,
+          (m) => addOverlay(m, b.sourceId, {
+            srcIn: b.in, srcOut: b.out, anchor: b.anchor, audioMode: b.audioMode, gainDb: b.gainDb, id,
+            layer: b.layer, rect: b.rect, opacity: b.opacity, fade: b.fade,
+          }),
+        );
+        return json(res, 200, { id, state: await stateSummary(p, ctx.transcribeJobs) });
+      }
+      if (b.op === 'overlay-update') {
+        if (!(m0.timeline.overlays ?? []).some((x) => x.id === b.id)) {
+          return json(res, 400, { error: `unknown overlay: ${b.id}` });
+        }
+        if (b.anchor !== undefined && (typeof b.anchor.sourceId !== 'string' || typeof b.anchor.srcTime !== 'number')) {
+          return json(res, 400, { error: 'overlay-update: anchor must be {sourceId, srcTime}' });
+        }
+        await mutate(p, actor, baseRev, 'overlay-update', b, `overlay-update ${b.id}`, (m) =>
+          updateOverlay(m, b.id, {
+            srcIn: b.in, srcOut: b.out, anchor: b.anchor, audioMode: b.audioMode, gainDb: b.gainDb,
+            layer: b.layer, rect: b.rect, opacity: b.opacity, fade: b.fade,
+          }),
+        );
+        return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
+      }
+      if (b.op === 'overlay-remove') {
+        if (!(m0.timeline.overlays ?? []).some((x) => x.id === b.id)) {
+          return json(res, 400, { error: `unknown overlay: ${b.id}` });
+        }
+        await mutate(p, actor, baseRev, 'overlay-remove', b, `overlay-remove ${b.id}`, (m) => removeOverlay(m, b.id));
         return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'sprite-add') {
@@ -1863,11 +1933,70 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         // (b.baseRev, falling back to the pre-request revision for
         // actor=ui) — the wire contract is unchanged; restore() now just
         // requires it explicitly instead of always racing onto "latest".
-        const m = await p.restore(b.rev, actor, baseRev);
+        // `b.cause` ('undo' | 'redo' | 'manual' | absent) is forwarded
+        // verbatim to Project.restore() — see cli.ts's `undo`/`redo` cases,
+        // which POST here with cause:'undo'/'redo' so resolveUndoTarget/
+        // resolveRedoTarget (core/project.ts) can tell a logical-undo/-redo
+        // restore apart from a manual one on the NEXT undo/redo call.
+        // Dropping this (as this branch previously did) breaks repeated
+        // undo: without the cause tag every restore replays as "manual",
+        // which clears the redo stack and makes the second `vedit undo`
+        // bounce back to the state the first undo just left, instead of
+        // walking further back.
+        const m = await p.restore(b.rev, actor, baseRev, b.cause);
         broadcast(ctx, { type: 'update', revision: m.revision, op: 'restore', summary: `restored r${b.rev}` });
         return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
       }
       return json(res, 400, { error: `unknown op: ${b.op}` });
+    }
+
+    // ---- E-1 (波E NLE操作性パック): logical undo/redo, thin routing over
+    // Project.undo()/redo() (already implemented + unit-tested in
+    // core/project.ts — resolveUndoTarget/resolveRedoTarget replay the
+    // revision log's cause tags so repeated presses walk further back
+    // instead of bouncing between two states). `vedit undo`/`vedit redo`
+    // (cli.ts) resolve the target client-side and POST /api/edit
+    // {op:'restore', cause:...} themselves — these two routes exist for a
+    // caller (the web UI's Cmd+Z/Shift+Cmd+Z, per E-4) that wants a single
+    // request instead of duplicating that resolution logic. Same
+    // actor/baseRev contract as /api/edit: baseRev is required for
+    // actor='claude', and defaults to the just-read current revision for
+    // 'ui'/'system' callers. ----
+    if (pathname === '/api/undo' && method === 'POST') {
+      const b = await readBody(req);
+      const actor = b.actor ?? 'claude';
+      if (actor === 'claude' && typeof b.baseRev !== 'number') {
+        return json(res, 400, { error: 'baseRev is required; run `vedit status` and pass --base <revision>' });
+      }
+      const m0 = await p.manifest();
+      const baseRev = typeof b.baseRev === 'number' ? b.baseRev : m0.revision;
+      let m: Manifest;
+      try {
+        m = await p.undo(actor, baseRev);
+      } catch (e: any) {
+        if (e?.message === 'nothing to undo') return json(res, 400, { error: '戻す対象がありません' });
+        throw e;
+      }
+      broadcast(ctx, { type: 'update', revision: m.revision, op: 'restore', summary: `undo -> r${m.revision}` });
+      return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
+    }
+    if (pathname === '/api/redo' && method === 'POST') {
+      const b = await readBody(req);
+      const actor = b.actor ?? 'claude';
+      if (actor === 'claude' && typeof b.baseRev !== 'number') {
+        return json(res, 400, { error: 'baseRev is required; run `vedit status` and pass --base <revision>' });
+      }
+      const m0 = await p.manifest();
+      const baseRev = typeof b.baseRev === 'number' ? b.baseRev : m0.revision;
+      let m: Manifest;
+      try {
+        m = await p.redo(actor, baseRev);
+      } catch (e: any) {
+        if (e?.message?.startsWith('nothing to redo')) return json(res, 400, { error: 'やり直す対象がありません' });
+        throw e;
+      }
+      broadcast(ctx, { type: 'update', revision: m.revision, op: 'restore', summary: `redo -> r${m.revision}` });
+      return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
     }
 
     // ---- detection & candidate queue ----
@@ -2217,7 +2346,12 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         await fs.access(fullThumb);
       } catch {
         const media = src.proxy ? path.join(p.dir, src.proxy) : src.path;
-        const at = Math.min(src.duration * 0.25, 30);
+        // Source.kind==='image' (オーバーレイ・スタック) always carries the
+        // 24h IMAGE_SOURCE_DURATION sentinel (see ingestImageFile), not a
+        // real duration — `duration * 0.25` would land on 30 (the min()'s
+        // other arm) and try to seek 30s into a single still frame, which
+        // fails. Seek to 0 for images; the video heuristic is unchanged.
+        const at = src.kind === 'image' ? 0 : Math.min(src.duration * 0.25, 30);
         await run('ffmpeg', ['-y', '-v', 'error', '-ss', String(at), '-i', media, '-frames:v', '1', '-vf', 'scale=320:-2', '-q:v', '4', fullThumb]);
       }
       res.writeHead(200, { 'content-type': 'image/jpeg', 'cache-control': 'max-age=3600' });
