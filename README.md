@@ -37,7 +37,7 @@ GitHubからCLIとWeb NLEをグローバルインストールします。npm reg
 不要で、このリポジトリの最新版を直接導入できます。
 
 ```bash
-npm install --global github:akakeishin/vedit
+npm install --global https://github.com/akakeishin/vedit/archive/refs/heads/main.tar.gz
 vedit doctor
 ```
 
@@ -55,8 +55,11 @@ vedit-install-skills --claude
 通常は再導入不要です。
 
 ```bash
-npm install --global github:akakeishin/vedit
+npm install --global https://github.com/akakeishin/vedit/archive/refs/heads/main.tar.gz
 ```
+
+固定版が必要な場合は、GitHub Releasesに添付される`vedit-<version>.tgz`を
+指定してください。`v*`タグをpushすると、CIがテスト済みtarballを自動生成します。
 
 ### ソースから導入
 
