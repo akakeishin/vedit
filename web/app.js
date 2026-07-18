@@ -139,6 +139,10 @@ const S = {
   lastSeenRevision: null,
   lastSeenCandidateIds: null,
   lastSeenProjectKey: null,
+  // IA v3 波B §8: GET /api/notes(vedit note、src/core/notes.ts の NOTES.md)
+  // の生配列、古い順。読み取り専用 — このタブから書き込むUIは作らない。
+  // reload() のたびに取り直す(renderQueueSheetDesk が policy/todo 先頭数件を拾う)。
+  notes: [],
 };
 const PLAY_RATES = [1, 1.5, 2];
 
@@ -218,6 +222,9 @@ async function reload() {
     ensureQueueSeenLoaded(); // IA v3 波A §1.1 — S.manifest/S.candidates が揃った直後(baseline seeding は現在の候補集合を必要とする)
     // W9: static-only QC pass (cheap — see daemon.ts's GET /api/qc doc), merged into renderInbox() below.
     S.qc = await api('/api/qc').catch(() => ({ issues: [], counts: { errors: 0, warnings: 0, infos: 0 } }));
+    // IA v3 波B §8: プロジェクトメモ(read-only)。renderQueueSheetDesk が
+    // policy/todo 先頭数件を「机」に載せる。
+    S.notes = await api('/api/notes').catch(() => []);
     for (const src of S.manifest.sources) {
       if (src.transcribed && !S.transcripts.has(src.id)) {
         const t = await api(`/api/transcript?full=1&source=${src.id}`);
@@ -4373,6 +4380,14 @@ function humanizeCandidateLabel(label, dur) {
 function isNewCandidate(id) {
   return S.lastSeenCandidateIds != null && !S.lastSeenCandidateIds.has(id);
 }
+// IA v3 波B §2「紙面=朱... 赤入れ下線」: ラベル中の最初の「引用」だけを
+// <mark> で囲む(候補文はすでに esc() 済みの安全な文字列 — ここでは新しい
+// タグを足すだけで、テキスト自体を再エスケープしない)。紙面(#claudeView)
+// スコープの CSS(.cand .lbl mark)だけが下線色を持つので、対象を持たない
+// ラベル(冒頭無音など「」を含まない文)はそのまま無地で通る。
+function markupPaperLabel(escapedLabel) {
+  return escapedLabel.replace(/「([^」]*)」/, '「<mark>$1</mark>」');
+}
 function candRow(c) {
   const d = document.createElement('div');
   d.className = `cand${isNewCandidate(c.id) ? ' candNew' : ''}`;
@@ -4388,7 +4403,7 @@ function candRow(c) {
   // the full sentence one hover away too (natural wrap can still run long).
   d.innerHTML = `<span class="kind ${c.kind}">${esc(KIND_LABEL[c.kind] ?? c.kind)}</span>
     <div class="candTop">
-      <span class="lbl" title="${esc(label)}">${esc(label)}</span>
+      <span class="lbl" title="${esc(label)}">${markupPaperLabel(esc(label))}</span>
       <span class="dur">−${dur.toFixed(1)}秒</span>
     </div>
     <div class="candBottom">
@@ -4894,11 +4909,48 @@ function nextMoveChipPrompts() {
   if ((S.manifest.timeline.music ?? []).length === 0) out.push('BGMを頼む');
   return out;
 }
+// IA v3 波B §8: プロジェクトメモ(GET /api/notes、S.notes — read-only)の
+// policy/todo 先頭数件を「机」に載せる。decision/pref など他 type や、
+// 完了済み todo(todos[].done=true)は「作業記録」ではなく「今読む価値がある
+// もの」だけに絞るため、pending todo だけを拾う(全文が pending 無しの todo
+// エントリなら本文をそのまま見せる)。件数は直近の作業記録と同じ流儀で
+// 「最新から数件」(記載順の先頭ではなく — セッション再開時に一番読みたいのは
+// 直近に書いたメモのため)。
+function relevantNoteEntries(n = 3) {
+  return S.notes
+    .filter((e) => e.type === 'policy' || e.type === 'todo')
+    .slice(-n)
+    .reverse();
+}
+function renderQueueSheetNotes() {
+  const heading = $('deskNotesHeading');
+  const list = $('deskNotesList');
+  if (!heading || !list) return;
+  const entries = relevantNoteEntries();
+  heading.hidden = entries.length === 0;
+  list.innerHTML = '';
+  for (const n of entries) {
+    const row = document.createElement('div');
+    row.className = 'queueRevRow queueWeak queueNoteRow';
+    const type = document.createElement('span');
+    type.className = 'queueRevActor';
+    type.textContent = n.type === 'policy' ? '方針' : 'todo';
+    const text = document.createElement('span');
+    text.className = 'queueRevText';
+    const pending = n.type === 'todo' ? (n.todos ?? []).filter((t) => !t.done) : [];
+    text.textContent = n.type === 'todo' && n.todos?.length
+      ? (pending.length > 0 ? pending.map((t) => t.text).join(' / ') : '(完了済み)')
+      : n.text;
+    row.append(type, text);
+    row.title = n.ts;
+    list.appendChild(row);
+  }
+}
 // 「紙を白紙にしない」(2026-07-18 仕様追記): 提案ゼロ・新着ゼロの定常状態
 // でもキューシートに載せる常設内容。(1)直近の作業記録3〜5件
 // (2)最後の書き出し結果ミニカード(#deskExportCard は renderExportResultCard
-// が更新 — ここでは呼ばない)(3)プロジェクトメモは daemon に読み取り API
-// が無いため本波では省略(最終報告に明記)(4)次の一手チップ。
+// が更新 — ここでは呼ばない)(3)プロジェクトメモ(波B §8、renderQueueSheetNotes)
+// (4)次の一手チップ。
 function renderQueueSheetDesk() {
   const el = $('queueSheetDesk');
   if (!el) return;
@@ -4911,6 +4963,8 @@ function renderQueueSheetDesk() {
   const recentList = $('deskRecentList');
   recentList.innerHTML = '';
   for (const r of recent) recentList.appendChild(queueRevisionRow(r, { weak: true }));
+
+  renderQueueSheetNotes();
 
   const chips = nextMoveChipPrompts();
   $('deskNextHeading').hidden = chips.length === 0;
@@ -6120,6 +6174,10 @@ async function renderAll() {
   // W-POLISH Low-4: 日本語ラベルまで丸ごとmonoにしない — 版番号だけ
   // <span class="mono"> で包む(.hdrRevLabel は style.css 側で.monoリストから外した)。
   $('revLabel').innerHTML = `現在の版 <span class="mono">${m.revision}</span> · 自動保存`;
+  // IA v3 波B §4: プレビュー右上のコマ番号(d4-cuesheet.html 準拠、現在の版を
+  // 「23A」様式で表示 — 純粋に装飾、コマ単位の実カウンタではない)。
+  const frameNumEl = $('frameNumber');
+  if (frameNumEl) frameNumEl.textContent = `${m.revision}A`;
   applyCompositionMode();
   await loadMotionSpecs();
   syncMusicElements();

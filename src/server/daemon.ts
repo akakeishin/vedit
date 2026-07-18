@@ -76,6 +76,7 @@ import { applyKitDefaults, readKitFile, recognizedKitSections } from '../core/ki
 import { listSystemFonts, scanKitFonts } from '../core/fonts.js';
 import { locateMedia, type MediaFingerprint } from '../ingest/locate.js';
 import { readExportResults } from '../core/exportResults.js';
+import { readNotes } from '../core/notes.js';
 
 const WEB_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'web');
 
@@ -899,6 +900,15 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       const n = Math.min(Math.max(Number(url.searchParams.get('n') ?? 5) || 5, 1), 20);
       const all = await readExportResults(p.dir);
       return json(res, 200, all.slice(0, n));
+    }
+    if (pathname === '/api/notes' && method === 'GET') {
+      // IA v3 波B §8: read-only surface for `vedit note`(src/core/notes.ts,
+      // NOTES.md)——同じ「実行系ルートは作らない、記録済みのものを返すだけ」
+      // 規律を /api/export-results と共有する。web の「机」(キューシート常設面
+      // §1.1「紙を白紙にしない」)がプロジェクトメモの policy/todo 先頭数件を
+      // ここから拾う(renderQueueSheetDesk in app.js)。古い順の全件を返し、
+      // 「先頭数件」の選び方(最新優先か記載順か)は表示側の裁量に委ねる。
+      return json(res, 200, await readNotes(p.dir));
     }
 
     // ---- ingest ----

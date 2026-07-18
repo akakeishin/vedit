@@ -3,55 +3,76 @@
 [hidden] { display: none !important; }
 
 /* ---------------------------------------------------------------------------
- * W-DESIGN — Claude Design ハンドオフ(design_handoff_vedit_nle_redesign/
- * README.md, 「vedit Pro v2.dc.html」)の実装。無彩色(achromatic)の単一
- * ダークパレット — 旧「ステージと書斎」二領域案(暖色/寒色の使い分け)は
- * 廃止し、ヘッダー/サイドパネル/ステージが同じトークンを共有する。
+ * IA v3 波B「調整室とキューシート」— docs/design-refs/d4-cuesheet.html(視覚の
+ * 正)+ d3v2-master.html(暗部トークンの出典)の実装。二面構成:
+ *   部屋(ヘッダー/左パネル/中央/タイムライン/フッター)= d3v2/d4 の暗い計器
+ *     トークン(#0F1013系・ヘアライン・銘板・読み出し窓)。
+ *   キューシート(右パネルの4ビューすべて — 会話/履歴/インスペクタ/字幕/
+ *     書き出し)= d4 の紙トークン(#F5EFE3系)。右パネル配下だけ、この:root
+ *     の暗部トークンをまとめて紙トークンへ**上書き**する(下記「紙面トークンの
+ *     上書き」ブロック参照)——個々のコンポーネント規則(.cand/.btn-approve/
+ *     .inboxWarn 等)はほぼ全てこの下の共通トークン経由で色を引いているため、
+ *     上書き1箇所で右パネル配下が自動的に紙化する(コンポーネント規則自体は
+ *     二重実装しない)。
  *
- * 意味色は3つだけに絞る(装飾グラデーション・カラーピル禁止):
- *   --pending(琥珀) = 確認待ち・警告 専用
- *   --ok(緑)        = 接続状態 専用
- *   --danger(赤茶)  = 破壊的操作(タイムラインから外す 等) 専用
- * それ以外の操作アクセントは --link(青灰)、状態を持たない中立アクションは
- * --wash。トラック識別色(B-roll/テロップ/モーション/BGM)は行の種類を見分ける
- * ための別語彙で、この3トークンとは独立(下の「タイムライン」節を参照)。
+ * 意味色の二面規律(仕様§2):
+ *   暗部 = --pending(琥珀、確認待ち/タリー) + --ok(緑、接続のみ)。
+ *   紙面 = --paper-red(朱、確認待ちピル・赤入れ下線・新着ドット)のみ——
+ *     紙面スコープでは --pending/--danger 自体を --paper-red に上書きするので、
+ *     既存コンポーネントの var(--pending)/var(--danger) 参照はそのまま朱になる。
+ * トラック識別色(B-roll/テロップ/モーション/BGM)は行の種類を見分けるための
+ * 別語彙で、上記2トークン系とは独立(「タイムライン」節を参照)。装飾
+ * グラデーションは禁止。
  * --------------------------------------------------------------------- */
 :root {
-  --bg: #131315;           /* アプリ全体の背景 */
-  --panel: #1b1b1e;        /* ヘッダー/サイドパネル/ガター */
-  --card: #202024;         /* カード・入力・クリップ */
-  --card-2: #26262b;       /* ユーザーバブル・active タブ/ツール */
-  --raised: #2e2e33;       /* セグメントactive・カットボタン(hover: #37373d) */
-  --timeline-bg: #18181b;  /* タイムライン(ツールバー+トラック本体)の背景 */
+  /* ---- 部屋(dark room, d3v2/d4 準拠) ---- */
+  --bg: #0f1013;            /* アプリ全体の背景(d4 --bg) */
+  --panel: #16181d;         /* ヘッダー/サイドパネル/ガター/タイムライン(d4 --surface) */
+  --card: #1d2026;          /* カード・入力・クリップ(d4 --hair-soft を再利用) */
+  --card-2: #232630;        /* ユーザーバブル・active タブ/ツール */
+  --raised: #2a2e38;        /* セグメントactive・カットボタン(hover: #343944) */
+  --timeline-bg: #16181d;   /* タイムライン(ツールバー+トラック本体)の背景(d4 --surface） */
+  --surface-sunk: #0b0c0f;  /* 読み出し窓・トラック本体の沈んだ面(d4 --surface-sunk) */
 
-  --border: rgba(255, 255, 255, 0.08);
-  --border-soft: rgba(255, 255, 255, 0.06);
-  --border-hover: rgba(255, 255, 255, 0.2);
-  /* W-POLISH Mid-3: フォーム(input/select)既定10%、戻る/フッター/候補アクション
-     ゴースト既定12% — 同じ階層のコントロール間で線密度を揃える。hoverは両者
-     とも既存の --border-hover(20%)、候補「残す」だけ v2.dc.html が25%を明示
-     しているため個別に rgba(255,255,255,0.25) を使う(下記 .btn-wash:hover)。 */
-  --border-input: rgba(255, 255, 255, 0.1);
-  --border-ghost: rgba(255, 255, 255, 0.12);
-  --accent: #8f8f96;       /* range/checkbox の accent-color(README/v2.dc.html 全域で使用) */
+  --border: #262a31;        /* ヘアライン(d4 --hair) */
+  --border-soft: #1d2026;   /* 弱ヘアライン(d4 --hair-soft) */
+  --border-input: #2b2f37;
+  --border-ghost: #2e323b;
+  --border-hover: #3d4149;
+  --accent: #8a919c;        /* range/checkbox の accent-color */
 
-  --text: #ececee;
-  --text-2: #b9b9bf;
-  --text-3: #9b9ba3;
-  --text-dim: #616167;
-  --text-cut: #57575d;
+  --text: #f2f4f7;          /* d4 --text */
+  --text-2: #a7aeb8;
+  --text-3: #8a919c;        /* d4 --weak */
+  --text-dim: #575d68;      /* d4 --faint */
+  --text-cut: #454b55;
 
-  --primary: #e8e8ea;      /* 白プライマリ(書き出し・適用・5件すべて適用) */
-  --primary-text: #17171a;
+  --primary: #f2f4f7;       /* 白プライマリ(= --text) */
+  --primary-text: #0f1013;  /* = --bg */
   --primary-hover: #ffffff;
 
-  --link: #8fb4dd;         /* テキストリンク/情報・フォーカス・busyドット */
-  --pending: #d9a45f;      /* 確認待ち/警告 専用 */
+  --link: #8fb4dd;          /* テキストリンク/情報・フォーカス・busyドット(部屋側のみ、紙面では中立化) */
+  --pending: #d9a45f;       /* 確認待ち/タリー 専用(d4 --amber) */
   --pending-hover: #e6b578;
-  --ok: #6fbe8b;           /* 接続ドット 専用 */
-  --danger: #c98a80;       /* 破壊的操作 専用 */
+  --ok: #6fbe8b;            /* 接続ドット 専用(d4 --green) */
+  --danger: #c98a80;        /* 破壊的操作 専用(部屋側) */
   --danger-border: rgba(201, 123, 107, 0.4);
-  --wash: #6f6f76;         /* 状態色を持たないニュートラルなアクション用(「残す」等) */
+  --wash: #6f6f76;          /* 状態色を持たないニュートラルなアクション用(「残す」等) */
+
+  /* ---- 紙(キューシート、d4 準拠。:root では値の置き場のみ——実際の適用は
+     下の「紙面トークンの上書き」ブロックが右パネル配下にだけ効かせる) ---- */
+  --paper-bg: #f5efe3;
+  --paper-card: #fffdf8;    /* 提案カード等、紙面よりわずかに明るい面 */
+  --paper-rule: #dcd3c0;
+  --paper-rule-soft: #e6dfcf;
+  --paper-ink: #211e1a;
+  /* コントラスト検算(WCAG AA 4.5:1、地=--paper-bg #F5EFE3): d4 の #8A8071
+     そのままだと弱文字が3.4:1で不足するため、色相を保ったまま暗く調整
+     (#6B6154、5.3:1)。 */
+  --paper-weak: #6b6154;
+  --paper-red: #b5493a;     /* 紙面の唯一の彩色アクセント(確認待ち/赤入れ/新着) */
+  --paper-red-hover: #9d4033;
+  --paper-pressed: #3f3a33; /* 紙面のプライマリボタン地色 */
 
   --radius: 6px;
   --radius-sm: 4px;
@@ -104,6 +125,30 @@
   position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
   overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0;
 }
+
+/* =============================================================================
+ * IA v3 波B §4「銘板とコマ番号」— d4-cuesheet.html の .plate / .frame-number /
+ * .frame-corners をそのまま移植。装飾専用(aria-hidden、機能を持たない)。
+ * ========================================================================== */
+.plate {
+  display: flex; align-items: center; gap: 6px;
+  font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.14em;
+  color: var(--text-dim); line-height: 1; flex: none;
+}
+.plate .plate-mark { width: 5px; height: 5px; border: 1px solid var(--text-dim); flex: none; }
+.stagePlate { padding: 10px 24px 0; }
+.tlPlate { gap: 6px; }
+
+.frameNumber {
+  position: absolute; top: 10px; right: 30px; z-index: 2;
+  font-size: 10px; letter-spacing: 0.08em; color: var(--text-dim); pointer-events: none;
+}
+.frameCorners { position: absolute; inset: 0; pointer-events: none; z-index: 2; }
+.frameCorners span { position: absolute; width: 14px; height: 14px; border-color: var(--text-3); opacity: 0.7; }
+.frameCorners .fc-tl { top: 10px; left: 10px; border-top: 1px solid; border-left: 1px solid; }
+.frameCorners .fc-tr { top: 10px; right: 10px; border-top: 1px solid; border-right: 1px solid; }
+.frameCorners .fc-bl { bottom: 10px; left: 10px; border-bottom: 1px solid; border-left: 1px solid; }
+.frameCorners .fc-br { bottom: 10px; right: 10px; border-bottom: 1px solid; border-right: 1px solid; }
 @media (prefers-reduced-motion: reduce) {
   .mo-chapter-card, .mo-lower-third, .mo-callout, .mo-cta, .badge.tallyPulse, .loadRowIn { animation: none !important; }
   /* N2 計器盤 §2: 呼吸(opacity 0.55→1.0 の周期アニメ)は止めるが、情報は
@@ -323,9 +368,16 @@ main { flex: 1; display: flex; min-height: 0; }
 }
 .kitStatus > span { white-space: normal; }
 .audioPanel { margin: 10px 12px 0; border-top: 1px solid var(--border-soft); padding-top: 4px; }
+/* IA v3 波B §4: 既存見出しの様式変更で銘板扱いに(小さな正方マーク —
+   .plate .plate-mark と同じ見た目、DOM追加はしない)。summary の既定
+   display(list-item — 開閉三角の描画元)は変えない。 */
 .audioPanel summary {
   cursor: pointer; padding: 6px 2px; color: var(--text-3); font-size: var(--fs-xs);
   font-weight: 600; letter-spacing: 0.06em; list-style: revert;
+}
+.audioPanel summary::before {
+  content: ''; display: inline-block; width: 5px; height: 5px; margin-right: 6px;
+  border: 1px solid var(--text-dim); vertical-align: middle;
 }
 .audioPanel summary:hover { color: var(--text); }
 .audioPanelBody { padding: 4px 2px 4px; display: flex; flex-direction: column; gap: 10px; }
@@ -451,13 +503,19 @@ main { flex: 1; display: flex; min-height: 0; }
   padding: 10px 0 8px; margin-top: 6px; border-bottom: 1px solid var(--border-soft);
 }
 .srcHeading:first-child { margin-top: 0; }
-.w { cursor: pointer; border-radius: 3px; padding: 1px 1px; }
+/* IA v3 波B §6「暗い原稿」: d3v2-master.html の文字起こしパネル
+   (.t-text は既定 --weak・.t-line.active だけ --text に明るくなる)に倣い、
+   語は既定で一段沈ませ、現在再生位置の語(.w.active — 既存の
+   highlightWord() が付け外しする、挙動は無変更)だけ明るく戻す。単語単位の
+   構造(1行=1発話のタイムコード柱ではない)は既存のまま——挙動を変えない
+   範囲でのトーン調整に留める(最終報告に既知差分として明記)。 */
+.w { cursor: pointer; border-radius: 3px; padding: 1px 1px; color: var(--text-2); }
 .w:hover { background: rgba(255, 255, 255, 0.08); }
 .w:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
 .w.cut { color: var(--text-cut); text-decoration: line-through; }
 .w.ignored { color: var(--text-3); text-decoration: none; border-bottom: 1px dotted var(--text-dim); }
-.w.sel { background: rgba(255, 255, 255, 0.14); outline: 1px solid rgba(255, 255, 255, 0.3); outline-offset: -1px; }
-.w.active { background: rgba(255, 255, 255, 0.14); outline: 1px solid rgba(255, 255, 255, 0.3); outline-offset: -1px; }
+.w.sel { background: rgba(255, 255, 255, 0.14); outline: 1px solid rgba(255, 255, 255, 0.3); outline-offset: -1px; color: var(--text); }
+.w.active { background: rgba(255, 255, 255, 0.14); outline: 1px solid rgba(255, 255, 255, 0.3); outline-offset: -1px; color: var(--text); }
 /* W-UI §0 "show words" — Claude pointing at specific words; a distinct
    highlight from .sel. One-shot attention cue -> --pending (tally exception). */
 .w.shown { outline: 2px solid var(--pending); outline-offset: 1px; border-radius: 3px; }
@@ -606,7 +664,7 @@ main { flex: 1; display: flex; min-height: 0; }
    読み込み失敗/プロジェクト未選択の他の #stageEmpty 用途では出さない
    (renderStageState が isProjectEmpty() のときだけ appendChild する)。 */
 .stageEmptyLogo {
-  width: 44px; height: 44px; border-radius: 11px; background: #2a2a2e; flex: none;
+  width: 44px; height: 44px; border-radius: 11px; background: var(--card-2); flex: none;
   display: flex; align-items: center; justify-content: center; color: var(--text);
   font-weight: 700; font-size: 22px;
 }
@@ -643,7 +701,15 @@ main { flex: 1; display: flex; min-height: 0; }
    のまま --text-3。フレームカウンタ(#frameLabel)は右端・現状維持
    (README: 左タイムコード mono、中央⏮▶⏭、右 f番号+fps mono10.5px)。 */
 #transport { display: flex; align-items: center; gap: 14px; padding: 8px 28px 12px; flex: none; }
-.tcMain { font-family: var(--font-mono); font-variant-numeric: tabular-nums; display: flex; align-items: baseline; gap: 6px; }
+/* IA v3 波B §7「読み出し窓」: d4-cuesheet.html/d3v2-master.html の
+   .readout(沈んだ面 — bg surface-sunk、inset box-shadow)を #tc に直接適用。
+   マークアップは無変更(#tc 自体を沈んだ窓の外枠として扱う)。 */
+.tcMain {
+  font-family: var(--font-mono); font-variant-numeric: tabular-nums; display: flex; align-items: baseline; gap: 6px;
+  background: var(--surface-sunk); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.55), inset 0 0 0 1px rgba(0, 0, 0, 0.15);
+  padding: 6px 12px 5px;
+}
 #tcNow { font-size: 21px; color: var(--text); font-weight: 500; }
 #tcNowSub { color: var(--text-3); font-weight: 400; }
 .tcDim, #tcTotal { color: var(--text-3); font-size: var(--fs-lg); }
@@ -659,7 +725,11 @@ main { flex: 1; display: flex; min-height: 0; }
 }
 .btnTransportPlay:hover { background: var(--primary-hover); }
 .btnTransportPlay:disabled { opacity: 0.35; }
-.frameLabel { font-size: 10.5px; color: var(--text-3); }
+.frameLabel {
+  font-size: 10.5px; color: var(--text-3);
+  background: var(--surface-sunk); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 3px 8px;
+}
 /* W-POLISH High-3: --link はテキストリンク/フォーカス/busyドット専用に絞る
    — 再生速度ピルは意味色ではなく中立トーン(--wash)へ。 */
 #rateLabel {
@@ -733,10 +803,12 @@ main { flex: 1; display: flex; min-height: 0; }
   position: absolute; left: 96px; right: 0; top: 0; height: 24px;
   border-bottom: 1px solid var(--border-soft); pointer-events: none;
 }
+/* IA v3 波B §5: d4-cuesheet.html の .ruler-tick に合わせる(9px・字間0.04em・
+   --text-dim=d4 --faint)。 */
 .rulerTick {
   position: absolute; top: 0; height: 100%; padding-left: 4px;
-  border-left: 1px solid rgba(255, 255, 255, 0.06); color: var(--text-3);
-  font-size: 9.5px; font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+  border-left: 1px solid var(--border-soft); color: var(--text-dim);
+  font-size: 9px; letter-spacing: 0.04em; font-family: var(--font-mono); font-variant-numeric: tabular-nums;
   white-space: nowrap; line-height: 24px;
 }
 /* W-POLISH Low-3: ラベル列と時間領域の境目のヘアラインが欠落していた。 */
@@ -801,10 +873,13 @@ main { flex: 1; display: flex; min-height: 0; }
 .clip.alt { background: #1c1c20; }
 /* W-POLISH High-5: 1.5px白ボーダーのみ(重複していた1px白shadowは廃止)。 */
 .clip.sel { outline: 1.5px solid #fff; }
-/* README「本編」: 上68%フィルムストリップ、下32% rgba(10,10,12,0.75)+波形。 */
+/* README「本編」: 上68%フィルムストリップ、下32% rgba(10,10,12,0.75)+波形。
+   IA v3 波B §5「サムネ行の明度コントラストを一段上げる」: 以前の
+   opacity:0.92 の薄い被膜を外し、フィルムストリップをフラットな不透明表示に
+   (周囲の暗いクリップ枠との明度差が一段はっきりする)。 */
 .clipThumb {
   position: absolute; top: 0; height: 68%; background-size: cover; background-position: center;
-  background-color: rgba(0,0,0,0.3); opacity: 0.92; pointer-events: none;
+  background-color: rgba(0,0,0,0.3); opacity: 1; pointer-events: none;
 }
 .clip::after {
   content: ''; position: absolute; left: 0; right: 0; bottom: 0; height: 32%;
@@ -903,8 +978,14 @@ main { flex: 1; display: flex; min-height: 0; }
   overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0 6px; line-height: 18px; cursor: pointer;
 }
 
+/* IA v3 波B §5「再生ヘッドはルーラーから最下行まで貫通」: #playhead は
+   #timelineTracks の子(座標系は既存のまま — JS の left% 計算は無変更)だが、
+   #timelineTracks 自体が #timeline の top:24px(=#timeRuler の高さぶん)から
+   始まるので、top を -24px にして真上のルーラー天までせり出させる。
+   #timeline は overflow:hidden だが -24px は #timeline 自身の内側(ちょうど
+   ルーラーの上端)に収まるため切り取られない。 */
 #playhead {
-  position: absolute; top: 0; bottom: 0; width: 1px; background: #fff; pointer-events: none;
+  position: absolute; top: -24px; bottom: 0; width: 1px; background: #fff; pointer-events: none;
 }
 #playhead::before {
   content: ''; position: absolute; top: 0; left: -4.5px; width: 10px; height: 12px;
@@ -935,8 +1016,10 @@ main { flex: 1; display: flex; min-height: 0; }
 /* ---- ヘッダー(README: アバター26px円 bg#2a2a2e border白10%「✳」+
    名前/サブライン+セグメント切替) ---- */
 .claudeHeader { display: flex; align-items: center; gap: 10px; padding: 11px 14px; border-bottom: 1px solid var(--border); flex: none; }
+/* IA v3 波B: 固定 #2a2a2e は紙面(明色地)に合わないため、地の階調トークン
+   (--card-2/--border)で作る — 紙面では自動的にクリーム地+墨字の丸に。 */
 .claudeAvatar {
-  width: 26px; height: 26px; border-radius: 50%; background: #2a2a2e; border: 1px solid rgba(255, 255, 255, 0.1);
+  width: 26px; height: 26px; border-radius: 50%; background: var(--card-2); border: 1px solid var(--border);
   display: flex; align-items: center; justify-content: center; color: var(--text-2); font-size: 12px; flex: none;
 }
 .claudeHeaderText { display: flex; flex-direction: column; min-width: 0; }
@@ -949,15 +1032,17 @@ main { flex: 1; display: flex; min-height: 0; }
 }
 .segTabs .tab.active { background: var(--raised); color: var(--text); font-weight: 600; }
 .segTabs .tab:focus-visible { outline: 2px solid var(--link); outline-offset: -2px; }
-/* タブの件数バッジ(会話タブに琥珀「N」) */
+/* タブの件数バッジ(会話タブに琥珀「N」、紙面では朱「N」— IA v3 波B §2)。
+   color-mix() で var(--pending) から地色を作るので、紙面スコープの
+   --pending 上書き(朱)にそのまま追従する(固定 rgba だと紙面で追従しない)。 */
 #inboxCount.badge {
-  background: rgba(217, 164, 95, 0.18); border-color: transparent; color: var(--pending); font-weight: 700;
+  background: color-mix(in srgb, var(--pending) 18%, transparent); border-color: transparent; color: var(--pending); font-weight: 700;
   font-size: 10px; padding: 0 5px; border-radius: var(--radius-pill);
 }
 #inboxCount.badge.tallyPulse { animation: tallyPulse 0.6s ease-out; }
 @keyframes tallyPulse {
-  from { box-shadow: 0 0 0 0 rgba(217, 164, 95, 0.55); }
-  to { box-shadow: 0 0 0 5px rgba(217, 164, 95, 0); }
+  from { box-shadow: 0 0 0 0 color-mix(in srgb, var(--pending) 55%, transparent); }
+  to { box-shadow: 0 0 0 5px color-mix(in srgb, var(--pending) 0%, transparent); }
 }
 
 #nowPanel, #historyPanel { padding: 0; }
@@ -987,7 +1072,7 @@ main { flex: 1; display: flex; min-height: 0; }
   display: flex; gap: 8px; align-items: flex-start; max-width: 100%;
 }
 .claudeBubble .claudeAvatarSm {
-  width: 20px; height: 20px; border-radius: 50%; background: #2a2a2e; border: 1px solid rgba(255, 255, 255, 0.1);
+  width: 20px; height: 20px; border-radius: 50%; background: var(--card-2); border: 1px solid var(--border);
   display: flex; align-items: center; justify-content: center; color: var(--text-2); font-size: 10px; flex: none; margin-top: 2px;
 }
 .claudeBubble .bubbleText {
@@ -1025,7 +1110,9 @@ main { flex: 1; display: flex; min-height: 0; }
 }
 .inboxWarn:last-child { border-bottom: 0; }
 .inboxWarn[role="button"] { cursor: pointer; }
-.inboxWarn[role="button"]:hover { background: rgba(255, 255, 255, 0.04); }
+/* IA v3 波B: 固定の白4%は紙面では見えなくなるため、地の文字色(--text)から
+   薄く作る — 部屋では白味、紙面では墨味のティントに自動で追従する。 */
+.inboxWarn[role="button"]:hover { background: color-mix(in srgb, var(--text) 4%, transparent); }
 .inboxWarn:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
 
 /* ---- IA v3 波A §1.1: キューシート「新着」区間 + 「紙を白紙にしない」
@@ -1068,13 +1155,28 @@ main { flex: 1; display: flex; min-height: 0; }
    spacer→残す→カット(raised)」へ揃える(以前は カット→残す で右端の
    視覚的着地点が逆転していた)。 */
 .cand {
-  display: flex; flex-direction: column; gap: 8px; padding: 10px 12px;
+  position: relative;
+  display: flex; flex-direction: column; gap: 8px; padding: 10px 12px 10px 15px;
   background: var(--card); outline: 1px solid var(--border-soft); border: 0; border-radius: var(--radius-lg); cursor: pointer;
 }
-.cand:hover { outline-color: rgba(255, 255, 255, 0.16); }
+/* IA v3 波B §2/§3: 紙面の提案カードは常に確認待ちなので、d4-cuesheet.html
+   の .proposal-card::before(左3pxの朱ルール)を常設する。部屋側の
+   candidateCard(#stage 上のフロートカード)は .cand ではなく別マークアップ
+   (.candActions)なので影響しない。 */
+.cand::before {
+  content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--pending);
+}
+.cand:hover { outline-color: var(--border-hover); }
 .cand .kind { display: none; } /* README のカードは種別バッジを見出し側だけに出す(グループ見出しの .kind は表示、行内は非表示) */
 .candTop { display: flex; align-items: baseline; gap: 8px; }
-.cand .lbl { flex: 1 1 auto; min-width: 0; color: #d6d6da; font-size: var(--fs-base); line-height: 1.55; white-space: normal; overflow-wrap: break-word; }
+.cand .lbl { flex: 1 1 auto; min-width: 0; color: var(--text); font-size: var(--fs-base); line-height: 1.55; white-space: normal; overflow-wrap: break-word; }
+/* IA v3 波B §2「赤入れ下線」: 引用対象語(markupPaperLabel in app.js が
+   <mark> で囲む)だけに下線 — var(--pending) 経由なので紙面では自動的に朱になる。 */
+.cand .lbl mark {
+  background: none; color: inherit; font-weight: 600;
+  text-decoration: underline; text-decoration-color: var(--pending);
+  text-decoration-thickness: 2px; text-underline-offset: 3px;
+}
 .cand .dur { color: var(--text-3); font-size: var(--fs-xs); flex: none; }
 /* v2.dc.html は1行(時刻→前後を再生→spacer→残す→カット)だが、そのhifiは
    単一素材デモで「カット」2文字。このアプリは複数素材+既存の「カットする」
@@ -1105,9 +1207,11 @@ main { flex: 1; display: flex; min-height: 0; }
 .btn-approve { background: var(--raised); color: var(--text); border-color: var(--border); font-weight: 600; }
 .btn-approve:hover { background: #37373d; }
 .btn-wash { background: none; color: var(--text-3); border-color: var(--border-ghost); }
-.btn-wash:hover { color: var(--text); border-color: rgba(255, 255, 255, 0.25); }
+/* IA v3 波B: 固定の白25%だと紙面(明色地)でほぼ見えないため、地の
+   --border-hover から追従する色に(部屋側は従来どおり明るいヘアライン)。 */
+.btn-wash:hover { color: var(--text); border-color: var(--border-hover); }
 .btn-reject { background: none; color: var(--danger); border-color: var(--danger-border); }
-.btn-reject:hover { background: rgba(201, 138, 128, 0.1); }
+.btn-reject:hover { background: color-mix(in srgb, var(--danger) 12%, transparent); }
 
 .candGroup { display: flex; flex-direction: column; gap: 8px; margin-bottom: 4px; }
 .candGroupHeader {
@@ -1147,7 +1251,7 @@ main { flex: 1; display: flex; min-height: 0; }
 .activityInfo { font-size: 12px; color: var(--text-2); line-height: 1.55; }
 .activityRev { color: var(--text-3); font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
 .activityActor { color: var(--text-3); font-size: var(--fs-10-5); }
-.activityText { color: #d6d6da; display: block; }
+.activityText { color: var(--text); display: block; }
 .activityActions { display: flex; gap: 10px; }
 /* README「まとめてカット」と同様、罫線なしのテキストリンクに戻す(以前は
    button の既定ボーダー付き見た目のまま --link 色だけ乗せていた)。「この
@@ -1208,7 +1312,7 @@ main { flex: 1; display: flex; min-height: 0; }
 .capColorRow .capField { flex: 1; }
 .capActions { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
 #capResetBtn { color: var(--danger); border-color: var(--danger-border); }
-#capResetBtn:hover { background: rgba(201, 138, 128, 0.1); }
+#capResetBtn:hover { background: color-mix(in srgb, var(--danger) 12%, transparent); }
 
 /* W-POLISH Mid-11: 字幕プリセットをnative selectから3(+)等分ボタンへ
    (v2.dc.html:402-404)。ビルトイン(クリーン/ボールド/アウトライン/ボックス
@@ -1221,7 +1325,7 @@ main { flex: 1; display: flex; min-height: 0; }
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .capPresetBtn:hover { color: var(--text); }
-.capPresetBtn.active { background: var(--raised); color: var(--text); border-color: rgba(255, 255, 255, 0.25); font-weight: 600; }
+.capPresetBtn.active { background: var(--raised); color: var(--text); border-color: var(--border-hover); font-weight: 600; }
 
 /* ---- 書き出しビュー(README ディレクター適応1) ---- */
 .exportResultCard { display: flex; flex-direction: column; gap: 8px; }
@@ -1247,7 +1351,7 @@ main { flex: 1; display: flex; min-height: 0; }
 #inspectorBody .btn-reject, #capResetBtn {
   background: none; color: var(--danger); border-color: var(--danger-border);
 }
-#inspectorBody .btn-reject:hover { background: rgba(201, 138, 128, 0.1); }
+#inspectorBody .btn-reject:hover { background: color-mix(in srgb, var(--danger) 12%, transparent); }
 
 /* =============================================================================
  * フローティングカード(候補/比較/テイク/取り込み確認)・トースト・ダイアログ
@@ -1314,3 +1418,104 @@ dialog#shortcutsDialog td:first-child { color: var(--text-2); min-width: 130px; 
 dialog#shortcutsDialog td:last-child { color: var(--text-3); }
 /* Mid-10: 説明段落を12px・行間1.55へ(色は既に--text-3=#9b9ba3、READMEどおり)。 */
 dialog#shortcutsDialog .hintText { display: block; margin-bottom: 14px; font-size: 12px; line-height: 1.55; }
+
+/* =============================================================================
+ * IA v3 波B「調整室とキューシート」— 紙面(右パネル)
+ * docs/design-refs/d4-cuesheet.html(視覚の正)。右パネルの4ビュー
+ * (#claudeView 会話+履歴/#inspectorView インスペクタ/#captionView 字幕/
+ * #exportView 書き出し)すべてが「紙のページ」になる — シート遷移
+ * (selectItem/openCaptionStylePopover/openExportView 等)は同じ紙の別ページ。
+ *
+ * 仕組み: 下の1ブロックで --bg/--card/--text/--border/--pending 等、
+ * このファイル全域のコンポーネント規則(.cand/.btn-*/.inboxWarn/.badge/
+ * button/select/input 等)がすでに参照している汎用トークンを紙面値へ
+ * **上書き**する。CSS変数はスコープに閉じてカスケードするので、右パネルの
+ * 外(ヘッダー/左パネル/中央/タイムライン/フッター)には一切漏れない——
+ * 個々のコンポーネント規則を紙面用に二重実装することはしていない。
+ * このブロックで解決しない少数のハードコード色/意味反転(--raised と
+ * --text をそのまま逆転できない「カットする」ボタン等)だけを、この下に
+ * 個別ルールとして追記する。
+ * ========================================================================== */
+
+/* ---- 机(#rightPanel、暗部トークンのまま)。紙はこの上に置かれた1枚
+   (d4 .paper-col の padding+shadow)。紙自体は#rightPanelいっぱいに伸びて
+   内部スクロールを保つ(挙動不変の要求 — 内容量に応じて紙が縮み下に机が
+   覗く d4 モックアップそのままの動的高さ化はしていない。四周の余白の
+   ぶんだけ常に机の縁が見える、既知の意図的差分。最終報告に明記)。 ---- */
+#rightPanel { background: var(--bg); padding: 16px 16px 18px; }
+
+#claudeView, #inspectorView, #captionView, #exportView {
+  /* ---- 紙面トークンの上書き ---- */
+  --bg: var(--paper-bg);
+  --panel: var(--paper-bg);
+  --card: var(--paper-card);
+  --card-2: #efe6d3;
+  --raised: var(--paper-rule);
+  --border: var(--paper-rule);
+  --border-soft: var(--paper-rule-soft);
+  --border-input: var(--paper-rule);
+  --border-ghost: var(--paper-rule);
+  --border-hover: #c9bda0;
+  --text: var(--paper-ink);
+  --text-2: #4a443c;
+  --text-3: var(--paper-weak);
+  --text-dim: var(--paper-weak);
+  --text-cut: #a69c89;
+  --primary: var(--paper-pressed);
+  --primary-text: var(--paper-bg);
+  --primary-hover: #2e2a25;
+  /* 紙面には朱1色以外の彩色を置かない(仕様§2) — テキストリンクの意味色は
+     中立化し、代わりに個別ルールで下線を足して可読性を保つ(下記参照)。 */
+  --link: var(--paper-ink);
+  --pending: var(--paper-red);
+  --pending-hover: var(--paper-red-hover);
+  /* 接続(緑)は暗部専用の意味色(仕様§2「暗部=琥珀+緑」)——紙面の
+     .claudeFooter は同じ接続状態をテキストで繰り返すだけなので中立化する。 */
+  --ok: var(--paper-weak);
+  --danger: var(--paper-red);
+  --danger-border: rgba(181, 73, 58, 0.4);
+  --wash: #8a8071;
+  --accent: var(--paper-ink);
+
+  /* ---- 紙の物性(d4): 影+上端の淡い暖色(過剰なら無し、のゲート結果として
+     ノイズテクスチャは省略——複数背景レイヤーの色だけを採用)。 ---- */
+  background:
+    linear-gradient(180deg, rgba(217, 164, 95, 0.10) 0%, rgba(217, 164, 95, 0.04) 90px, rgba(217, 164, 95, 0) 170px),
+    var(--paper-bg);
+  color: var(--paper-ink);
+  box-shadow:
+    0 20px 36px -14px rgba(0, 0, 0, 0.55),
+    0 4px 10px -3px rgba(0, 0, 0, 0.4),
+    0 0 0 1px rgba(33, 30, 26, 0.06);
+}
+
+/* 紙面の押下フラッシュ: 部屋側の固定 #37373d(暗灰)は明色地で浮くため、
+   紙のルール色ベースの薄いティントに差し替える。 */
+#claudeView button:active:not(.btnPrimary):not(.btn-applyAllCandidates),
+#inspectorView button:active:not(.btnPrimary):not(.btn-applyAllCandidates),
+#captionView button:active:not(.btnPrimary):not(.btn-applyAllCandidates),
+#exportView button:active:not(.btnPrimary):not(.btn-applyAllCandidates) {
+  background: var(--paper-rule-soft);
+}
+
+/* 「カットする」(候補カードの主アクション)だけは d4 の cbtn-primary
+   (濃い墨のプレスボタン+クリーム文字)に。.btn-approve は他に
+   segTabs.tab.active/.capPresetBtn.active と --raised+--text の組を共有して
+   おり、そちらは「淡い選択チップ」(地の文字色のまま)であるべきなので
+   全体を反転させるとそれらが読めなくなる——対象を .candActionsGroup 配下の
+   1個の候補行アクションだけに絞る(「まとめてカット」テキストリンク版
+   .candGroupHeader button.btn-approve は対象外のまま)。 */
+#claudeView .candActionsGroup .btn-approve {
+  background: var(--paper-pressed); color: var(--paper-bg); border-color: var(--paper-pressed);
+}
+#claudeView .candActionsGroup .btn-approve:hover { background: var(--primary-hover); }
+
+/* 紙面でテキストリンク(--link)を中立化した分、下線で押せる合図を残す
+   (「まとめてカット/残す」「この変更を見る」)。 */
+#claudeView .candGroupHeader button.btn-approve,
+#claudeView .candGroupHeader button.btn-wash,
+#claudeView .btn-activityShow {
+  text-decoration: underline; text-decoration-color: var(--border-hover); text-underline-offset: 2px;
+}
+/* 固定の淡い青 hover(部屋の --link 由来)は紙面に合わないため中立化。 */
+#claudeView .btn-activityShow:hover { color: var(--text); }

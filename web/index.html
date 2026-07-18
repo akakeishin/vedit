@@ -123,6 +123,9 @@
   </aside>
 
   <section id="stage" aria-label="プレビュー">
+    <!-- IA v3 波B §4: 銘板(モニター) — d4-cuesheet.html の .plate 様式
+         (等幅9px・字間広め・小さな正方マーク)。見た目のみ、機能は持たない。 -->
+    <div class="plate stagePlate" aria-hidden="true"><span class="plate-mark"></span>モニター</div>
     <div id="videoWrap">
       <div id="videoBox">
         <!-- W-ANIME: composition background/ambient layer, behind everything
@@ -142,6 +145,13 @@
         <div id="motionLayer"></div>
         <!-- W-ANIME: speech-bubble dialogue layer, above everything else. -->
         <div id="dialogueLayer" aria-hidden="true"></div>
+        <!-- IA v3 波B §4: コマ番号(現在の版を「23A」様式で — renderAll in
+             app.js)+四隅の見当マーク。装飾のみ、pointer-events:none。 -->
+        <span id="frameNumber" class="frameNumber mono" aria-hidden="true"></span>
+        <div class="frameCorners" aria-hidden="true">
+          <span class="fc-tl"></span><span class="fc-tr"></span>
+          <span class="fc-bl"></span><span class="fc-br"></span>
+        </div>
         <!-- N2 計器盤 §3(K6): 押している間だけ重ねる「直前」小ラベル。 -->
         <span id="prevRevBadge" class="prevRevBadge" hidden aria-hidden="true">直前</span>
         <div id="ingestOverlay" hidden><div class="spin"></div><span id="ingestStep" aria-live="polite"></span></div>
@@ -222,6 +232,9 @@
          無いため disabled+title「今後対応」— 嘘の機能を置かない。全体表示は
          タイムラインが常に全区間表示のため実質つねに満たされている状態。 -->
     <div class="tlToolbar">
+      <!-- IA v3 波B §4: 銘板(タイムライン)。 -->
+      <div class="plate tlPlate" aria-hidden="true"><span class="plate-mark"></span>タイムライン</div>
+      <span class="tlToolbarSep" aria-hidden="true"></span>
       <button class="tlTool active" id="tlToolSelect" type="button" aria-pressed="true" title="選択ツール(現在の唯一のツール)">選択</button>
       <span class="tlToolbarSep" aria-hidden="true"></span>
       <label class="tlSnapCheck"><input type="checkbox" id="snapToggle" checked> スナップ</label>
@@ -353,8 +366,8 @@
              構造的回答): 提案ゼロ・新着ゼロの定常状態でもキューシートを
              空白にしない常設内容 — 受信箱ではなく「机の上の記録紙」。
              (1) 直近の作業記録 (2) 最後の書き出し結果ミニカード
-             (3) 「次の一手」チップ。プロジェクトメモ(NOTES.md)は daemon に
-             読み取り API が無いため本波では省略(最終報告に明記)。
+             (3) プロジェクトメモ(波B §8: GET /api/notes、vedit note の
+             policy/todo 先頭数件) (4) 「次の一手」チップ。
              renderQueueSheetDesk in app.js。 -->
         <div id="queueSheetDesk" class="queueSheetDesk" hidden>
           <div id="deskRecentHeading" class="inboxHeading" hidden><span>直近の作業記録</span></div>
@@ -362,6 +375,8 @@
           <!-- #deskExportCard は #exportResultCard と同じ renderExportResultCard()
                が更新する共有の書き出し結果ミニカード(波2.5のデータソースを流用)。 -->
           <div id="deskExportCard" class="exportResultCard" hidden></div>
+          <div id="deskNotesHeading" class="inboxHeading" hidden><span>メモ</span></div>
+          <div id="deskNotesList" class="queueRecentList"></div>
           <div id="deskNextHeading" class="inboxHeading" hidden><span>次の一手</span></div>
           <div id="deskNextChips" class="queueNextChips"></div>
         </div>

@@ -8,6 +8,7 @@ import { Project } from '../core/project.js';
 import { startDaemon } from './daemon.js';
 import { writeKitFile } from '../core/kit.js';
 import { appendExportResult, type ExportResultRecord } from '../core/exportResults.js';
+import { appendNote } from '../core/notes.js';
 import type { CutCandidate, KitFile, Word } from '../core/types.js';
 
 // music-add shells out to ffprobe via probeAudio(); stub it so the "daemon:
@@ -4059,5 +4060,49 @@ describe('daemon: GET /api/export-results', () => {
     const { body } = await getJson(BASE, '/api/state');
     expect(body).not.toHaveProperty('exportResults');
     expect(body).not.toHaveProperty('export-results');
+  });
+});
+
+// ---- IA v3 波B §8: read-only route GET /api/notes ----
+// src/core/notes.ts(`vedit note` の NOTES.md)を読むだけの route——書き込み
+// ルートは daemon に一切追加しない(appendNote/markTodoDone は CLI 専用のまま)。
+// web の「机」のプロジェクトメモ表示(renderQueueSheetDesk in app.js)がこれを叩く。
+describe('daemon: GET /api/notes', () => {
+  const PORT = 18256;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let dir: string;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-notes-'));
+    dir = path.join(root, 'proj');
+    await Project.create(dir, 'notes-route');
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('returns [] when NOTES.md does not exist yet', async () => {
+    const { status, body } = await getJson(BASE, '/api/notes');
+    expect(status).toBe(200);
+    expect(body).toEqual([]);
+  });
+
+  it('returns appended entries oldest-first, with type/text/todos intact', async () => {
+    await appendNote(dir, { type: 'policy', text: '前半はテンポ重視で0.5s以上の間を全部詰める。', rev: 3 });
+    await appendNote(dir, { type: 'todo', text: 'BGMの候補を3曲ユーザーに出す' });
+
+    const { status, body } = await getJson(BASE, '/api/notes');
+    expect(status).toBe(200);
+    expect(body).toHaveLength(2);
+    expect(body[0]).toMatchObject({ type: 'policy', rev: 3, text: '前半はテンポ重視で0.5s以上の間を全部詰める。' });
+    expect(body[1]).toMatchObject({ type: 'todo' });
+    expect(body[1].todos).toEqual([{ done: false, text: 'BGMの候補を3曲ユーザーに出す' }]);
+  });
+
+  it('does not leak into /api/state (no write route exists for this data)', async () => {
+    const { body } = await getJson(BASE, '/api/state');
+    expect(body).not.toHaveProperty('notes');
   });
 });
