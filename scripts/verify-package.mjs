@@ -22,10 +22,13 @@ try {
 }
 const report = JSON.parse(raw)[0];
 const files = report.files.map(({ path }) => path);
+const packageJson = JSON.parse(readFileSync(new URL('package.json', root), 'utf8'));
 
 const requiredFiles = [
   'bin/vedit.js',
   'dist/cli.js',
+  'LICENSE',
+  'scripts/install-agent-skills.mjs',
   'web/app.js',
   'web/index.html',
   'web/style.css',
@@ -46,6 +49,12 @@ const requiredSkillContracts = [
   'ヘルプ、仕様相談、設計レビュー、単なる一覧・診断・レポート取得では自動表示',
 ];
 const missingSkillContracts = requiredSkillContracts.filter((contract) => !skillText.includes(contract));
+
+const expectedBins = {
+  vedit: './bin/vedit.js',
+  'vedit-install-skills': './scripts/install-agent-skills.mjs',
+};
+const missingBins = Object.entries(expectedBins).filter(([name, target]) => packageJson.bin?.[name] !== target);
 
 /** Resolve the browser's local static dependency closure from index.html.
  * A hand-maintained npm `files` allowlist is otherwise liable to ship app.js
@@ -95,8 +104,9 @@ const forbidden = files.filter((path) =>
   || /(?:^|\/)docs\//i.test(path),
 );
 
-if (missing.length || missingSkillContracts.length || missingBrowserSources.length || missingBrowserPackageFiles.length || forbidden.length) {
+if (missing.length || missingBins.length || missingSkillContracts.length || missingBrowserSources.length || missingBrowserPackageFiles.length || forbidden.length) {
   if (missing.length) console.error(`Missing package files: ${missing.join(', ')}`);
+  if (missingBins.length) console.error(`Missing package bins: ${missingBins.map(([name, target]) => `${name} -> ${target}`).join(', ')}`);
   if (missingSkillContracts.length) console.error(`Missing shipped skill contracts: ${missingSkillContracts.join(', ')}`);
   if (missingBrowserSources.length) console.error(`Missing browser dependency sources: ${missingBrowserSources.join(', ')}`);
   if (missingBrowserPackageFiles.length) console.error(`Browser dependencies omitted from package: ${missingBrowserPackageFiles.join(', ')}`);

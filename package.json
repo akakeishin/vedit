@@ -3,6 +3,14 @@
   "version": "0.1.0",
   "description": "AI-directed, non-destructive local video editing CLI and web NLE",
   "main": "./dist/cli.js",
+  "homepage": "https://github.com/akakeishin/vedit#readme",
+  "bugs": {
+    "url": "https://github.com/akakeishin/vedit/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/akakeishin/vedit.git"
+  },
   "files": [
     "bin/",
     "dist/",
@@ -16,7 +24,8 @@
     "web/mediaScaleLogic.js",
     "web/transcribeJobLogic.js",
     "web/style.css",
-    "skill/"
+    "skill/",
+    "scripts/install-agent-skills.mjs"
   ],
   "directories": {
     "doc": "docs"
@@ -24,19 +33,32 @@
   "scripts": {
     "test": "vitest",
     "build": "tsc -p .",
+    "prepare": "npm run build",
     "prepack": "npm run build",
     "verify:package": "npm run build && node scripts/verify-package.mjs",
+    "verify:install": "npm run build && node scripts/verify-install.mjs",
     "smoke:export": "node scripts/smoke-export.mjs",
     "smoke:compose": "npm run build && node scripts/smoke-compose.mjs",
     "smoke:overlay": "node scripts/smoke-overlay-stack.mjs",
     "test:e2e": "playwright test"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "video-editor",
+    "nle",
+    "ai",
+    "codex",
+    "claude-code",
+    "ffmpeg"
+  ],
+  "author": "akakeishin",
   "license": "ISC",
+  "engines": {
+    "node": ">=20"
+  },
   "type": "module",
   "bin": {
-    "vedit": "./bin/vedit.js"
+    "vedit": "./bin/vedit.js",
+    "vedit-install-skills": "./scripts/install-agent-skills.mjs"
   },
   "devDependencies": {
     "@playwright/test": "^1.61.1",

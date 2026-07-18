@@ -7,3 +7,7 @@ cache/
 test-results/
 playwright-report/
 blob-report/
+
+# OS / local package artifacts
+.DS_Store
+*.tgz
