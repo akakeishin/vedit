@@ -170,6 +170,25 @@
         <div id="takesCardBody"></div>
       </div>
     </div>
+
+    <!-- IA v3 波A §1.2: 時刻同期スリムバー — プレビュー下・計器列の上に
+         高さ固定(~44px)で常設予約する専用行(リフローなし・transport を
+         覆わない)。再生中、プレイヘッドが提案区間の2秒前に入ると予告
+         → 区間通過中は[カットする][残す] → 通過後1秒で消灯。停止中は
+         空(薄い罫のみ、hidden にはしない)。キューシートの候補カードと
+         同一データ(S.candidates)・同一アクション(decide())なので、
+         片方で承認/却下すれば両方から消える。renderCandidateSlimBar in
+         app.js が renderPlaybackFrame/renderCompositionFrame の末尾から
+         毎フレーム駆動される(既存の同期描画経路に相乗り — rAF 依存の
+         断線を作らないためのブリーフ指定)。 -->
+    <div id="slimBar" class="slimBar" aria-live="polite">
+      <span id="slimBarText" class="slimBarText"></span>
+      <div id="slimBarActions" class="slimBarActions" hidden>
+        <button id="slimBarKeep" class="btn-wash">残す</button>
+        <button id="slimBarCut" class="btn-approve">カットする</button>
+      </div>
+    </div>
+
     <div id="transport">
       <!-- N2 計器盤 §1: 現在タイムコードを主役に(約2倍・tabular-nums)。
            下位桁(小数点以下、renderTimecode が #tcNowMain/#tcNowSub に分配)
@@ -285,6 +304,13 @@
              actor=Claude から合成)。renderClaudeConversation in app.js。 -->
         <div id="claudeConversation" class="claudeConversation"></div>
 
+        <!-- IA v3 波A §1.1: 新着の直交軸 — 「前回の確認から」区切り+
+             revision ログ由来の実行済み項目(新着区間のみ)。未決保護される
+             候補自体はここに含まれない(candidatesSection側はlastSeenに
+             関わらず常に全件表示 — 既読≠既決)。renderQueueSheetNew in
+             app.js。中身が無ければ hidden(空状態では出さない)。 -->
+        <div id="queueSheetNew" class="queueSheetNew" hidden></div>
+
         <div id="claudeStrip" class="claudeStrip" hidden aria-live="polite">
           <div class="spin"></div><span id="claudeStripText"></span>
         </div>
@@ -322,6 +348,23 @@
           <div id="warningsEmpty" class="hintText inboxEmpty" hidden>✓ 対応が必要な項目はありません</div>
           <div id="warningsList"></div>
         </div>
+
+        <!-- IA v3 波A §1.1「紙を白紙にしない」(2026-07-18 ユーザー指摘への
+             構造的回答): 提案ゼロ・新着ゼロの定常状態でもキューシートを
+             空白にしない常設内容 — 受信箱ではなく「机の上の記録紙」。
+             (1) 直近の作業記録 (2) 最後の書き出し結果ミニカード
+             (3) 「次の一手」チップ。プロジェクトメモ(NOTES.md)は daemon に
+             読み取り API が無いため本波では省略(最終報告に明記)。
+             renderQueueSheetDesk in app.js。 -->
+        <div id="queueSheetDesk" class="queueSheetDesk" hidden>
+          <div id="deskRecentHeading" class="inboxHeading" hidden><span>直近の作業記録</span></div>
+          <div id="deskRecentList" class="queueRecentList"></div>
+          <!-- #deskExportCard は #exportResultCard と同じ renderExportResultCard()
+               が更新する共有の書き出し結果ミニカード(波2.5のデータソースを流用)。 -->
+          <div id="deskExportCard" class="exportResultCard" hidden></div>
+          <div id="deskNextHeading" class="inboxHeading" hidden><span>次の一手</span></div>
+          <div id="deskNextChips" class="queueNextChips"></div>
+        </div>
       </div>
 
       <!-- W-UI IA v2 §1: 独立した「履歴」タブ — 旧「いま」タブの変更履歴セクションを
@@ -342,8 +385,14 @@
          スプライト/セリフ/BGM を選択すると右パネルが一時的にこちらへ遷移する
          (← 会話に戻る で復帰、selectItem/renderInspector in app.js)。 -->
     <div id="inspectorView" hidden>
+      <!-- IA v3 波A §1.3: ドリルイン文法の統一 — 「← 戻る(文脈名)/対象
+           ラベル」。この3ビュー(inspector/caption/export)はどれも常に
+           「会話」(claudeView)へ戻る(selectItem/closeCaptionStylePopover/
+           closeExportView 参照、rightMode は必ず 'claude' に戻す)ため、
+           文脈名は固定文言でよい。対象ラベルは #inspectorTitle が種別
+           (クリップ/B-roll/…)を動的に設定する。 -->
       <div class="rightViewHeader">
-        <button id="inspectorBack" class="btnBack">← 戻る</button>
+        <button id="inspectorBack" class="btnBack">← 戻る(会話)</button>
         <span id="inspectorTitle" class="rightViewTitle"></span>
       </div>
       <div id="inspectorBody" class="rightViewBody"></div>
@@ -356,9 +405,13 @@
          W-DESIGN: 旧 <dialog id="captionStyleDialog"> を右パネルの常設ビュー
          へ移植(openCaptionStylePopover/closeCaptionStylePopover in app.js)。 -->
     <div id="captionView" hidden>
+      <!-- IA v3 波A §1.3: 「← 戻る(会話)」+対象ラベル。#captionViewTitle は
+           特定の cue から開いたか(その cue の文言)、字幕行/全体設定から
+           開いたか(「字幕スタイル」)で syncCaptionPopoverControls in app.js
+           が切り替える。 -->
       <div class="rightViewHeader">
-        <button id="captionBackBtn" class="btnBack">← 戻る</button>
-        <span class="rightViewTitle">字幕スタイル</span>
+        <button id="captionBackBtn" class="btnBack">← 戻る(会話)</button>
+        <span id="captionViewTitle" class="rightViewTitle">字幕スタイル</span>
         <span class="spacer"></span>
         <label class="capEnabledRow"><input type="checkbox" id="capEnabledToggle"> 表示</label>
       </div>
@@ -417,8 +470,11 @@
          read-only)。既存の書き出し結果ポーリングを流用(openExportView/
          fetchExportResults in app.js)。 -->
     <div id="exportView" hidden>
+      <!-- IA v3 波A §1.3: 「← 戻る(会話)」+対象ラベル(「書き出し」固定 —
+           このビューは版全体を対象とする単一スコープなので個別ラベル化は
+           不要)。 -->
       <div class="rightViewHeader">
-        <button id="exportBackBtn" class="btnBack">← 戻る</button>
+        <button id="exportBackBtn" class="btnBack">← 戻る(会話)</button>
         <span class="rightViewTitle">書き出し</span>
       </div>
       <div class="rightViewBody">

@@ -126,6 +126,19 @@ const S = {
   // requestAnimationFrame-driven virtual clock; see compTlNow()/tickComposition().
   compTl: 0,
   compClockAnchor: null,
+  // ---- IA v3 波A §1.1: キューシート「新着」の直交軸 ----
+  // localStorage 由来の「前回の確認」基準点。lastSeenRevision は revision
+  // ログ側の新着判定に使う実 revision 番号。candidates.json は revision を
+  // 持たない別ファイル(daemon.ts の /api/detect は mutate() を経由せず
+  // p.writeCandidates() で直接書く)ため revision と紐付けられず、代わりに
+  // lastSeenCandidateIds(Set)で「前回確認した候補id」をスナップショットして
+  // 差分を新着とする(実装判断 — 詳細は ensureQueueSeenLoaded/
+  // markQueueSheetSeenIfVisible のコメント参照)。lastSeenProjectKey は
+  // 現在ロード済みの2値がどのプロジェクト向けかを覚えておき、プロジェクト
+  // 切替(/api/open で別ディレクトリが開かれた等)を検出する。
+  lastSeenRevision: null,
+  lastSeenCandidateIds: null,
+  lastSeenProjectKey: null,
 };
 const PLAY_RATES = [1, 1.5, 2];
 
@@ -202,6 +215,7 @@ async function reload() {
     S.candidates = await api('/api/candidates');
     S.candidatesAll = await api('/api/candidates?all=1');
     S.revisions = await api('/api/revisions');
+    ensureQueueSeenLoaded(); // IA v3 波A §1.1 — S.manifest/S.candidates が揃った直後(baseline seeding は現在の候補集合を必要とする)
     // W9: static-only QC pass (cheap — see daemon.ts's GET /api/qc doc), merged into renderInbox() below.
     S.qc = await api('/api/qc').catch(() => ({ issues: [], counts: { errors: 0, warnings: 0, infos: 0 } }));
     for (const src of S.manifest.sources) {
@@ -229,6 +243,97 @@ async function reload() {
     throw e;
   }
 }
+
+// ---------- IA v3 波A §1.1: キューシート「前回の確認」トラッキング ----------
+// localStorage キー: `vedit.queueSheetSeen.<projectKey>` に
+// { revision, candidateIds } を保存する。
+//
+// projectKey について: 仕様は `lastSeenRevision[projectDir]` と書いているが、
+// /api/project は絶対パスの projectDir を web へ一切返さない(daemon は
+// 単一プロジェクトを開いた状態で応答する設計 — HANDOFF §5「複数プロジェクト
+// 同時編集は未検証」)。このため manifest.name(Project.create に渡される
+// プロジェクト名。通常はディレクトリ名由来)を projectDir の代替
+// identifier として使う — 実装判断としてここと最終報告に明記する。
+const QUEUE_SEEN_LS_PREFIX = 'vedit.queueSheetSeen.';
+function queueSeenStorageKey(projectKey) {
+  return `${QUEUE_SEEN_LS_PREFIX}${projectKey}`;
+}
+function queueSeenProjectKey() {
+  return S.manifest?.name ?? '__unknown__';
+}
+function loadQueueSeenState(projectKey) {
+  try {
+    const raw = localStorage.getItem(queueSeenStorageKey(projectKey));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (typeof parsed?.revision !== 'number') return null;
+    return { revision: parsed.revision, candidateIds: new Set(Array.isArray(parsed.candidateIds) ? parsed.candidateIds : []) };
+  } catch {
+    return null;
+  }
+}
+function saveQueueSeenState(projectKey, state) {
+  try {
+    localStorage.setItem(
+      queueSeenStorageKey(projectKey),
+      JSON.stringify({ revision: state.revision, candidateIds: [...state.candidateIds] }),
+    );
+  } catch {
+    // localStorage 不可(プライベートモード等) — 新着マークが常時表示され
+    // 続ける劣化のみで、キューシート自体の機能(未決保護)は失われない。
+  }
+}
+function setsEqual(a, b) {
+  if (!a || !b || a.size !== b.size) return false;
+  for (const v of a) if (!b.has(v)) return false;
+  return true;
+}
+// reload() の末尾(S.manifest/S.candidates 確定直後)から毎回呼ぶ。既に
+// このプロジェクト用の値をロード済みならなにもしない。
+function ensureQueueSeenLoaded() {
+  const key = queueSeenProjectKey();
+  if (S.lastSeenProjectKey === key && S.lastSeenRevision != null) return;
+  const stored = loadQueueSeenState(key);
+  if (stored) {
+    S.lastSeenRevision = stored.revision;
+    S.lastSeenCandidateIds = stored.candidateIds;
+  } else {
+    // このプロジェクトでこの機能を初めて見る(保存値なし): 「開いた瞬間に
+    // 全履歴が新着扱いになる」フラッディングを避けるため、現在地を
+    // 静かな基準点として記録する(仕様は更新タイミングのみを規定していて
+    // 初期値は未規定 — 実装判断としてここと最終報告に明記する)。
+    S.lastSeenRevision = S.manifest.revision;
+    S.lastSeenCandidateIds = new Set(S.candidates.map((c) => c.id));
+    saveQueueSeenState(key, { revision: S.lastSeenRevision, candidateIds: S.lastSeenCandidateIds });
+  }
+  S.lastSeenProjectKey = key;
+}
+// 更新タイミング(仕様 §1.1): 「キューシートが可視のままユーザー操作
+// (クリック/キー)が発生した時点の現 revision」— 開いただけでは進めない。
+// document への capture フェーズ登録が要点: 候補行の承認/却下/前後を
+// 再生ボタンは e.stopPropagation() で bubble を止める(候補カード自体の
+// seek クリックと競合させないための既存実装)ため、bubble フェーズで
+// document に置くとそれらの操作を見逃す。capture は要素へ到達する前に
+// 発火するので stopPropagation の影響を受けない。DOM 標準では
+// イベント経路(target 含む)は dispatch 開始時に確定するため、ここで
+// renderInbox() が同期的に DOM を作り直しても、クリックされた要素自身の
+// onclick は(既に解決済みの経路をたどって)問題なく発火する。
+function markQueueSheetSeenIfVisible() {
+  if (!S.manifest) return;
+  if (S.rightMode !== 'claude') return; // ドリルインシート表示中はキューシート自体が不可視
+  if (!$('nowPanel')?.classList.contains('active')) return; // 履歴タブ表示中は対象外(新着マークは会話タブの中身)
+  const key = queueSeenProjectKey();
+  const curRev = S.manifest.revision;
+  const curIds = new Set(S.candidates.map((c) => c.id));
+  if (S.lastSeenProjectKey === key && S.lastSeenRevision === curRev && setsEqual(S.lastSeenCandidateIds, curIds)) return;
+  S.lastSeenRevision = curRev;
+  S.lastSeenCandidateIds = curIds;
+  S.lastSeenProjectKey = key;
+  saveQueueSeenState(key, { revision: curRev, candidateIds: curIds });
+  renderInbox();
+}
+document.addEventListener('click', markQueueSheetSeenIfVisible, true);
+document.addEventListener('keydown', markQueueSheetSeenIfVisible, true);
 
 // ---------- stage empty/failure states (persistent, not just a toast) ----------
 // W-UI IA v2 §5(a): a normal (source-driven, see W-ANIME's Manifest.
@@ -439,6 +544,11 @@ function renderCompositionFrame(tl) {
   renderSprites(tl);
   renderDialogueBubbles(tl);
   syncMusicPlayback(tl);
+  // IA v3 波A §1.2: 時刻同期スリムバー — composition プロジェクトは通常
+  // 話者素材を持たない(candidates は主に無音/フィラー検出由来)ため実際に
+  // 候補が見つかることは稀だが、対称性のため同じ同期描画経路から駆動する
+  // (renderCandidateSlimBar 自体は該当候補が無ければ空表示のまま)。
+  renderCandidateSlimBar(tl);
 }
 function tickComposition() {
   const tl = compTlNow();
@@ -555,6 +665,11 @@ function renderPlaybackFrame(tl) {
   // 追従させる(既存の同期描画経路に相乗り — tick()毎フレーム/seekTl 双方
   // からこの関数を経由するので、押している間のシーク/再生でも同期する)。
   if (S.comparingPrev) renderPrevRevFrame(tl);
+  // IA v3 波A §1.2: 時刻同期スリムバー(renderCandidateSlimBar のコメント
+  // 参照)。renderPlaybackFrame は tick() から毎フレーム(再生中/停止中を
+  // 問わず)呼ばれるので、ブリーフ「既存の同期描画経路を必ず経由」を満たす
+  // — 専用の rAF/setInterval は作らない。
+  renderCandidateSlimBar(tl);
 }
 function fmt(t) {
   const m = Math.floor(t / 60);
@@ -1878,6 +1993,11 @@ function enterSourcePreview(sourceId, { at = 0 } = {}) {
   const returnTl = S.sourcePreview ? S.sourcePreview.returnTl : tlNow();
   S.sourcePreview = { sourceId, returnTl };
   renderPreviewBanner();
+  // IA v3 波A §1.2: ソースプレビュー中は tick() が renderPlaybackFrame を
+  // 呼ばない専用分岐に入る(タイムライン上の候補区間という概念自体が
+  // 適用されないため)ので、スリムバーが直前の状態のまま固まって残らない
+  // よう明示的に空へ戻す。
+  setSlimBarEmpty();
   // Stale overlays/crop framing from timeline mode shouldn't linger over the
   // preview video — it's the raw source, not a specific timeline clip.
   const cap = $('captionLayer'); cap.innerHTML = ''; cap.dataset.cur = '';
@@ -3189,6 +3309,15 @@ function updateCapPreview() {
 }
 
 function syncCaptionPopoverControls() {
+  // IA v3 波A §1.3: ドリルインシート統一文法の「対象ラベル」— 特定の cue
+  // から開いた(captionPreviewText が非null)ときはその cue の文言を、T1行
+  // /字幕全体設定から開いた(cue=null)ときは汎用「字幕スタイル」を出す。
+  const titleEl = $('captionViewTitle');
+  if (titleEl) {
+    titleEl.textContent = captionPreviewText
+      ? `字幕: 「${captionPreviewText.slice(0, 20)}${captionPreviewText.length > 20 ? '…' : ''}」`
+      : '字幕スタイル';
+  }
   // W-UI IA v2 波2 §5: enabled/style/maxChars are plain project settings
   // (captions.enabled/.style/.maxChars), not part of the overrides draft —
   // they always reflect S.manifest.captions directly and commit immediately
@@ -4119,6 +4248,88 @@ function candidateTl(t, c) {
   return seg.tlStart + (clamped - seg.srcStart);
 }
 
+// ---------- IA v3 波A §1.2: 時刻同期スリムバー ----------
+// #slimBar(index.html、プレビュー下・計器列の上に常設予約された固定高さの
+// 1行)を再生位置に同期させる。キューシートの候補カードと完全に同一の
+// データ(S.candidates)・同一のアクション(decide())を使うので、片方で
+// 承認/却下すればもう一方からも消える(状態は1つ、入口が2つ)。
+// renderPlaybackFrame/renderCompositionFrame の末尾から毎フレーム呼ばれる
+// (ブリーフの指定どおり既存の同期描画経路に相乗り — 専用のタイマーは
+// 作らない)。
+const SLIM_BAR_LOOKAHEAD = 2; // 秒: 区間の何秒前から予告するか
+const SLIM_BAR_DECAY = 1; // 秒: 区間通過後、何秒 [カットする][残す] を残すか
+let slimBarShownFor = null; // 直近描画した候補id(null=空)— 変化した時だけDOMを触る
+let slimBarState = null; // 'forecast' | 'active' | null
+// 候補の(パディング済み)source 時間レンジを、現在のタイムライン上の
+// [開始, 終了] 秒に変換する。candidateTl と同じ変換を2点分行うだけ —
+// candRow の「前後を再生」と全く同じ経路(タイムラインが編集されて
+// マッピングが変わっても自然に追従する)。
+function candidateTlWindow(c) {
+  const tlStart = candidateTl(c.t0, c);
+  const tlEnd = candidateTl(c.t1, c);
+  if (tlStart == null || tlEnd == null) return null;
+  return { tlStart, tlEnd };
+}
+// スリムバー用の短縮ラベル(humanizeCandidateLabel の末尾「— 詰めると
+// −X.X秒」を落とす — 秒数は別途ボタン操作の文脈で分かるため、44px1行に
+// 収めることを優先)。
+function slimBarLabel(c) {
+  const dur = Math.max(0, c.t1 - c.t0);
+  return humanizeCandidateLabel(c.label, dur).replace(/ — 詰めると −[\d.]+秒$/, '');
+}
+function setSlimBarEmpty() {
+  if (slimBarShownFor === null) return; // 既に空 — 不要な再描画を避ける
+  slimBarShownFor = null;
+  slimBarState = null;
+  const bar = $('slimBar');
+  if (!bar) return;
+  bar.classList.remove('slimBar-forecast', 'slimBar-active');
+  $('slimBarText').textContent = '';
+  $('slimBarActions').hidden = true;
+}
+function renderSlimBarFor(c, state) {
+  if (slimBarShownFor === c.id && slimBarState === state) return; // 変化なし
+  slimBarShownFor = c.id;
+  slimBarState = state;
+  const bar = $('slimBar');
+  if (!bar) return;
+  bar.classList.toggle('slimBar-forecast', state === 'forecast');
+  bar.classList.toggle('slimBar-active', state === 'active');
+  const label = slimBarLabel(c);
+  const textEl = $('slimBarText');
+  const actionsEl = $('slimBarActions');
+  if (state === 'forecast') {
+    textEl.textContent = `まもなく: ${label}`;
+    actionsEl.hidden = true;
+  } else {
+    textEl.textContent = label;
+    actionsEl.hidden = false;
+    // 承認/却下は候補カード(candRow)と全く同じ decide() 呼び出し —
+    // 「同一データ・同一状態」(片方で承認すれば両方から消える)の実体。
+    $('slimBarCut').onclick = () => decide([c.id], 'approve');
+    $('slimBarKeep').onclick = () => decide([c.id], 'reject');
+  }
+}
+function renderCandidateSlimBar(tl) {
+  if (!$('slimBar')) return;
+  if (!S.playing) { setSlimBarEmpty(); return; } // 仕様: 停止中は空(薄い罫のみ)
+  let best = null; // { c, state }
+  for (const c of S.candidates) {
+    const win = candidateTlWindow(c);
+    if (!win) continue;
+    const { tlStart, tlEnd } = win;
+    if (tl >= tlStart && tl <= tlEnd + SLIM_BAR_DECAY) {
+      best = { c, state: 'active' }; // 通過中/通過後1秒以内 — 最優先、即決定
+      break;
+    }
+    if (!best && tl >= tlStart - SLIM_BAR_LOOKAHEAD && tl < tlStart) {
+      best = { c, state: 'forecast' }; // 他候補が active かもしれないので走査は続ける
+    }
+  }
+  if (!best) { setSlimBarEmpty(); return; }
+  renderSlimBarFor(best.c, best.state);
+}
+
 /**
  * detect.ts (src/core/detect.ts) emits candidate labels as English template
  * sentences ("0.6s silence after \"...\"", "filler \"...\"", etc.) — fine
@@ -4154,9 +4365,17 @@ function humanizeCandidateLabel(label, dur) {
 // の提案文が窮屈で、素材名まで丸ごとmonoになっていた(素材名はSans、時刻の
 // み.candTimeでMono — Low-4)。ボタン順も「前後を再生→spacer→残す→
 // カット(raised)」へ(以前はカット→残すで右端の視覚的着地点が逆転していた)。
+// IA v3 波A §1.1: この候補が「前回の確認」以降に現れたものかどうか。
+// candidates.json は revision を持たない別ファイル(daemon.ts の
+// /api/detect は mutate() を経由しない)ため、lastSeenRevision と直接
+// 比較できない — 代わりに S.lastSeenCandidateIds(前回スナップショット)
+// との差分で判定する(実装判断、queueSeenProjectKey のコメント参照)。
+function isNewCandidate(id) {
+  return S.lastSeenCandidateIds != null && !S.lastSeenCandidateIds.has(id);
+}
 function candRow(c) {
   const d = document.createElement('div');
-  d.className = 'cand';
+  d.className = `cand${isNewCandidate(c.id) ? ' candNew' : ''}`;
   d.tabIndex = 0;
   const dur = Math.max(0, c.t1 - c.t0);
   const label = humanizeCandidateLabel(c.label, dur);
@@ -4456,8 +4675,16 @@ async function fetchExportResults() {
   }
   renderExportResultCard();
 }
+// IA v3 波A §1.1「紙を白紙にしない」: 定常状態のキューシートにも同じ
+// 「最後の書き出し」ミニカードを載せる(#deskExportCard)。データソース
+// (S.exportResults、波2.5から流用)・組み立てロジックは exportView の
+// #exportResultCard と完全共通 — 対象要素を配列で回すだけで二重実装を避ける。
+const EXPORT_RESULT_CARD_IDS = ['exportResultCard', 'deskExportCard'];
 function renderExportResultCard() {
-  const el = $('exportResultCard');
+  for (const elId of EXPORT_RESULT_CARD_IDS) renderExportResultCardInto(elId);
+}
+function renderExportResultCardInto(elId) {
+  const el = $(elId);
   if (!el) return;
   const rec = S.exportResults[0];
   // レコード0件・プロジェクト空のいずれでも非表示(空状態の文言は出さない —
@@ -4609,12 +4836,96 @@ function renderClaudeConversation() {
   el.appendChild(bubble);
 }
 
+// ---------- IA v3 波A §1.1: キューシート「新着」区間 + 「紙を白紙にしない」常設内容 ----------
+// revision ログの1件を1行に(revision番号・行為者・humanizeRevision の
+// 人間語要約)。newMark=true で朱/琥珀ドット付き(新着区間用)、weak=true で
+// 弱トーン(「紙を白紙にしない」常設内容の直近作業記録用)。activityFeed
+// (履歴タブの全量)と同じデータ・同じ humanizeRevision を使うが、こちらは
+// 遥かに軽い1行表示(show/restore ボタンは持たない — 履歴タブへの誘導は
+// 既存のまま)。
+function queueRevisionRow(r, { newMark = false, weak = false } = {}) {
+  const row = document.createElement('div');
+  row.className = `queueRevRow${newMark ? ' queueNewItem' : ''}${weak ? ' queueWeak' : ''}`;
+  row.title = `${r.op}: ${r.summary}`;
+  const rev = document.createElement('span');
+  rev.className = 'queueRevNum mono';
+  rev.textContent = `#${r.rev}`;
+  const actor = document.createElement('span');
+  actor.className = 'queueRevActor';
+  actor.textContent = ACTOR_LABEL[r.actor] ?? r.actor;
+  const text = document.createElement('span');
+  text.className = 'queueRevText';
+  text.textContent = humanizeRevision(r);
+  row.append(rev, actor, text);
+  return row;
+}
+// lastSeenRevision より新しい revision ログ項目(=「実行済み」新着区間)。
+// S.lastSeenRevision が未確定(reload 前)なら空配列を返す(未決保護される
+// 候補側は別経路 — ここが空でも candidatesSection は常に全件表示される)。
+function newSinceLastSeenRevisions() {
+  if (S.lastSeenRevision == null) return [];
+  return S.revisions.filter((r) => r.rev > S.lastSeenRevision);
+}
+function renderQueueSheetNew() {
+  const el = $('queueSheetNew');
+  if (!el) return;
+  el.innerHTML = '';
+  if (isProjectEmpty()) { el.hidden = true; return; }
+  const entries = newSinceLastSeenRevisions();
+  if (entries.length === 0) { el.hidden = true; return; }
+  el.hidden = false;
+  const divider = document.createElement('div');
+  divider.className = 'queueNewDivider';
+  divider.id = 'queueNewDivider';
+  divider.textContent = `― 前回の確認から ${entries.length}件 ―`;
+  el.appendChild(divider);
+  const list = document.createElement('div');
+  list.className = 'queueNewList';
+  list.id = 'queueNewList';
+  for (const r of [...entries].reverse()) list.appendChild(queueRevisionRow(r, { newMark: true })); // 新しい順
+  el.appendChild(list);
+}
+// 「次の一手」チップの導出(状態から、最大2枚)。askClaudeChip の既存の
+// コピー導線をそのまま使う — 構造編集は会話側という製品の賭けに合わせ、
+// ここでも実行ボタンではなく「Cowork に頼む」コピーチップのみを置く。
+function nextMoveChipPrompts() {
+  const out = [];
+  if (S.manifest.sources.some((s) => !s.transcribed && !S.transcribing.has(s.id))) out.push('文字起こしを頼む');
+  if ((S.manifest.timeline.music ?? []).length === 0) out.push('BGMを頼む');
+  return out;
+}
+// 「紙を白紙にしない」(2026-07-18 仕様追記): 提案ゼロ・新着ゼロの定常状態
+// でもキューシートに載せる常設内容。(1)直近の作業記録3〜5件
+// (2)最後の書き出し結果ミニカード(#deskExportCard は renderExportResultCard
+// が更新 — ここでは呼ばない)(3)プロジェクトメモは daemon に読み取り API
+// が無いため本波では省略(最終報告に明記)(4)次の一手チップ。
+function renderQueueSheetDesk() {
+  const el = $('queueSheetDesk');
+  if (!el) return;
+  const showDesk = !isProjectEmpty() && S.candidates.length === 0 && newSinceLastSeenRevisions().length === 0;
+  el.hidden = !showDesk;
+  if (!showDesk) return;
+
+  const recent = [...S.revisions].slice(-5).reverse();
+  $('deskRecentHeading').hidden = recent.length === 0;
+  const recentList = $('deskRecentList');
+  recentList.innerHTML = '';
+  for (const r of recent) recentList.appendChild(queueRevisionRow(r, { weak: true }));
+
+  const chips = nextMoveChipPrompts();
+  $('deskNextHeading').hidden = chips.length === 0;
+  const chipsRow = $('deskNextChips');
+  chipsRow.innerHTML = '';
+  for (const prompt of chips.slice(0, 2)) chipsRow.appendChild(askClaudeChip(prompt));
+}
+
 function renderInbox() {
   // W-UI IA v2 §5a: a brand-new (zero-source) project has nothing to review
   // yet — the whole 確認 tab collapses to one sentence instead of showing
   // two empty groups + detection controls that don't apply yet.
   const projectEmpty = isProjectEmpty();
   renderClaudeConversation();
+  renderQueueSheetNew();
   $('confirmEmptyProject').hidden = !projectEmpty;
   $('candidatesSection').hidden = projectEmpty;
   $('warningsSection').hidden = projectEmpty;
@@ -4622,6 +4933,10 @@ function renderInbox() {
   // (revision may have just changed via reload(), which flips the "古い版"
   // banner) — this does NOT re-fetch; see fetchExportResults for that.
   renderExportResultCard();
+  // IA v3 波A §1.1: S.candidates/S.revisions は上ですでに確定しているので
+  // (renderCandidatesGroup/renderWarningsGroup の DOM 構築を待つ必要はない)
+  // ここで1回呼べば足りる。
+  renderQueueSheetDesk();
   const badge = $('inboxCount');
   if (projectEmpty) { badge.hidden = true; return; }
 

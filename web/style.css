@@ -616,6 +616,26 @@ main { flex: 1; display: flex; min-height: 0; }
 }
 #stageEmptyMsg .stageEmptyLead { font-size: var(--fs-xl); font-weight: 600; color: var(--text); }
 
+/* ---- IA v3 波A §1.2: 時刻同期スリムバー ----
+   プレビュー下・計器列の上に高さ固定(44px)で常設予約する専用行。
+   hidden は使わず(リフローを起こさないため常に box を確保)、状態は
+   クラス切り替えのみで表現する。停止中(既定)は薄い罫のみ・文字なし。
+   見た目の作り込みはこの波では最小限(トークン適用は波B) — 意味色だけ
+   既存の --pending(琥珀=確認待ち)を流用する。 ---- */
+.slimBar {
+  flex: none; height: 44px; padding: 0 28px; margin: 0;
+  display: flex; align-items: center; gap: 12px;
+  border-top: 1px solid var(--border-soft); border-bottom: 1px solid var(--border-soft);
+  font-size: var(--fs-base); color: var(--text-3);
+}
+.slimBar.slimBar-forecast { color: var(--pending); }
+.slimBar.slimBar-active {
+  color: var(--text); background: rgba(217, 164, 95, 0.08);
+  border-top-color: rgba(217, 164, 95, 0.35); border-bottom-color: rgba(217, 164, 95, 0.35);
+}
+.slimBarText { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.slimBarActions { display: flex; gap: 8px; flex: none; }
+
 /* ---- N2 計器盤 §1 トランスポート計器列 ----
    現在タイムコード(#tcNow)を主役に: 現行の約2倍(21px)・tabular-nums・
    白(--text)。その中の下位桁(秒未満、#tcNowSub — 判断には使わない精密
@@ -1007,6 +1027,37 @@ main { flex: 1; display: flex; min-height: 0; }
 .inboxWarn[role="button"] { cursor: pointer; }
 .inboxWarn[role="button"]:hover { background: rgba(255, 255, 255, 0.04); }
 .inboxWarn:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
+
+/* ---- IA v3 波A §1.1: キューシート「新着」区間 + 「紙を白紙にしない」
+   常設内容(direct-visual polish は波Bへ送る — ここは構造と最小限の見た目)。
+   revision ログ1件=1行(#{rev} mono/行為者/人間語要約)を .queueRevRow で
+   共通化し、新着区間側は先頭に朱/琥珀ドット(.queueNewItem、既存の
+   --pending を流用)、常設「直近の作業記録」側は弱トーン(.queueWeak)。 ---- */
+.queueSheetNew { padding: 2px 14px 10px; border-bottom: 1px solid var(--border-soft); }
+.queueNewDivider { text-align: center; font-size: 10px; color: var(--text-3); letter-spacing: 0.04em; padding: 4px 0 8px; }
+.queueNewList, .queueRecentList { display: flex; flex-direction: column; gap: 6px; }
+.queueRevRow {
+  display: flex; align-items: baseline; gap: 6px; font-size: var(--fs-sm); color: var(--text-2);
+  line-height: 1.5; padding: 2px 0 2px 12px; position: relative;
+}
+.queueRevRow .queueRevNum { color: var(--text-3); flex: none; }
+.queueRevRow .queueRevActor { color: var(--text-3); flex: none; }
+.queueRevRow .queueRevText { flex: 1; min-width: 0; }
+.queueRevRow.queueNewItem::before {
+  content: ''; position: absolute; left: 0; top: 7px; width: 6px; height: 6px; border-radius: 50%; background: var(--pending);
+}
+.queueRevRow.queueWeak { color: var(--text-3); padding-left: 0; }
+.queueRevRow.queueWeak .queueRevText { color: var(--text-3); }
+
+.queueSheetDesk { padding: 10px 14px 14px; display: flex; flex-direction: column; gap: 4px; }
+.queueNextChips { display: flex; flex-wrap: wrap; gap: 8px; padding: 2px 0 8px; }
+
+/* 候補カードの新着ドット(候補は revision を持たないので候補id
+   スナップショットとの差分で判定 — 実装は isNewCandidate in app.js)。 */
+.cand.candNew { position: relative; }
+.cand.candNew::after {
+  content: ''; position: absolute; top: 8px; right: 8px; width: 6px; height: 6px; border-radius: 50%; background: var(--pending);
+}
 #warningsList { padding: 2px 12px 10px; display: flex; flex-direction: column; gap: 0; }
 
 /* README「提案カード」: bg#202024 radius8 outline白6%。1行目: 提案文12.5px
