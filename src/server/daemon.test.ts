@@ -1549,7 +1549,11 @@ describe('daemon: static/media regular-file streaming resilience', () => {
   });
 
   it('keeps streaming the opened inode when its pathname is renamed and replaced by a directory', async () => {
-    const response = await fetch(`${BASE}/media/proxy/srace`);
+    // Isolate the inode/pathname race from undici's Node 20 keep-alive reuse:
+    // that transport may race a just-finished streamed response and reset the
+    // next request before it reaches the daemon. Browser behavior and the
+    // separate daemon-health assertion are covered elsewhere in this suite.
+    const response = await fetch(`${BASE}/media/proxy/srace`, { headers: { connection: 'close' } });
     expect(response.status).toBe(200);
     await fsp.rename(racePath, movedRacePath);
     await fsp.mkdir(racePath);
