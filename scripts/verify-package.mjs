@@ -55,6 +55,8 @@ const expectedBins = {
   'vedit-install-skills': './scripts/install-agent-skills.mjs',
 };
 const missingBins = Object.entries(expectedBins).filter(([name, target]) => packageJson.bin?.[name] !== target);
+const forbiddenRuntimeDependencies = ['tsx', 'typescript', 'vitest'];
+const leakedRuntimeDependencies = forbiddenRuntimeDependencies.filter((name) => packageJson.dependencies?.[name]);
 
 /** Resolve the browser's local static dependency closure from index.html.
  * A hand-maintained npm `files` allowlist is otherwise liable to ship app.js
@@ -104,9 +106,10 @@ const forbidden = files.filter((path) =>
   || /(?:^|\/)docs\//i.test(path),
 );
 
-if (missing.length || missingBins.length || missingSkillContracts.length || missingBrowserSources.length || missingBrowserPackageFiles.length || forbidden.length) {
+if (missing.length || missingBins.length || leakedRuntimeDependencies.length || missingSkillContracts.length || missingBrowserSources.length || missingBrowserPackageFiles.length || forbidden.length) {
   if (missing.length) console.error(`Missing package files: ${missing.join(', ')}`);
   if (missingBins.length) console.error(`Missing package bins: ${missingBins.map(([name, target]) => `${name} -> ${target}`).join(', ')}`);
+  if (leakedRuntimeDependencies.length) console.error(`Development tools leaked into runtime dependencies: ${leakedRuntimeDependencies.join(', ')}`);
   if (missingSkillContracts.length) console.error(`Missing shipped skill contracts: ${missingSkillContracts.join(', ')}`);
   if (missingBrowserSources.length) console.error(`Missing browser dependency sources: ${missingBrowserSources.join(', ')}`);
   if (missingBrowserPackageFiles.length) console.error(`Browser dependencies omitted from package: ${missingBrowserPackageFiles.join(', ')}`);
