@@ -10,7 +10,8 @@
     "test": "vitest",
     "build": "tsc -p .",
     "smoke:export": "node scripts/smoke-export.mjs",
-    "smoke:compose": "npm run build && node scripts/smoke-compose.mjs"
+    "smoke:compose": "npm run build && node scripts/smoke-compose.mjs",
+    "test:e2e": "playwright test"
   },
   "keywords": [],
   "author": "",
@@ -20,6 +21,7 @@
     "vedit": "./bin/vedit.js"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.1",
     "@types/node": "^26.1.1",
     "@types/ws": "^8.18.1",
     "typescript": "^7.0.2",
