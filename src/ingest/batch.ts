@@ -320,6 +320,10 @@ export function createJournal(dir: string, initial: IngestJournalEntry[]) {
   let entries = [...initial];
   let chain: Promise<unknown> = Promise.resolve();
   function record(entry: IngestJournalEntry): Promise<void> {
+    // A prior record() in the chain failing (e.g. disk full) must not wedge
+    // every subsequent call — swallow it here so the chain keeps going;
+    // the caller of the FAILING call still sees its own rejection below.
+    const recoverPriorFailure = () => undefined;
     chain = chain.then(
       async () => {
         const idx = entries.findIndex((e) => e.file === entry.file);
@@ -327,10 +331,7 @@ export function createJournal(dir: string, initial: IngestJournalEntry[]) {
         else entries = [...entries, entry];
         await writeJournal(dir, entries);
       },
-      // A prior record() in the chain failing (e.g. disk full) must not wedge
-      // every subsequent call — swallow it here so the chain keeps going;
-      // the caller of the FAILING call still sees its own rejection below.
-      () => undefined,
+      recoverPriorFailure,
     );
     return chain as Promise<void>;
   }

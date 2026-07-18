@@ -12,6 +12,7 @@ cd vedit
 npm ci
 npm run build
 npm test -- --run
+npm run verify:dist
 npm run verify:package
 npm run verify:install
 ```
@@ -21,8 +22,9 @@ tests, but most unit tests use isolated stubs.
 
 ## Pull requests
 
-- Keep source media, rendered videos, `dist/`, caches, and Playwright output
-  out of commits.
+- Keep source media, rendered videos, caches, and Playwright output out of
+  commits. `dist/` is the exception: GitHub installs need the compiled CLI,
+  so update it with `npm run build` whenever `src/` changes.
 - Add focused tests for behavior changes.
 - Preserve optimistic locking (`--base`) for mutations.
 - Do not add uploads, publishing, or other external effects without an

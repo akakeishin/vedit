@@ -1,0 +1,186 @@
+import path from 'node:path';
+import { cropGeometry, resolvedActiveOverlays, resolvedActiveSprites, segments } from '../core/ops.js';
+import { buildColorChain } from './color.js';
+import { ffmpegHasFilter, run } from '../ingest/run.js';
+/**
+ * Frames come from the proxy (or, for domain 'source', straight from the
+ * source path) at whatever resolution ffmpeg actually decodes — not
+ * necessarily src.width/height, which record the ORIGINAL file. Pixel-exact
+ * crop coordinates computed against the original resolution would be wrong
+ * here, so express the crop as iw/ih-relative fractions instead; ffmpeg
+ * resolves those against the real decoded frame size.
+ */
+function cropFilterExpr(geo, srcW, srcH) {
+    if (!geo)
+        return '';
+    const fw = geo.width / srcW;
+    const fh = geo.height / srcH;
+    const fx = geo.x / srcW;
+    const fy = geo.y / srcH;
+    return `crop=iw*${fw}:ih*${fh}:iw*${fx}:ih*${fy},`;
+}
+/**
+ * Filmstrip + waveform digest PNG so Claude can inspect footage without
+ * playing video. Frames carry burned-in SOURCE timecodes.
+ *
+ * domain 'timeline': renders the current edit (cuts skipped) for a timeline
+ * range. domain 'source': renders raw source time (cuts visible).
+ */
+export async function renderView(m, projectDir, opts = {}) {
+    const cols = opts.cols ?? 6;
+    const rows = opts.rows ?? 2;
+    const n = cols * rows;
+    const domain = opts.domain ?? 'timeline';
+    const segs = segments(m);
+    if (segs.length === 0)
+        throw new Error('empty timeline');
+    const srcById = new Map(m.sources.map((s) => [s.id, s]));
+    // Build the list of (sourceId, srcTime) sample points. Crop only applies
+    // in 'timeline' domain — it's a per-clip concept, and 'source' domain is
+    // meant to show the raw, uncut, unframed source for inspection.
+    const points = [];
+    if (domain === 'timeline') {
+        const total = segs[segs.length - 1].tlEnd;
+        const from = opts.from ?? 0;
+        const to = Math.min(opts.to ?? total, total);
+        // A sample point that falls inside a resolved (non-orphan) B-roll
+        // overlay's [tlStart,tlEnd) draws the B-roll frame instead of the A-roll
+        // clip underneath — matching what render.ts's overlay compositing
+        // actually produces at that timeline instant.
+        const activeOverlays = resolvedActiveOverlays(m);
+        // W8 sprites are a translucent compositing layer on top of the frame,
+        // not a frame-source swap like B-roll — actually drawing the sprite
+        // pixels into the filmstrip is out of scope here (spec leaves this to
+        // implementer judgment); instead every sample point inside a resolved
+        // sprite's [tlStart,tlEnd) gets its id(s) noted in the grid legend below,
+        // same spirit as the `[overlay <id>]` annotation.
+        const activeSprites = resolvedActiveSprites(m);
+        for (let i = 0; i < n; i++) {
+            const tl = from + ((to - from) * (i + 0.5)) / n;
+            const spriteIds = activeSprites.filter((r) => tl >= r.tlStart && tl < r.tlEnd).map((r) => r.sprite.id);
+            const ov = activeOverlays.find((r) => tl >= r.tlStart && tl < r.tlEnd);
+            if (ov) {
+                points.push({
+                    sourceId: ov.overlay.sourceId, t: ov.overlay.srcIn + (tl - ov.tlStart), overlayId: ov.overlay.id,
+                    ...(spriteIds.length ? { spriteIds } : {}),
+                });
+                continue;
+            }
+            const seg = segs.find((s) => tl >= s.tlStart && tl < s.tlEnd) ?? segs[segs.length - 1];
+            points.push({
+                sourceId: seg.sourceId, t: seg.srcStart + (tl - seg.tlStart), crop: seg.crop,
+                ...(spriteIds.length ? { spriteIds } : {}),
+            });
+        }
+    }
+    else {
+        const sourceId = opts.sourceId ?? m.sources[0].id;
+        const dur = srcById.get(sourceId).duration;
+        const from = opts.from ?? 0;
+        const to = Math.min(opts.to ?? dur, dur);
+        for (let i = 0; i < n; i++)
+            points.push({ sourceId, t: from + ((to - from) * (i + 0.5)) / n });
+    }
+    // Extract each frame (proxy, fast seeks), stamp timecode, tile, add waveform.
+    const canDrawText = ffmpegHasFilter('drawtext');
+    const tmpFrames = [];
+    const outPath = path.join(projectDir, 'cache', `view-${Date.now()}.png`);
+    for (let i = 0; i < points.length; i++) {
+        const pt = points[i];
+        const src = srcById.get(pt.sourceId);
+        const usingProxy = Boolean(src.proxy);
+        const media = usingProxy ? path.join(projectDir, src.proxy) : src.path;
+        const f = path.join(projectDir, 'cache', `.vf${i}.png`);
+        const mm = Math.floor(pt.t / 60);
+        const ss = (pt.t % 60).toFixed(1).padStart(4, '0');
+        const geo = m.output ? cropGeometry(src.width, src.height, m.output.width, m.output.height, pt.crop) : null;
+        const cropPart = cropFilterExpr(geo, src.width, src.height);
+        // W5: the proxy already has colorTransform baked in (see makeProxy),
+        // so applying it again here would double-transform — only colorAdjust
+        // (never baked into the proxy) is layered on for that case. A source
+        // with no proxy yet (rare; ingestFile always generates one) falls back
+        // to the original file and needs the full chain, matching what
+        // render.ts would actually produce.
+        const colorChainSrc = usingProxy ? undefined : src.colorTransform;
+        const colorChain = buildColorChain(colorChainSrc, m.colorAdjust?.[pt.sourceId]);
+        const colorPart = colorChain ? `${colorChain},` : '';
+        const vf = canDrawText
+            ? `${colorPart}${cropPart}scale=320:-2,drawtext=text='${mm}\\:${ss}':x=6:y=h-th-6:fontsize=22:fontcolor=white:box=1:boxcolor=black@0.6`
+            : `${colorPart}${cropPart}scale=320:-2`;
+        await run('ffmpeg', ['-y', '-v', 'error', '-ss', String(pt.t), '-i', media, '-frames:v', '1', '-vf', vf, f]);
+        tmpFrames.push(f);
+    }
+    const inputs = tmpFrames.flatMap((f) => ['-i', f]);
+    const tile = tmpFrames.map((_, i) => `[${i}:v]`).join('') + `xstack=grid=${cols}x${rows}[strip]`;
+    await run('ffmpeg', ['-y', '-v', 'error', ...inputs, '-filter_complex', tile, '-map', '[strip]', outPath]);
+    await run('rm', tmpFrames);
+    // Grid legend (left-to-right, top-to-bottom): source times of each cell,
+    // essential when timecodes could not be burned in. Cells drawn from a
+    // B-roll overlay are flagged explicitly so the legend doesn't silently
+    // misattribute a frame to the A-roll clip that's actually cut away there.
+    const grid = points.map((pt, i) => `cell${i + 1}(r${Math.floor(i / cols) + 1}c${(i % cols) + 1})=${pt.t.toFixed(1)}s@${pt.sourceId}${pt.overlayId ? ` [overlay ${pt.overlayId}]` : ''}${pt.spriteIds?.length ? ` [sprite ${pt.spriteIds.join(',')}]` : ''}`);
+    return { png: outPath, timecodesBurnedIn: canDrawText, grid };
+}
+async function probeDims(file) {
+    const out = await run('ffprobe', [
+        '-v', 'error', '-select_streams', 'v:0',
+        '-show_entries', 'stream=width,height',
+        '-of', 'csv=s=x:p=0',
+        file,
+    ]);
+    const [w, h] = out.trim().split('x').map(Number);
+    return { width: w || 160, height: h || 90 };
+}
+/**
+ * Contact sheet PNG for a source's scene index: one cell per scene thumbnail
+ * (already generated at detect time), tiled into a grid with the scene id +
+ * start timecode burned in. Mirrors renderView's approach (grid legend as a
+ * JSON fallback when drawtext isn't available).
+ */
+export async function renderSceneSheet(file, projectDir, opts = {}) {
+    const scenes = file.scenes;
+    if (scenes.length === 0) {
+        throw new Error(`no scenes detected for source ${file.sourceId}; run \`vedit scenes detect --source ${file.sourceId}\` first`);
+    }
+    const cols = Math.max(1, opts.cols ?? Math.min(6, scenes.length));
+    const rows = Math.ceil(scenes.length / cols);
+    const canDrawText = ffmpegHasFilter('drawtext');
+    const cellPaths = [];
+    const tmpFrames = [];
+    for (let i = 0; i < scenes.length; i++) {
+        const sc = scenes[i];
+        const thumbAbs = path.join(projectDir, sc.thumb);
+        if (!canDrawText) {
+            cellPaths.push(thumbAbs);
+            continue;
+        }
+        const f = path.join(projectDir, 'cache', `.ss${i}.jpg`);
+        const mm = Math.floor(sc.t0 / 60);
+        const ss = (sc.t0 % 60).toFixed(1).padStart(4, '0');
+        const label = `${sc.id} ${mm}\\:${ss}`;
+        const vf = `drawtext=text='${label}':x=4:y=h-th-4:fontsize=13:fontcolor=white:box=1:boxcolor=black@0.6`;
+        await run('ffmpeg', ['-y', '-v', 'error', '-i', thumbAbs, '-vf', vf, f]);
+        cellPaths.push(f);
+        tmpFrames.push(f);
+    }
+    // Pad to a full grid so xstack's fixed cols x rows is satisfied when the
+    // scene count isn't a multiple of cols.
+    const pad = cols * rows - scenes.length;
+    let blankPath = null;
+    if (pad > 0) {
+        const dims = await probeDims(cellPaths[0]);
+        blankPath = path.join(projectDir, 'cache', '.ssblank.jpg');
+        await run('ffmpeg', ['-y', '-v', 'error', '-f', 'lavfi', '-i', `color=black:s=${dims.width}x${dims.height}:d=1`, '-frames:v', '1', blankPath]);
+        for (let i = 0; i < pad; i++)
+            cellPaths.push(blankPath);
+    }
+    const outPath = path.join(projectDir, 'cache', `scenes-sheet-${file.sourceId}-${Date.now()}.png`);
+    const inputs = cellPaths.flatMap((f) => ['-i', f]);
+    const tile = cellPaths.map((_, i) => `[${i}:v]`).join('') + `xstack=grid=${cols}x${rows}[strip]`;
+    await run('ffmpeg', ['-y', '-v', 'error', ...inputs, '-filter_complex', tile, '-map', '[strip]', outPath]);
+    const cleanup = [...tmpFrames, ...(blankPath ? [blankPath] : [])];
+    if (cleanup.length)
+        await run('rm', cleanup);
+    const grid = scenes.map((sc, i) => `cell${i + 1}(r${Math.floor(i / cols) + 1}c${(i % cols) + 1})=${sc.id}@${sc.t0.toFixed(1)}s`);
+    return { png: outPath, timecodesBurnedIn: canDrawText, grid };
+}

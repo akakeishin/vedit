@@ -22,5 +22,6 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test -- --run
+      - run: npm run verify:dist
       - run: npm run verify:package
       - run: npm run verify:install

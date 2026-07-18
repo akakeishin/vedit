@@ -1,0 +1,539 @@
+import path from 'node:path';
+import { promises as fs } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { backgroundIntervals, COMP_SOURCE_ID, cropGeometry, keptWords, resolvedActiveSprites, segments, sourceTimeToTimeline, timelineDuration, } from '../core/ops.js';
+import { captionCues } from '../core/captions.js';
+import { run } from '../ingest/run.js';
+const PUBLISH_PACK_MARKER = '.vedit-publish-pack.json';
+const PUBLISH_PACK_MARKER_KIND = 'vedit-publish-pack';
+/** "0:00" / "1:23" / "1:02:03" — YouTube's chapter timestamp format. */
+export function formatChapterTimestamp(t) {
+    const total = Math.max(0, Math.round(t));
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    if (h > 0)
+        return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    return `${m}:${String(s).padStart(2, '0')}`;
+}
+/** Chapter entries sourced from chapter-card motion overlays (highest-priority source), sorted ascending. */
+export function chaptersFromMotion(items) {
+    return items
+        .filter((it) => it.type === 'chapter-card' && it.text && it.text.trim().length > 0)
+        .map((it) => ({ tlTime: it.tlStart, title: it.text.trim() }))
+        .sort((a, b) => a.tlTime - b.tlTime);
+}
+/**
+ * Chapter entries sourced from annotated scenes (fallback when there are no
+ * chapter-card motion overlays): only scenes carrying a note become
+ * chapters. Scene t0 is in SOURCE time; boundaries cut away by editing map
+ * to null via sourceTimeToTimeline and are skipped.
+ */
+export function chaptersFromScenes(m, sceneFile) {
+    const out = [];
+    for (const sc of sceneFile.scenes) {
+        if (!sc.note)
+            continue;
+        const tl = sourceTimeToTimeline(m, sceneFile.sourceId, sc.t0);
+        if (tl === null)
+            continue; // this boundary was cut away
+        out.push({ tlTime: tl, title: sc.note.text });
+    }
+    return out.sort((a, b) => a.tlTime - b.tlTime);
+}
+/**
+ * Sort, dedupe (entries within 0.5s of a kept one are dropped — usually
+ * near-duplicate scene notes), and guarantee the list starts at 0:00
+ * (synthesizing an "オープニング" chapter when the first real one isn't
+ * already there). Returns a reason instead of an empty file when there is
+ * nothing to chapter at all.
+ */
+export function assembleChapterLines(entries) {
+    if (entries.length === 0) {
+        return { entries: null, lines: null, reason: 'no chapter-card motion overlays and no annotated scenes with notes — nothing to base chapters on' };
+    }
+    const sorted = [...entries].sort((a, b) => a.tlTime - b.tlTime);
+    const deduped = [];
+    for (const e of sorted) {
+        if (deduped.length > 0 && e.tlTime - deduped[deduped.length - 1].tlTime < 0.5)
+            continue;
+        deduped.push(e);
+    }
+    const withOpening = deduped[0].tlTime > 0.5 ? [{ tlTime: 0, title: 'オープニング' }, ...deduped] : deduped;
+    const lines = withOpening.map((e) => `${formatChapterTimestamp(e.tlTime)} ${e.title}`);
+    return { entries: withOpening, lines };
+}
+/**
+ * Pick up to `count` timeline moments to thumbnail: chapter starts first
+ * (ascending), then the highest-energy waveform moments filling any
+ * remaining budget — spaced apart so thumbnails don't cluster on one loud
+ * beat. Peaks are keyed by sourceId (Source.peaks, already loaded by the
+ * caller) and are looked up only within each segment's kept source range, so
+ * a peak inside footage that got cut away is never a candidate. Pure: given
+ * the same manifest + peaks, always returns the same points — actual JPG
+ * extraction (ffmpeg) happens in publishPack.
+ *
+ * A composition project (W-ANIME, `m.composition` set — see
+ * selectCompositionThumbnailPoints below) never populates `timeline.video`,
+ * so `segments(m)` is always empty and there is no waveform-energy signal
+ * tied to an A-roll; it gets its own candidate logic entirely. Every
+ * existing (source-driven) project is unaffected — `m.composition` is unset
+ * for those, so this branch never activates and the rest of the function is
+ * byte-for-byte unchanged.
+ */
+export function selectThumbnailPoints(m, chapterTimes, peaksBySource, count) {
+    if (count <= 0)
+        return [];
+    if (m.composition)
+        return selectCompositionThumbnailPoints(m, chapterTimes, count);
+    const segs = segments(m);
+    if (segs.length === 0)
+        return [];
+    const total = segs[segs.length - 1].tlEnd;
+    const tlToPoint = (tl, reason) => {
+        const seg = segs.find((s) => tl >= s.tlStart && tl < s.tlEnd) ?? (tl >= total ? segs[segs.length - 1] : null);
+        if (!seg)
+            return null;
+        const clampedTl = Math.min(Math.max(tl, seg.tlStart), seg.tlEnd - 1e-6);
+        return { tlTime: clampedTl, sourceId: seg.sourceId, srcTime: seg.srcStart + (clampedTl - seg.tlStart), crop: seg.crop, reason };
+    };
+    const minGap = Math.max(0.5, total / Math.max(1, count * 4));
+    const chosen = [];
+    const tooClose = (tl) => chosen.some((c) => Math.abs(c.tlTime - tl) < minGap);
+    for (const tl of [...chapterTimes].sort((a, b) => a - b)) {
+        if (chosen.length >= count)
+            break;
+        if (tooClose(tl))
+            continue;
+        const pt = tlToPoint(tl, 'chapter');
+        if (pt)
+            chosen.push(pt);
+    }
+    const remaining = count - chosen.length;
+    if (remaining > 0) {
+        const samples = [];
+        for (const seg of segs) {
+            const peaks = peaksBySource[seg.sourceId];
+            if (!peaks || peaks.peaks.length === 0 || peaks.rate <= 0)
+                continue;
+            const segDur = seg.tlEnd - seg.tlStart;
+            const i0 = Math.max(0, Math.floor(seg.srcStart * peaks.rate));
+            const i1 = Math.min(peaks.peaks.length, Math.ceil((seg.srcStart + segDur) * peaks.rate));
+            for (let i = i0; i < i1; i++) {
+                const srcT = i / peaks.rate;
+                samples.push({ tlTime: seg.tlStart + (srcT - seg.srcStart), energy: peaks.peaks[i] });
+            }
+        }
+        samples.sort((a, b) => b.energy - a.energy);
+        for (const s of samples) {
+            if (chosen.length >= count)
+                break;
+            if (tooClose(s.tlTime))
+                continue;
+            const pt = tlToPoint(s.tlTime, 'energy');
+            if (pt)
+                chosen.push(pt);
+        }
+    }
+    return chosen.sort((a, b) => a.tlTime - b.tlTime);
+}
+/**
+ * Composition-mode (W-ANIME) thumbnail candidates — see selectThumbnailPoints
+ * above. There is no A-roll and no waveform-energy signal to rank on, so the
+ * candidate pool is every moment something visually changes: background-track
+ * cut points (t=0 plus each `backgroundIntervals()` boundary — the "紙芝居"
+ * scene changes) unioned with every resolved sprite's entrance time
+ * (`resolvedActiveSprites()`'s tlStart). Chapter times (from motion
+ * chapter-cards — the same list the source-driven path receives) still take
+ * priority when present, using the same spacing/dedup rule (`minGap`) so
+ * picks don't cluster. Every point is stamped `sourceId: COMP_SOURCE_ID`,
+ * `srcTime: tlTime` — the same "srcTime IS absolute timeline time" sentinel
+ * convention as `sourceTimeToTimeline` — since there is no per-source origin
+ * to extract from; publishPack routes these to ffmpeg against a rendered
+ * file (`opts.renderedFile`) instead of an original source path, or reports
+ * a reason instead of silently producing zero thumbnails when none was
+ * given. Pure, same contract as selectThumbnailPoints.
+ */
+function selectCompositionThumbnailPoints(m, chapterTimes, count) {
+    const duration = m.composition.duration;
+    if (!(duration > 0))
+        return [];
+    const toPoint = (tl, reason) => {
+        const clampedTl = Math.min(Math.max(tl, 0), duration - 1e-6);
+        return { tlTime: clampedTl, sourceId: COMP_SOURCE_ID, srcTime: clampedTl, reason };
+    };
+    const minGap = Math.max(0.5, duration / Math.max(1, count * 4));
+    const chosen = [];
+    const tooClose = (tl) => chosen.some((c) => Math.abs(c.tlTime - tl) < minGap);
+    for (const tl of [...chapterTimes].sort((a, b) => a - b)) {
+        if (chosen.length >= count)
+            break;
+        if (tl < 0 || tl >= duration)
+            continue;
+        if (tooClose(tl))
+            continue;
+        chosen.push(toPoint(tl, 'chapter'));
+    }
+    const remaining = count - chosen.length;
+    if (remaining > 0) {
+        const boundaryTimes = backgroundIntervals(m).map((iv) => iv.t0);
+        const spriteTimes = resolvedActiveSprites(m).map((r) => r.tlStart);
+        const candidateTimes = [...new Set([...boundaryTimes, ...spriteTimes])]
+            .filter((t) => t >= 0 && t < duration)
+            .sort((a, b) => a - b);
+        for (const tl of candidateTimes) {
+            if (chosen.length >= count)
+                break;
+            if (tooClose(tl))
+                continue;
+            chosen.push(toPoint(tl, 'composition'));
+        }
+    }
+    return chosen.sort((a, b) => a.tlTime - b.tlTime);
+}
+/**
+ * Factual material for the director to draft a title/description from in
+ * conversation — never a generated description itself. `sources` lists only
+ * `kind !== 'image'` sources (i.e. real footage): an image-kind overlay
+ * source (オーバーレイ・スタック, logo/photo/stamp material) carries a
+ * synthetic `duration` (see IMAGE_SOURCE_DURATION in ingest.ts) that would
+ * read as bogus/misleading "footage length" here — it isn't material for a
+ * title/description in the way an actual filmed source is. Every project
+ * with no image sources (i.e. every project before this feature existed) is
+ * unaffected — full regression.
+ */
+export function buildMaterials(m, transcripts, chapterLines) {
+    return {
+        duration: timelineDuration(m),
+        chapterList: chapterLines,
+        sources: m.sources.filter((s) => s.kind !== 'image').map((s) => ({ file: path.basename(s.path), duration: s.duration })),
+        keptWordCount: transcripts.reduce((a, t) => a + keptWords(m, t.sourceId, t.words).length, 0),
+        captionsCueCount: captionCues(m, transcripts).length,
+    };
+}
+// ---- orchestration (impure: fs + ffmpeg) ----
+/** Exported for reuse by `vedit qc`'s tempoContractLite wiring (cli.ts) — same peaks-by-source shape qc.ts's tempoContractLite expects. */
+export async function loadPeaksBySource(project, m) {
+    const out = {};
+    for (const s of m.sources) {
+        if (!s.peaks)
+            continue;
+        try {
+            out[s.id] = JSON.parse(await fs.readFile(path.join(project.dir, s.peaks), 'utf8'));
+        }
+        catch {
+            // peaks flagged but file missing/corrupt; that source just contributes no energy candidates
+        }
+    }
+    return out;
+}
+/**
+ * Full publish-pack pipeline: chapters (motion chapter-cards, else annotated
+ * scenes) -> thumbnail candidate selection -> full-res JPG extraction ->
+ * materials.json. For a source-driven project, thumbnails are extracted from
+ * ORIGINAL sources (never proxies, so publish-quality stills). A composition
+ * project (W-ANIME, `m.composition` set) has no source to extract from at
+ * all — its candidate points are stamped with the COMP_SOURCE_ID sentinel
+ * (see selectCompositionThumbnailPoints) and are extracted from
+ * `opts.renderedFile` (an already-rendered output file, timeline-aligned by
+ * construction) when given; when it's not given, thumbnail extraction is
+ * skipped and `thumbnailsReason` explains why instead of silently producing
+ * zero thumbnails. Entirely read-only with respect to the project (no
+ * manifest mutation, no --base needed).
+ */
+async function buildPublishPackInDirectory(project, m, transcripts, outdir, opts = {}) {
+    const thumbsCount = opts.thumbs ?? 6;
+    await fs.mkdir(outdir, { recursive: true });
+    // ---- chapters ----
+    const motionEntries = [];
+    for (const item of m.timeline.motion) {
+        try {
+            const spec = (await project.readMotionSpec(item.id));
+            const text = typeof spec.params?.text === 'string' ? spec.params.text : undefined;
+            motionEntries.push({ tlStart: item.tlStart, type: spec.type, text });
+        }
+        catch {
+            // sidecar missing/unreadable; skip this overlay for chapter purposes
+        }
+    }
+    let chapterEntries = chaptersFromMotion(motionEntries);
+    if (chapterEntries.length === 0) {
+        const srcIds = [...new Set(segments(m).map((s) => s.sourceId))];
+        for (const sourceId of srcIds) {
+            const sceneFile = await project.scenes(sourceId);
+            chapterEntries.push(...chaptersFromScenes(m, sceneFile));
+        }
+    }
+    const assembled = assembleChapterLines(chapterEntries);
+    const files = [];
+    let chaptersFile = null;
+    let chaptersReason;
+    if (assembled.entries) {
+        chaptersFile = path.join(outdir, 'chapters.txt');
+        await fs.writeFile(chaptersFile, assembled.lines.join('\n') + '\n');
+        files.push(chaptersFile);
+    }
+    else {
+        chaptersReason = assembled.reason;
+    }
+    // ---- thumbnails ----
+    const thumbsDir = path.join(outdir, 'thumbnails');
+    await fs.mkdir(thumbsDir, { recursive: true });
+    const peaksBySource = await loadPeaksBySource(project, m);
+    const chapterTimes = assembled.entries?.map((e) => e.tlTime) ?? [];
+    const points = selectThumbnailPoints(m, chapterTimes, peaksBySource, thumbsCount);
+    const srcById = new Map(m.sources.map((s) => [s.id, s]));
+    const output = m.output;
+    const thumbnails = [];
+    let thumbnailsReason;
+    for (let i = 0; i < points.length; i++) {
+        const pt = points[i];
+        // W-ANIME composition points have no original source to extract from at
+        // all (see selectCompositionThumbnailPoints) — extract from a rendered
+        // file when given, otherwise skip with an explicit reason rather than a
+        // silent no-op. `thumbsCount` may legitimately mix in a `false`
+        // opts.renderedFile with zero composition points (e.g. an empty
+        // composition), so the reason is only ever set once we actually had a
+        // point to skip.
+        if (pt.sourceId === COMP_SOURCE_ID) {
+            if (!opts.renderedFile) {
+                thumbnailsReason ??=
+                    'コンポジション(スプライトアニメ)プロジェクトのサムネイル抽出にはレンダー済みファイルが必要です。' +
+                        '`vedit publish-pack <outdir> --render <file>` のように、書き出し済みファイルのパスを指定してください。';
+                continue;
+            }
+            const dest = path.join(thumbsDir, `thumb-${String(i + 1).padStart(2, '0')}-t${pt.tlTime.toFixed(1)}.jpg`);
+            await run('ffmpeg', [
+                '-y', '-v', 'error',
+                '-ss', String(pt.srcTime),
+                '-i', opts.renderedFile,
+                '-frames:v', '1',
+                '-q:v', '2',
+                dest,
+            ]);
+            thumbnails.push(dest);
+            files.push(dest);
+            continue;
+        }
+        const src = srcById.get(pt.sourceId);
+        if (!src)
+            continue;
+        const geo = output ? cropGeometry(src.width, src.height, output.width, output.height, pt.crop) : null;
+        const dest = path.join(thumbsDir, `thumb-${String(i + 1).padStart(2, '0')}-t${pt.tlTime.toFixed(1)}.jpg`);
+        await run('ffmpeg', [
+            '-y', '-v', 'error',
+            '-ss', String(pt.srcTime),
+            '-i', src.path,
+            '-frames:v', '1',
+            ...(geo ? ['-vf', `crop=${geo.width}:${geo.height}:${geo.x}:${geo.y}`] : []),
+            '-q:v', '2',
+            dest,
+        ]);
+        thumbnails.push(dest);
+        files.push(dest);
+    }
+    // ---- materials.json ----
+    const materials = buildMaterials(m, transcripts, assembled.lines ?? []);
+    const materialsFile = path.join(outdir, 'materials.json');
+    await fs.writeFile(materialsFile, JSON.stringify(materials, null, 2));
+    files.push(materialsFile);
+    // Ownership marker for safe reuse. A later run may replace this directory
+    // only because this marker proves it is a generated pack, not an arbitrary
+    // user folder that happened to be chosen as an output destination.
+    await fs.writeFile(path.join(outdir, PUBLISH_PACK_MARKER), JSON.stringify({
+        kind: PUBLISH_PACK_MARKER_KIND,
+        version: 1,
+        projectDir: path.resolve(project.dir),
+        revision: m.revision,
+        generatedAt: new Date().toISOString(),
+    }, null, 2));
+    return { outdir, files, chaptersFile, chaptersReason, thumbnails, thumbnailsReason, materialsFile };
+}
+function rebasedPackResult(result, stagingDir, finalDir) {
+    const rebase = (file) => path.join(finalDir, path.relative(stagingDir, file));
+    return {
+        ...result,
+        outdir: finalDir,
+        files: result.files.map(rebase),
+        chaptersFile: result.chaptersFile ? rebase(result.chaptersFile) : null,
+        thumbnails: result.thumbnails.map(rebase),
+        materialsFile: rebase(result.materialsFile),
+    };
+}
+async function processIsAlive(pid) {
+    if (!Number.isSafeInteger(pid) || pid <= 0)
+        return false;
+    try {
+        process.kill(pid, 0);
+        return true;
+    }
+    catch (error) {
+        // EPERM still means a process owns that pid; ESRCH means it is gone.
+        return error?.code !== 'ESRCH';
+    }
+}
+async function acquirePublishLock(lockDir) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+            await fs.mkdir(lockDir);
+            try {
+                await fs.writeFile(path.join(lockDir, 'owner.json'), JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+            }
+            catch (error) {
+                await fs.rm(lockDir, { recursive: true, force: true }).catch(() => { });
+                throw error;
+            }
+            return async () => { await fs.rm(lockDir, { recursive: true, force: true }); };
+        }
+        catch (error) {
+            if (error?.code !== 'EEXIST')
+                throw error;
+            let ownerPid = NaN;
+            let ownerKnown = false;
+            try {
+                ownerPid = Number(JSON.parse(await fs.readFile(path.join(lockDir, 'owner.json'), 'utf8')).pid);
+                ownerKnown = Number.isSafeInteger(ownerPid) && ownerPid > 0;
+            }
+            catch { /* an interrupted process may have died before owner.json */ }
+            // mkdir and owner.json are necessarily two filesystem operations. If
+            // another writer observes the directory in that tiny gap, its recent
+            // mtime makes it active rather than "stale"; only an old owner-less
+            // lock, or a lock whose recorded pid is definitely dead, is reclaimed.
+            const lockAgeMs = await fs.stat(lockDir)
+                .then((stat) => Date.now() - stat.mtimeMs)
+                .catch(() => 0);
+            const reclaimable = ownerKnown
+                ? !(await processIsAlive(ownerPid))
+                : lockAgeMs > 60_000;
+            if (attempt === 0 && reclaimable) {
+                await fs.rm(lockDir, { recursive: true, force: true });
+                continue;
+            }
+            throw new Error(`publish-pack is already running for ${path.basename(lockDir).replace(/^\./, '').replace(/\.vedit-publish-lock$/, '')}`);
+        }
+    }
+    throw new Error('could not acquire publish-pack output lock');
+}
+async function assertGeneratedPackDirectory(dir) {
+    const names = await fs.readdir(dir);
+    if (names.length === 0)
+        return;
+    const allowedTopLevel = new Set([PUBLISH_PACK_MARKER, 'chapters.txt', 'materials.json', 'thumbnails', '.DS_Store']);
+    const unexpected = names.filter((name) => !allowedTopLevel.has(name));
+    if (unexpected.length > 0) {
+        throw new Error(`refusing to replace non-vedit files in publish-pack output ${dir}: ${unexpected.join(', ')}`);
+    }
+    if (names.includes(PUBLISH_PACK_MARKER)) {
+        let marker;
+        try {
+            marker = JSON.parse(await fs.readFile(path.join(dir, PUBLISH_PACK_MARKER), 'utf8'));
+        }
+        catch (error) {
+            throw new Error(`publish-pack ownership marker is unreadable in ${dir}: ${error?.message ?? error}`);
+        }
+        if (marker?.kind !== PUBLISH_PACK_MARKER_KIND || marker?.version !== 1) {
+            throw new Error(`publish-pack ownership marker is invalid in ${dir}`);
+        }
+    }
+    else if (!names.includes('materials.json')) {
+        // Pre-marker packs are accepted only under their exact legacy shape.
+        // materials.json was always mandatory, so its absence means this could
+        // simply be an unrelated directory with a coincidental thumbnails name.
+        throw new Error(`refusing to replace an unmarked directory that is not a legacy vedit publish pack: ${dir}`);
+    }
+    for (const name of names) {
+        if (name === '.DS_Store')
+            continue;
+        const full = path.join(dir, name);
+        const stat = await fs.lstat(full);
+        if (stat.isSymbolicLink()) {
+            throw new Error(`refusing to replace publish-pack output containing a symlink: ${full}`);
+        }
+        if (name === 'thumbnails') {
+            if (!stat.isDirectory())
+                throw new Error(`publish-pack thumbnails path is not a directory: ${full}`);
+            const thumbNames = await fs.readdir(full);
+            const unexpectedThumbs = thumbNames.filter((thumb) => thumb !== '.DS_Store' && !/^thumb-\d+-t\d+(?:\.\d+)?\.jpg$/.test(thumb));
+            if (unexpectedThumbs.length > 0) {
+                throw new Error(`refusing to replace non-vedit files in publish-pack thumbnails ${full}: ${unexpectedThumbs.join(', ')}`);
+            }
+        }
+        else if (!stat.isFile()) {
+            throw new Error(`unexpected non-file in publish-pack output: ${full}`);
+        }
+    }
+}
+async function replacePackDirectory(stagingDir, finalDir) {
+    let backupDir = null;
+    try {
+        const existing = await fs.lstat(finalDir);
+        if (existing.isSymbolicLink()) {
+            throw new Error(`publish-pack output must not be a symlink: ${finalDir}`);
+        }
+        if (!existing.isDirectory()) {
+            throw new Error(`publish-pack output exists and is not a directory: ${finalDir}`);
+        }
+        await assertGeneratedPackDirectory(finalDir);
+        backupDir = path.join(path.dirname(finalDir), `.${path.basename(finalDir)}.vedit-publish-backup-${process.pid}-${randomUUID()}`);
+        await fs.rename(finalDir, backupDir);
+    }
+    catch (error) {
+        if (error?.code !== 'ENOENT')
+            throw error;
+    }
+    try {
+        await fs.rename(stagingDir, finalDir);
+    }
+    catch (error) {
+        if (backupDir) {
+            try {
+                await fs.rename(backupDir, finalDir);
+                backupDir = null;
+            }
+            catch (rollbackError) {
+                throw new Error(`publish-pack replacement failed (${error?.message ?? error}) and rollback failed (${rollbackError?.message ?? rollbackError}); previous pack remains at ${backupDir}`);
+            }
+        }
+        throw error;
+    }
+    if (backupDir) {
+        await fs.rm(backupDir, { recursive: true, force: true }).catch((error) => {
+            // The committed pack is complete and visible. A hidden backup cleanup
+            // problem must not turn that successful output into a reported failure.
+            console.error(`警告: 古い公開パックのバックアップを削除できませんでした (${backupDir}): ${error?.message ?? error}`);
+        });
+    }
+}
+/**
+ * Build the complete pack off to the side, then switch directories. Reusing
+ * an output path therefore cannot retain old chapters/thumbnails, and a
+ * failed thumbnail extraction leaves the previous complete pack untouched.
+ * A per-output lock rejects concurrent writers instead of exposing a mix of
+ * two generations.
+ */
+export async function publishPack(project, m, transcripts, outdir, opts = {}) {
+    const finalDir = path.resolve(outdir);
+    if (finalDir === path.parse(finalDir).root) {
+        throw new Error(`refusing to use a filesystem root as publish-pack output: ${finalDir}`);
+    }
+    const projectDir = path.resolve(project.dir);
+    if (projectDir === finalDir || projectDir.startsWith(finalDir + path.sep)) {
+        throw new Error(`publish-pack output must not be the project directory or one of its ancestors: ${finalDir}`);
+    }
+    const parent = path.dirname(finalDir);
+    const base = path.basename(finalDir);
+    await fs.mkdir(parent, { recursive: true });
+    const lockDir = path.join(parent, `.${base}.vedit-publish-lock`);
+    const release = await acquirePublishLock(lockDir);
+    const stagingDir = path.join(parent, `.${base}.vedit-publish-stage-${process.pid}-${randomUUID()}`);
+    try {
+        await fs.mkdir(stagingDir);
+        const staged = await buildPublishPackInDirectory(project, m, transcripts, stagingDir, opts);
+        await replacePackDirectory(stagingDir, finalDir);
+        return rebasedPackResult(staged, stagingDir, finalDir);
+    }
+    finally {
+        await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => { });
+        await release().catch(() => { });
+    }
+}
