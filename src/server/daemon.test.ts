@@ -2280,6 +2280,85 @@ describe('daemon: show channel (W-UI §0, single transcribed source)', () => {
   });
 });
 
+// ---- N2 デザイン波「計器盤」K6「押している間、直前」: GET /api/manifest-at ----
+// 読み取り専用(revisionSnapshot を再利用 — /api/show kind=compare と同じ
+// 関数、revisions.jsonl から再構成するだけで一切コミットしない)。
+describe('daemon: GET /api/manifest-at (N2 K6 "押している間、直前")', () => {
+  const PORT = 18257;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-manifest-at-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'manifest-at');
+    await project.commit(0, 'system', 'setup', {}, 'seed source', (m) => ({
+      ...m,
+      fps: 30,
+      sources: [{ id: 's1', path: '/media/one.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: true, transcribed: false }],
+      timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 30 }], motion: [] },
+    }));
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+
+    // r1 (seed, 30s) -> r2 (trim -1s => 29s) -> r3 (captions patch, no duration change).
+    await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: 1, op: 'trim', clipId: 'c1', edge: 'out', frames: -30 });
+    await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: 2, op: 'captions', patch: { style: 'bold' } });
+  });
+
+  afterAll(() => server.close());
+
+  it('reconstructs the manifest/segments/duration as of an earlier revision, without committing anything', async () => {
+    const before = (await getJson(BASE, '/api/state')).body.revision;
+    const { status, body } = await getJson(BASE, '/api/manifest-at?revision=1');
+    expect(status).toBe(200);
+    expect(body.revision).toBe(1);
+    expect(body.duration).toBe(30);
+    expect(body.segments).toHaveLength(1);
+    expect(body.manifest.captions.style).not.toBe('bold'); // pre-captions-patch snapshot
+    const after = (await getJson(BASE, '/api/state')).body.revision;
+    expect(after).toBe(before); // read-only GET — no new revision committed
+  });
+
+  it("reflects a later revision's timeline change (trim -1s)", async () => {
+    const { status, body } = await getJson(BASE, '/api/manifest-at?revision=2');
+    expect(status).toBe(200);
+    expect(body.duration).toBe(29);
+    expect(body.manifest.captions.style).not.toBe('bold'); // trim landed before the captions patch
+  });
+
+  it('the response shape matches GET /api/project (manifest/segments/duration/overlays/sprites/dialogue/backgroundIntervals)', async () => {
+    const { body } = await getJson(BASE, '/api/manifest-at?revision=2');
+    expect(Object.keys(body).sort()).toEqual(
+      ['backgroundIntervals', 'dialogue', 'duration', 'manifest', 'overlays', 'revision', 'segments', 'sprites'].sort(),
+    );
+  });
+
+  it('rejects revision=0 (pristine pre-history — nothing for the hold-to-compare UI to show)', async () => {
+    const { status, body } = await getJson(BASE, '/api/manifest-at?revision=0');
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/revision must be an integer/);
+  });
+
+  it('rejects a non-integer revision', async () => {
+    const { status, body } = await getJson(BASE, '/api/manifest-at?revision=1.5');
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/revision must be an integer/);
+  });
+
+  it('rejects a revision beyond the current one', async () => {
+    const { status, body } = await getJson(BASE, '/api/manifest-at?revision=999');
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/revision must be an integer/);
+  });
+
+  it('rejects a missing revision param', async () => {
+    const { status, body } = await getJson(BASE, '/api/manifest-at');
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/revision must be an integer/);
+  });
+});
+
 describe('daemon: show words (ambiguous multi-source project)', () => {
   const PORT = 18211;
   const BASE = `http://localhost:${PORT}`;

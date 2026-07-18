@@ -673,6 +673,38 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       }
     }
     if (pathname === '/api/revisions') return json(res, 200, await p.revisions());
+    // N2 デザイン波「計器盤」K6「押している間、直前」: 読み取り専用の revision
+    // スナップショット再構成(revisionSnapshot は既存の /api/show kind=compare
+    // が使っているのと同じ関数 — 書き込みは一切行わない)。web は現行
+    // revision-1 をホールド開始時に1回だけ取得してキャッシュする(ブリーフ
+    // §3)ので、レスポンス形は GET /api/project と同じ形(manifest/segments/
+    // duration/overlays/sprites/dialogue/backgroundIntervals)に揃え、web 側が
+    // 別のデータ整形を持たずに済むようにする。
+    if (pathname === '/api/manifest-at') {
+      const m = await p.manifest();
+      const revParam = url.searchParams.get('revision');
+      const rev = Number(revParam);
+      if (!revParam || !Number.isInteger(rev) || rev < 1 || rev > m.revision) {
+        return json(res, 400, { error: `manifest-at: revision must be an integer between 1 and ${m.revision}` });
+      }
+      let snapshot: Manifest | null;
+      try {
+        snapshot = await revisionSnapshot(p, rev);
+      } catch (e: any) {
+        return json(res, 404, { error: e?.message ?? String(e) });
+      }
+      if (!snapshot) return json(res, 404, { error: `revision ${rev} has no snapshot` });
+      return json(res, 200, {
+        revision: rev,
+        manifest: snapshot,
+        segments: segments(snapshot),
+        duration: timelineDuration(snapshot),
+        overlays: resolveOverlays(snapshot),
+        sprites: resolveSprites(snapshot),
+        dialogue: snapshot.timeline.dialogue ?? [],
+        backgroundIntervals: backgroundIntervals(snapshot),
+      });
+    }
     if (pathname === '/api/transcript') {
       const m = await p.manifest();
       const requestedSource = url.searchParams.get('source');

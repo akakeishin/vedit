@@ -13,7 +13,6 @@
 // 位置(末尾)に置いてある。
 import { expect, test } from '@playwright/test';
 import { parseTc, setupVedit, teardownVedit, type VeditFixture } from './fixtures';
-import { clickWord } from './interactions';
 
 let fx: VeditFixture;
 
@@ -65,11 +64,15 @@ test.describe.serial('vedit web UI', () => {
     await openTranscriptTab(page);
     const word = wordLocator(page, 'w0000'); // t0=0.5 t1=1.1 → tl中点 0.8s
     await expect(word).toBeVisible();
-    // 単語クリックは通常の .click() ではなく clickWord を使う — 理由は
-    // e2e/interactions.ts の doc 参照(pointerdown ハンドラが同期的に
-    // #words を作り直すため、動かさずに離すと Chromium の implicit pointer
-    // capture が pointerup を配送しなくなる、実機診断で確認済みの挙動)。
-    await clickWord(page, word);
+    // N2 計器盤 #7 実バグ修正: 以前はここで通常の .click() が使えず、専用の
+    // clickWord ワークアラウンド(押す→#words内の別地点へ動かす→離す)が
+    // 必要だった(pointerdown ハンドラが同期的に #words を全再構築するため、
+    // 動かさずに離すと Chromium の implicit pointer capture が壊れた要素を
+    // 掴んだままになり pointerup/click が配送されない、実機診断で確認済み
+    // の挙動)。#words の選択更新を全再構築からクラス差分更新(
+    // updateWordSelectionUI)へ直したことで、素の .click() がそのまま通る
+    // ようになった(直接の回帰確認はテスト「その場クリック」を参照)。
+    await word.click();
     // rAF 待ちに戻っていないか(F-s3-3 の再発防止)= リトライなしでも
     // ほぼ即時に反映されることを短いタイムアウトで確認する。
     await expect
@@ -81,6 +84,31 @@ test.describe.serial('vedit web UI', () => {
     // #tc内の現在時刻表示(tcNow)も同期していること。
     await expect
       .poll(async () => Math.abs(parseTc(await page.locator('#tcNow').textContent()) - fx.cueA.tlStart), { timeout: 1_000 })
+      .toBeLessThan(0.2);
+  });
+
+  // ---- b2: その場クリック(#7 実バグ修正の直接回帰テスト) ----
+  // clickWord ワークアラウンド(旧 e2e/interactions.ts)が要らなくなった
+  // ことを、そのワークアラウンドが避けていた「動かさずに離す」手順そのもの
+  // で直接確認する — mouse.move を1回だけ行い、down/up の間はカーソルを
+  // 一切動かさない(実際の「その場クリック」と同じ入力パターン)。
+  test('その場クリック: マウスを動かさずに単語を押して離しても選択+シークが効く', async ({ page }) => {
+    await openApp(page);
+    await openTranscriptTab(page);
+    const word = wordLocator(page, 'w0001'); // t0=1.1 t1=1.6 → tl中点 1.35s(cueA内の別語 — テストbの選択状態と独立)
+    await expect(word).toBeVisible();
+    const box = await word.boundingBox();
+    if (!box) throw new Error('word not visible/attached');
+    const cx = box.x + box.width / 2;
+    const cy = box.y + box.height / 2;
+    await page.mouse.move(cx, cy);
+    await page.mouse.down();
+    await page.mouse.up();
+    // 選択(#7 が差分更新に直した経路)とシーク(pointerup ハンドラ、#7 の
+    // 修正前は「その場」だと一切発火しなかった)の両方が効くことを見る。
+    await expect(word).toHaveClass(/\bsel\b/);
+    await expect
+      .poll(async () => Math.abs(parseTc(await page.locator('#tcNow').textContent()) - 1.35), { timeout: 1_000 })
       .toBeLessThan(0.2);
   });
 
@@ -103,7 +131,7 @@ test.describe.serial('vedit web UI', () => {
     // 2) cue をクリック(シングルクリック)→ 字幕スタイルビュー。cue が
     // ステージに出るよう、まず transcript の単語クリックで cueA の窓へシーク。
     await openTranscriptTab(page);
-    await clickWord(page, wordLocator(page, 'w0000'));
+    await wordLocator(page, 'w0000').click();
     const cue = page.locator('#captionLayer .cue');
     await expect(cue).toBeVisible();
     await cue.click();
@@ -141,7 +169,7 @@ test.describe.serial('vedit web UI', () => {
 
     await openApp(page);
     await openTranscriptTab(page);
-    await clickWord(page, wordLocator(page, 'w0000')); // seek into cueA's window
+    await wordLocator(page, 'w0000').click(); // seek into cueA's window
     const cue = page.locator('#captionLayer .cue');
     await expect(cue).toBeVisible();
     await expect(cue).toHaveText(fx.cueA.text);
@@ -177,7 +205,7 @@ test.describe.serial('vedit web UI', () => {
   test('mutation状態: 変更確定中はトリガーボタンが無効化され、成功で復帰する', async ({ page }) => {
     await openApp(page);
     await openTranscriptTab(page);
-    await clickWord(page, wordLocator(page, 'w0002')); // cueB の窓へシーク(cueA は前テストで編集済みのため別 cue を使う)
+    await wordLocator(page, 'w0002').click(); // cueB の窓へシーク(cueA は前テストで編集済みのため別 cue を使う)
     const cue = page.locator('#captionLayer .cue');
     await expect(cue).toBeVisible();
     await cue.click(); // シングルクリック → 字幕スタイルビュー

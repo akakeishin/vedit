@@ -85,6 +85,13 @@ const S = {
   rangeOut: null, // timeline seconds
   previewStopAt: null, // timeline seconds; candidate "前後を再生" auto-stop point
   loadState: 'loading', // 'loading' | 'ok' | 'no-project' | 'error'
+  // N2 計器盤 §3(K6)「押している間、直前」: GET /api/manifest-at で取得した
+  // 直前 revision の segments/overlays を保持するキャッシュ。forRevision は
+  // 「このキャッシュがどの現行 revision に対して取得されたか」— 現行
+  // revision が進んだら forRevision 不一致で自然に破棄され、次のホールドで
+  // 取り直す(ensurePrevRevCache 参照)。comparingPrev はホールド中フラグ。
+  prevRevCache: null, // { forRevision, revision, segments, overlays } | null
+  comparingPrev: false,
   // Media pool panel (source preview mode): while non-null, #video plays the
   // raw source proxy from an arbitrary point instead of the timeline mix.
   // returnTl is the timeline position to restore on exit.
@@ -121,6 +128,30 @@ const S = {
   compClockAnchor: null,
 };
 const PLAY_RATES = [1, 1.5, 2];
+
+// ---------- N2 計器盤 §5「ロードの所作」 ----------
+// プロジェクト読み込み完了時、トラック行を下から順に60ms間隔でフェード+4px
+// 上昇(計250ms以内)、1回だけ。再接続・revision更新(reload()の以後の呼び
+// 出し)では発火しない — モジュールスコープの hasPlayedLoadIn フラグで
+// 「今セッションで一度でも再生したか」だけを見る(reload()は初回ロードと
+// WS再接続/revision更新の両方から呼ばれるが、どちらもここを通るので
+// フラグ1つで確実に「初回のみ」になる)。実際のON/OFFはCSS側の
+// prefers-reduced-motion:reduce(.loadRowIn{animation:none!important})が
+// 担うので、ここではモーション判定を重複させない。
+const LOAD_IN_ROW_IDS = ['musicRow', 'motionRow', 'captionRow', 'clips', 'overlayRow']; // 下(BGM)から上(B-ROLL)の順
+const LOAD_IN_STAGGER_MS = 30;
+let hasPlayedLoadIn = false;
+function playLoadInAnimationOnce() {
+  if (hasPlayedLoadIn) return;
+  hasPlayedLoadIn = true;
+  LOAD_IN_ROW_IDS.forEach((id, i) => {
+    const el = $(id);
+    if (!el) return;
+    el.style.animationDelay = `${i * LOAD_IN_STAGGER_MS}ms`;
+    el.classList.add('loadRowIn');
+    el.addEventListener('animationend', () => { el.classList.remove('loadRowIn'); el.style.animationDelay = ''; }, { once: true });
+  });
+}
 
 // ---------- data ----------
 async function api(path, init) {
@@ -191,6 +222,7 @@ async function reload() {
     }
     S.loadState = 'ok';
     renderAll();
+    playLoadInAnimationOnce();
   } catch (e) {
     S.loadState = 'error';
     renderStageState();
@@ -519,6 +551,10 @@ function renderPlaybackFrame(tl) {
   highlightWord(tl);
   syncMusicPlayback(tl);
   syncOverlayVideo(tl);
+  // N2 計器盤 K6: 「直前と比べる」ホールド中だけ、同じ tl でゴーストフレームも
+  // 追従させる(既存の同期描画経路に相乗り — tick()毎フレーム/seekTl 双方
+  // からこの関数を経由するので、押している間のシーク/再生でも同期する)。
+  if (S.comparingPrev) renderPrevRevFrame(tl);
 }
 function fmt(t) {
   const m = Math.floor(t / 60);
@@ -528,15 +564,173 @@ function fmt(t) {
 // 小さなフレーム/fps読み(f369 / f7575 · 30fps)を別要素に分ける — 旧
 // #tc.textContent の単一文字列(fmtF 併記)を tcNow/tcTotal/frameLabel の
 // 3要素へ分配するだけで、フォーマット自体(fmt)は無変更。
+// N2 計器盤 §1: #tcNow 自身は主役級(約2倍・白)に上げつつ、その中の
+// 小数点以下(秒未満の下位桁 — 判断には使わない精密作業用の情報)だけ
+// #tcNowSub(--text-3)へ分けて一段弱くする。#tcNow は分割後も子要素の
+// textContent が連結されて "0:12.4" と同じ文字列になる(innerHTML の
+// 組み立てはしない)ので、既存 e2e の parseTc(#tcNow) はそのまま通る。
 function renderTimecode(tl, dur) {
   const fps = S.manifest?.fps ?? 30;
-  const now = $('tcNow');
+  const nowMain = $('tcNowMain');
+  const nowSub = $('tcNowSub');
   const total = $('tcTotal');
   const frame = $('frameLabel');
-  if (now) now.textContent = fmt(tl);
+  if (nowMain && nowSub) {
+    const full = fmt(tl);
+    const dot = full.indexOf('.');
+    nowMain.textContent = dot >= 0 ? full.slice(0, dot) : full;
+    nowSub.textContent = dot >= 0 ? full.slice(dot) : '';
+  }
   if (total) total.textContent = `/ ${fmt(dur)}`;
   if (frame) frame.textContent = `f${Math.round(tl * fps)} / f${Math.round(dur * fps)} · ${Math.round(fps)}fps`;
 }
+
+// ---------- N2 計器盤 §3(K6)「押している間、直前」 ----------
+// 1手適用直後の「効いた?」を1操作で返す機能。押している間だけ、直前
+// revision の映像を同一プレイヘッド時刻で表示し、離すと即座に現行へ戻る。
+//
+// 既存の tick()/renderPlaybackFrame ループ(#video・BGM・B-roll音声・字幕・
+// モーション等の「現在」を描く経路)はホールド中もいっさい止めない・触らない
+// — 代わりに常時 muted の専用ゴースト <video>(#prevRevVideo)を用意し、
+// ホールド中だけ「直前 manifest でこの tl を見たら何が映るか」をそこに描いて
+// プレビューの上に重ねる。#video 自体の src/currentTime は無変更なので、
+// A-roll・BGM・B-roll の音声は一切スイッチしない(ブリーフ「音声は切り替え
+// ない、映像のみの知覚比較」)。
+//
+// スコープの意図的な縮小(最終報告に明記): 字幕/モーション/スプライト/
+// セリフの各レイヤーはこの波ではゴースト化していない。字幕 cue の直前版
+// 再導出には src/core/captions.ts の captionCues 相当をクライアント側に
+// 複製する必要があり、ブリーフが許す daemon 側の追加は読み取り専用
+// エンドポイント1本(/api/manifest-at、manifest そのものの再構成のみ)に
+// 限られる制約と釣り合わない判断。ホールド中もそれらのレイヤーは tick() の
+// 通常経路のまま「現在」を表示し続ける(古い映像の上に現在の字幕が乗る形の
+// 近似 — 誤りではないが完全な過去の再現でもない、既知の限界)。
+// B-roll オーバーレイは resolveOverlays 由来のデータをそのまま使えるため
+// ゴースト対象に含めている(altVisualSourceAt)。コンポジション(紙芝居)
+// プロジェクトは #video 自体を使わない別レンダリング経路のため今回は対象外
+// — updatePrevRevAvailability が disabled にする(嘘の機能を置かない)。
+function prevRevButton() { return $('prevRevHoldBtn'); }
+
+function updatePrevRevAvailability() {
+  const btn = prevRevButton();
+  if (!btn) return;
+  const rev = S.manifest?.revision ?? 0;
+  const comp = isComposition();
+  btn.disabled = comp || rev <= 1;
+  btn.title = comp
+    ? 'コンポジションプロジェクトは今後対応'
+    : rev <= 1 ? 'まだ比較する版がありません' : '押している間、直前の版の映像を表示します';
+}
+
+async function ensurePrevRevCache() {
+  const rev = S.manifest?.revision ?? 0;
+  if (S.prevRevCache && S.prevRevCache.forRevision === rev) return S.prevRevCache;
+  const target = rev - 1;
+  if (target < 1) return null;
+  try {
+    const data = await api(`/api/manifest-at?revision=${target}`);
+    S.prevRevCache = { forRevision: rev, revision: data.revision, segments: data.segments ?? [], overlays: data.overlays ?? [] };
+    return S.prevRevCache;
+  } catch (e) {
+    toast(`直前の版を取得できませんでした: ${e.message}`, { type: 'error' });
+    return null;
+  }
+}
+
+// 直前 manifest 基準で「この tl に何を映すか」を1つに決める — アクティブな
+// B-roll オーバーレイがあればそちら(現行の syncOverlayVideo と同じ優先順位:
+// オーバーレイは本編の上に重なって見えるものなので、そちらが「見え」の実体)、
+// 無ければ本編セグメント。
+function altVisualSourceAt(tl, cache) {
+  for (const r of cache.overlays) {
+    if (r.tlStart == null) continue; // orphan
+    const dur = r.overlay.srcOut - r.overlay.srcIn;
+    if (tl >= r.tlStart && tl < r.tlStart + dur) {
+      return { sourceId: r.overlay.sourceId, srcTime: r.overlay.srcIn + (tl - r.tlStart) };
+    }
+  }
+  const segs = cache.segments;
+  if (!segs.length) return null;
+  const seg = segs.find((s) => tl >= s.tlStart && tl < s.tlEnd) ?? segs[segs.length - 1];
+  return { sourceId: seg.sourceId, srcTime: seg.srcStart + Math.max(0, tl - seg.tlStart) };
+}
+
+let prevRevVideoSrc = null;
+// tick()/renderPlaybackFrame と同じ「毎フレーム呼ばれる」経路に相乗りする
+// (renderPlaybackFrame の末尾から呼ぶ — ブリーフ「既存の同期描画経路を
+// 必ず経由」)。S.comparingPrev が false の間は即 return、既存の描画に一切
+// 干渉しない。
+function renderPrevRevFrame(tl) {
+  const pv = $('prevRevVideo');
+  if (!pv) return;
+  const cache = S.prevRevCache;
+  const target = cache ? altVisualSourceAt(tl, cache) : null;
+  if (!target) { pv.hidden = true; return; }
+  const url = proxyUrl(target.sourceId);
+  const apply = () => {
+    try { pv.currentTime = target.srcTime; } catch { /* not seekable yet */ }
+    pv.hidden = false;
+  };
+  if (prevRevVideoSrc !== url) {
+    prevRevVideoSrc = url;
+    pv.pause();
+    pv.src = url;
+    pv.addEventListener('loadedmetadata', apply, { once: true });
+    pv.load();
+  } else if (pv.hidden || Math.abs(pv.currentTime - target.srcTime) > 0.03) {
+    apply();
+  }
+}
+
+let prevRevHoldSeq = 0; // race guard: a fast tap-and-release before the cache fetch resolves must not leave a stuck ghost frame visible
+async function startPrevRevHold() {
+  const btn = prevRevButton();
+  if (!btn || btn.disabled || S.comparingPrev) return;
+  const seq = ++prevRevHoldSeq;
+  const cache = await ensurePrevRevCache();
+  if (seq !== prevRevHoldSeq) return; // released (or superseded by a new press) before the fetch resolved
+  if (!cache) return;
+  S.comparingPrev = true;
+  btn.setAttribute('aria-pressed', 'true');
+  $('prevRevBadge').hidden = false;
+  const ind = $('prevRevIndicator');
+  ind.hidden = false;
+  ind.textContent = `直前の版 ${cache.revision} を表示中`;
+  renderPrevRevFrame(tlNow());
+}
+function endPrevRevHold() {
+  prevRevHoldSeq++; // invalidate any in-flight startPrevRevHold from this (or a stale) press
+  if (!S.comparingPrev) return;
+  S.comparingPrev = false;
+  const btn = prevRevButton();
+  if (btn) btn.setAttribute('aria-pressed', 'false');
+  $('prevRevBadge').hidden = true;
+  $('prevRevIndicator').hidden = true;
+  const pv = $('prevRevVideo');
+  if (pv) pv.hidden = true;
+}
+(() => {
+  const btn = prevRevButton();
+  if (!btn) return;
+  btn.addEventListener('pointerdown', () => startPrevRevHold());
+  btn.addEventListener('pointerup', endPrevRevHold);
+  btn.addEventListener('pointerleave', endPrevRevHold);
+  btn.addEventListener('pointercancel', endPrevRevHold);
+  // キーボード: フォーカス+Space/Enter 押下中も同挙動(keydown/keyupで
+  // pointerdown/upを模す)。e.repeat で OS のキーリピートによる再トリガーを防ぐ。
+  btn.addEventListener('keydown', (e) => {
+    if (e.key !== ' ' && e.key !== 'Enter') return;
+    if (e.repeat) return;
+    e.preventDefault();
+    startPrevRevHold();
+  });
+  btn.addEventListener('keyup', (e) => {
+    if (e.key !== ' ' && e.key !== 'Enter') return;
+    e.preventDefault();
+    endPrevRevHold();
+  });
+  btn.addEventListener('blur', endPrevRevHold);
+})();
 
 function setPlaybackRate(rate) {
   video.playbackRate = rate;
@@ -1923,6 +2117,13 @@ function mediaRow(src) {
     info.append(badges, usage);
   }
 
+  // N2 計器盤 直し#4: ここは元々「再生/タイムラインへ追加/詳細」の3(+シーン)
+  // ボタンをフルテキストのまま .srcActions(縦積み flex-direction:column)へ
+  // 詰め込んでおり、展開時(2列分の横幅いっぱいのカード)ではサムネ+情報の
+  // 右にボタンが縦3〜4段で並んでカードが縦に間延びしていた。CSS 側を
+  // 「カード下部の横一列フッター」に変えた(style.css の .srcActions 参照)
+  // 上で、ラベルもアイコン+短語に詰める(アクセシブルな全文は aria-label 側
+  // に残す — 見出しラベルだけを削る、情報を消さない)。
   const actions = document.createElement('div');
   actions.className = 'srcActions';
   const playBtn = document.createElement('button');
@@ -1931,7 +2132,7 @@ function mediaRow(src) {
   playBtn.onclick = (e) => { e.stopPropagation(); setMediaFocus(src.id, { focus: false }); enterSourcePreview(src.id); };
   actions.appendChild(playBtn);
   const addBtn = document.createElement('button');
-  addBtn.textContent = 'タイムラインへ追加';
+  addBtn.textContent = '+ 追加';
   addBtn.setAttribute('aria-label', `${name} をタイムラインへ追加`);
   addBtn.onclick = (e) => { e.stopPropagation(); addSourceToTimeline(src, addBtn); };
   actions.appendChild(addBtn);
@@ -1946,7 +2147,7 @@ function mediaRow(src) {
     const scenesExpanded = S.expandedScenes.has(src.id);
     const scenesBtn = document.createElement('button');
     scenesBtn.className = 'btn-viewScenes';
-    scenesBtn.textContent = 'シーンを見る';
+    scenesBtn.textContent = 'シーン';
     scenesBtn.setAttribute('aria-expanded', String(scenesExpanded));
     scenesBtn.setAttribute('aria-label', `${name} のシーンを${scenesExpanded ? '閉じる' : '見る'}`);
     scenesBtn.onclick = (e) => { e.stopPropagation(); toggleScenes(src.id); };
@@ -3381,8 +3582,18 @@ function speechBubbleTailDirectionJS(bubblePos, spritePos) {
   return dx >= 0 ? 'right' : 'left';
 }
 // A JS port of render.ts's dialogueAnchorPixels.
+// N2 計器盤 小パリティ: render.ts 側は d.pos(0..1 正規化座標の手動アンカー)
+// があれば自動アンカー(スプライト追従/既定位置)より無条件に優先する
+// (dialogueAnchorPixels の最初の分岐)。web 側にはこのチェックが無く、
+// --pos を付けたセリフでもプレビューでは常にスプライト追従位置に描かれて
+// いた(書き出しとプレビューがズレる)。sprite 自体の解決は tail 方向の
+// 算出に引き続き使うので、pos があってもスプライト参照は解決したままにし、
+// 座標だけ pos を優先する(render.ts はセリフの吹き出し「しっぽ」を描かない
+// プレビュー専用の近似なので、この部分の実装順はそこと完全に一致していなく
+// てもよい — 座標の優先順位だけが export との整合性に効く)。
 function dialogueAnchorPx(d, out) {
   const sprite = d.spriteId ? (S.manifest.timeline.sprites ?? []).find((s) => s.id === d.spriteId) : undefined;
+  if (d.pos) return { x: d.pos.x * out.width, y: d.pos.y * out.height, sprite };
   const asset = sprite ? (S.kit?.kit?.assets ?? []).find((a) => a.id === sprite.assetId) : undefined;
   if (sprite && asset) {
     const geo = spriteGeometryJS(asset, sprite.position, sprite.scale, out, sprite.flip);
@@ -3639,6 +3850,32 @@ function renderTranscript() {
   }
 }
 
+// N2 計器盤 実バグ修正 #7: #words の pointerdown ハンドラは選択が変わる
+// たびに renderTranscript() を同期呼び出しして #words のサブツリーを丸ごと
+// 作り直していた。マウスを1pxも動かさない「その場クリック」だと、押した
+// 瞬間クリックされた <span> がその再構築で DOM から切り離され、Chromium の
+// implicit pointer capture が「もう存在しない要素」を掴んだままになって
+// pointerup/click が一切配送されない(e2e/interactions.ts の doc・実 CDP
+// 診断で確認済み)。
+//
+// 選択状態の変更(sel/shown クラス・aria-selected・roving tabindex)は
+// 見出し/gap/cut/ignored など #words の他の構造をいっさい変えないので、
+// 全再構築ではなく既存の <span class="w"> 群へ差分でクラス/属性を当てる
+// だけにする — クリックされた要素が DOM に留まり続けるので pointer
+// capture が壊れない。#words の構造そのものが変わる経路(transcript の
+// ロード/削除/reload 等)は従来どおり renderTranscript() のフル再構築を使う。
+function updateWordSelectionUI() {
+  const el = $('words');
+  for (const s of el.querySelectorAll('.w')) {
+    const key = `${s.dataset.src}:${s.dataset.id}`;
+    const selected = S.selWords.has(key);
+    s.classList.toggle('sel', selected);
+    s.setAttribute('aria-selected', String(selected));
+    s.classList.toggle('shown', S.showWordKeys.has(key));
+    s.tabIndex = key === S.focusKey ? 0 : -1;
+  }
+}
+
 function wordTl(srcId, w) {
   const seg = S.segments.find((s) => s.sourceId === srcId && (w.t0 + w.t1) / 2 >= s.srcStart && (w.t0 + w.t1) / 2 < s.srcStart + (s.tlEnd - s.tlStart));
   if (!seg) return null;
@@ -3675,13 +3912,14 @@ $('words').addEventListener('pointerdown', (e) => {
       S.selSourceId = srcId;
     }
     S.focusKey = key;
-    renderTranscript();
+    // N2 #7: class/attr diff only (updateWordSelectionUI) instead of
+    // renderTranscript()'s full rebuild — `t` stays attached to #words, so
+    // pointer capture/click delivery for this same pointerdown gesture is
+    // never disrupted. `t` is still the live element, so a plain .focus()
+    // suffices (no need to re-query the DOM for a replacement node).
+    updateWordSelectionUI();
     updateSelBtn();
-    // renderTranscript() rebuilds #words' DOM, so the element the mouse
-    // actually clicked no longer exists — the browser's native "click
-    // focuses this element" doesn't carry over. Re-focus the replacement so
-    // a keyboard user can immediately continue with arrow keys.
-    focusWordEl(srcId, t.dataset.id);
+    t.focus();
     return;
   }
   dragging = true;
@@ -3689,9 +3927,9 @@ $('words').addEventListener('pointerdown', (e) => {
   S.selSourceId = srcId;
   S.focusKey = key;
   S.selWords = new Set([key]);
-  renderTranscript();
+  updateWordSelectionUI();
   updateSelBtn();
-  focusWordEl(srcId, t.dataset.id);
+  t.focus();
 });
 $('words').addEventListener('pointerover', (e) => {
   if (!dragging) return;
@@ -3706,9 +3944,9 @@ $('words').addEventListener('pointerover', (e) => {
   if (a < 0 || b < 0) return;
   S.selWords = new Set(ids.slice(Math.min(a, b), Math.max(a, b) + 1));
   S.focusKey = `${srcId}:${t.dataset.id}`;
-  renderTranscript();
+  updateWordSelectionUI();
   updateSelBtn();
-  focusWordEl(srcId, t.dataset.id);
+  t.focus();
 });
 window.addEventListener('pointerup', (e) => {
   if (!dragging) return;
@@ -3748,9 +3986,9 @@ function toggleWordSelection(srcId, id) {
     S.selAnchor = key;
   }
   S.focusKey = key;
-  renderTranscript();
+  updateWordSelectionUI();
   updateSelBtn();
-  focusWordEl(srcId, id); // renderTranscript() rebuilt the DOM; reclaim focus so Space/arrows keep working
+  focusWordEl(srcId, id);
 }
 // All words across all sources, in the same order they render in — used so
 // plain (non-extending) arrow-key focus movement can cross a source
@@ -3781,7 +4019,7 @@ function moveWordFocus(flat, newIdx, extend) {
     }
   }
   S.focusKey = newKey;
-  renderTranscript();
+  updateWordSelectionUI();
   updateSelBtn();
   focusWordEl(entry.srcId, entry.id);
 }
@@ -5170,10 +5408,11 @@ function setClaudeTask(label) {
 // あなたの確認待ち; otherwise 待機中. Reads the badge AFTER renderInbox() has
 // run (see renderAll) rather than recomputing the same anchor/color/
 // low-confidence/QC scan a second time here.
-// W-DESIGN: README のピル(ドット+文言、bg#202024 radius999)へ再構成 —
-// 同じ3値の導出ロジックのまま、出力先を el.textContent 単独から
-// .claudeDot/.claudeText の2要素+右パネルのサブライン(#claudeSubline、
-// 「Cowork 接続中 · ...」)へ広げる。
+// N2 計器盤 §2「タリーランプ」: 旧「Claude・1件 — 確認待ち」ピルの文言を
+// 「ランプ+短文」の文法(ブリーフ)へ揃える — 状態名は待機中/編集中/確認待ち
+// の3つで統一し、いずれも「Claude: <状態>[ — 補足]」の形にする(state/
+// class 名は既存の idle/busy/waiting のまま — CSS 側の見た目とランプの
+// 点灯・呼吸だけを見た目の主体にする、DOM構造・導出ロジックは無変更)。
 function renderClaudeStatus() {
   const el = $('claudeStatus');
   if (!el) return;
@@ -5183,7 +5422,7 @@ function renderClaudeStatus() {
   let state, label, title, subline;
   if (S.activeTask) {
     state = 'busy';
-    label = `Claude · 編集中 — ${S.activeTask.label}`;
+    label = `Claude: 編集中 — ${S.activeTask.label}`;
     title = S.activeTask.label;
     subline = 'Cowork 接続中 · 編集中…';
   } else {
@@ -5191,21 +5430,19 @@ function renderClaudeStatus() {
     const pending = badge && !badge.hidden ? Number(badge.textContent || '0') : 0;
     if (empty) {
       state = 'idle';
-      label = 'Claude · 待機中 — 動画を取り込むと編集を始められます';
+      label = 'Claude: 待機中 — 動画を取り込むと編集を始められます';
       title = '';
       subline = 'Cowork 接続中 · 待機中';
     } else if (pending > 0) {
       // 「pending」は編集提案(候補)+対応が必要(警告)の合算(旧 renderClaudeStatus
       // と同じ導出 — README「claudeStatus...旧 renderClaudeStatus と同じ導出」)。
-      // 警告だけでも表示されうるため、v2.dc.html の固定コピー「N件の編集提案」を
-      // そのまま流用せず、実際の内訳に即した中立な言い回しにする。
       state = 'waiting';
-      label = `Claude · ${pending}件 — 確認待ち`;
+      label = `Claude: 確認待ち ${pending}件`;
       title = `${pending}件の確認待ち — 会話タブを開いてください`;
       subline = `Cowork 接続中 · 確認待ち ${pending}件`;
     } else {
       state = 'idle';
-      label = 'Claude · 待機中';
+      label = 'Claude: 待機中';
       title = '';
       subline = 'Cowork 接続中 · 待機中';
     }
@@ -5583,6 +5820,16 @@ async function renderAll() {
   renderPlayability();
   renderClaudeStatus(); // after renderInbox() — reads its badge, see the doc above
   renderIntentZonesInfo();
+  // N2 計器盤 K6: revision が進んだら「直前」キャッシュを破棄(ブリーフ
+  // 「revision が進んだら破棄」)— 次のホールドで ensurePrevRevCache が
+  // 新しい revision-1 を取り直す。ホールド中に(Claude 側の編集などで)
+  // revision が動いた場合は、もう正しくない「直前」を見せ続けないよう
+  // ホールド自体も終了する。
+  if (S.prevRevCache && S.prevRevCache.forRevision !== m.revision) {
+    S.prevRevCache = null;
+    if (S.comparingPrev) endPrevRevHold();
+  }
+  updatePrevRevAvailability();
 }
 
 window.addEventListener('resize', () => { drawWave(); renderRuler(); });

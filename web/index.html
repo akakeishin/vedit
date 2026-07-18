@@ -4,12 +4,12 @@
 <meta charset="utf-8">
 <title>vedit</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<!-- W-DESIGN: Claude Design ハンドオフ(design_handoff_vedit_nle_redesign/README.md)の
-     フォント指定。IBM Plex 系が読み込めない環境向けのフォールバックは style.css の
-     --font-jp/--font-mono 側で担保(このlinkが失敗しても崩れない)。 -->
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+JP:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<!-- N2 計器盤: コーディネーター指示によりIBM Plex(Google Fonts)を廃止し、
+     UIクロームはシステムフォントへ切り替え(style.css の --font-jp/
+     --font-mono 参照)。オフライン時に読み込みが失敗して見た目が崩れる
+     懸念(HANDOFF §5)もこれで解消。字幕プレビュー等コンテンツ側の
+     フォント選択機能(#capFont, kit フォント)は影響を受けない — あちらは
+     常に個別の @font-face/--kit-font で解決する別経路。 -->
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -21,10 +21,12 @@
     <span id="projName">vedit</span>
     <!-- W-UI IA v2 §1: 「現在の版 N」+ 自動保存の弱表示(renderAll in app.js)。 -->
     <span id="revLabel" class="hdrRevLabel"></span>
-    <!-- 既存: ヘッダー常設のライブタイムコード(tick/tickComposition in app.js)。
-         v2.dc.html のヘッダーには無いが、既存機能を壊さないため縮小して維持
-         (W-DESIGN 既知差分)。 -->
-    <span id="headerTc" class="mono hdrTc">0:00.0</span>
+    <!-- N2 計器盤 §1: 現在タイムコードは中央の計器列(#tc)に一本化 —
+         ヘッダー側の重複表示は見た目から外す(hidden 属性、JS の
+         textContent 更新自体は既存のまま維持: id を消すと過去の波が
+         「既存 DOM id はすべて保持」と定めた絶対条件に反するため、
+         要素自体は残し表示だけを消す)。 -->
+    <span id="headerTc" class="mono hdrTc" hidden>0:00.0</span>
     <!-- W-UI redesign §1: 出力解像度/素材スペック/fps の弱い二次情報
          (renderStat in app.js)。v2.dc.html には無い要素だが、既存の有用な
          情報を失わないため小さく残す(W-DESIGN 既知差分)。 -->
@@ -129,12 +131,19 @@
         <div id="compBgLayer" hidden aria-hidden="true"></div>
         <video id="video" playsinline aria-label="プレビュー動画"></video>
         <video id="videoOverlay" hidden muted playsinline aria-hidden="true"></video>
+        <!-- N2 計器盤 §3(K6): 「直前と比べる」ホールド中だけ表示するゴースト
+             フレーム。常時 muted の別要素 — #video/BGM/B-roll の音声は一切
+             触らない(押している間だけ映像を差し替える、知覚比較専用)。
+             renderPrevRevFrame in app.js。 -->
+        <video id="prevRevVideo" hidden muted playsinline aria-hidden="true"></video>
         <div id="spriteLayer" aria-hidden="true"></div>
         <div id="captionLayer"></div>
         <div id="captionDragGuide" hidden aria-hidden="true"></div>
         <div id="motionLayer"></div>
         <!-- W-ANIME: speech-bubble dialogue layer, above everything else. -->
         <div id="dialogueLayer" aria-hidden="true"></div>
+        <!-- N2 計器盤 §3(K6): 押している間だけ重ねる「直前」小ラベル。 -->
+        <span id="prevRevBadge" class="prevRevBadge" hidden aria-hidden="true">直前</span>
         <div id="ingestOverlay" hidden><div class="spin"></div><span id="ingestStep" aria-live="polite"></span></div>
         <div id="stageEmpty" hidden>
           <!-- W-POLISH Mid-9: 空プロジェクト状態専用の44pxロゴ(README/
@@ -162,7 +171,15 @@
       </div>
     </div>
     <div id="transport">
-      <span id="tc" class="tcMain"><span id="tcNow">0:00.0</span> <span id="tcTotal" class="tcDim">/ 0:00.0</span></span>
+      <!-- N2 計器盤 §1: 現在タイムコードを主役に(約2倍・tabular-nums)。
+           下位桁(小数点以下、renderTimecode が #tcNowMain/#tcNowSub に分配)
+           は --text-3 で一段弱く — 秒までが判断に使う情報、下位桁は精密作業用。
+           #tcNow 自体の textContent は子要素の連結でこれまでどおり
+           "0:12.4" 形式のまま(既存 e2e の parseTc(#tcNow) 互換)。 -->
+      <span id="tc" class="tcMain"><span id="tcNow"><span id="tcNowMain">0:00</span><span id="tcNowSub">.0</span></span> <span id="tcTotal" class="tcDim">/ 0:00.0</span></span>
+      <!-- N2 計器盤 §3(K6): ホールド中だけ表示する状態表示(警告ではない
+           ので --pending ではなく --text-2)。 -->
+      <span id="prevRevIndicator" class="prevRevIndicator" hidden aria-live="polite"></span>
       <span class="spacer"></span>
       <div class="transportControls">
         <button id="jumpBackBtn" class="btnTransportSm" title="2秒巻き戻して再生 (J)" aria-label="2秒巻き戻して再生">⏮</button>
@@ -171,6 +188,12 @@
       </div>
       <span id="rateLabel" hidden></span>
       <span class="spacer"></span>
+      <!-- N2 計器盤 §3(K6)「押している間、直前」: pointerdown/up +
+           キーボード Space/Enter 押下中で直前 revision の映像を同一
+           プレイヘッドで表示(startPrevRevHold/endPrevRevHold in app.js)。
+           revision<=1 またはコンポジションプロジェクトでは disabled。
+           任意版ピッカーではない(直前1世代限定)。 -->
+      <button id="prevRevHoldBtn" class="btnPrevRev" type="button" disabled aria-pressed="false" title="まだ比較する版がありません">直前と比べる</button>
       <span id="frameLabel" class="frameLabel mono"></span>
     </div>
 
