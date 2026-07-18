@@ -1554,12 +1554,19 @@ describe('daemon: static/media regular-file streaming resilience', () => {
     // next request before it reaches the daemon. Browser behavior and the
     // separate daemon-health assertion are covered elsewhere in this suite.
     const response = await fetch(`${BASE}/media/proxy/srace`, { headers: { connection: 'close' } });
+    const freshStatus = (pathname: string) => new Promise<number>((resolve, reject) => {
+      const request = http.get(BASE + pathname, { agent: false }, (next) => {
+        next.resume();
+        next.once('end', () => resolve(next.statusCode ?? 0));
+      });
+      request.once('error', reject);
+    });
     expect(response.status).toBe(200);
     await fsp.rename(racePath, movedRacePath);
     await fsp.mkdir(racePath);
     expect(Buffer.from(await response.arrayBuffer())).toEqual(raceContent);
-    expect((await fetch(`${BASE}/media/proxy/srace`)).status).toBe(404);
-    expect((await getJson(BASE, '/api/ping')).body.ok).toBe(true);
+    expect(await freshStatus('/media/proxy/srace')).toBe(404);
+    expect(await freshStatus('/api/ping')).toBe(200);
   }, 15_000);
 });
 
