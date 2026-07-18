@@ -5,6 +5,7 @@ import {
   needsColorTransform,
   orphanedOverlays,
   orphanedSprites,
+  overlayGeometryWarnings,
   segments,
   timelineDuration,
 } from '../core/ops.js';
@@ -45,6 +46,7 @@ export type QcCategory =
   | 'candidates'
   | 'scene-review'
   | 'overlay-orphan'
+  | 'overlay-geometry'
   | 'sprite-orphan'
   | 'captions'
   | 'color'
@@ -108,6 +110,21 @@ export function checkOrphans(m: Manifest): QcIssue[] {
   const sprite = issueList('sprite-orphan');
   for (const s of orphanedSprites(m)) sprite.push('error', `スプライト ${s.id} が orphan です — ${s.reason}`);
   return [...overlay.issues, ...sprite.issues];
+}
+
+/**
+ * オーバーレイ・スタック mini-spec's required render/QC advisories
+ * ("タイムライン終端をはみ出すオーバーレイ/出力比率と極端に合わない画像...
+ * は warnings[] へ") — thin QcIssue wrapper over ops.ts's
+ * overlayGeometryWarnings (the same pure check render.ts's renderFinal
+ * pushes onto its own `warnings` array, so `vedit qc` and an actual render
+ * never disagree about which overlays are flagged). Always 'warning'
+ * severity — neither condition blocks a render, both just look off.
+ */
+export function checkOverlayGeometry(m: Manifest): QcIssue[] {
+  const { issues, push } = issueList('overlay-geometry');
+  for (const w of overlayGeometryWarnings(m)) push('warning', w);
+  return issues;
 }
 
 /**
@@ -287,6 +304,7 @@ export async function staticChecks(
   const issues: QcIssue[] = [
     ...checkPendingQueues(m, sceneFiles, opts.candidates ?? []),
     ...checkOrphans(m),
+    ...checkOverlayGeometry(m),
     ...checkCaptionCues(cues, maxCps),
     ...checkColorWarnings(m.sources),
     ...(await checkMediaFilesExist(m)),

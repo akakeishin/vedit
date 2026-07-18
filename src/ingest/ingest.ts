@@ -144,6 +144,66 @@ export async function probeAudio(file: string): Promise<AudioProbeResult> {
   return { duration, hasAudio: Boolean(a) };
 }
 
+// ---- オーバーレイ・スタック: still-image overlay sources (Source.kind:'image') ----
+//
+// A separate, deliberately lightweight sibling to probe()/ingestFile() above
+// — see docs/superpowers/specs/2026-07-18-vedit-overlay-stack.md. An image
+// overlay source (PNG/JPEG/WebP) never needs a proxy (there's nothing to
+// seek — the whole point is a single still frame), a waveform (no audio),
+// scene detection, or transcription, so this path skips all four rather than
+// reusing ingestFile's video pipeline. See Source.kind's doc in
+// core/types.ts for what an image-kind Source's fields mean.
+
+const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp']);
+
+/** Whether `file`'s extension marks it as an overlay-stack image source rather than footage — case-insensitive match against IMAGE_EXTENSIONS. Used by ingestFile to route to ingestImageFile, and by cli.ts's `overlay-add` to decide whether a bare file argument should be auto-ingested. */
+export function isImageFile(file: string): boolean {
+  return IMAGE_EXTENSIONS.has(path.extname(file).toLowerCase());
+}
+
+/**
+ * Synthetic Source.duration for an image-kind source: a still image has no
+ * intrinsic duration, but addOverlay/updateOverlay (ops.ts) bound
+ * OverlayClip.srcOut by `<= source.duration`, and OTIO's media
+ * `available_range` wants SOME finite number. 24 hours is far beyond any
+ * practical overlay placement while staying a normal finite JSON number —
+ * `Infinity` would round-trip through JSON.stringify as `null` and corrupt
+ * the manifest, so a large-but-finite sentinel is required, not just
+ * convenient. `vedit overlay-add --dur <秒>` on an image source sets
+ * srcIn:0, srcOut:<秒> — the requested ON-SCREEN duration, unrelated to
+ * this sentinel (which only bounds how large that request is ALLOWED to be).
+ */
+export const IMAGE_SOURCE_DURATION = 24 * 60 * 60;
+
+export interface ImageProbeResult {
+  width: number;
+  height: number;
+}
+
+/**
+ * Lightweight ffprobe for a still image: unlike `probe()` above, this never
+ * requires (or reports) a duration/fps/audio-stream — a still image has none
+ * of those intrinsically (ffprobe reports a single-frame "video" stream for
+ * a PNG/JPEG with no `format.duration` at all, which is exactly why probe()
+ * itself can't be reused here — it would throw "no usable duration").
+ */
+export async function probeImage(file: string): Promise<ImageProbeResult> {
+  const out = await run('ffprobe', [
+    '-v', 'error',
+    '-print_format', 'json',
+    '-show_streams',
+    file,
+  ]);
+  const j = JSON.parse(out);
+  const v = (j.streams as any[]).find((s) => s.codec_type === 'video');
+  const width = Number(v?.width);
+  const height = Number(v?.height);
+  if (!v || !Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    throw new Error(`ffprobe returned no usable image dimensions for ${file}`);
+  }
+  return { width, height };
+}
+
 /**
  * Streaming SHA-256 of a file's raw bytes (hex digest). Used by
  * `vedit ingest-batch` (src/ingest/batch.ts) for duplicate detection and
@@ -452,6 +512,66 @@ export interface IngestResult {
   timings: Record<string, number>;
 }
 
+/**
+ * Lightweight ingest for a still-image overlay source (Source.kind:'image' —
+ * see the "オーバーレイ・スタック" section above): probes dimensions only —
+ * no proxy, no waveform, no scene detection, no transcription, none of
+ * which apply to a still image. Unlike ingestFile's video path, the
+ * resulting source is NEVER added to `timeline.video` (an image has no
+ * A-roll role; it exists purely to be referenced by `vedit overlay-add`)
+ * and NEVER touches manifest-level fps/width/height, even when this is the
+ * very first source ingested into a brand new project — those describe the
+ * PROJECT's own canvas/frame rate, which a decorative overlay image must
+ * never redefine. `ingestFile` delegates here automatically for any file
+ * `isImageFile` recognizes, so both `vedit ingest <image>` and the daemon's
+ * generic `/api/ingest` route (which just calls `ingestFile`) already work
+ * for images with no daemon.ts changes needed.
+ */
+export async function ingestImageFile(
+  project: Project,
+  file: string,
+  opts: { sha256?: string; onProgress?: IngestProgress } = {},
+): Promise<IngestResult> {
+  const abs = path.resolve(file);
+  await fs.access(abs);
+  const notify = opts.onProgress ?? (() => {});
+  const timings: Record<string, number> = {};
+  const started = Date.now();
+  notify('probing (image)');
+  const p = await probeImage(abs);
+  timings.probeMs = Date.now() - started;
+  const id = freshId('src');
+  const source: Source = {
+    id,
+    path: abs,
+    duration: IMAGE_SOURCE_DURATION,
+    fps: 0,
+    width: p.width,
+    height: p.height,
+    hasAudio: false,
+    kind: 'image',
+    sha256: opts.sha256,
+  };
+  const summary = `ingested ${path.basename(abs)} (image, ${p.width}x${p.height})`;
+  const buildNext = (m: Manifest): Manifest => ({ ...m, sources: [...m.sources, source] });
+  // Same retry-on-STALE_REVISION loop as ingestFile's video path (see its
+  // doc below for why concurrent ingests need it) — the risk is identical
+  // here (ingest-batch never targets images, but overlay-add's auto-ingest
+  // and a plain `vedit ingest` on multiple image files can still race).
+  const MAX_STALE_RETRIES = 20;
+  for (let attempt = 0; ; attempt++) {
+    const cur = await project.manifest();
+    try {
+      await project.commit(cur.revision, 'system', 'ingest-image', { file: abs }, summary, buildNext);
+      break;
+    } catch (e: any) {
+      if (e?.code === 'STALE_REVISION' && attempt < MAX_STALE_RETRIES) continue;
+      throw e;
+    }
+  }
+  return { source, timings };
+}
+
 export async function ingestFile(
   project: Project,
   file: string,
@@ -492,6 +612,14 @@ export async function ingestFile(
     sha256?: string;
   } = {},
 ): Promise<IngestResult> {
+  // オーバーレイ・スタック: a PNG/JPEG/WebP routes to the lightweight
+  // image-only path instead — see ingestImageFile's doc above. language/
+  // transcribe/scenes/addToTimeline are all meaningless for a still image
+  // (no audio, no scenes, no A-roll role), so they're silently ignored
+  // rather than threaded through; sha256/onProgress still apply uniformly.
+  if (isImageFile(file)) {
+    return ingestImageFile(project, file, { sha256: opts.sha256, onProgress: opts.onProgress });
+  }
   const abs = path.resolve(file);
   await fs.access(abs);
   const notify = opts.onProgress ?? (() => {});

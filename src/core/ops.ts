@@ -898,7 +898,9 @@ export function buildSelectsTimeline(m: Manifest, sceneFiles: SceneFile[], opts?
   return result;
 }
 
-// ---- B-roll V2 overlay track (W3) ----
+// ---- B-roll V2 overlay track (W3), generalized into a multi-layer
+// ---- "overlay stack" (オーバーレイ・スタック,
+// ---- docs/superpowers/specs/2026-07-18-vedit-overlay-stack.md) ----
 //
 // Anchor rule (see OverlayClip in types.ts): an overlay stores WHERE it's
 // glued to the A-roll (anchor.sourceId + anchor.srcTime), never a timeline
@@ -906,6 +908,22 @@ export function buildSelectsTimeline(m: Manifest, sceneFiles: SceneFile[], opts?
 // sourceTimeToTimeline on demand through resolveOverlays/resolvedActiveOverlays
 // below — there is no cached/absolute tlStart anywhere in the manifest, so a
 // ripple edit to the A-roll can never leave a stale overlay position behind.
+//
+// W3 originally modeled ONE global non-overlapping overlay track (any two
+// overlays anywhere on the timeline had to be disjoint in time — "the B-roll
+// V2 track"). The overlay-stack mini-spec generalizes this to N independently
+// exclusive layers (OverlayClip.layer, defaulted to 1 via overlayLayerOf):
+// still no overlap WITHIN a layer (assertNoOverlayOverlap), but layers freely
+// overlap each other, letting a logo + a photo + a stamp all sit on screen at
+// once. `broll-add`/`broll-update` (daemon.ts) never set `layer`, so they
+// keep producing (and only ever collide within) layer 1 — "broll-add は
+// layer 1 の別名として整合", full regression for every project that never
+// touches `vedit overlay-add`'s --layer flag. This section also now accepts
+// Source.kind:'image' overlay sources (still PNG/JPEG/WebP, always mute — no
+// proxy/scenes/transcript, see ingestImageFile in src/ingest/ingest.ts) in
+// addition to the original video B-roll sources; render.ts branches on
+// Source.kind when building each overlay's ffmpeg chain (image inputs need
+// `-loop 1`, have no time dimension of their own to trim/PTS-shift).
 
 const OVERLAY_AUDIO_MODES = new Set(['mute', 'mix', 'replace']);
 
@@ -932,11 +950,22 @@ export interface ResolvedOverlay {
   tlEnd: number;
 }
 
+/** OverlayClip.layer, defaulted — every consumer that groups/sorts by layer goes through this single helper so "omitted means 1" stays consistent everywhere (assertNoOverlayOverlap, resolvedActiveOverlays' sort, otio.ts's per-layer tracks). */
+export function overlayLayerOf(o: OverlayClip): number {
+  return o.layer ?? 1;
+}
+
 /**
  * Non-orphan overlays with a resolved [tlStart, tlEnd) timeline placement,
- * sorted by tlStart — the only overlays render/view/OTIO ever touch. Orphans
- * (anchor cut away) are silently excluded here; see orphanedOverlays for the
- * warning-surface list.
+ * sorted by (layer ascending, then tlStart) — the z-order render/OTIO
+ * composite in (see buildFilterGraph's overlay-stack block in render.ts and
+ * otio.ts's per-layer V2..Vn tracks); `view.ts`/other tlStart-only consumers
+ * are unaffected by the secondary key. Every overlay defaults to layer 1
+ * (overlayLayerOf), so a project with no `layer` set anywhere (every
+ * pre-existing project, and every broll-add/-update call) collapses this
+ * back to a pure tlStart sort — byte-for-byte the same order as before this
+ * field existed. Orphans (anchor cut away) are silently excluded here; see
+ * orphanedOverlays for the warning-surface list.
  */
 export function resolvedActiveOverlays(m: Manifest): ResolvedOverlay[] {
   const out: ResolvedOverlay[] = [];
@@ -944,7 +973,7 @@ export function resolvedActiveOverlays(m: Manifest): ResolvedOverlay[] {
     if (r.tlStart === null) continue;
     out.push({ overlay: r.overlay, tlStart: r.tlStart, tlEnd: r.tlStart + (r.overlay.srcOut - r.overlay.srcIn) });
   }
-  out.sort((a, b) => a.tlStart - b.tlStart);
+  out.sort((a, b) => overlayLayerOf(a.overlay) - overlayLayerOf(b.overlay) || a.tlStart - b.tlStart);
   return out;
 }
 
@@ -966,27 +995,78 @@ function resolvedOverlayRange(m: Manifest, o: OverlayClip): { tlStart: number; t
 }
 
 /**
- * V2 is a single non-overlapping layer: reject an add/update whose RESOLVED
- * region collides with another overlay's resolved region. An orphan
+ * Each individual layer is a single non-overlapping track (オーバーレイ・
+ * スタック: "同一 layer 内は重複不可、レイヤー間は自由") — reject an
+ * add/update whose RESOLVED region collides with another overlay's resolved
+ * region ON THE SAME LAYER (overlayLayerOf, defaulted to 1). An orphan
  * candidate (unresolvable) has nothing to collide with and is always
  * allowed through — it just won't render/preview/export until re-anchored.
+ * Every pre-existing overlay (and every broll-add/-update call, which never
+ * sets `layer`) defaults to layer 1, so this stays byte-for-byte the
+ * original "one global non-overlapping track" check for any project that
+ * never touches layers.
  */
 function assertNoOverlayOverlap(m: Manifest, candidate: OverlayClip, excludeId?: string): void {
   const range = resolvedOverlayRange(m, candidate);
   if (!range) return;
+  const candidateLayer = overlayLayerOf(candidate);
   for (const o of m.timeline.overlays ?? []) {
     if (o.id === excludeId) continue;
+    if (overlayLayerOf(o) !== candidateLayer) continue;
     const other = resolvedOverlayRange(m, o);
     if (!other) continue;
     if (range.tlStart < other.tlEnd && other.tlStart < range.tlEnd) {
       throw new Error(
-        `broll: overlaps existing overlay ${o.id} (${other.tlStart.toFixed(2)}-${other.tlEnd.toFixed(2)}s); the B-roll V2 track allows no overlap`,
+        `broll: overlaps existing overlay ${o.id} on layer ${candidateLayer} (${other.tlStart.toFixed(2)}-${other.tlEnd.toFixed(2)}s); a single layer allows no overlap (use a different --layer to stack)`,
       );
     }
   }
 }
 
-/** Add a B-roll overlay clip, anchored to an A-roll moment (see OverlayClip). Validates finiteness, srcIn<srcOut, both sources exist, and no overlap with an existing overlay's resolved region. */
+const OVERLAY_LAYER_MIN = 1;
+const OVERLAY_LAYER_MAX = 1000;
+
+/** Validate an explicit OverlayClip.layer value (addOverlay/updateOverlay). Absent/undefined is always valid (defaults to 1 — see overlayLayerOf) and never reaches this function. */
+function assertOverlayLayer(layer: number, label: string): void {
+  if (!Number.isInteger(layer) || layer < OVERLAY_LAYER_MIN || layer > OVERLAY_LAYER_MAX) {
+    throw new Error(`${label}: layer (${layer}) must be an integer between ${OVERLAY_LAYER_MIN} and ${OVERLAY_LAYER_MAX}`);
+  }
+}
+
+/** Validate an explicit OverlayClip.rect value (addOverlay/updateOverlay): x/y/w each 0..1, and the box must not run off the canvas's right/bottom edge (x+w<=1; height is derived from source aspect at render time, so it can't be checked here). */
+function assertOverlayRect(rect: { x: number; y: number; w: number }, label: string): void {
+  assertUnit(rect.x, label, 'rect.x');
+  assertUnit(rect.y, label, 'rect.y');
+  if (!Number.isFinite(rect.w) || rect.w <= 0 || rect.w > 1) {
+    throw new Error(`${label}: rect.w (${rect.w}) must be a finite number between 0 (exclusive) and 1`);
+  }
+  if (rect.x + rect.w > 1 + 1e-9) {
+    throw new Error(`${label}: rect.x + rect.w (${(rect.x + rect.w).toFixed(3)}) must not exceed 1 (the box would run off the canvas's right edge)`);
+  }
+}
+
+/** Validate an explicit OverlayClip.fade value (addOverlay/updateOverlay): in/out each finite and >= 0 when given; at least one key must be present. */
+function assertOverlayFade(fade: { in?: number; out?: number }, label: string): void {
+  if (fade.in === undefined && fade.out === undefined) {
+    throw new Error(`${label}: fade must set at least one of "in"/"out"`);
+  }
+  if (fade.in !== undefined && (!Number.isFinite(fade.in) || fade.in < 0)) {
+    throw new Error(`${label}: fade.in (${fade.in}) must be a finite number >= 0`);
+  }
+  if (fade.out !== undefined && (!Number.isFinite(fade.out) || fade.out < 0)) {
+    throw new Error(`${label}: fade.out (${fade.out}) must be a finite number >= 0`);
+  }
+}
+
+/**
+ * Add an overlay clip (B-roll video OR — オーバーレイ・スタック — a still
+ * image), anchored to an A-roll moment (see OverlayClip). Validates
+ * finiteness, srcIn<srcOut, both sources exist, layer/rect/opacity/fade
+ * shape, and no same-layer overlap with an existing overlay's resolved
+ * region. `broll-add` (daemon.ts) calls this with none of
+ * layer/rect/opacity/fade set, which is exactly the pre-stack behavior —
+ * "layer 1 の別名".
+ */
 export function addOverlay(
   m: Manifest,
   sourceId: string,
@@ -997,6 +1077,10 @@ export function addOverlay(
     audioMode?: 'mute' | 'mix' | 'replace';
     gainDb?: number;
     id?: string;
+    layer?: number;
+    rect?: { x: number; y: number; w: number };
+    opacity?: number;
+    fade?: { in?: number; out?: number };
   },
 ): Manifest {
   const src = m.sources.find((s) => s.id === sourceId);
@@ -1018,7 +1102,18 @@ export function addOverlay(
   if (!OVERLAY_AUDIO_MODES.has(audioMode)) {
     throw new Error(`broll-add: audioMode (${JSON.stringify(audioMode)}) must be "mute", "mix", or "replace"`);
   }
+  // オーバーレイ・スタック: a still image is always silent (no audio stream
+  // exists to mix/replace with) — reject the mismatch loudly instead of
+  // silently downgrading to mute, so a caller doesn't think --audio mix
+  // actually did something for an image overlay.
+  if (src.kind === 'image' && audioMode !== 'mute') {
+    throw new Error(`broll-add: source ${sourceId} is an image (Source.kind:'image') — audioMode must be "mute" (images have no audio)`);
+  }
   if (opts.gainDb !== undefined) assertGain(opts.gainDb, 'broll-add');
+  if (opts.layer !== undefined) assertOverlayLayer(opts.layer, 'broll-add');
+  if (opts.rect !== undefined) assertOverlayRect(opts.rect, 'broll-add');
+  if (opts.opacity !== undefined) assertUnit(opts.opacity, 'broll-add', 'opacity');
+  if (opts.fade !== undefined) assertOverlayFade(opts.fade, 'broll-add');
   const overlays = m.timeline.overlays ?? [];
   const id = opts.id ?? freshId('ov');
   if (overlays.some((o) => o.id === id)) throw new Error(`broll-add: overlay id already exists: ${id}`);
@@ -1030,12 +1125,25 @@ export function addOverlay(
     anchor: { sourceId: opts.anchor.sourceId, srcTime: opts.anchor.srcTime },
     audioMode: audioMode as 'mute' | 'mix' | 'replace',
     ...(opts.gainDb !== undefined ? { gainDb: opts.gainDb } : {}),
+    ...(opts.layer !== undefined ? { layer: opts.layer } : {}),
+    ...(opts.rect !== undefined ? { rect: opts.rect } : {}),
+    ...(opts.opacity !== undefined ? { opacity: opts.opacity } : {}),
+    ...(opts.fade !== undefined ? { fade: opts.fade } : {}),
   };
   assertNoOverlayOverlap(m, item);
   return { ...m, timeline: { ...m.timeline, overlays: [...overlays, item] } };
 }
 
-/** Patch an existing overlay's range/anchor/audio fields (never its B-roll sourceId). Re-anchoring (patch.anchor) is how a user fixes an orphaned overlay. */
+/**
+ * Patch an existing overlay's range/anchor/audio/layer/rect/opacity/fade
+ * fields (never its B-roll sourceId). Re-anchoring (patch.anchor) is how a
+ * user fixes an orphaned overlay. `layer`/`rect`/`opacity`/`fade` follow
+ * this codebase's null-clears/undefined-leaves-unchanged convention (same
+ * as updateDialogue's `pos`/`spriteId`): passing `null` removes the field
+ * (back to its default — full-bleed for rect, 1 for layer/opacity, no fade),
+ * omitting it leaves the current value untouched, a value replaces it
+ * outright.
+ */
 export function updateOverlay(
   m: Manifest,
   id: string,
@@ -1045,6 +1153,10 @@ export function updateOverlay(
     anchor?: { sourceId: string; srcTime: number };
     audioMode?: 'mute' | 'mix' | 'replace';
     gainDb?: number;
+    layer?: number | null;
+    rect?: { x: number; y: number; w: number } | null;
+    opacity?: number | null;
+    fade?: { in?: number; out?: number } | null;
   },
 ): Manifest {
   const overlays = m.timeline.overlays ?? [];
@@ -1080,9 +1192,44 @@ export function updateOverlay(
     }
     next.audioMode = patch.audioMode;
   }
+  if (src.kind === 'image' && next.audioMode !== 'mute') {
+    throw new Error(`broll-update: source ${cur.sourceId} is an image (Source.kind:'image') — audioMode must be "mute" (images have no audio)`);
+  }
   if (patch.gainDb !== undefined) {
     assertGain(patch.gainDb, 'broll-update');
     next.gainDb = patch.gainDb;
+  }
+  if (patch.layer !== undefined) {
+    if (patch.layer === null) {
+      delete next.layer;
+    } else {
+      assertOverlayLayer(patch.layer, 'broll-update');
+      next.layer = patch.layer;
+    }
+  }
+  if (patch.rect !== undefined) {
+    if (patch.rect === null) {
+      delete next.rect;
+    } else {
+      assertOverlayRect(patch.rect, 'broll-update');
+      next.rect = patch.rect;
+    }
+  }
+  if (patch.opacity !== undefined) {
+    if (patch.opacity === null) {
+      delete next.opacity;
+    } else {
+      assertUnit(patch.opacity, 'broll-update', 'opacity');
+      next.opacity = patch.opacity;
+    }
+  }
+  if (patch.fade !== undefined) {
+    if (patch.fade === null) {
+      delete next.fade;
+    } else {
+      assertOverlayFade(patch.fade, 'broll-update');
+      next.fade = patch.fade;
+    }
   }
   assertNoOverlayOverlap(m, next, id);
   const out = [...overlays];
@@ -1098,15 +1245,63 @@ export function removeOverlay(m: Manifest, id: string): Manifest {
   return { ...m, timeline: { ...m.timeline, overlays: next } };
 }
 
+/**
+ * Non-blocking advisories for the overlay stack's spec-required warnings —
+ * "タイムライン終端をはみ出すオーバーレイ/出力比率と極端に合わない画像...は
+ * warnings[] へ". Pure function of the manifest, shared by qc.ts's
+ * staticChecks (as QcIssue) and render.ts's renderFinal (as a plain string
+ * pushed onto its own `warnings` array) so the two surfaces never drift.
+ * Two independent checks per resolved (non-orphan) overlay:
+ *  - "overflow": the overlay's resolved [tlStart,tlEnd) extends past the
+ *    timeline's own end — the main video branch stops at timelineDuration(m)
+ *    regardless, so the overlay would silently get cut short.
+ *  - "aspect mismatch": a FULL-BLEED overlay (no `rect` — the only case
+ *    that stretches/pads to fill the whole canvas) whose source is a
+ *    different ORIENTATION (portrait vs landscape) than the output canvas —
+ *    e.g. a portrait photo forced full-bleed onto a 16:9 output. An overlay
+ *    WITH `rect` is exempt: its box always preserves the source's own aspect
+ *    ratio (see overlayRectGeometry in render.ts), so there's nothing to
+ *    warn about there.
+ */
+export function overlayGeometryWarnings(m: Manifest): string[] {
+  const output = m.output ?? { width: m.width, height: m.height };
+  const total = timelineDuration(m);
+  const srcById = new Map(m.sources.map((s) => [s.id, s]));
+  const warnings: string[] = [];
+  for (const r of resolvedActiveOverlays(m)) {
+    const ov = r.overlay;
+    if (r.tlEnd > total + 1e-6) {
+      warnings.push(
+        `オーバーレイ ${ov.id}: タイムライン終端(${total.toFixed(2)}s)を超えて${r.tlEnd.toFixed(2)}sまで配置されています(はみ出し分は書き出しに反映されません)`,
+      );
+    }
+    if (!ov.rect) {
+      const src = srcById.get(ov.sourceId);
+      if (src && src.width > 0 && src.height > 0) {
+        const srcLandscape = src.width >= src.height;
+        const outLandscape = output.width >= output.height;
+        if (srcLandscape !== outLandscape) {
+          warnings.push(
+            `オーバーレイ ${ov.id}: 素材(${src.width}x${src.height})の向きが出力(${output.width}x${output.height})と異なり --rect 未指定のため全面表示されます(引き伸ばし/レターボックスに注意)`,
+          );
+        }
+      }
+    }
+  }
+  return warnings;
+}
+
 // ---- sprite overlays (W8 kit) ----
 //
 // Character/prop sprites anchored to an A-roll moment via the SAME
 // (sourceId, srcTime) contract as B-roll overlays above —
 // resolveSprites/resolvedActiveSprites/orphanedSprites mirror
 // resolveOverlays/resolvedActiveOverlays/orphanedOverlays exactly. Unlike
-// the B-roll V2 track, sprites are NOT a single exclusive layer: multiple
-// sprites may resolve to overlapping timeline ranges (more than one
-// character on screen at once), so there is no overlap check here.
+// each individual B-roll overlay layer (a single layer is still exclusive —
+// see assertNoOverlayOverlap — but distinct layers may overlap, オーバー
+// レイ・スタック), sprites have no layer concept at all: multiple sprites
+// may resolve to overlapping timeline ranges (more than one character on
+// screen at once), so there is no overlap check here whatsoever.
 // `assetId` is validated by the caller (daemon.ts), not here — this module
 // has no access to the linked kit's asset list, only Manifest.kit.path.
 

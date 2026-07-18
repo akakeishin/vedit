@@ -43,6 +43,8 @@ import {
   buildRepairChain,
   loudnormClause,
   overlayAudioClause,
+  overlayImageVideoClause,
+  overlayRectGeometry,
   overlayVideoClause,
   planExportPreset,
   renderComposition,
@@ -682,6 +684,157 @@ describe('overlayVideoClause / overlayAudioClause (pure helpers)', () => {
     const clause = overlayAudioClause(2, 0, 0, 2, 1.2345, -18);
     expect(clause).toBe('[2:a]atrim=start=0:end=2,asetpts=PTS-STARTPTS,adelay=1235:all=1,volume=-18dB[ova0]');
   });
+
+  it('overlayVideoClause with an EMPTY opts object reproduces the exact same legacy chain as no opts arg at all', () => {
+    expect(overlayVideoClause(1, 0, 0, 2, 5, 1920, 1080, 1920, 1080, 30, {})).toBe(
+      overlayVideoClause(1, 0, 0, 2, 5, 1920, 1080, 1920, 1080, 30),
+    );
+  });
+});
+
+// ---- オーバーレイ・スタック: overlayRectGeometry / overlayVideoClause+opts / overlayImageVideoClause (pure helpers) ----
+
+describe('overlayRectGeometry (pure)', () => {
+  it('with no rect, returns the full output canvas (the original W3 full-bleed geometry)', () => {
+    expect(overlayRectGeometry(undefined, 1920, 1080, 1920, 1080)).toEqual({ x: 0, y: 0, w: 1920, h: 1080 });
+    expect(overlayRectGeometry(undefined, 400, 800, 1080, 1920)).toEqual({ x: 0, y: 0, w: 1080, h: 1920 });
+  });
+
+  it('with a rect, width comes from rect.w * outW and height preserves the SOURCE aspect ratio (not the box/output aspect)', () => {
+    // source 400x200 (2:1) at rect.w=0.5 of a 1920-wide canvas -> w=960, h = 960 * (200/400) = 480.
+    const geo = overlayRectGeometry({ x: 0.1, y: 0.2, w: 0.5 }, 400, 200, 1920, 1080);
+    expect(geo.w).toBe(960);
+    expect(geo.h).toBe(480);
+    expect(geo.x).toBe(Math.round(0.1 * 1920));
+    expect(geo.y).toBe(Math.round(0.2 * 1080));
+  });
+
+  it('rounds width and height to even pixel counts (encoder chroma-subsampling requirement)', () => {
+    const geo = overlayRectGeometry({ x: 0, y: 0, w: 0.333 }, 401, 199, 1920, 1080);
+    expect(geo.w % 2).toBe(0);
+    expect(geo.h % 2).toBe(0);
+  });
+});
+
+describe('overlayVideoClause with rect/opacity/fade (extended path — never touched by the legacy no-opts path)', () => {
+  it('a rect (no opacity/fade) scales to the rect box and shifts PTS in two stages (local geometry, THEN absolute tlStart shift)', () => {
+    const clause = overlayVideoClause(1, 0, 0, 2, 5, 400, 200, 1920, 1080, 30, { rect: { x: 0, y: 0, w: 0.5 } });
+    expect(clause).toBe('[1:v]trim=start=0:end=2,setpts=PTS-STARTPTS,scale=960:480,fps=30,setpts=PTS+5/TB[ov0]');
+  });
+
+  it('opacity < 1 (no rect, no fade) keeps full-bleed geometry but adds format=rgba + colorchannelmixer, applied in the LOCAL domain before the tlStart shift', () => {
+    const clause = overlayVideoClause(1, 0, 0, 2, 5, 1920, 1080, 1920, 1080, 30, { opacity: 0.5 });
+    expect(clause).toBe(
+      '[1:v]trim=start=0:end=2,setpts=PTS-STARTPTS,scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,fps=30,format=rgba,colorchannelmixer=aa=0.5,setpts=PTS+5/TB[ov0]',
+    );
+  });
+
+  it('opacity of exactly 1 is treated as "no opacity" (byte-for-byte legacy chain) — only opacity < 0.999 triggers the extended path', () => {
+    const clause = overlayVideoClause(1, 0, 0, 2, 5, 1920, 1080, 1920, 1080, 30, { opacity: 1 });
+    expect(clause).toBe(overlayVideoClause(1, 0, 0, 2, 5, 1920, 1080, 1920, 1080, 30));
+  });
+
+  it('fade.in/fade.out land at LOCAL clip time (0 and duration-fadeOut), not the shifted absolute tlStart', () => {
+    // srcIn=0, srcOut=4 -> local duration 4; fade.out=1 -> st=4-1=3, all BEFORE the trailing tlStart shift.
+    const clause = overlayVideoClause(1, 0, 0, 4, 7, 1920, 1080, 1920, 1080, 30, { fade: { in: 0.5, out: 1 } });
+    expect(clause).toContain('fade=t=in:st=0:d=0.5:alpha=1');
+    expect(clause).toContain('fade=t=out:st=3:d=1:alpha=1');
+    expect(clause.endsWith(',setpts=PTS+7/TB[ov0]')).toBe(true);
+  });
+
+  it('a rect + opacity + fade all combine into one chain', () => {
+    const clause = overlayVideoClause(1, 0, 0, 2, 5, 400, 200, 1920, 1080, 30, {
+      rect: { x: 0, y: 0, w: 0.5 }, opacity: 0.8, fade: { in: 0.3 },
+    });
+    expect(clause).toBe(
+      '[1:v]trim=start=0:end=2,setpts=PTS-STARTPTS,scale=960:480,fps=30,format=rgba,fade=t=in:st=0:d=0.3:alpha=1,colorchannelmixer=aa=0.8,setpts=PTS+5/TB[ov0]',
+    );
+  });
+});
+
+describe('overlayImageVideoClause (still-image overlay chain — オーバーレイ・スタック)', () => {
+  it('has no trim/setpts at all (a looped still image presents the same frame at every timestamp)', () => {
+    const clause = overlayImageVideoClause(1, 0, 400, 200, 1920, 1080, 30, 3);
+    expect(clause).not.toMatch(/trim=|setpts=/);
+  });
+
+  it('full-bleed (no rect) uses the same letterbox scale+pad geometry as the video path, and ALWAYS carries format=rgba even with no opacity/fade', () => {
+    // 1600x900 shares the SAME aspect ratio as the 1920x1080 output (both 16:9), so cropGeometry
+    // contributes no crop= clause here — isolates the scale/pad/format assertion from the
+    // separate crop-on-mismatch behavior (already covered by overlayVideoClause's own test).
+    const clause = overlayImageVideoClause(1, 0, 1600, 900, 1920, 1080, 30, 3);
+    expect(clause).toBe('[1:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,fps=30,format=rgba[ov0]');
+  });
+
+  it('a rect scales to the rect box (no padding — the box already preserves the source aspect ratio)', () => {
+    const clause = overlayImageVideoClause(1, 0, 400, 200, 1920, 1080, 30, 3, { rect: { x: 0.1, y: 0.1, w: 0.5 } });
+    expect(clause).toBe('[1:v]scale=960:480,fps=30,format=rgba[ov0]');
+  });
+
+  it('fade.out is computed against the passed displayDuration (the overlay\'s own srcOut-srcIn), not the source\'s huge sentinel duration', () => {
+    const clause = overlayImageVideoClause(1, 0, 400, 200, 1920, 1080, 30, 5, { fade: { out: 2 } });
+    expect(clause).toContain('fade=t=out:st=3:d=2:alpha=1'); // st = displayDuration(5) - fadeOut(2)
+  });
+
+  it('opacity is applied after format=rgba/fade, exactly once', () => {
+    const clause = overlayImageVideoClause(1, 0, 400, 200, 1920, 1080, 30, 3, { opacity: 0.4 });
+    expect(clause.match(/colorchannelmixer=aa=0\.4/g)).toHaveLength(1);
+    expect(clause.match(/format=rgba/g)).toHaveLength(1); // never duplicated between the fx clause and the always-on fallback
+  });
+});
+
+// ---- buildFilterGraph: overlay stack — layers overlapping in time, and image-kind sources ----
+
+describe('buildFilterGraph: overlay stack (layers + image sources)', () => {
+  it('two overlays on DIFFERENT layers with the SAME resolved time range both composite (layer 2 stacks after/above layer 1)', () => {
+    let m = baseManifest();
+    m = { ...m, sources: [...m.sources, { id: 's2', path: '/broll.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: false }] };
+    m = addOverlay(m, 's2', { id: 'low', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 1 }, layer: 1 });
+    m = addOverlay(m, 's2', { id: 'high', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 1 }, layer: 2 });
+    const built = buildFilterGraph(m);
+    // Both overlap tl[1,3) — layer 1 composites first (n=0), layer 2 on top of it (n=1), chained onto [ovc0].
+    expect(built.graph).toContain("[vc][ov0]overlay=enable='between(t,1,3)'[ovc0]");
+    expect(built.graph).toContain("[ovc0][ov1]overlay=enable='between(t,1,3)'[ovc1]");
+    expect(built.videoLabel).toBe('[ovc1]');
+  });
+
+  it('an image-kind overlay source records its input index for -loop 1 (spriteInputIndices), and its chain has no trim/setpts', () => {
+    let m = baseManifest();
+    m = { ...m, sources: [...m.sources, { id: 'img1', path: '/logo.png', duration: 86400, fps: 0, width: 400, height: 200, hasAudio: false, kind: 'image' }] };
+    m = addOverlay(m, 'img1', { id: 'ov1', srcIn: 0, srcOut: 3, anchor: { sourceId: 's1', srcTime: 1 } });
+    const built = buildFilterGraph(m);
+    expect(built.inputPaths).toEqual(['/x.mp4', '/logo.png']);
+    expect(built.spriteInputIndices).toEqual([1]); // index of /logo.png
+    expect(built.graph).not.toMatch(/\[1:v\]trim=|\[1:v\].*setpts=/);
+    // shortest=1 is REQUIRED for an image-kind overlay: its `-loop 1` input
+    // never reaches EOF, so without this the render hangs forever on real
+    // ffmpeg (verified empirically — see the doc comment at this call site
+    // in render.ts). A video-kind overlay never gets this (see the
+    // 'overlayVideoClause / overlayAudioClause' describe block above).
+    expect(built.graph).toContain("overlay=shortest=1:enable='between(t,1,4)'");
+  });
+
+  it('an image overlay never triggers the audio-mix branch even though ops.ts already forces its audioMode to mute (hasAudio:false is the actual regression guard here)', () => {
+    let m = baseManifest();
+    m = { ...m, sources: [...m.sources, { id: 'img1', path: '/logo.png', duration: 86400, fps: 0, width: 400, height: 200, hasAudio: false, kind: 'image' }] };
+    m = addOverlay(m, 'img1', { id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 1 } });
+    const built = buildFilterGraph(m);
+    expect(built.audioLabel).toBe('[ac]');
+    expect(built.graph).not.toMatch(/amix|\bova0\b/);
+  });
+
+  it('a video overlay with a rect gets an explicit x=..:y=.. on the outer overlay filter; without a rect the enable clause has no x=/y= at all (legacy)', () => {
+    let m = baseManifest();
+    m = { ...m, sources: [...m.sources, { id: 's2', path: '/broll.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: false }] };
+    const withRect = addOverlay(m, 's2', { id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 1 }, rect: { x: 0.1, y: 0.1, w: 0.2 } });
+    const builtRect = buildFilterGraph(withRect);
+    expect(builtRect.graph).toMatch(/overlay=x=\d+:y=\d+:enable='between/);
+
+    const noRect = addOverlay(m, 's2', { id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 1 } });
+    const builtNoRect = buildFilterGraph(noRect);
+    expect(builtNoRect.graph).toContain("overlay=enable='between(t,1,3)'");
+    expect(builtNoRect.graph).not.toMatch(/overlay=x=/);
+  });
 });
 
 // ---- buildFilterGraph: W8 kit sprite compositing ----
@@ -753,7 +906,11 @@ describe('buildFilterGraph: W8 kit sprite compositing', () => {
     // asset aspect 200/400=0.5, scale 0.5 * output height 1080 -> display/full height 540, full width 270.
     expect(built.graph).toContain('[1:v]scale=270:540,format=rgba[sv0]');
     // ground_anchor (0.5,1) of the 270x540 image at position (0.5,1)*1920x1080=(960,1080) -> top-left (960-135, 1080-540)=(825,540).
-    expect(built.graph).toContain("[vc][sv0]overlay=x=825:y=540:enable='between(t,2,5)'[svc0]");
+    // shortest=1 is REQUIRED here: a sprite's `-loop 1` PNG input never
+    // reaches EOF, so without this the render hangs forever on real ffmpeg
+    // (pre-existing bug, found/fixed via the overlay stack's real-ffmpeg
+    // verification — see the doc comment at this call site in render.ts).
+    expect(built.graph).toContain("[vc][sv0]overlay=x=825:y=540:shortest=1:enable='between(t,2,5)'[svc0]");
     expect(built.videoLabel).toBe('[svc0]');
   });
 
@@ -1538,7 +1695,9 @@ describe('renderFinal: W8 kit (styles + sprites)', () => {
     expect(args[pngIdx - 2]).toBe('1');
     expect(args[pngIdx - 3]).toBe('-loop');
     const graph = args[args.indexOf('-filter_complex') + 1];
-    expect(graph).toMatch(/overlay=x=\d+:y=\d+:enable='between\(t,2,5\)'/);
+    // shortest=1: required so a real render never hangs on the sprite's
+    // infinite `-loop 1` PNG input (see render.ts's doc comment there).
+    expect(graph).toMatch(/overlay=x=\d+:y=\d+:shortest=1:enable='between\(t,2,5\)'/);
   });
 
   it('warns that sprite/motion animation renders static in a normal (non-composition) project export (HANDOFF §5)', async () => {

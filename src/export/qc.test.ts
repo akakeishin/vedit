@@ -30,6 +30,7 @@ import {
   checkKitDuration,
   checkMediaFilesExist,
   checkOrphans,
+  checkOverlayGeometry,
   checkPendingQueues,
   parseAstatsOverall,
   parseBlackDetect,
@@ -319,6 +320,47 @@ describe('checkOrphans', () => {
       },
     });
     expect(checkOrphans(m)).toEqual([]);
+  });
+});
+
+describe('checkOverlayGeometry (オーバーレイ・スタック)', () => {
+  it('returns [] for a manifest with no overlays', () => {
+    expect(checkOverlayGeometry(manifest())).toEqual([]);
+  });
+
+  it('warns (category overlay-geometry, severity warning) when an overlay extends past the timeline\'s own end', () => {
+    const m = manifest({
+      sources: [
+        { id: 's1', path: '/media/one.mp4', duration: 60, fps: 30, width: 1920, height: 1080, hasAudio: true },
+        { id: 's2', path: '/media/broll.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: true },
+      ],
+      timeline: {
+        video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 10 }],
+        motion: [],
+        overlays: [{ id: 'ov1', sourceId: 's2', srcIn: 0, srcOut: 5, anchor: { sourceId: 's1', srcTime: 8 }, audioMode: 'mute' }], // tl[8,13) — past tl end 10
+      },
+    });
+    const issues = checkOverlayGeometry(m);
+    expect(issues).toHaveLength(1);
+    expect(issues[0].category).toBe('overlay-geometry');
+    expect(issues[0].severity).toBe('warning');
+    expect(issues[0].message).toContain('ov1');
+  });
+
+  it('is wired into staticChecks (a real render/qc pass surfaces the same warning)', async () => {
+    const m = manifest({
+      sources: [
+        { id: 's1', path: '/media/one.mp4', duration: 60, fps: 30, width: 1920, height: 1080, hasAudio: true },
+        { id: 'img1', path: '/media/portrait.png', duration: 86400, fps: 0, width: 400, height: 800, hasAudio: false, kind: 'image' },
+      ],
+      timeline: {
+        video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 10 }],
+        motion: [],
+        overlays: [{ id: 'ov1', sourceId: 'img1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 1 }, audioMode: 'mute' }],
+      },
+    });
+    const report = await staticChecks(m, []);
+    expect(report.issues.some((i) => i.category === 'overlay-geometry')).toBe(true);
   });
 });
 

@@ -327,6 +327,16 @@ describe('buildMaterials', () => {
     expect(materials.keptWordCount).toBe(2);
     expect(materials.captionsCueCount).toBeGreaterThan(0);
   });
+
+  it('excludes kind:"image" overlay sources from the sources list (a synthetic ~24h duration would read as bogus footage length)', () => {
+    const m = baseManifest({ srcDuration: 10, clipOut: 10 });
+    m.sources = [
+      ...m.sources,
+      { id: 'img1', path: '/media/logo.png', duration: 86400, fps: 0, width: 400, height: 200, hasAudio: false, kind: 'image' },
+    ];
+    const materials = buildMaterials(m, [], []);
+    expect(materials.sources).toEqual([{ file: 'a.mp4', duration: 10 }]);
+  });
 });
 
 // ---- publishPack (integration: real Project on a tmpdir, ffmpeg mocked) ----

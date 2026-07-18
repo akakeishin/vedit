@@ -253,12 +253,22 @@ export interface PublishMaterials {
   captionsCueCount: number;
 }
 
-/** Factual material for the director to draft a title/description from in conversation — never a generated description itself. */
+/**
+ * Factual material for the director to draft a title/description from in
+ * conversation — never a generated description itself. `sources` lists only
+ * `kind !== 'image'` sources (i.e. real footage): an image-kind overlay
+ * source (オーバーレイ・スタック, logo/photo/stamp material) carries a
+ * synthetic `duration` (see IMAGE_SOURCE_DURATION in ingest.ts) that would
+ * read as bogus/misleading "footage length" here — it isn't material for a
+ * title/description in the way an actual filmed source is. Every project
+ * with no image sources (i.e. every project before this feature existed) is
+ * unaffected — full regression.
+ */
 export function buildMaterials(m: Manifest, transcripts: Transcript[], chapterLines: string[]): PublishMaterials {
   return {
     duration: timelineDuration(m),
     chapterList: chapterLines,
-    sources: m.sources.map((s) => ({ file: path.basename(s.path), duration: s.duration })),
+    sources: m.sources.filter((s) => s.kind !== 'image').map((s) => ({ file: path.basename(s.path), duration: s.duration })),
     keptWordCount: transcripts.reduce((a, t) => a + keptWords(m, t.sourceId, t.words).length, 0),
     captionsCueCount: captionCues(m, transcripts).length,
   };

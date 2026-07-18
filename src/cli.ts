@@ -17,7 +17,7 @@ import {
 import { listProjects } from './core/registry.js';
 import { loadPreset, listPresets, savePreset } from './core/presets.js';
 import { renderView, renderSceneSheet } from './export/view.js';
-import { hasReframe, writeOtio } from './export/otio.js';
+import { hasOverlayTransform, hasReframe, writeOtio } from './export/otio.js';
 import { loadMotionSpecs, renderComposition, renderFinal, renderRangePreview, toAss } from './export/render.js';
 import { forkProject } from './core/fork.js';
 import { planGc, runGc } from './core/gc.js';
@@ -31,7 +31,7 @@ import {
   type TempoFacts,
 } from './export/qc.js';
 import { writeSrt } from './export/srt.js';
-import { downloadWhisperModel, findWhisperModel, sha256File } from './ingest/ingest.js';
+import { downloadWhisperModel, findWhisperModel, isImageFile, sha256File } from './ingest/ingest.js';
 import { proposeColorMatch } from './export/color.js';
 import {
   buildPlan,
@@ -77,7 +77,7 @@ const BOOLEAN_FLAGS = new Set([
   'no-repair', 'fast-loudnorm', 'deess', 'confirm',
   'plan', 'link', 'no-verify', 'force', 'flip', 'no-flip',
   'clear', 'no-motion', 'no-sprite', 'no-pos', 'raw', 'keep-duration', 'sfx',
-  'yes', 'dry-run', 'mute', 'no-mute',
+  'yes', 'dry-run', 'mute', 'no-mute', 'no-rect', 'no-fade',
 ]);
 const argv = process.argv.slice(2);
 const cmd = argv[0];
@@ -343,6 +343,21 @@ function parseEmoteAt(raw: string): { t: number; assetId: string }[] {
   });
 }
 
+/** `--rect x,y,w` -> {x,y,w} (0..1 normalized against the output canvas — see OverlayClip.rect) — overlay-add/overlay-update share this. */
+function parseOverlayRectFlag(raw: string): { x: number; y: number; w: number } {
+  const parts = raw.split(',');
+  if (parts.length !== 3) fail(`--rect must be "x,y,w" (got ${JSON.stringify(raw)})`);
+  return { x: numArg('--rect x', parts[0]), y: numArg('--rect y', parts[1]), w: numArg('--rect w', parts[2]) };
+}
+
+/** Collect `--fade-in`/`--fade-out` into an OverlayClip.fade patch, or undefined when neither was given — overlay-add/overlay-update share this. */
+function overlayFadeFromFlags(): { in?: number; out?: number } | undefined {
+  const fadeIn = numFlag('fade-in', flags['fade-in']);
+  const fadeOut = numFlag('fade-out', flags['fade-out']);
+  if (fadeIn === undefined && fadeOut === undefined) return undefined;
+  return { ...(fadeIn !== undefined ? { in: fadeIn } : {}), ...(fadeOut !== undefined ? { out: fadeOut } : {}) };
+}
+
 /** Collect `--enter`/`--loop`/`--exit`/`--emote-at` into a SpriteItem.motion patch (W-ANIME), or undefined when none were given — sprite-add/sprite-update share this. */
 function spriteMotionFromFlags(): Record<string, unknown> | undefined {
   const motion: Record<string, unknown> = {};
@@ -369,6 +384,7 @@ notes:     note "<text>" [--type policy|decision|todo|pref]   # 低摩擦メモ(
              # 未完了todo全件・直近decision2件を自動で拾う
 ingest:    ingest <file...> [--language ja] [--transcribe] [--no-scenes] [--no-add]
              # 既定: プロキシ+波形+シーン検出まで(文字起こしはしない)。旧挙動(即時transcribe)は --transcribe
+             # 画像ファイル(png/jpg/jpeg/webp)は probe のみ(kind:'image'。オーバーレイ素材用、timelineには追加されない)
            ingest-batch <dir|files...> [--plan] [--copy destDir | --link] [--no-verify]
              [--language ja] [--transcribe] [--no-scenes] [--no-add]   # 撮影カード一括取込、検証付き・再開可能
 transcribe: transcribe <sourceId|all> [--language ja] [--glossary "語1,語2,..."]
@@ -412,6 +428,14 @@ broll:     broll-add <brollSourceId> [--in s --out s | --scene sX]
              (--at-word wXXXX [--source aRollSrc] | --at-src aRollSrc t | --at-tl t)
              [--audio mute|mix|replace] [--gain -18] --base <rev>        # B-roll V2 トラック(重複不可・話者音声に張り付く)
            broll-update <id> [同フラグ] --base <rev> | broll-remove <id> --base <rev>
+             # broll-add は overlay-add の layer 1 の別名として引き続き動作(挙動不変)
+overlay:   overlay-add <sourceId|画像ファイル> --at <アンカー> [--dur s | --in s --out s | --scene sX]
+             [--rect x,y,w] [--layer N(既定1)] [--opacity 0..1] [--fade-in s] [--fade-out s]
+             [--audio mute|mix|replace] [--gain -18] --base <rev>
+             # オーバーレイ・スタック: 複数レイヤーの画像/動画重ね(同一layer内は重複不可・レイヤー間は自由)
+             # 画像ファイル(png/jpg/jpeg/webp)を直接指定すると自動 ingest(kind:'image')してから配置。画像は常に無音
+             # --rect x,y,w は 0..1 正規化(縦は元画像比率を維持)。省略時は現行どおり全面表示
+           overlay-update <id> [同フラグ] [--no-rect] [--no-fade] --base <rev> | overlay-remove <id> --base <rev>
 kit:       kit-init <dir> [--name n]                  # 雛形生成(kit.json + GUIDE.md + fonts/ + assets/{characters,backgrounds,props})
            kit-link <dir> --base <rev> | kit-unlink --base <rev> | kit   # リンク/解除/内容表示(profile要点含む)
            kit-scan [dir] [--force]                    # assets/ の PNG からアルファ境界・足元アンカーを自動計算
@@ -1506,6 +1530,125 @@ async function main() {
     case 'broll-remove':
       return edit({ op: 'broll-remove', id: pos[0] ?? fail('usage: vedit broll-remove <id>') });
 
+    // ---- overlay stack (オーバーレイ・スタック): generalizes broll-add/
+    // -update/-remove above into N layers + image sources + rect/opacity/
+    // fade. broll-add/-update/-remove are UNCHANGED and keep working
+    // exactly as before (they always produce/target layer-1 overlays,
+    // "layer 1 の別名") — use these new commands when you need more than
+    // one overlay on screen at once, or a still-image overlay. See
+    // docs/superpowers/specs/2026-07-18-vedit-overlay-stack.md.
+    case 'overlay-add': {
+      const USAGE =
+        'usage: vedit overlay-add <sourceId|画像ファイル> --at <アンカー> [--dur s | --in s --out s | --scene sX] ' +
+        '[--rect x,y,w] [--layer N] [--opacity 0..1] [--fade-in s] [--fade-out s] ' +
+        '[--audio mute|mix|replace] [--gain -18] --base <rev>';
+      if (pos.length === 0) fail(USAGE);
+      const firstArg = pos[0];
+      if (flags.scene && (flags.in !== undefined || flags.out !== undefined || flags.dur !== undefined)) {
+        fail(`--scene cannot be combined with --in/--out/--dur\n${USAGE}`);
+      }
+      if (flags.dur !== undefined && (flags.in !== undefined || flags.out !== undefined)) {
+        fail(`--dur cannot be combined with --in/--out\n${USAGE}`);
+      }
+      const dir = projectDir();
+      await ensureDaemon(dir);
+
+      // ファイル指定時、既知の source id でなければ拡張子が画像
+      // (png/jpg/jpeg/webp) かつ実在するファイルなら自動 ingest してから
+      // 配置する(kind:'image' — see ingestImageFile in src/ingest/ingest.ts).
+      // 既知の source id、または画像以外のファイルパスはそのまま sourceId
+      // として渡す(既存の broll-add と同じ「typo は addOverlay 側の
+      // "unknown B-roll source" で失敗する」規約)。
+      let sourceId = firstArg;
+      const p0 = await Project.open(dir);
+      const m0 = await p0.manifest();
+      const isKnownSource = m0.sources.some((s) => s.id === firstArg);
+      if (!isKnownSource && isImageFile(firstArg) && existsSync(path.resolve(firstArg))) {
+        const abs = path.resolve(firstArg);
+        console.error(`画像 ${path.basename(abs)} を自動 ingest します(kind:'image')...`);
+        const ingestRes = await api('/api/ingest', { method: 'POST', body: JSON.stringify({ file: abs }) });
+        sourceId = ingestRes.source.id;
+      }
+
+      let inVal = numFlag('in', flags.in);
+      let outVal = numFlag('out', flags.out);
+      if (flags.scene) {
+        const r = await resolveScene(dir, String(flags.scene), sourceId);
+        inVal = r.t0;
+        outVal = r.t1;
+      } else if (flags.dur !== undefined) {
+        const dur = numFlag('dur', flags.dur)!;
+        inVal = 0;
+        outVal = dur;
+      }
+      if (inVal === undefined || outVal === undefined) fail(`overlay-add requires --dur, --in/--out, or --scene\n${USAGE}`);
+      const anchor = await resolveAnchorFlags(dir);
+      if (!anchor) fail(`overlay-add requires an anchor: --at / --at-word / --at-src / --at-tl\n${USAGE}`);
+
+      return edit({
+        op: 'overlay-add',
+        sourceId,
+        in: inVal,
+        out: outVal,
+        anchor,
+        audioMode: flags.audio,
+        gainDb: numFlag('gain', flags.gain),
+        layer: numFlag('layer', flags.layer),
+        rect: flags.rect !== undefined ? parseOverlayRectFlag(String(flags.rect)) : undefined,
+        opacity: numFlag('opacity', flags.opacity),
+        fade: overlayFadeFromFlags(),
+      });
+    }
+
+    case 'overlay-update': {
+      const USAGE =
+        'usage: vedit overlay-update <id> [--dur s | --in s --out s | --scene sX] ' +
+        '[--at / --at-word / --at-src / --at-tl] [--rect x,y,w | --no-rect] [--layer N] [--opacity 0..1] ' +
+        '[--fade-in s] [--fade-out s | --no-fade] [--audio mute|mix|replace] [--gain -18] --base <rev>';
+      const id = pos[0] ?? fail(USAGE);
+      if (flags.scene && (flags.in !== undefined || flags.out !== undefined || flags.dur !== undefined)) {
+        fail(`--scene cannot be combined with --in/--out/--dur\n${USAGE}`);
+      }
+      if (flags.dur !== undefined && (flags.in !== undefined || flags.out !== undefined)) {
+        fail(`--dur cannot be combined with --in/--out\n${USAGE}`);
+      }
+      if (flags.rect !== undefined && flags['no-rect']) fail(`--rect and --no-rect are mutually exclusive\n${USAGE}`);
+      const dir = projectDir();
+      let inVal = numFlag('in', flags.in);
+      let outVal = numFlag('out', flags.out);
+      if (flags.scene) {
+        const p = await Project.open(dir);
+        const m = await p.manifest();
+        const ov = (m.timeline.overlays ?? []).find((o) => o.id === id);
+        if (!ov) fail(`unknown overlay: ${id}`);
+        const r = await resolveScene(dir, String(flags.scene), ov.sourceId);
+        inVal = r.t0;
+        outVal = r.t1;
+      } else if (flags.dur !== undefined) {
+        const dur = numFlag('dur', flags.dur)!;
+        inVal = 0;
+        outVal = dur;
+      }
+      const anchor = await resolveAnchorFlags(dir);
+      const fade = flags['no-fade'] ? null : overlayFadeFromFlags();
+      return edit({
+        op: 'overlay-update',
+        id,
+        in: inVal,
+        out: outVal,
+        anchor,
+        audioMode: flags.audio,
+        gainDb: numFlag('gain', flags.gain),
+        layer: numFlag('layer', flags.layer),
+        rect: flags['no-rect'] ? null : flags.rect !== undefined ? parseOverlayRectFlag(String(flags.rect)) : undefined,
+        opacity: numFlag('opacity', flags.opacity),
+        fade,
+      });
+    }
+
+    case 'overlay-remove':
+      return edit({ op: 'overlay-remove', id: pos[0] ?? fail('usage: vedit overlay-remove <id> --base <rev>') });
+
     case 'intent-add': {
       const USAGE = 'usage: vedit intent-add <sourceId> <t0> <t1> --label "余韻" [--kind quiet|hold] --base <rev>';
       if (pos.length < 3) fail(USAGE);
@@ -1898,6 +2041,11 @@ async function main() {
             console.error(w);
             warnings.push(w);
           }
+          if (hasOverlayTransform(m)) {
+            const w = 'オーバーレイの位置/不透明度/フェードは再現されません(メタデータとして記録)';
+            console.error(w);
+            warnings.push(w);
+          }
           await recordExportResult(dir, { kind: 'otio', file: dest, ok: true, revision: m.revision, ...(warnings.length ? { warnings } : {}) });
           return out({
             ok: true,
@@ -2043,6 +2191,11 @@ async function main() {
           const warnings: string[] = [];
           if (hasReframe(m)) {
             const w = 'Resolve 側でリフレームは再現されません(メタデータとして記録)';
+            console.error(w);
+            warnings.push(w);
+          }
+          if (hasOverlayTransform(m)) {
+            const w = 'オーバーレイの位置/不透明度/フェードは再現されません(メタデータとして記録)';
             console.error(w);
             warnings.push(w);
           }

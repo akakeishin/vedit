@@ -29,7 +29,18 @@ vi.mock('./run.js', () => ({
   ffmpegHasFilter: (...args: unknown[]) => hasFilterMock(...args),
 }));
 
-import { buildWhisperPrompt, ingestFile, makeProxy, probe, sanitizeWords, transcribe } from './ingest.js';
+import {
+  buildWhisperPrompt,
+  IMAGE_SOURCE_DURATION,
+  ingestFile,
+  ingestImageFile,
+  isImageFile,
+  makeProxy,
+  probe,
+  probeImage,
+  sanitizeWords,
+  transcribe,
+} from './ingest.js';
 
 describe('sanitizeWords', () => {
   it('leaves well-formed words untouched', () => {
@@ -496,5 +507,154 @@ describe('ingestFile defaults (W-LAZY: transcribe off, scenes on)', () => {
     const scenes = await project.scenes(source.id);
     expect(scenes.scenes.length).toBeGreaterThan(0);
     expect(scenes.scenes.every((s) => s.hasSpeech)).toBe(true);
+  });
+});
+
+// ---- オーバーレイ・スタック: isImageFile / probeImage / ingestImageFile ----
+
+describe('isImageFile', () => {
+  it('recognizes png/jpg/jpeg/webp case-insensitively', () => {
+    expect(isImageFile('/x/logo.png')).toBe(true);
+    expect(isImageFile('/x/photo.JPG')).toBe(true);
+    expect(isImageFile('/x/photo.jpeg')).toBe(true);
+    expect(isImageFile('/x/sticker.WebP')).toBe(true);
+  });
+
+  it('rejects video/other extensions', () => {
+    expect(isImageFile('/x/clip.mp4')).toBe(false);
+    expect(isImageFile('/x/clip.mov')).toBe(false);
+    expect(isImageFile('/x/notes.txt')).toBe(false);
+    expect(isImageFile('/x/no-extension')).toBe(false);
+  });
+});
+
+describe('IMAGE_SOURCE_DURATION', () => {
+  it('is a large but finite, JSON-safe number (not Infinity, which would serialize to null and corrupt the manifest)', () => {
+    expect(Number.isFinite(IMAGE_SOURCE_DURATION)).toBe(true);
+    expect(IMAGE_SOURCE_DURATION).toBeGreaterThan(3600); // comfortably longer than any practical overlay
+    expect(JSON.parse(JSON.stringify({ d: IMAGE_SOURCE_DURATION })).d).toBe(IMAGE_SOURCE_DURATION);
+  });
+});
+
+describe('probeImage', () => {
+  it('extracts width/height from ffprobe, without requiring (or reporting) a duration', async () => {
+    runMock.mockReset();
+    runMock.mockResolvedValue(
+      JSON.stringify({
+        streams: [{ codec_type: 'video', codec_name: 'png', width: 400, height: 200, pix_fmt: 'rgba' }],
+      }),
+    );
+    const p = await probeImage('/logo.png');
+    expect(p).toEqual({ width: 400, height: 200 });
+  });
+
+  it('throws a clear error when ffprobe reports no video stream or unusable dimensions', async () => {
+    runMock.mockReset();
+    runMock.mockResolvedValue(JSON.stringify({ streams: [] }));
+    await expect(probeImage('/broken.png')).rejects.toThrow(/no usable image dimensions/);
+
+    runMock.mockResolvedValue(JSON.stringify({ streams: [{ codec_type: 'video', width: 0, height: 0 }] }));
+    await expect(probeImage('/zero.png')).rejects.toThrow(/no usable image dimensions/);
+  });
+});
+
+describe('ingestImageFile', () => {
+  function fakeImageProbe(width = 400, height = 200) {
+    return JSON.stringify({ streams: [{ codec_type: 'video', codec_name: 'png', width, height }] });
+  }
+
+  it('creates a kind:"image" Source with the probed dimensions, hasAudio:false, fps:0, and the IMAGE_SOURCE_DURATION sentinel — no proxy/peaks/transcribed fields', async () => {
+    runMock.mockReset();
+    runMock.mockResolvedValue(fakeImageProbe(400, 200));
+
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-ingest-image-'));
+    const project = await Project.create(path.join(root, 'proj'), 'img-test');
+    const file = path.join(root, 'logo.png');
+    await fs.writeFile(file, 'x');
+
+    const { source, timings } = await ingestImageFile(project, file);
+    expect(source.kind).toBe('image');
+    expect(source.width).toBe(400);
+    expect(source.height).toBe(200);
+    expect(source.hasAudio).toBe(false);
+    expect(source.fps).toBe(0);
+    expect(source.duration).toBe(IMAGE_SOURCE_DURATION);
+    expect(source.proxy).toBeUndefined();
+    expect(source.peaks).toBeUndefined();
+    expect(source.transcribed).toBeUndefined();
+    expect(timings.probeMs).toBeGreaterThanOrEqual(0);
+
+    const m = await project.manifest();
+    expect(m.sources).toHaveLength(1);
+    expect(m.sources[0].id).toBe(source.id);
+  });
+
+  it('never adds the image to timeline.video, even into a brand-new project with no other sources yet', async () => {
+    runMock.mockReset();
+    runMock.mockResolvedValue(fakeImageProbe());
+
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-ingest-image-notl-'));
+    const project = await Project.create(path.join(root, 'proj'), 'img-notl');
+    const file = path.join(root, 'logo.png');
+    await fs.writeFile(file, 'x');
+
+    await ingestImageFile(project, file);
+    const m = await project.manifest();
+    expect(m.timeline.video).toEqual([]);
+  });
+
+  it('never touches manifest-level fps/width/height, even as the very first source ingested', async () => {
+    runMock.mockReset();
+    runMock.mockResolvedValue(fakeImageProbe(4000, 3000)); // deliberately NOT the project's own canvas size
+
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-ingest-image-canvas-'));
+    const project = await Project.create(path.join(root, 'proj'), 'img-canvas');
+    const before = await project.manifest();
+    const file = path.join(root, 'logo.png');
+    await fs.writeFile(file, 'x');
+
+    await ingestImageFile(project, file);
+    const after = await project.manifest();
+    expect(after.fps).toBe(before.fps);
+    expect(after.width).toBe(before.width);
+    expect(after.height).toBe(before.height);
+  });
+
+  it('records sha256 when given, same as the video ingest path', async () => {
+    runMock.mockReset();
+    runMock.mockResolvedValue(fakeImageProbe());
+
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-ingest-image-sha-'));
+    const project = await Project.create(path.join(root, 'proj'), 'img-sha');
+    const file = path.join(root, 'logo.png');
+    await fs.writeFile(file, 'x');
+
+    const { source } = await ingestImageFile(project, file, { sha256: 'deadbeef' });
+    expect(source.sha256).toBe('deadbeef');
+  });
+});
+
+describe('ingestFile routes image files to ingestImageFile automatically', () => {
+  it('a .png file ingested via ingestFile produces a kind:"image" source without ever calling makeProxy/scene-detection', async () => {
+    runMock.mockReset();
+    runCaptureMock.mockReset();
+    runMock.mockResolvedValue(JSON.stringify({ streams: [{ codec_type: 'video', codec_name: 'png', width: 100, height: 50 }] }));
+
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-ingestfile-image-'));
+    const project = await Project.create(path.join(root, 'proj'), 'ingestfile-image');
+    const file = path.join(root, 'sticker.png');
+    await fs.writeFile(file, 'x');
+
+    const { source } = await ingestFile(project, file, { scenes: true, transcribe: true, addToTimeline: true });
+    expect(source.kind).toBe('image');
+    expect(source.width).toBe(100);
+    expect(source.height).toBe(50);
+    // scenes/transcribe/addToTimeline were all requested but must be silently
+    // ignored for an image — no scene-change ffmpeg call, no timeline entry.
+    expect(runCaptureMock).not.toHaveBeenCalled();
+    const m = await project.manifest();
+    expect(m.timeline.video).toEqual([]);
+    // No proxy/peaks -> ffmpeg's video-encode `-c:v libx264` proxy args never appear in any run() call.
+    expect(runMock.mock.calls.every(([cmd]) => cmd === 'ffprobe')).toBe(true);
   });
 });

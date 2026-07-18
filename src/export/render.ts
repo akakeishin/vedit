@@ -4,6 +4,7 @@ import {
   backgroundIntervals,
   cropGeometry,
   emoteWindows,
+  overlayGeometryWarnings,
   OVERLAY_GAIN_DEFAULT,
   resolvedActiveOverlays,
   resolvedActiveSprites,
@@ -329,7 +330,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 }
 
 export interface FilterGraphBuild {
-  /** Ordered `-i` input paths: video sources first (dedup'd, seg order), then one per music item, then B-roll sources, then W8 sprite PNGs (one per resolved sprite). */
+  /** Ordered `-i` input paths: video sources first (dedup'd, seg order), then one per music item, then overlay-stack sources (dedup'd, video OR image — see Source.kind), then W8 sprite PNGs (one per resolved sprite). */
   inputPaths: string[];
   /** filter_complex graph string. */
   graph: string;
@@ -337,7 +338,15 @@ export interface FilterGraphBuild {
   videoLabel: string;
   /** Label to `-map` for the final audio mix. */
   audioLabel: string;
-  /** Indices into `inputPaths` that are still-image sprite inputs needing `-loop 1` (see renderFinal). Present only when the project has resolved sprites AND a `kitAssets` map was supplied. */
+  /**
+   * Indices into `inputPaths` that are still-image inputs needing `-loop 1`
+   * (see renderFinal/ffmpegInputArgs) — originally W8 sprite PNGs only, now
+   * also any resolved overlay whose source is `Source.kind:'image'`
+   * (オーバーレイ・スタック). Present only when the project has at least one
+   * such input (resolved image overlays, and/or resolved sprites with a
+   * `kitAssets` map supplied); absent (undefined) reproduces the exact same
+   * flat `-i` sequence as before either feature existed.
+   */
   spriteInputIndices?: number[];
 }
 
@@ -534,19 +543,36 @@ export function buildFilterGraph(
     audioLabel = '[final]';
   }
 
-  // ---- W3: B-roll V2 overlay compositing ----
+  // ---- W3: B-roll V2 overlay compositing, generalized into a multi-layer
+  // ---- "overlay stack" (オーバーレイ・スタック) ----
   // Applied LAST, on top of the (possibly music-mixed) [vc]/audioLabel, so
   // caption burn and preset postFilter (both applied by the caller after
-  // buildFilterGraph returns) land on top of the composited B-roll frame —
+  // buildFilterGraph returns) land on top of the composited overlay stack —
   // matching the render/preview parity the spec requires. An overlay-less
   // project never reaches this block's body: `graph`/videoLabel/audioLabel
   // stay byte-for-byte what they were before W3 existed (full regression).
+  // `activeOverlays` is already sorted (layer asc, then tlStart — see
+  // resolvedActiveOverlays) so simply compositing in array order IS the
+  // z-order the spec requires ("layer 昇順に構築"); every pre-existing
+  // project has every overlay on layer 1 (overlayLayerOf's default), so this
+  // collapses to the original tlStart-only order — no regression.
   let videoLabel = '[vc]';
+  // Overlay image sources (Source.kind:'image') need `-loop 1` on their
+  // ffmpeg `-i`, same mechanism as W8 sprite PNGs below — collected here and
+  // merged with the sprite block's own indices into a single array (returned
+  // as `spriteInputIndices` for back-compat with existing callers/tests;
+  // the field is really "still-image inputs needing -loop 1", sprites were
+  // just the only source of those before this feature existed).
+  const loopInputIndices: number[] = [];
   const activeOverlays = resolvedActiveOverlays(m);
   if (activeOverlays.length > 0) {
     const overlaySrcIds = [...new Set(activeOverlays.map((r) => r.overlay.sourceId))];
     const overlayInputBase = inputPaths.length; // video sources + music, already pushed above
-    for (const id of overlaySrcIds) inputPaths.push(srcById.get(id)!.path);
+    for (const id of overlaySrcIds) {
+      const s = srcById.get(id)!;
+      inputPaths.push(s.path);
+      if (s.kind === 'image') loopInputIndices.push(inputPaths.length - 1);
+    }
 
     const ovParts: string[] = [];
     const audioMixLabels: string[] = [];
@@ -554,9 +580,39 @@ export function buildFilterGraph(
       const ov = r.overlay;
       const ovSrc = srcById.get(ov.sourceId)!;
       const idx = overlayInputBase + overlaySrcIds.indexOf(ov.sourceId);
-      ovParts.push(overlayVideoClause(idx, n, ov.srcIn, ov.srcOut, r.tlStart, ovSrc.width, ovSrc.height, output.width, output.height, m.fps));
+      const fxOpts = { rect: ov.rect, opacity: ov.opacity, fade: ov.fade };
+      if (ovSrc.kind === 'image') {
+        ovParts.push(
+          overlayImageVideoClause(idx, n, ovSrc.width, ovSrc.height, output.width, output.height, m.fps, ov.srcOut - ov.srcIn, fxOpts),
+        );
+      } else {
+        ovParts.push(
+          overlayVideoClause(idx, n, ov.srcIn, ov.srcOut, r.tlStart, ovSrc.width, ovSrc.height, output.width, output.height, m.fps, fxOpts),
+        );
+      }
       const composited = `[ovc${n}]`;
-      ovParts.push(`${videoLabel}[ov${n}]overlay=enable='between(t,${r.tlStart},${r.tlEnd})'${composited}`);
+      const posPart = ov.rect
+        ? (() => {
+            const geo = overlayRectGeometry(ov.rect, ovSrc.width, ovSrc.height, output.width, output.height);
+            return `x=${geo.x}:y=${geo.y}:`;
+          })()
+        : '';
+      // shortest=1 (image-kind sources only): a `-loop 1` still-image input
+      // is infinite from ffmpeg's own perspective — it never reaches EOF, so
+      // `overlay`'s default eof_action (which only fires on the SECONDARY
+      // input's own EOF) never triggers and the whole render hangs forever
+      // on a REAL ffmpeg run (verified empirically — the mocked-ffmpeg unit
+      // tests below can't catch this at all). `shortest=1` forces the filter
+      // to end at the shorter of its two inputs; since the looped image is
+      // always the longer one, this safely reproduces exactly the main
+      // branch's own natural length, every time. Deliberately NOT applied to
+      // a video-kind overlay: a finite B-roll clip shorter than the
+      // remaining timeline is SUPPOSED to just stop being drawn (the
+      // `enable` gate already handles that) without truncating the render —
+      // `shortest=1` there would wrongly cut the whole output short at the
+      // B-roll's own end.
+      const shortestPart = ovSrc.kind === 'image' ? 'shortest=1:' : '';
+      ovParts.push(`${videoLabel}[ov${n}]overlay=${posPart}${shortestPart}enable='between(t,${r.tlStart},${r.tlEnd})'${composited}`);
       videoLabel = composited;
 
       if (ov.audioMode === 'replace') {
@@ -587,23 +643,32 @@ export function buildFilterGraph(
   // this stays a pure function of exactly the assets it was HANDED. No
   // sprites (or no `kitAssets` map at all) never reaches this block's body —
   // full regression for every pre-W8 project.
-  let spriteInputIndices: number[] | undefined;
   if (opts.kitAssets) {
     const activeSprites = resolvedActiveSprites(m).filter((r) => opts.kitAssets!.has(r.sprite.assetId));
     if (activeSprites.length > 0) {
       const spriteInputBase = inputPaths.length;
-      spriteInputIndices = [];
       const spParts: string[] = [];
       activeSprites.forEach((r, n) => {
         const asset = opts.kitAssets!.get(r.sprite.assetId)!;
         inputPaths.push(asset.absPath);
         const idx = spriteInputBase + n;
-        spriteInputIndices!.push(idx);
+        loopInputIndices.push(idx);
         const geo = spriteGeometry(asset, r.sprite.position, r.sprite.scale, output, { flip: r.sprite.flip });
         spParts.push(spriteVideoClause(idx, n, geo.width, geo.height, { opacity: r.sprite.opacity, flip: r.sprite.flip }));
         const composited = `[svc${n}]`;
+        // shortest=1: a sprite's `-loop 1` PNG input is unconditionally
+        // infinite (no video-vs-image branch needed here, unlike the W3
+        // overlay-stack block above — every sprite input IS a still image).
+        // Pre-existing bug fix (found while building this feature's real-
+        // ffmpeg verification, see the sibling comment on the overlay-stack
+        // `overlay=` call above for the full explanation): without this, a
+        // NORMAL (non-composition) project with ANY sprite hangs forever on
+        // a real `vedit export render` — `renderComposition`'s own sprite/
+        // background loop inputs are unaffected (a hard `-t` bound already
+        // protects that separate code path), so this fix is scoped to just
+        // this call site.
         spParts.push(
-          `${videoLabel}[sv${n}]overlay=x=${Math.round(geo.x)}:y=${Math.round(geo.y)}:enable='between(t,${r.tlStart},${r.tlEnd})'${composited}`,
+          `${videoLabel}[sv${n}]overlay=x=${Math.round(geo.x)}:y=${Math.round(geo.y)}:shortest=1:enable='between(t,${r.tlStart},${r.tlEnd})'${composited}`,
         );
         videoLabel = composited;
       });
@@ -611,7 +676,7 @@ export function buildFilterGraph(
     }
   }
 
-  return { inputPaths, graph, videoLabel, audioLabel, ...(spriteInputIndices ? { spriteInputIndices } : {}) };
+  return { inputPaths, graph, videoLabel, audioLabel, ...(loopInputIndices.length ? { spriteInputIndices: loopInputIndices } : {}) };
 }
 
 // ---- W-ANIME: composition-mode filtergraph (background/ambient/sprites, no A-roll) ----
@@ -960,13 +1025,98 @@ export function spriteVideoClause(
   return `[${inputIdx}:v]${parts.join(',')}[sv${n}]`;
 }
 
+/** Options shared by overlayVideoClause/overlayImageVideoClause (オーバーレイ・スタック: rect/opacity/fade — see OverlayClip in types.ts). All optional; an object with every field absent/undefined must reproduce the exact pre-stack chain. */
+export interface OverlayFxOpts {
+  rect?: { x: number; y: number; w: number };
+  opacity?: number;
+  fade?: { in?: number; out?: number };
+}
+
+export interface OverlayGeometry {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
 /**
- * One overlay's video chain: trim its B-roll source to [srcIn,srcOut), shift
- * its PTS to start at the resolved tlStart (so ffmpeg's `overlay` filter —
- * which samples the overlay input by ITS OWN timestamp — presents the right
- * frame once `between(t,tlStart,tlEnd)` goes true), then scale/pad/crop to
- * the output canvas exactly like a main clip. Overlays have no per-clip crop
- * field (unlike VideoClip) — `cropGeometry(...,undefined)` auto-centers.
+ * Pixel placement geometry for an overlay's `rect` (0..1 normalized box) —
+ * or the ORIGINAL W3 full-bleed geometry (x=0,y=0,w=outW,h=outH) when `rect`
+ * is absent. With a rect, width comes straight from `rect.w * outW`
+ * (rounded to an even pixel count — most encoders require even chroma
+ * dimensions), and height is DERIVED from the overlay source's own aspect
+ * ratio applied to that width (also rounded even) so the box is never
+ * distorted/stretched — "縦は元比率維持". Pure/side-effect-free; used both
+ * by overlayVideoClause/overlayImageVideoClause (to size the `scale=`
+ * clause) and by buildFilterGraph directly (to position the outer
+ * `overlay=x=..:y=..` filter).
+ */
+export function overlayRectGeometry(
+  rect: { x: number; y: number; w: number } | undefined,
+  srcW: number,
+  srcH: number,
+  outW: number,
+  outH: number,
+): OverlayGeometry {
+  if (!rect) return { x: 0, y: 0, w: outW, h: outH };
+  const w = Math.max(2, Math.round((rect.w * outW) / 2) * 2);
+  const h = Math.max(2, Math.round((w * (srcH / Math.max(1, srcW))) / 2) * 2);
+  return { x: Math.round(rect.x * outW), y: Math.round(rect.y * outH), w, h };
+}
+
+/** The ORIGINAL W3 "fill the whole output canvas, preserving aspect via letterbox/pillarbox" scale+pad clause (no leading/trailing comma) — shared by the legacy overlayVideoClause path, the extended (opacity/fade, still no rect) video path, and any rect-less image overlay. Overlays have no per-clip crop field (unlike VideoClip) — `cropGeometry(...,undefined)` auto-centers. */
+function overlayFullBleedScalePad(srcW: number, srcH: number, outW: number, outH: number): string {
+  const geo = cropGeometry(srcW, srcH, outW, outH, undefined);
+  const cropPart = geo ? `crop=${geo.width}:${geo.height}:${geo.x}:${geo.y},` : '';
+  return `${cropPart}scale=${outW}:${outH}:force_original_aspect_ratio=decrease,pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2`;
+}
+
+/**
+ * Opacity/fade filter suffix (leading comma, no trailing one) shared by the
+ * video- and image-kind overlay clauses below. `duration` is the overlay's
+ * own LOCAL displayed length (srcOut-srcIn) — `fade.out`'s `st=` is computed
+ * against it, so the caller must apply this BEFORE shifting into the
+ * absolute timeline domain (see overlayVideoClause's two-stage setpts).
+ * Returns '' (no format=rgba, no filter at all) when neither opacity nor a
+ * real fade is set — the ONLY case a video-kind overlay's chain must stay
+ * byte-for-byte identical to before this feature existed; an image-kind
+ * overlay always forces format=rgba itself regardless (see
+ * overlayImageVideoClause), independent of this helper.
+ */
+function overlayOpacityFadeClause(opts: OverlayFxOpts, duration: number): string {
+  const fadeIn = opts.fade?.in;
+  const fadeOut = opts.fade?.out;
+  const hasFade = (fadeIn !== undefined && fadeIn > 0) || (fadeOut !== undefined && fadeOut > 0);
+  const hasOpacity = opts.opacity !== undefined && opts.opacity < 0.999;
+  if (!hasFade && !hasOpacity) return '';
+  const parts = ['format=rgba'];
+  if (fadeIn !== undefined && fadeIn > 0) parts.push(`fade=t=in:st=0:d=${fadeIn}:alpha=1`);
+  if (fadeOut !== undefined && fadeOut > 0) {
+    const st = Math.max(0, duration - fadeOut);
+    parts.push(`fade=t=out:st=${st}:d=${fadeOut}:alpha=1`);
+  }
+  if (hasOpacity) parts.push(`colorchannelmixer=aa=${opts.opacity}`);
+  return ',' + parts.join(',');
+}
+
+/**
+ * One overlay's video chain for a VIDEO-kind B-roll source: trim to
+ * [srcIn,srcOut), shift PTS to the resolved tlStart (so ffmpeg's `overlay`
+ * filter — which samples the overlay input by ITS OWN timestamp — presents
+ * the right frame once `between(t,tlStart,tlEnd)` goes true), then
+ * scale/pad/crop to the output canvas.
+ *
+ * With no `opts` (or opts with rect/opacity/fade all absent) this reproduces
+ * the ORIGINAL W3 chain byte-for-byte — trim+setpts combined into one
+ * filter, full-bleed scale+pad, no rgba/fade/opacity anywhere — the
+ * back-compat contract for every `broll-add`-created overlay. Once any of
+ * rect/opacity/fade IS set, geometry/opacity/fade are applied FIRST in the
+ * clip's own LOCAL time domain (trim, then a bare `setpts=PTS-STARTPTS`
+ * reset to 0 — required so a `fade` filter's `st=`/`d=` land at the right
+ * LOCAL moments, not the absolute timeline), and only THEN shifted into the
+ * absolute timeline domain via a second `setpts=PTS+tlStart/TB` at the very
+ * end — mirroring how each A-roll segment's own `afade` already works in
+ * buildFilterGraph's main segment loop above.
  */
 export function overlayVideoClause(
   inputIdx: number,
@@ -979,13 +1129,60 @@ export function overlayVideoClause(
   outW: number,
   outH: number,
   fps: number,
+  opts: OverlayFxOpts = {},
 ): string {
-  const geo = cropGeometry(srcW, srcH, outW, outH, undefined);
-  const cropPart = geo ? `crop=${geo.width}:${geo.height}:${geo.x}:${geo.y},` : '';
+  const fadeIn = opts.fade?.in;
+  const fadeOut = opts.fade?.out;
+  const hasFade = (fadeIn !== undefined && fadeIn > 0) || (fadeOut !== undefined && fadeOut > 0);
+  const hasOpacity = opts.opacity !== undefined && opts.opacity < 0.999;
+  const hasExtra = Boolean(opts.rect) || hasFade || hasOpacity;
+  if (!hasExtra) {
+    return `[${inputIdx}:v]trim=start=${srcIn}:end=${srcOut},setpts=PTS-STARTPTS+${tlStart}/TB,${overlayFullBleedScalePad(srcW, srcH, outW, outH)},fps=${fps}[ov${n}]`;
+  }
+  const scalePart = opts.rect
+    ? (() => {
+        const geo = overlayRectGeometry(opts.rect, srcW, srcH, outW, outH);
+        return `scale=${geo.w}:${geo.h}`;
+      })()
+    : overlayFullBleedScalePad(srcW, srcH, outW, outH);
+  const fxPart = overlayOpacityFadeClause(opts, srcOut - srcIn);
   return (
-    `[${inputIdx}:v]trim=start=${srcIn}:end=${srcOut},setpts=PTS-STARTPTS+${tlStart}/TB,` +
-    `${cropPart}scale=${outW}:${outH}:force_original_aspect_ratio=decrease,pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2,fps=${fps}[ov${n}]`
+    `[${inputIdx}:v]trim=start=${srcIn}:end=${srcOut},setpts=PTS-STARTPTS,` +
+    `${scalePart},fps=${fps}${fxPart},setpts=PTS+${tlStart}/TB[ov${n}]`
   );
+}
+
+/**
+ * One overlay's video chain for an IMAGE-kind source (Source.kind:'image',
+ * オーバーレイ・スタック): unlike overlayVideoClause, there's no
+ * trim/PTS-shift — a `-loop 1` still image presents the same frame at every
+ * timestamp, so (exactly like W8's spriteVideoClause) only geometry/
+ * opacity/fade matter; the caller's outer `overlay=enable=
+ * 'between(t,tlStart,tlEnd)'` gate is what actually confines it to its
+ * placed window. `format=rgba` is ALWAYS applied (unlike the video path)
+ * so a PNG's alpha survives even with no opacity/fade requested — same
+ * rationale as spriteVideoClause's unconditional format=rgba.
+ */
+export function overlayImageVideoClause(
+  inputIdx: number,
+  n: number,
+  srcW: number,
+  srcH: number,
+  outW: number,
+  outH: number,
+  fps: number,
+  displayDuration: number,
+  opts: OverlayFxOpts = {},
+): string {
+  const scalePart = opts.rect
+    ? (() => {
+        const geo = overlayRectGeometry(opts.rect, srcW, srcH, outW, outH);
+        return `scale=${geo.w}:${geo.h}`;
+      })()
+    : overlayFullBleedScalePad(srcW, srcH, outW, outH);
+  const fxPart = overlayOpacityFadeClause(opts, displayDuration);
+  const tail = fxPart ? `,fps=${fps}${fxPart}` : `,fps=${fps},format=rgba`;
+  return `[${inputIdx}:v]${scalePart}${tail}[ov${n}]`;
 }
 
 /** One overlay's audio chain for audioMode mix/replace: trim, delay to tlStart, apply gain. */
@@ -1296,6 +1493,11 @@ export async function renderFinal(
   if (effectiveM.timeline.video.some((c) => c.gainDb !== undefined || c.muted)) {
     warnings.push('クリップ音量/ミュートはプレビュー未反映(書き出しで確認)');
   }
+  // オーバーレイ・スタック: timeline-overflow / full-bleed-aspect-mismatch
+  // advisories — see overlayGeometryWarnings' doc in ops.ts. A project with
+  // no overlays (or none tripping either check) pushes nothing here — full
+  // regression.
+  warnings.push(...overlayGeometryWarnings(effectiveM));
   let kit: import('../core/types.js').KitFile | null = null;
   if (effectiveM.kit) {
     try {

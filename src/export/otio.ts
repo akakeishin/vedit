@@ -26,6 +26,20 @@ export function hasReframe(m: Manifest): boolean {
   return Boolean(m.output) || m.timeline.video.some((c) => c.crop);
 }
 
+/**
+ * Whether any resolved (non-orphan) overlay carries placement/visual state
+ * OTIO's Clip.1 has no standard field for — `rect`/`opacity`/`fade` (see
+ * OverlayClip in types.ts). Those still ride along as opaque
+ * `metadata.vedit` on each Clip.1 (overlayTracksByLayer below), same
+ * "record it, but most importers won't visually apply it" contract as
+ * `hasReframe`'s crop/output metadata — this just decides whether
+ * `export otio`'s caller (cli.ts) should also print the same kind of
+ * best-effort warning it already prints for reframe.
+ */
+export function hasOverlayTransform(m: Manifest): boolean {
+  return resolvedActiveOverlays(m).some((r) => Boolean(r.overlay.rect) || r.overlay.opacity !== undefined || Boolean(r.overlay.fade));
+}
+
 export function toOtio(m: Manifest): unknown {
   const rate = m.fps;
   const srcById = new Map(m.sources.map((s) => [s.id, s]));
@@ -169,55 +183,90 @@ export function toOtio(m: Manifest): unknown {
   };
   const mTrack = musicTrack();
 
-  // B-roll V2 track (W3): resolved (non-orphan) overlays only, each a
-  // Clip.1 gapped to its resolved tlStart — same Gap/Clip shape as the A2
-  // music track above. Orphans (anchor cut away) are never written to the
-  // file; they're surfaced as a console warning instead, mirroring how
-  // reframe state that OTIO can't express is warned about via hasReframe().
-  const overlayTrack = () => {
-    const active = resolvedActiveOverlays(m);
+  // Overlay stack (W3 B-roll V2, generalized to N layers — オーバーレイ・
+  // スタック mini-spec: layer ごとに V2..Vn トラックとして出力): resolved
+  // (non-orphan) overlays only, one Track.1 PER LAYER, each a Gap/Clip
+  // sequence exactly like the A2 music track above. OTIO tracks are
+  // sequential/non-overlapping by construction — a single layer is itself
+  // guaranteed non-overlapping (assertNoOverlayOverlap in ops.ts), so it
+  // maps naturally onto one track; DIFFERENT layers may overlap in time
+  // (the whole point of a stack), so each needs its OWN track to be
+  // representable at all. Layers present in the manifest are mapped to
+  // SEQUENTIAL V2, V3, ... names in ascending layer order — a project with
+  // every overlay on layer 1 (overlayLayerOf's default: every pre-existing
+  // project, and every broll-add/-update call) produces exactly one track
+  // named "V2", byte-for-byte the original single-track W3 shape (full
+  // regression). Orphans (anchor cut away) are never written to the file;
+  // they're surfaced as a console warning instead, mirroring how reframe
+  // state OTIO can't express is warned about via hasReframe(). `rect`/
+  // `opacity`/`fade` — OTIO has no standard transform field for them, same
+  // situation as crop/reframe (see hasOverlayTransform above) — ride along
+  // as opaque `metadata.vedit` only, same as audioMode/gainDb already did.
+  const overlayTracksByLayer = () => {
+    const active = resolvedActiveOverlays(m); // already sorted: layer asc, then tlStart
     for (const o of orphanedOverlays(m)) {
-      console.warn(`[vedit] overlay ${o.id} is orphaned (${o.reason}); excluded from OTIO V2 track`);
+      console.warn(`[vedit] overlay ${o.id} is orphaned (${o.reason}); excluded from OTIO overlay track`);
     }
-    if (active.length === 0) return null;
-    const children: unknown[] = [];
-    let cursor = 0;
+    if (active.length === 0) return [];
+    const byLayer = new Map<number, typeof active>();
     for (const r of active) {
-      const ov = r.overlay;
-      if (r.tlStart > cursor + 1e-9) {
+      const layer = r.overlay.layer ?? 1;
+      const bucket = byLayer.get(layer);
+      if (bucket) bucket.push(r);
+      else byLayer.set(layer, [r]);
+    }
+    const layers = [...byLayer.keys()].sort((a, b) => a - b);
+    return layers.map((layer, trackIdx) => {
+      const items = byLayer.get(layer)!; // inherits `active`'s tlStart order within this layer
+      const children: unknown[] = [];
+      let cursor = 0;
+      for (const r of items) {
+        const ov = r.overlay;
+        if (r.tlStart > cursor + 1e-9) {
+          children.push({
+            OTIO_SCHEMA: 'Gap.1',
+            name: 'gap',
+            source_range: tr(0, r.tlStart - cursor, rate),
+            effects: [],
+            markers: [],
+            metadata: {},
+          });
+        }
+        const ovSrc = srcById.get(ov.sourceId)!;
+        const ovRate = ovSrc.fps || rate;
         children.push({
-          OTIO_SCHEMA: 'Gap.1',
-          name: 'gap',
-          source_range: tr(0, r.tlStart - cursor, rate),
+          OTIO_SCHEMA: 'Clip.1',
+          name: `B${children.length + 1}`,
+          source_range: tr(ov.srcIn, ov.srcOut, ovRate),
+          media_reference: mediaRef(ov.sourceId),
           effects: [],
           markers: [],
-          metadata: {},
+          metadata: {
+            vedit: {
+              overlayId: ov.id,
+              layer,
+              audioMode: ov.audioMode,
+              ...(ov.gainDb !== undefined ? { gainDb: ov.gainDb } : {}),
+              ...(ov.rect ? { rect: ov.rect } : {}),
+              ...(ov.opacity !== undefined ? { opacity: ov.opacity } : {}),
+              ...(ov.fade ? { fade: ov.fade } : {}),
+            },
+          },
         });
+        cursor = Math.max(cursor, r.tlEnd);
       }
-      const ovSrc = srcById.get(ov.sourceId)!;
-      const ovRate = ovSrc.fps || rate;
-      children.push({
-        OTIO_SCHEMA: 'Clip.1',
-        name: `B${children.length + 1}`,
-        source_range: tr(ov.srcIn, ov.srcOut, ovRate),
-        media_reference: mediaRef(ov.sourceId),
-        effects: [],
+      return {
+        OTIO_SCHEMA: 'Track.1',
+        name: `V${trackIdx + 2}`,
+        kind: 'Video',
+        children,
         markers: [],
-        metadata: { vedit: { overlayId: ov.id, audioMode: ov.audioMode, ...(ov.gainDb !== undefined ? { gainDb: ov.gainDb } : {}) } },
-      });
-      cursor = Math.max(cursor, r.tlEnd);
-    }
-    return {
-      OTIO_SCHEMA: 'Track.1',
-      name: 'V2',
-      kind: 'Video',
-      children,
-      markers: [],
-      effects: [],
-      metadata: {},
-    };
+        effects: [],
+        metadata: {},
+      };
+    });
   };
-  const oTrack = overlayTrack();
+  const oTracks = overlayTracksByLayer();
 
   return {
     OTIO_SCHEMA: 'Timeline.1',
@@ -226,7 +275,7 @@ export function toOtio(m: Manifest): unknown {
     tracks: {
       OTIO_SCHEMA: 'Stack.1',
       name: 'tracks',
-      children: [track('Video'), track('Audio'), ...(mTrack ? [mTrack] : []), ...(oTrack ? [oTrack] : [])],
+      children: [track('Video'), track('Audio'), ...(mTrack ? [mTrack] : []), ...oTracks],
       markers: [],
       effects: [],
       metadata: {},
@@ -239,6 +288,12 @@ export function toOtio(m: Manifest): unknown {
               output: m.output,
               reframeNote:
                 'crop/output are recorded under each clip\'s metadata.vedit.crop, but OTIO has no standard transform field — most importers (including Resolve) will not visually apply the reframe on import.',
+            }
+          : {}),
+        ...(hasOverlayTransform(m)
+          ? {
+              overlayTransformNote:
+                'overlay rect/opacity/fade are recorded under each overlay clip\'s metadata.vedit, but OTIO has no standard transform field — most importers (including Resolve) will not visually apply the placement/opacity/fade on import.',
             }
           : {}),
       },

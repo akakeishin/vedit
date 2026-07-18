@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { toOtio } from './otio.js';
+import { hasOverlayTransform, toOtio } from './otio.js';
 import { addOverlay, addSprite, removeSourceRange, trimClip } from '../core/ops.js';
 import type { Manifest, MusicItem } from '../core/types.js';
 
@@ -21,6 +21,7 @@ function manifest(clips: { srcIn: number; srcOut: number; sourceId?: string }[],
       width: 3840,
       height: 2160,
       hasAudio: s.hasAudio ?? true,
+      ...(s.kind ? { kind: s.kind } : {}),
     })),
     timeline: {
       video: clips.map((c, i) => ({ id: `c${i}`, sourceId: c.sourceId ?? 's1', srcIn: c.srcIn, srcOut: c.srcOut })),
@@ -216,6 +217,100 @@ describe('toOtio B-roll V2 track (wave W3)', () => {
     expect(clips).toHaveLength(1);
     expect(clips[0].metadata.vedit.overlayId).toBe('ovOk');
     warn.mockRestore();
+  });
+
+  it('a layer-1-only overlay carries layer:1 in its clip metadata (still just ONE "V2" track — full regression shape)', () => {
+    const m = addOverlay(withOverlaySources(), 's2', { id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 1 } });
+    const o: any = toOtio(m);
+    const overlayTracks = o.tracks.children.filter((t: any) => /^V[2-9]/.test(t.name));
+    expect(overlayTracks).toHaveLength(1);
+    expect(overlayTracks[0].name).toBe('V2');
+    const clip = overlayTracks[0].children.find((c: any) => c.OTIO_SCHEMA === 'Clip.1');
+    expect(clip.metadata.vedit.layer).toBe(1);
+  });
+});
+
+// ---- オーバーレイ・スタック: layer -> V2..Vn tracks ----
+
+describe('toOtio overlay stack: layer -> V2..Vn tracks', () => {
+  function withStackSources(): Manifest {
+    return manifest(
+      [{ srcIn: 0, srcOut: 10, sourceId: 's1' }],
+      [{ id: 's1' }, { id: 's2', duration: 30 }, { id: 'img1', duration: 86400, kind: 'image' }],
+    );
+  }
+
+  it('two overlays on DIFFERENT layers overlapping in time produce TWO tracks (V2, V3) — impossible to represent in a single sequential OTIO track', () => {
+    let m = addOverlay(withStackSources(), 's2', { id: 'ovA', srcIn: 0, srcOut: 3, anchor: { sourceId: 's1', srcTime: 1 }, layer: 1 });
+    m = addOverlay(m, 'img1', { id: 'ovB', srcIn: 0, srcOut: 3, anchor: { sourceId: 's1', srcTime: 1 }, layer: 2 }); // same resolved range, different layer
+    const o: any = toOtio(m);
+    const v2 = o.tracks.children.find((t: any) => t.name === 'V2');
+    const v3 = o.tracks.children.find((t: any) => t.name === 'V3');
+    expect(v2).toBeDefined();
+    expect(v3).toBeDefined();
+    const v2Clip = v2.children.find((c: any) => c.OTIO_SCHEMA === 'Clip.1');
+    const v3Clip = v3.children.find((c: any) => c.OTIO_SCHEMA === 'Clip.1');
+    expect(v2Clip.metadata.vedit.overlayId).toBe('ovA');
+    expect(v2Clip.metadata.vedit.layer).toBe(1);
+    expect(v3Clip.metadata.vedit.overlayId).toBe('ovB');
+    expect(v3Clip.metadata.vedit.layer).toBe(2);
+  });
+
+  it('layers are mapped to SEQUENTIAL V-names in ascending layer order, regardless of the raw layer numbers used (e.g. layer 5 -> still V3 if it is the second-lowest present)', () => {
+    let m = addOverlay(withStackSources(), 's2', { id: 'ovLow', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 1 }, layer: 1 });
+    m = addOverlay(m, 'img1', { id: 'ovHigh', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 1 }, layer: 5 });
+    const o: any = toOtio(m);
+    const names = o.tracks.children.filter((t: any) => /^V[2-9]/.test(t.name)).map((t: any) => t.name).sort();
+    expect(names).toEqual(['V2', 'V3']);
+    const v3 = o.tracks.children.find((t: any) => t.name === 'V3');
+    const v3Clip = v3.children.find((c: any) => c.OTIO_SCHEMA === 'Clip.1');
+    expect(v3Clip.metadata.vedit.layer).toBe(5);
+  });
+
+  it('rect/opacity/fade ride along as opaque clip metadata when set', () => {
+    const m = addOverlay(withStackSources(), 's2', {
+      id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 1 },
+      rect: { x: 0.1, y: 0.2, w: 0.3 }, opacity: 0.5, fade: { in: 1 },
+    });
+    const o: any = toOtio(m);
+    const clip = o.tracks.children.find((t: any) => t.name === 'V2').children.find((c: any) => c.OTIO_SCHEMA === 'Clip.1');
+    expect(clip.metadata.vedit.rect).toEqual({ x: 0.1, y: 0.2, w: 0.3 });
+    expect(clip.metadata.vedit.opacity).toBe(0.5);
+    expect(clip.metadata.vedit.fade).toEqual({ in: 1 });
+  });
+
+  it('an image-kind overlay source still gets a normal ExternalReference media_reference (same as a video overlay)', () => {
+    const m = addOverlay(withStackSources(), 'img1', { id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 1 } });
+    const o: any = toOtio(m);
+    const clip = o.tracks.children.find((t: any) => t.name === 'V2').children.find((c: any) => c.OTIO_SCHEMA === 'Clip.1');
+    expect(clip.media_reference.OTIO_SCHEMA).toBe('ExternalReference.1');
+    expect(clip.media_reference.target_url).toMatch(/^file:\/\//);
+  });
+});
+
+describe('hasOverlayTransform', () => {
+  function withStackSources(): Manifest {
+    return manifest([{ srcIn: 0, srcOut: 10, sourceId: 's1' }], [{ id: 's1' }, { id: 's2', duration: 30 }]);
+  }
+
+  it('false for a manifest with no overlays, or overlays with no rect/opacity/fade', () => {
+    expect(hasOverlayTransform(manifest([{ srcIn: 0, srcOut: 10 }]))).toBe(false);
+    const m = addOverlay(withStackSources(), 's2', { id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 1 } });
+    expect(hasOverlayTransform(m)).toBe(false);
+  });
+
+  it('true when any resolved overlay has a rect, opacity, or fade', () => {
+    const withRect = addOverlay(withStackSources(), 's2', { id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 1 }, rect: { x: 0, y: 0, w: 0.5 } });
+    expect(hasOverlayTransform(withRect)).toBe(true);
+    const withOpacity = addOverlay(withStackSources(), 's2', { id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 1 }, opacity: 0.5 });
+    expect(hasOverlayTransform(withOpacity)).toBe(true);
+    const withFade = addOverlay(withStackSources(), 's2', { id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 1 }, fade: { in: 1 } });
+    expect(hasOverlayTransform(withFade)).toBe(true);
+  });
+
+  it('ignores an orphaned overlay\'s rect/opacity/fade (only resolved overlays count)', () => {
+    const m = addOverlay(withStackSources(), 's2', { id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 50 }, rect: { x: 0, y: 0, w: 0.5 } });
+    expect(hasOverlayTransform(m)).toBe(false); // src=50 is past the A-roll's only clip -> orphan
   });
 });
 

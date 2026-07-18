@@ -29,6 +29,8 @@ import {
   orphanedOverlays,
   orphanedSprites,
   overlappingIntentZones,
+  overlayGeometryWarnings,
+  overlayLayerOf,
   OVERLAY_GAIN_DEFAULT,
   padWordRange,
   parseFocus,
@@ -1288,6 +1290,266 @@ describe('B-roll V2 overlays (addOverlay / updateOverlay / removeOverlay)', () =
     r = removeOverlay(r, 'ov1');
     expect(r.timeline.overlays!.map((o) => o.id)).toEqual(['ov2']);
     expect(() => removeOverlay(r, 'ov1')).toThrow(/unknown overlay/);
+  });
+});
+
+// ---- オーバーレイ・スタック: layer / rect / opacity / fade / image sources ----
+
+describe('overlay stack: layer (assertNoOverlayOverlap grouped by layer, overlayLayerOf, resolvedActiveOverlays sort)', () => {
+  function m(): Manifest {
+    const base = manifest();
+    return {
+      ...base,
+      sources: [
+        ...base.sources,
+        { id: 's2', path: '/broll.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: true },
+        { id: 'img1', path: '/logo.png', duration: 24 * 60 * 60, fps: 0, width: 400, height: 200, hasAudio: false, kind: 'image' },
+      ],
+    };
+  }
+
+  it('overlayLayerOf defaults an unset layer to 1', () => {
+    const r = addOverlay(m(), 's2', { id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 2 } });
+    expect(overlayLayerOf(r.timeline.overlays![0])).toBe(1);
+  });
+
+  it('addOverlay stores no `layer` key at all when omitted — back-compat: an existing manifest with no layer field anywhere is untouched', () => {
+    const r = addOverlay(m(), 's2', { id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 2 } });
+    expect(r.timeline.overlays![0]).not.toHaveProperty('layer');
+  });
+
+  it('two overlays on the SAME (default) layer at overlapping resolved times: rejected — same as pre-stack V2 behavior', () => {
+    let r = addOverlay(m(), 's2', { id: 'ov1', srcIn: 0, srcOut: 4, anchor: { sourceId: 's1', srcTime: 2 } }); // tl[2,6)
+    expect(() =>
+      addOverlay(r, 's2', { id: 'ov2', srcIn: 0, srcOut: 4, anchor: { sourceId: 's1', srcTime: 4 } }), // tl[4,8) — overlaps
+    ).toThrow(/overlaps existing overlay ov1 on layer 1/);
+  });
+
+  it('two overlays on DIFFERENT layers at the exact same resolved time: allowed (that is the whole point of a stack)', () => {
+    let r = addOverlay(m(), 's2', { id: 'ov1', srcIn: 0, srcOut: 4, anchor: { sourceId: 's1', srcTime: 2 }, layer: 1 }); // tl[2,6)
+    r = addOverlay(r, 'img1', { id: 'ov2', srcIn: 0, srcOut: 4, anchor: { sourceId: 's1', srcTime: 2 }, layer: 2 }); // tl[2,6), same range, different layer
+    expect(r.timeline.overlays).toHaveLength(2);
+  });
+
+  it('a third overlay on layer 2 that collides with the layer-2 occupant is still rejected (each layer is independently exclusive)', () => {
+    let r = addOverlay(m(), 'img1', { id: 'ov1', srcIn: 0, srcOut: 4, anchor: { sourceId: 's1', srcTime: 2 }, layer: 2 }); // tl[2,6)
+    expect(() =>
+      addOverlay(r, 'img1', { id: 'ov2', srcIn: 0, srcOut: 4, anchor: { sourceId: 's1', srcTime: 4 }, layer: 2 }), // tl[4,8) overlaps on layer 2
+    ).toThrow(/overlaps existing overlay ov1 on layer 2/);
+  });
+
+  it('updateOverlay moving an overlay onto an occupied layer is rejected; moving it to a free layer succeeds', () => {
+    let r = addOverlay(m(), 's2', { id: 'ov1', srcIn: 0, srcOut: 4, anchor: { sourceId: 's1', srcTime: 2 } }); // layer 1, tl[2,6)
+    r = addOverlay(r, 's2', { id: 'ov2', srcIn: 0, srcOut: 4, anchor: { sourceId: 's1', srcTime: 2 }, layer: 2 }); // tl[2,6) on layer 2 — fine, different layer
+    expect(() => updateOverlay(r, 'ov2', { layer: 1 })).toThrow(/overlaps existing overlay ov1 on layer 1/);
+    const moved = updateOverlay(r, 'ov1', { layer: 3 });
+    expect(moved.timeline.overlays!.find((o) => o.id === 'ov1')!.layer).toBe(3);
+  });
+
+  it('updateOverlay layer:null clears back to the default (1)', () => {
+    let r = addOverlay(m(), 's2', { id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 2 }, layer: 5 });
+    r = updateOverlay(r, 'ov1', { layer: null });
+    expect(r.timeline.overlays![0]).not.toHaveProperty('layer');
+  });
+
+  it('addOverlay/updateOverlay reject a non-integer or out-of-range layer', () => {
+    expect(() => addOverlay(m(), 's2', { srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 2 }, layer: 1.5 })).toThrow(/layer/);
+    expect(() => addOverlay(m(), 's2', { srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 2 }, layer: 0 })).toThrow(/layer/);
+    const r = addOverlay(m(), 's2', { id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 2 } });
+    expect(() => updateOverlay(r, 'ov1', { layer: -1 })).toThrow(/layer/);
+  });
+
+  it('resolvedActiveOverlays sorts by (layer ascending, then tlStart) — z-order render/OTIO composite in', () => {
+    let r = addOverlay(m(), 's2', { id: 'high', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 1 }, layer: 5 }); // tl 1
+    r = addOverlay(r, 's2', { id: 'low', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 20 }, layer: 1 }); // tl 20, but layer 1 sorts first
+    const active = resolvedActiveOverlays(r);
+    expect(active.map((a) => a.overlay.id)).toEqual(['low', 'high']);
+  });
+
+  it('a broll-add-shaped call (no layer given) still collides with itself across multiple adds, exactly like before layers existed', () => {
+    // Regression: default-layer overlap enforcement must be unchanged for
+    // every call site that never passes `layer` at all (broll-add/-update).
+    let r = addOverlay(m(), 's2', { id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 2 } });
+    expect(() => addOverlay(r, 's2', { id: 'ov2', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 2.5 } })).toThrow(/allows no overlap/);
+  });
+});
+
+describe('overlay stack: rect (validation, normalization, back-compat)', () => {
+  function m(): Manifest {
+    const base = manifest();
+    return {
+      ...base,
+      sources: [
+        ...base.sources,
+        { id: 's2', path: '/broll.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: true },
+      ],
+    };
+  }
+
+  it('addOverlay stores no `rect` key at all when omitted — back-compat: full-bleed video B-roll stays exactly as before', () => {
+    const r = addOverlay(m(), 's2', { id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 2 } });
+    expect(r.timeline.overlays![0]).not.toHaveProperty('rect');
+  });
+
+  it('addOverlay accepts and stores a valid rect verbatim', () => {
+    const r = addOverlay(m(), 's2', {
+      id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 2 }, rect: { x: 0.1, y: 0.2, w: 0.3 },
+    });
+    expect(r.timeline.overlays![0].rect).toEqual({ x: 0.1, y: 0.2, w: 0.3 });
+  });
+
+  it('addOverlay rejects rect.x/y outside 0..1, rect.w <= 0 or > 1, and a box that would run off the right edge', () => {
+    const base = { srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 2 } };
+    expect(() => addOverlay(m(), 's2', { ...base, rect: { x: 1.5, y: 0, w: 0.1 } })).toThrow(/rect\.x/);
+    expect(() => addOverlay(m(), 's2', { ...base, rect: { x: 0, y: -0.1, w: 0.1 } })).toThrow(/rect\.y/);
+    expect(() => addOverlay(m(), 's2', { ...base, rect: { x: 0, y: 0, w: 0 } })).toThrow(/rect\.w/);
+    expect(() => addOverlay(m(), 's2', { ...base, rect: { x: 0, y: 0, w: 1.1 } })).toThrow(/rect\.w/);
+    expect(() => addOverlay(m(), 's2', { ...base, rect: { x: 0.8, y: 0, w: 0.5 } })).toThrow(/right edge/);
+  });
+
+  it('updateOverlay rect:null clears back to full-bleed', () => {
+    let r = addOverlay(m(), 's2', {
+      id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 2 }, rect: { x: 0, y: 0, w: 0.5 },
+    });
+    r = updateOverlay(r, 'ov1', { rect: null });
+    expect(r.timeline.overlays![0]).not.toHaveProperty('rect');
+  });
+
+  it('updateOverlay validates a replacement rect the same way addOverlay does', () => {
+    const r = addOverlay(m(), 's2', { id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 2 } });
+    expect(() => updateOverlay(r, 'ov1', { rect: { x: 0, y: 0, w: 2 } })).toThrow(/rect\.w/);
+  });
+});
+
+describe('overlay stack: opacity / fade', () => {
+  function m(): Manifest {
+    const base = manifest();
+    return {
+      ...base,
+      sources: [
+        ...base.sources,
+        { id: 's2', path: '/broll.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: true },
+      ],
+    };
+  }
+
+  it('addOverlay stores no opacity/fade keys when omitted — back-compat', () => {
+    const r = addOverlay(m(), 's2', { id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 2 } });
+    expect(r.timeline.overlays![0]).not.toHaveProperty('opacity');
+    expect(r.timeline.overlays![0]).not.toHaveProperty('fade');
+  });
+
+  it('addOverlay rejects opacity outside 0..1', () => {
+    const base = { srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 2 } };
+    expect(() => addOverlay(m(), 's2', { ...base, opacity: 1.5 })).toThrow(/opacity/);
+    expect(() => addOverlay(m(), 's2', { ...base, opacity: -0.1 })).toThrow(/opacity/);
+  });
+
+  it('addOverlay accepts fade with just `in`, just `out`, or both, but rejects an empty fade object and negative values', () => {
+    const base = { srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 2 } };
+    const inOnly = addOverlay(m(), 's2', { ...base, id: 'a', fade: { in: 0.5 } });
+    expect(inOnly.timeline.overlays![0].fade).toEqual({ in: 0.5 });
+    const outOnly = addOverlay(m(), 's2', { ...base, id: 'b', fade: { out: 0.3 } });
+    expect(outOnly.timeline.overlays![0].fade).toEqual({ out: 0.3 });
+    expect(() => addOverlay(m(), 's2', { ...base, fade: {} })).toThrow(/at least one/);
+    expect(() => addOverlay(m(), 's2', { ...base, fade: { in: -1 } })).toThrow(/fade\.in/);
+    expect(() => addOverlay(m(), 's2', { ...base, fade: { out: -1 } })).toThrow(/fade\.out/);
+  });
+
+  it('updateOverlay opacity:null / fade:null clear back to defaults', () => {
+    let r = addOverlay(m(), 's2', {
+      id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 2 }, opacity: 0.5, fade: { in: 1, out: 1 },
+    });
+    r = updateOverlay(r, 'ov1', { opacity: null, fade: null });
+    expect(r.timeline.overlays![0]).not.toHaveProperty('opacity');
+    expect(r.timeline.overlays![0]).not.toHaveProperty('fade');
+  });
+});
+
+describe('overlay stack: image sources (Source.kind:\'image\')', () => {
+  function m(): Manifest {
+    const base = manifest();
+    return {
+      ...base,
+      sources: [
+        ...base.sources,
+        { id: 'img1', path: '/logo.png', duration: 24 * 60 * 60, fps: 0, width: 400, height: 200, hasAudio: false, kind: 'image' },
+        { id: 's2', path: '/broll.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: true },
+      ],
+    };
+  }
+
+  it('addOverlay onto an image source defaults audioMode to mute, same as a video source', () => {
+    const r = addOverlay(m(), 'img1', { srcIn: 0, srcOut: 3, anchor: { sourceId: 's1', srcTime: 2 } });
+    expect(r.timeline.overlays![0].audioMode).toBe('mute');
+  });
+
+  it('addOverlay onto an image source rejects an explicit audioMode of mix/replace', () => {
+    const base = { srcIn: 0, srcOut: 3, anchor: { sourceId: 's1', srcTime: 2 } };
+    expect(() => addOverlay(m(), 'img1', { ...base, audioMode: 'mix' })).toThrow(/image.*audioMode must be "mute"/);
+    expect(() => addOverlay(m(), 'img1', { ...base, audioMode: 'replace' })).toThrow(/image.*audioMode must be "mute"/);
+  });
+
+  it('updateOverlay onto an image-sourced overlay rejects switching audioMode away from mute', () => {
+    const r = addOverlay(m(), 'img1', { id: 'ov1', srcIn: 0, srcOut: 3, anchor: { sourceId: 's1', srcTime: 2 } });
+    expect(() => updateOverlay(r, 'ov1', { audioMode: 'mix' })).toThrow(/image.*audioMode must be "mute"/);
+  });
+
+  it('an image overlay uses --dur-shaped srcIn:0/srcOut:<displayed duration> against the IMAGE_SOURCE_DURATION sentinel bound', () => {
+    // A very long displayed duration is fine (sentinel is 24h); exceeding it is rejected same as any other source-duration bound.
+    const ok = addOverlay(m(), 'img1', { srcIn: 0, srcOut: 3600, anchor: { sourceId: 's1', srcTime: 2 } });
+    expect(ok.timeline.overlays![0].srcOut).toBe(3600);
+    expect(() => addOverlay(m(), 'img1', { srcIn: 0, srcOut: 24 * 60 * 60 + 1, anchor: { sourceId: 's1', srcTime: 2 } })).toThrow(/exceeds source duration/);
+  });
+
+  it('an image overlay and a video overlay can share the same resolved time range on different layers', () => {
+    let r = addOverlay(m(), 'img1', { id: 'ov1', srcIn: 0, srcOut: 4, anchor: { sourceId: 's1', srcTime: 2 }, layer: 2 });
+    r = addOverlay(r, 's2', { id: 'ov2', srcIn: 0, srcOut: 4, anchor: { sourceId: 's1', srcTime: 2 } }); // layer 1 (default)
+    expect(r.timeline.overlays).toHaveLength(2);
+  });
+});
+
+describe('overlayGeometryWarnings (pure — shared by qc.ts/render.ts)', () => {
+  function m(): Manifest {
+    const base = manifest();
+    return {
+      ...base,
+      sources: [
+        ...base.sources,
+        { id: 's2', path: '/broll.mp4', duration: 30, fps: 30, width: 1920, height: 1080, hasAudio: true },
+        { id: 'portrait', path: '/portrait.png', duration: 24 * 60 * 60, fps: 0, width: 400, height: 800, hasAudio: false, kind: 'image' },
+      ],
+    };
+  }
+
+  it('returns nothing for a manifest with no overlays', () => {
+    expect(overlayGeometryWarnings(manifest())).toEqual([]);
+  });
+
+  it('warns when a resolved overlay extends past the timeline\'s own end', () => {
+    // base manifest() timeline is tl[0,60); anchor at src=58 with a 5s overlay resolves to tl[58,63) — past 60.
+    const r = addOverlay(m(), 's2', { id: 'ov1', srcIn: 0, srcOut: 5, anchor: { sourceId: 's1', srcTime: 58 } });
+    const warnings = overlayGeometryWarnings(r);
+    expect(warnings.some((w) => w.includes('ov1') && w.includes('タイムライン終端'))).toBe(true);
+  });
+
+  it('does not warn about overflow for an overlay that fits within the timeline', () => {
+    const r = addOverlay(m(), 's2', { id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 2 } });
+    expect(overlayGeometryWarnings(r).some((w) => w.includes('タイムライン終端'))).toBe(false);
+  });
+
+  it('warns about a full-bleed (no rect) overlay whose orientation mismatches the output canvas', () => {
+    // manifest() output is 1920x1080 (landscape); portrait source is 400x800 (portrait) -> orientation mismatch, no rect.
+    const r = addOverlay(m(), 'portrait', { id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 2 } });
+    const warnings = overlayGeometryWarnings(r);
+    expect(warnings.some((w) => w.includes('ov1') && w.includes('向き'))).toBe(true);
+  });
+
+  it('does not warn about aspect mismatch when a rect is set (the box always preserves the source\'s own aspect ratio)', () => {
+    const r = addOverlay(m(), 'portrait', {
+      id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 2 }, rect: { x: 0, y: 0, w: 0.3 },
+    });
+    expect(overlayGeometryWarnings(r).some((w) => w.includes('向き'))).toBe(false);
   });
 });
 

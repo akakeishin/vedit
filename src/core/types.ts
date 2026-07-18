@@ -173,7 +173,24 @@ export interface Source {
   width: number;
   height: number;
   hasAudio: boolean;
-  /** Relative path under cache/ once generated. */
+  /**
+   * Media kind (オーバーレイ・スタック). Optional/absent means 'video' —
+   * every source ingested before this field existed, and every source
+   * ingested via the normal footage-ingest path (`vedit ingest`/
+   * `ingest-batch` on .mp4/.mov/.m4v), is implicitly 'video'; full
+   * regression. 'image' marks a still PNG/JPEG/WebP ingested via the
+   * lightweight image-ingest path (see ingestImageFile in
+   * src/ingest/ingest.ts) purely for use as an overlay (OverlayClip.rect/
+   * opacity/fade) — it is NEVER added to `timeline.video` (no A-roll role),
+   * always has `hasAudio: false`, `fps: 0` (unused by any consumer — render
+   * passes the MANIFEST's own fps to overlay chains, never a source's own;
+   * otio.ts's `s.fps || rate` falls back to the timeline rate for it), and
+   * a synthetic `duration` (see IMAGE_SOURCE_DURATION) far larger than any
+   * practical overlay length, since a still image has no intrinsic
+   * duration of its own for OverlayClip.srcIn/srcOut to be bounded by.
+   */
+  kind?: 'video' | 'image';
+  /** Relative path under cache/ once generated. Never set for an image-kind source (no proxy is ever generated for a still image). */
   proxy?: string;
   peaks?: string;
   /** Set once transcription completed. */
@@ -362,10 +379,50 @@ export interface OverlayClip {
   srcOut: number;
   /** The A-roll moment this overlay is glued to. */
   anchor: { sourceId: string; srcTime: number };
-  /** How the B-roll's own audio interacts with the A-roll's; default 'mute'. */
+  /** How the B-roll's own audio interacts with the A-roll's; default 'mute'. An image-kind source (see Source.kind) MUST be 'mute' — addOverlay/updateOverlay reject anything else, since a still image never has audio to mix/replace with. */
   audioMode: 'mute' | 'mix' | 'replace';
   /** Gain applied to the B-roll audio when audioMode is 'mix'/'replace'; default -18 (see render.ts's OVERLAY_GAIN_DEFAULT). */
   gainDb?: number;
+  /**
+   * Compositing layer (オーバーレイ・スタック mini-spec:
+   * docs/superpowers/specs/2026-07-18-vedit-overlay-stack.md). Overlays
+   * composite onto the A-roll in ASCENDING layer order — a higher number
+   * sits ABOVE a lower one wherever their resolved timeline ranges overlap
+   * (see resolvedActiveOverlays' sort and buildFilterGraph's W3/overlay-
+   * stack block in render.ts). Optional/absent means 1 — the original W3
+   * B-roll V2 track's single implicit layer — so every overlay added
+   * before this field existed, and every `broll-add`/`broll-update` call
+   * (which has no --layer flag), reads as layer 1 unchanged: full
+   * regression, and "broll-add is layer 1's alias" per the spec.
+   * assertNoOverlayOverlap only rejects a collision WITHIN the same layer;
+   * different layers may freely overlap in time (that's the whole point of
+   * a multi-layer stack — logo + photo + stamp all on screen together).
+   */
+  layer?: number;
+  /**
+   * Placement box, normalized 0..1 against the OUTPUT canvas (m.output, or
+   * m.width/height when unset): {x,y} is the box's top-left corner, {w} is
+   * its width as a fraction of the output width. Height is NOT stored —
+   * it's derived at render/preview time to preserve the overlay source's
+   * own aspect ratio (see overlayRectGeometry in render.ts), matching the
+   * spec's "縦は元比率維持". Optional/absent means the original W3
+   * full-bleed behavior: scaled+padded to fill the entire output canvas,
+   * byte-for-byte the same ffmpeg chain as before this field existed. This
+   * is also the ONLY legal state for a plain video B-roll overlay added
+   * via `broll-add` before this feature existed — back-compat: "rect 未指定
+   * の動画 B-roll は全面".
+   */
+  rect?: { x: number; y: number; w: number };
+  /** 0..1 opacity multiplier for the overlay's own video (1 = fully opaque). Optional/absent means 1 — byte-for-byte the same chain as before this field existed. */
+  opacity?: number;
+  /**
+   * Alpha fade in/out at the overlay's own head/tail, in seconds — ffmpeg's
+   * `fade=alpha=1` (fades the overlay's OWN transparency, not a black
+   * video-content fade, and never touches the A-roll underneath). Either
+   * key may be given alone. Optional/absent means no fade at all —
+   * byte-for-byte the same chain as before this field existed.
+   */
+  fade?: { in?: number; out?: number };
 }
 
 export interface VideoClip {
