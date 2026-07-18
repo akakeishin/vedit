@@ -47,6 +47,7 @@ import {
   planExportPreset,
   renderComposition,
   renderFinal,
+  renderRangePreview,
   resolveRenderParams,
   spriteVideoClause,
   toAss,
@@ -1260,6 +1261,59 @@ describe('buildFilterGraph: audioRepair splices into the per-segment audio chain
   });
 });
 
+// ---- roadmap "クリップ単位の音量・ミュート" ----
+describe('buildFilterGraph: per-clip gainDb/muted splices a volume clause into that clip\'s own audio segment', () => {
+  it('no gainDb/muted on either clip leaves the audio chain byte-identical to before this feature existed', () => {
+    const built = buildFilterGraph(baseManifest());
+    expect(built.graph).not.toMatch(/volume=/);
+  });
+
+  it('a clip with gainDb gets a volume=<n>dB clause appended after its fade, only on that clip\'s segment', () => {
+    const m = baseManifest();
+    m.timeline.video[0].gainDb = -6;
+    const built = buildFilterGraph(m);
+    expect(built.graph).toContain(
+      '[0:a]atrim=start=0:end=5,asetpts=PTS-STARTPTS,afade=t=in:st=0:d=0.012,afade=t=out:st=4.988:d=0.012,volume=-6dB[a0]',
+    );
+    // The second clip (no override) stays exactly as before this feature existed.
+    expect(built.graph).toContain(
+      '[0:a]atrim=start=10:end=20,asetpts=PTS-STARTPTS,afade=t=in:st=0:d=0.012,afade=t=out:st=9.988:d=0.012[a1]',
+    );
+  });
+
+  it('muted:true produces volume=0 and wins over a simultaneously-set gainDb', () => {
+    const m = baseManifest();
+    m.timeline.video[1].gainDb = 4;
+    m.timeline.video[1].muted = true;
+    const built = buildFilterGraph(m);
+    expect(built.graph).toContain(',volume=0[a1]');
+    expect(built.graph).not.toContain('volume=4dB');
+  });
+
+  it('a 0 gainDb is falsy in JS but this is still expressed as no override (documented scope: no explicit "clear" syntax, --gain 0 is indistinguishable from unset)', () => {
+    const m = baseManifest();
+    m.timeline.video[0].gainDb = 0;
+    const built = buildFilterGraph(m);
+    expect(built.graph).not.toContain('volume=0dB');
+  });
+});
+
+describe('renderFinal: クリップ音量/ミュート parity self-report warning', () => {
+  it('warns when any clip has gainDb/muted set (web preview does not apply it yet)', async () => {
+    runMock.mockClear();
+    const m = baseManifest();
+    m.timeline.video[0].gainDb = -6;
+    const res = await renderFinal(m, [], outPathIn('/tmp'));
+    expect(res.warnings.some((w) => w.includes('プレビュー未反映'))).toBe(true);
+  });
+
+  it('no warning when no clip has an override', async () => {
+    runMock.mockClear();
+    const res = await renderFinal(baseManifest(), [], outPathIn('/tmp'));
+    expect(res.warnings.some((w) => w.includes('プレビュー未反映'))).toBe(false);
+  });
+});
+
 describe('buildFilterGraph: W5 color transform + adjust splices into the per-segment video chain', () => {
   it('no colorTransform / no colorAdjust leaves the video chain byte-identical to before this feature existed', () => {
     const built = buildFilterGraph(baseManifest());
@@ -1879,5 +1933,49 @@ describe('renderComposition: full regression (unaffected by the renderFinal defa
     const args = runMock.mock.calls[0][1] as string[];
     const graph = args[args.indexOf('-filter_complex') + 1];
     expect(graph).not.toMatch(/ass=/);
+  });
+});
+
+// ---- roadmap "範囲指定の下見レンダー": renderRangePreview ----
+describe('renderRangePreview', () => {
+  it('slices to the range, forces veryfast + 1-pass loudnorm + a <=1280-long-edge output, and leads warnings with the 下見品質 disclaimer', async () => {
+    runMock.mockClear();
+    runCaptureMock.mockClear();
+    const m = baseManifest(); // 1920x1080, two clips: tl[0,5) and tl[5,15) (source [0,5) / [10,20))
+    m.audioRepair = { preset: 'outdoor' }; // forces loudnorm to actually run so fastLoudnorm's effect is observable
+    const res = await renderRangePreview(m, [], outPathIn('/tmp'), { a: 2, b: 8 });
+
+    expect(res.range).toEqual({ a: 2, b: 8 });
+    expect(res.warnings[0]).toBe('下見品質(本番は通常書き出しで)');
+    expect(runCaptureMock).not.toHaveBeenCalled(); // fastLoudnorm skips the 2-pass measurement pass
+
+    expect(runMock).toHaveBeenCalledTimes(1);
+    const args = runMock.mock.calls[0][1] as string[];
+    expect(args[args.indexOf('-preset') + 1]).toBe('veryfast');
+    const graph = args[args.indexOf('-filter_complex') + 1];
+    expect(graph).toContain('scale=1280:720'); // 1920x1080 long edge capped at 1280 (720p-class)
+    expect(graph).toContain('loudnorm=I=-14:TP=-1.5:LRA=11['); // plain 1-pass, no measured_* substitution
+    expect(graph).not.toMatch(/measured_/);
+  });
+
+  it('never upscales a canvas already <=1280 on its long edge', async () => {
+    runMock.mockClear();
+    const m = baseManifest();
+    m.output = { width: 640, height: 360 };
+    await renderRangePreview(m, [], outPathIn('/tmp'), { a: 0, b: 5 });
+    const args = runMock.mock.calls[0][1] as string[];
+    const graph = args[args.indexOf('-filter_complex') + 1];
+    expect(graph).toContain('scale=640:360');
+  });
+
+  it('composition-mode manifests route through renderComposition instead of renderFinal', async () => {
+    runMock.mockClear();
+    const m = compManifest({ duration: 10 });
+    const res = await renderRangePreview(m, [], outPathIn('/tmp'), { a: 2, b: 6 });
+    expect(res.range).toEqual({ a: 2, b: 6 });
+    expect(res.warnings[0]).toBe('下見品質(本番は通常書き出しで)');
+    const args = runMock.mock.calls[0][1] as string[];
+    expect(args).toContain('-t');
+    expect(args[args.indexOf('-t') + 1]).toBe('4'); // sliced composition duration (6-2)
   });
 });

@@ -18,7 +18,9 @@ import { listProjects } from './core/registry.js';
 import { loadPreset, listPresets, savePreset } from './core/presets.js';
 import { renderView, renderSceneSheet } from './export/view.js';
 import { hasReframe, writeOtio } from './export/otio.js';
-import { loadMotionSpecs, renderComposition, renderFinal, toAss } from './export/render.js';
+import { loadMotionSpecs, renderComposition, renderFinal, renderRangePreview, toAss } from './export/render.js';
+import { forkProject } from './core/fork.js';
+import { planGc, runGc } from './core/gc.js';
 import { chaptersFromMotion, loadPeaksBySource, publishPack } from './export/publish.js';
 import {
   buildQcReport,
@@ -75,6 +77,7 @@ const BOOLEAN_FLAGS = new Set([
   'no-repair', 'fast-loudnorm', 'deess', 'confirm',
   'plan', 'link', 'no-verify', 'force', 'flip', 'no-flip',
   'clear', 'no-motion', 'no-sprite', 'no-pos', 'raw', 'keep-duration', 'sfx',
+  'yes', 'dry-run', 'mute', 'no-mute',
 ]);
 const argv = process.argv.slice(2);
 const cmd = argv[0];
@@ -355,6 +358,9 @@ const HELP = `vedit — conversational local NLE
 usage: vedit <command> [args] [--project <dir>]
 
 project:   create <dir> [--name n] | status | resume | revisions | undo [--rev N] | open | projects
+           fork --project <src> --to <dir> [--name n]   # 派生プロジェクト作成(revision 独立、cache/transcriptをhardlink流用)
+maintenance: compact [--dry-run]   # revisions.jsonl の世代圧縮(直近100件は全量、以降は10件毎に1件のみ全量保持)
+           gc [--yes]              # cache/ の孤児(未参照プロキシ・波形・シーンサムネ等)+ orphan transcript を列挙/削除(既定 dry-run)
 notes:     note "<text>" [--type policy|decision|todo|pref]   # 低摩擦メモ(既定 decision; revision が読めれば rev N も記録)
            notes [--limit N]                    # 直近のメモ一覧(既定10件。todo には note-done 用の番号付き)
            note-done <todo番号>                   # 未完了 todo を完了にする(番号は vedit notes の todos[].no)
@@ -365,14 +371,16 @@ ingest:    ingest <file...> [--language ja] [--transcribe] [--no-scenes] [--no-a
              # 既定: プロキシ+波形+シーン検出まで(文字起こしはしない)。旧挙動(即時transcribe)は --transcribe
            ingest-batch <dir|files...> [--plan] [--copy destDir | --link] [--no-verify]
              [--language ja] [--transcribe] [--no-scenes] [--no-add]   # 撮影カード一括取込、検証付き・再開可能
-transcribe: transcribe <sourceId|all> [--language ja]
+transcribe: transcribe <sourceId|all> [--language ja] [--glossary "語1,語2,..."]
              # 文字起こしを裏で非同期実行(即座に返る; WSで transcribe-progress/-done/-error を配信)
+             # --glossary は whisper の --prompt に整形して渡し、manifest に保存して以後の transcribe にも自動適用
 read:      transcript [--full] [--source id] | candidates [--all] | sources
 detect:    detect [--min-gap 0.7] [--threshold 0.06] [--no-fillers] [--no-silence]
 cut:       remove-words <w1 w5..w9 ...> [--source id] [--pad 0.08] | remove-range <t0> <t1> [--source id]
            approve <id...|all> | reject <id...> | trim <clipId> <in|out> <±frames>
 clips:     clip-add <sourceId> [--in s] [--out s] [--at index] | clip-remove <clipId>
            clip-move <clipId> --before <clipId|end>
+           clip-audio <clipId> [--gain -30..12] [--mute|--no-mute] --base <rev>   # クリップ単位の音量/ミュート(プレビュー未反映、書き出しで確認)
 scenes:    scenes detect [--source id] [--sensitivity 0.3] [--max-len 12] [--min-len 1.5]
            scenes [--source id]                    # packed scene list (id/range/hasSpeech/energy/[keep|reject]/note)
            scenes sheet [--source id] [--cols n]    # contact sheet PNG (prints path; Read it)
@@ -438,6 +446,7 @@ qc:        qc [--render <out.mp4>] [--report <out.html>]
              # kit があれば tempo contract(表示のみ・合否判定なし)も付与。--report で buildQcReport の HTML を書き出し
 export:    export otio <out.otio> | export render <out.mp4> [--no-burn-captions] [--preset youtube|shorts|x]
            export render ... [--no-repair] [--fast-loudnorm]   # 乾音A/B比較 / 1-passループドネスに落とす
+           export render <out.mp4> --range <a>..<b>   # 範囲下見レンダー(下見品質固定: 720p級/veryfast/1-passloudnorm)
              # captions.enabled なら字幕は既定で焼き込み。--no-burn-captions でクリーン映像に(NLE手渡し用)
              # dialogue(セリフ)は captions 設定と無関係に常に焼き込み(唯一の出口のため)
              # motion(チャプターカード等4プリセット)は自動で焼き込み。custom-html は対象外(警告を出力)
@@ -506,6 +515,19 @@ async function main() {
       await Project.create(dir, (flags.name as string) ?? path.basename(dir));
       await ensureDaemon(dir);
       return out({ ok: true, dir, next: `vedit ingest <video> --project ${dir}` });
+    }
+
+    case 'fork': {
+      // 「--project」はここでは source project の意味(projectDir() の通常
+      // 解決規則そのまま — --project/VEDIT_PROJECT/cwd の順)。新しい派生
+      // プロジェクトの行き先は --to。派生元の daemon は不要(ファイル操作の
+      // み)なので ensureDaemon は呼ばない。
+      const destArg = flags.to as string | undefined;
+      if (!destArg) fail('usage: vedit fork --project <src> --to <dir> [--name <名前>]');
+      const srcDir = projectDir();
+      const destDir = path.resolve(destArg);
+      const res = await forkProject(srcDir, destDir, { name: flags.name as string | undefined });
+      return out({ ...res, hint: `vedit open --project ${destDir}` });
     }
 
     case 'compose': {
@@ -911,15 +933,30 @@ async function main() {
       // transcribe-done / transcribe-error) and via `vedit status`'s
       // per-source transcribing/transcribed fields — this command does not
       // block until the job finishes.
-      const target = pos[0] ?? fail('usage: vedit transcribe <sourceId|all> [--language ja]');
+      const target = pos[0] ?? fail('usage: vedit transcribe <sourceId|all> [--language ja] [--glossary "語1,語2,..."]');
       const dir = projectDir();
+      // 用語集(roadmap "whisper 用語集プロンプト"): --glossary が明示され
+      // ればそれを使い、manifest へ保存して以後の transcribe にも自動適用
+      // (setTranscriptionGlossary, core/ops.ts)。省略時は manifest に既に
+      // 保存されている用語集を読んで、そのまま今回にも適用する。
+      const explicitGlossary = flags.glossary !== undefined
+        ? String(flags.glossary).split(',').map((s) => s.trim()).filter(Boolean)
+        : undefined;
+      let glossary = explicitGlossary;
+      if (glossary === undefined) {
+        try {
+          const p0 = await Project.open(dir);
+          glossary = (await p0.manifest()).transcription?.glossary;
+        } catch { /* project not open yet — nothing stored to fall back to */ }
+      }
       await ensureDaemon(dir);
       const res = await api('/api/transcribe', {
         method: 'POST',
-        body: JSON.stringify({ sourceId: target, language: flags.language }),
+        body: JSON.stringify({ sourceId: target, language: flags.language, glossary }),
       });
       return out({
         ...res,
+        glossary: glossary ?? [],
         hint: res.started?.length
           ? '裏で実行中。完了は `vedit status` の sources[].transcribed、または web の存在感ストリップで確認できる'
           : '対象なし(既に文字起こし済み、または全て実行中)',
@@ -1062,6 +1099,15 @@ async function main() {
     case 'clip-move':
       if (pos.length === 0 || flags.before === undefined) fail('usage: vedit clip-move <clipId> --before <clipId|end>');
       return edit({ op: 'clip-move', clipId: pos[0], before: flags.before });
+
+    case 'clip-audio': {
+      if (pos.length === 0) fail('usage: vedit clip-audio <clipId> [--gain -30..12] [--mute|--no-mute] --base <rev>');
+      if (flags.mute && flags['no-mute']) fail('--mute and --no-mute are mutually exclusive');
+      const gainDb = numFlag('gain', flags.gain);
+      const muted = flags.mute ? true : flags['no-mute'] ? false : undefined;
+      if (gainDb === undefined && muted === undefined) fail('usage: vedit clip-audio <clipId> [--gain -30..12] [--mute|--no-mute] --base <rev> (at least one of --gain/--mute/--no-mute is required)');
+      return edit({ op: 'clip-audio', clipId: pos[0], gainDb, muted });
+    }
 
     case 'scenes': {
       const sub = pos[0];
@@ -1651,6 +1697,39 @@ async function main() {
       return out(revs.map((r: any) => `r${r.rev} [${r.actor}] ${r.op}: ${r.summary}`).join('\n'));
     }
 
+    case 'compact': {
+      // Maintenance command, purely local file rewrite — no daemon needed
+      // (like ingest-batch's pre-daemon reads), and no --base/revision
+      // bump: it's a bookkeeping pass over revisions.jsonl, not a manifest
+      // edit, so it never shows up as a new revision itself.
+      const dir = projectDir();
+      const p = await Project.open(dir);
+      const res = await p.compact({ dryRun: Boolean(flags['dry-run']) });
+      return out({
+        ...res,
+        hint: res.dryRun
+          ? `${res.snapshotsDropped}件のスナップショットを削減見込み(${res.bytesBefore}B → ${res.bytesAfter}B)。実行するには --dry-run を外して再実行`
+          : `完了(バックアップ: ${path.join(dir, 'revisions.jsonl.bak')})`,
+      });
+    }
+
+    case 'gc': {
+      // 同上、daemon 不要のローカル操作。既定は dry-run(一覧+合計バイト数のみ)。
+      const dir = projectDir();
+      const p = await Project.open(dir);
+      const res = flags.yes ? await runGc(p, { yes: true }) : await planGc(p);
+      return out({
+        orphans: res.orphans,
+        totalBytes: res.totalBytes,
+        deleted: res.deleted,
+        hint: res.deleted
+          ? `${res.orphans.length}件削除しました(${res.totalBytes}B)`
+          : res.orphans.length
+            ? `孤児 ${res.orphans.length}件・計${res.totalBytes}B(dry-run)。削除するには --yes を付けて再実行`
+            : '孤児なし',
+      });
+    }
+
     case 'show': {
       const USAGE = 'usage: vedit show range <t0> <t1> | show words <w1 w5..w9 ...> [--source id] | show candidate <id> | show compare <revA> <revB> | show source <id> [--at s] | show takes <sourceId> <groupId>';
       const sub = pos[0];
@@ -1858,6 +1937,35 @@ async function main() {
         // res.warnings and flow into the JSON output below like every other
         // render warning.
         const motionSpecs = m.timeline.motion.length > 0 ? await loadMotionSpecs(p, m) : undefined;
+        // 範囲下見レンダー(roadmap "範囲指定の下見レンダー"): 既存パイプ
+        // ラインをタイムライン範囲 [a,b) に制約するだけ(sliceTimelineRange,
+        // core/ops.ts)で、音・色・字幕の変更を数秒で A/B できる。下見品質
+        // (720p級/veryfast/1-passloudnorm)固定 — --preset 等の通常書き出し
+        // オプションとは独立(組み合わせ不可)。
+        if (flags.range) {
+          const rangeRaw = String(flags.range);
+          const rangeMatch = /^(-?[\d.]+)\.\.(-?[\d.]+)$/.exec(rangeRaw);
+          if (!rangeMatch) fail(`--range must look like "<a>..<b>" in seconds (got ${JSON.stringify(rangeRaw)})`);
+          const a = numArg('range a', rangeMatch[1]);
+          const b = numArg('range b', rangeMatch[2]);
+          console.error(`rendering range preview [${a}s..${b}s] (下見品質)...`);
+          const options = { range: rangeRaw };
+          try {
+            const res = await renderRangePreview(m, await transcriptsOf(), path.resolve(dest), { a, b }, {
+              noBurnCaptions: Boolean(flags['no-burn-captions']),
+              noRepair: Boolean(flags['no-repair']),
+              ...(motionSpecs ? { motionSpecs } : {}),
+            });
+            await recordExportResult(dir, {
+              kind: 'render-preview', file: dest, ok: true, revision: m.revision, options,
+              warnings: res.warnings,
+            });
+            return out({ ok: true, file: dest, range: res.range, warnings: res.warnings });
+          } catch (e: any) {
+            await recordExportResult(dir, { kind: 'render-preview', file: dest, ok: false, revision: m.revision, options, error: e?.message ?? String(e) });
+            throw e;
+          }
+        }
         if (m.composition) {
           console.error('rendering composition (background + sprites + dialogue)...');
           const options = { preset: presetRaw };

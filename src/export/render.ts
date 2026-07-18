@@ -8,6 +8,7 @@ import {
   resolvedActiveOverlays,
   resolvedActiveSprites,
   segments,
+  sliceTimelineRange,
   SPRITE_EMOTE_CROSSFADE_SECONDS,
   spriteGeometry,
   spriteMotionPlan,
@@ -426,6 +427,11 @@ export function buildFilterGraph(
   if (segs.length === 0) throw new Error('empty timeline');
   const srcIds = [...new Set(segs.map((s) => s.sourceId))];
   const srcById = new Map(m.sources.map((s) => [s.id, s]));
+  // Roadmap "クリップ単位の音量・ミュート": looked up per-segment via
+  // seg.clipId below (each Segment carries the originating VideoClip.id —
+  // see segments() in ops.ts) so a clip's gainDb/muted override applies to
+  // exactly its own audio, not neighboring clips from the same source.
+  const clipById = new Map(m.timeline.video.map((c) => [c.id, c]));
   const music = m.timeline.music ?? [];
   const inputPaths = [...srcIds.map((id) => srcById.get(id)!.path), ...music.map((mu) => mu.path)];
   const musicInputBase = srcIds.length;
@@ -464,7 +470,13 @@ export function buildFilterGraph(
       const fd = Math.min(xfade, dur / 2);
       const fadePart = fd > 1e-4 ? `,afade=t=in:st=0:d=${fd},afade=t=out:st=${Math.max(0, dur - fd)}:d=${fd}` : '';
       const repairPart = repairChain ? `,${repairChain}` : '';
-      parts.push(`[${idx}:a]atrim=start=${a}:end=${b},asetpts=PTS-STARTPTS${repairPart}${fadePart}[a${i}]`);
+      // Roadmap "クリップ単位の音量・ミュート": muted wins over gainDb (no
+      // need to also clear a previously-set gain to silence a clip); a clip
+      // with neither set produces '' here — byte-for-byte the same chain as
+      // before this feature existed.
+      const clip = clipById.get(seg.clipId);
+      const clipAudioPart = clip?.muted ? ',volume=0' : clip?.gainDb ? `,volume=${clip.gainDb}dB` : '';
+      parts.push(`[${idx}:a]atrim=start=${a}:end=${b},asetpts=PTS-STARTPTS${repairPart}${fadePart}${clipAudioPart}[a${i}]`);
     } else {
       parts.push(`anullsrc=r=48000:cl=stereo,atrim=duration=${dur}[a${i}]`);
     }
@@ -1277,6 +1289,13 @@ export async function renderFinal(
   if ((effectiveM.timeline.sprites ?? []).length > 0) {
     warnings.push('スプライト/モーションのアニメーションは通常プロジェクトの書き出しでは静止画になります');
   }
+  // Roadmap "クリップ単位の音量・ミュート": the web preview doesn't apply
+  // gainDb/muted yet (that's a separate, untouched wave — see the
+  // roadmap item's spec) — self-report the parity gap on every render that
+  // actually has an override set, rather than silently diverging.
+  if (effectiveM.timeline.video.some((c) => c.gainDb !== undefined || c.muted)) {
+    warnings.push('クリップ音量/ミュートはプレビュー未反映(書き出しで確認)');
+  }
   let kit: import('../core/types.js').KitFile | null = null;
   if (effectiveM.kit) {
     try {
@@ -1600,4 +1619,81 @@ export async function renderComposition(
   if (assPath) await fs.rm(assPath, { force: true });
   if (motionAssPath) await fs.rm(motionAssPath, { force: true });
   return { file: outPath, warnings };
+}
+
+// ---- range preview render (roadmap "範囲指定の下見レンダー") ----
+
+export interface RangePreviewResult {
+  file: string;
+  warnings: string[];
+  range: { a: number; b: number };
+  captionsBurned?: boolean;
+  captionCueCount?: number;
+  dialogueBurned?: boolean;
+  dialogueCount?: number;
+}
+
+/**
+ * `vedit export render --range <a>..<b>`: a fast A/B preview of audio/color/
+ * caption changes over just the timeline window [a,b) — NOT a lower-fidelity
+ * pipeline. `sliceTimelineRange` (core/ops.ts) does the one real piece of
+ * work: it produces a manifest whose timeline IS exactly that window
+ * remapped to [0,b-a), then this function hands that sliced manifest to the
+ * SAME renderFinal/renderComposition every normal export uses — captions,
+ * BGM ducking, color, dialogue, motion burn-in all behave identically,
+ * because nothing about their code path changed, only the input manifest's
+ * shape.
+ *
+ * "下見品質で良い" (spec): this is the ONLY place preview quality is
+ * downgraded — `-preset veryfast` (fast x264 encode), a single-pass loudnorm
+ * (no measurement pass — `fastLoudnorm: true`, same flag `--fast-loudnorm`
+ * already exposes on a normal render), and the output canvas capped so its
+ * long edge is <=1280 (720p-class in either orientation; never upscales a
+ * canvas that's already smaller). The returned `warnings` always leads with
+ * an explicit "下見品質" disclaimer so a caller can't mistake this for a
+ * final-quality export.
+ */
+export async function renderRangePreview(
+  m: Manifest,
+  transcripts: Transcript[],
+  outPath: string,
+  range: { a: number; b: number },
+  opts: { motionSpecs?: Record<string, MotionSpec>; noBurnCaptions?: boolean; noRepair?: boolean } = {},
+): Promise<RangePreviewResult> {
+  const sliced = sliceTimelineRange(m, range.a, range.b);
+  const baseOutput = sliced.output ?? { width: sliced.width, height: sliced.height };
+  const longEdge = Math.max(baseOutput.width, baseOutput.height);
+  const previewOutput =
+    longEdge > 1280
+      ? {
+          width: Math.max(2, Math.round((baseOutput.width * (1280 / longEdge)) / 2) * 2),
+          height: Math.max(2, Math.round((baseOutput.height * (1280 / longEdge)) / 2) * 2),
+        }
+      : baseOutput;
+  const previewManifest: Manifest = { ...sliced, output: previewOutput };
+
+  const warnings = ['下見品質(本番は通常書き出しで)'];
+  if (previewManifest.composition) {
+    const res = await renderComposition(previewManifest, outPath, {
+      encPreset: 'veryfast',
+      ...(opts.motionSpecs ? { motionSpecs: opts.motionSpecs } : {}),
+    });
+    return { file: res.file, warnings: [...warnings, ...res.warnings], range };
+  }
+  const res = await renderFinal(previewManifest, transcripts, outPath, {
+    encPreset: 'veryfast',
+    fastLoudnorm: true,
+    noBurnCaptions: opts.noBurnCaptions,
+    noRepair: opts.noRepair,
+    ...(opts.motionSpecs ? { motionSpecs: opts.motionSpecs } : {}),
+  });
+  return {
+    file: res.file,
+    warnings: [...warnings, ...res.warnings],
+    range,
+    captionsBurned: res.captionsBurned,
+    captionCueCount: res.captionCueCount,
+    dialogueBurned: res.dialogueBurned,
+    dialogueCount: res.dialogueCount,
+  };
 }

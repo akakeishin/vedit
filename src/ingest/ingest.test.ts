@@ -29,7 +29,7 @@ vi.mock('./run.js', () => ({
   ffmpegHasFilter: (...args: unknown[]) => hasFilterMock(...args),
 }));
 
-import { ingestFile, makeProxy, probe, sanitizeWords, transcribe } from './ingest.js';
+import { buildWhisperPrompt, ingestFile, makeProxy, probe, sanitizeWords, transcribe } from './ingest.js';
 
 describe('sanitizeWords', () => {
   it('leaves well-formed words untouched', () => {
@@ -294,6 +294,44 @@ describe('transcribe', () => {
     expect(meta.at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     expect(t.words).toHaveLength(1);
     expect(t.words[0].text).toBe('hello');
+  });
+
+  // ---- roadmap "whisper 用語集プロンプト": buildWhisperPrompt is pure
+  // (no whisper invocation needed) — see its doc in ingest.ts. ----
+  it('buildWhisperPrompt joins trimmed, non-empty terms with a Japanese comma', () => {
+    expect(buildWhisperPrompt(['ヴィエディット', ' Claude ', '空 ']))
+      .toBe('ヴィエディット、Claude、空');
+  });
+
+  it('buildWhisperPrompt drops empty/whitespace-only terms', () => {
+    expect(buildWhisperPrompt(['', '  ', 'termA'])).toBe('termA');
+  });
+
+  it('buildWhisperPrompt returns "" for an empty or all-blank glossary', () => {
+    expect(buildWhisperPrompt([])).toBe('');
+    expect(buildWhisperPrompt(['', '   '])).toBe('');
+  });
+
+  it('transcribe passes --prompt to whisper-cli when glossary is given, omits it otherwise', async () => {
+    runMock.mockReset();
+    runMock.mockImplementation(async (cmd: string, args: string[]) => {
+      if (cmd === 'whisper-cli') {
+        const outBase = args[args.indexOf('-of') + 1];
+        await fs.writeFile(
+          `${outBase}.json`,
+          JSON.stringify({ transcription: [], result: { language: 'ja' } }),
+        );
+      }
+      return '';
+    });
+    await transcribe('/in.mp4', 'src1', { model: '/models/ggml-small.bin', glossary: ['ヴィエディット', 'Claude'] });
+    const withGlossary = runMock.mock.calls.find(([cmd]) => cmd === 'whisper-cli') as [string, string[]];
+    expect(withGlossary[1]).toEqual(expect.arrayContaining(['--prompt', 'ヴィエディット、Claude']));
+
+    runMock.mockClear();
+    await transcribe('/in.mp4', 'src1', { model: '/models/ggml-small.bin' });
+    const withoutGlossary = runMock.mock.calls.find(([cmd]) => cmd === 'whisper-cli') as [string, string[]];
+    expect(withoutGlossary[1]).not.toContain('--prompt');
   });
 });
 

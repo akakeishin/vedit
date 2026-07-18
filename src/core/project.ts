@@ -3,6 +3,25 @@ import path from 'node:path';
 import type { CutCandidate, Manifest, RevisionEntry, Scene, SceneFile, Transcript } from './types.js';
 import { upsertProject } from './registry.js';
 
+/** Result of `Project.compact()` — see its doc for the retention policy. */
+export interface CompactResult {
+  totalEntries: number;
+  /** How many of the most-recent entries kept their snapshot unconditionally. */
+  recentKept: number;
+  /** How many entries fell outside that recent window (candidates for dropping). */
+  olderTotal: number;
+  /** Among `olderTotal`, how many kept their snapshot anyway (every SNAPSHOT_STRIDE-th one). */
+  snapshotsKept: number;
+  snapshotsDropped: number;
+  bytesBefore: number;
+  /** Projected (dryRun) or actual (real run) size after compaction. */
+  bytesAfter: number;
+  bytesSaved: number;
+  dryRun: boolean;
+  /** Only set on a real (non-dry-run) run: where the pre-compaction file was copied. */
+  backupPath?: string;
+}
+
 /**
  * Ids used to build filenames (sourceId, motion spec id) must never carry a
  * path separator or ".." segment — the daemon treats a manifest and its
@@ -320,6 +339,13 @@ export class Project {
    * always racing onto "whatever's latest". Also rolls motion/*.json
    * sidecars back to their content as of `rev`, when that revision recorded
    * it (older entries predating this feature won't have `motionSpecs`).
+   *
+   * `vedit compact` (see compact() below) can have dropped `rev`'s snapshot
+   * to bound revisions.jsonl's growth — RevisionEntry.snapshot is declared
+   * required in types.ts (every WRITER always fills it in) but a compacted
+   * entry's JSON on disk genuinely omits the key, so this checks for that
+   * at runtime and fails with a "nearest restorable revision" pointer
+   * instead of restoring `undefined`.
    */
   async restore(rev: number, actor: RevisionEntry['actor'], baseRev: number): Promise<Manifest> {
     return this.withLock(async () => {
@@ -336,6 +362,24 @@ export class Project {
       let target: RevisionEntry | undefined;
       for (const e of entries) if (e.rev === rev) target = e; // last match wins (revs are unique in practice)
       if (!target) throw new Error(`revision ${rev} not found`);
+      if (!target.snapshot) {
+        const withSnapshot = entries.filter((e) => e.snapshot);
+        if (withSnapshot.length === 0) {
+          throw new Error(`revision ${rev} has no stored snapshot (compacted by \`vedit compact\`), and no other revision has one either — cannot restore`);
+        }
+        let nearest = withSnapshot[0];
+        let bestDist = Math.abs(nearest.rev - rev);
+        for (const e of withSnapshot) {
+          const d = Math.abs(e.rev - rev);
+          if (d < bestDist) {
+            nearest = e;
+            bestDist = d;
+          }
+        }
+        throw new Error(
+          `revision ${rev} has no stored snapshot (compacted by \`vedit compact\`); nearest restorable revision is ${nearest.rev} ("${nearest.summary}") — run \`vedit undo --rev ${nearest.rev}\``,
+        );
+      }
       const snap = target.snapshot;
       return this.commitLocked(
         baseRev,
@@ -347,6 +391,79 @@ export class Project {
         target.motionSpecs,
       );
     });
+  }
+
+  /**
+   * Bound revisions.jsonl's growth (HANDOFF §5: "revisions.jsonl は全量
+   * スナップショット追記で肥大" — every commit appends a full manifest
+   * snapshot). Policy: the most recent `RECENT_KEEP` entries always keep
+   * their full snapshot+motionSpecs untouched; among OLDER entries, every
+   * `SNAPSHOT_STRIDE`-th one (0-based position within the older subset, so
+   * the very OLDEST entry always qualifies — restore() never runs out of a
+   * fallback target) also keeps its snapshot, and the rest have `snapshot`/
+   * `motionSpecs` dropped, leaving only the summary metadata
+   * (`Project.revisions()` never reads `.snapshot` at all, so the UI/CLI
+   * history list is byte-for-byte unaffected by compaction — see that
+   * method's doc). `dryRun` computes the projected byte delta without
+   * writing anything; a real run first copies the current file to
+   * `revisions.jsonl.bak` (overwriting any earlier backup), then replaces
+   * revisions.jsonl atomically (tmp + rename).
+   */
+  async compact(opts: { dryRun?: boolean } = {}): Promise<CompactResult> {
+    return this.withLock(() => this.compactLocked(opts));
+  }
+
+  private async compactLocked(opts: { dryRun?: boolean }): Promise<CompactResult> {
+    const RECENT_KEEP = 100;
+    const SNAPSHOT_STRIDE = 10;
+    let raw: string;
+    try {
+      raw = await fs.readFile(this.revisionsPath, 'utf8');
+    } catch {
+      raw = '';
+    }
+    const bytesBefore = Buffer.byteLength(raw, 'utf8');
+    if (!raw) {
+      return { totalEntries: 0, recentKept: 0, olderTotal: 0, snapshotsKept: 0, snapshotsDropped: 0, bytesBefore: 0, bytesAfter: 0, bytesSaved: 0, dryRun: Boolean(opts.dryRun) };
+    }
+    const { entries } = this.parseRevisionLines(raw); // append order === ascending rev
+    const total = entries.length;
+    const recentCount = Math.min(RECENT_KEEP, total);
+    const olderCount = total - recentCount;
+
+    let snapshotsKept = 0;
+    let snapshotsDropped = 0;
+    const rewritten = entries.map((e, i) => {
+      if (i >= olderCount) return e; // within the "recent" window — untouched
+      if (i % SNAPSHOT_STRIDE === 0) {
+        snapshotsKept++;
+        return e;
+      }
+      snapshotsDropped++;
+      const { snapshot: _snapshot, motionSpecs: _motionSpecs, ...rest } = e;
+      return rest as RevisionEntry;
+    });
+
+    const body = rewritten.map((e) => JSON.stringify(e)).join('\n') + (rewritten.length ? '\n' : '');
+    const bytesAfter = Buffer.byteLength(body, 'utf8');
+    const base = {
+      totalEntries: total,
+      recentKept: recentCount,
+      olderTotal: olderCount,
+      snapshotsKept,
+      snapshotsDropped,
+      bytesBefore,
+      bytesAfter,
+      bytesSaved: bytesBefore - bytesAfter,
+    };
+    if (opts.dryRun) return { ...base, dryRun: true };
+
+    const backupPath = `${this.revisionsPath}.bak`;
+    await fs.writeFile(backupPath, raw);
+    const tmp = `${this.revisionsPath}.tmp-compact-${Math.random().toString(36).slice(2)}`;
+    await fs.writeFile(tmp, body);
+    await fs.rename(tmp, this.revisionsPath);
+    return { ...base, dryRun: false, backupPath };
   }
 
   // ---- transcript ----

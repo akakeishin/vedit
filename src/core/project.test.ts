@@ -3,7 +3,7 @@ import { mkdtempSync, promises as fsp } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { Project } from './project.js';
-import type { CutCandidate, Manifest } from './types.js';
+import type { CutCandidate, Manifest, RevisionEntry } from './types.js';
 
 function freshDir(prefix: string): string {
   return path.join(mkdtempSync(path.join(tmpdir(), `vedit-project-${prefix}-`)), 'proj');
@@ -288,5 +288,131 @@ describe('Project: decideCandidates atomicity', () => {
     ).rejects.toMatchObject({ code: 'STALE_REVISION' });
     const onDisk = await p.candidates();
     expect(onDisk[0].status).toBe('proposed'); // untouched — commit failed before the status flip
+  });
+});
+
+// ---- roadmap "revisions.jsonl 世代圧縮": Project.compact() ----
+describe('Project: compact()', () => {
+  function fixtureManifest(n: number): Manifest {
+    return {
+      version: 1, name: `rev${n}`, revision: n, fps: 30, width: 1920, height: 1080,
+      sources: [], timeline: { video: [], motion: [] },
+      captions: { enabled: true, style: 'clean', maxChars: 24 },
+    };
+  }
+
+  function fixtureEntry(rev: number): RevisionEntry {
+    return {
+      rev, baseRev: rev - 1, actor: 'ui', op: `op${rev}`, params: {}, ts: '2020-01-01T00:00:00.000Z',
+      summary: `summary ${rev}`, snapshot: fixtureManifest(rev),
+    };
+  }
+
+  /**
+   * Bypasses commit() entirely — writes N synthetic full-snapshot entries
+   * directly (so 100+-entry retention-policy tests don't need hundreds of
+   * real commits), and also overwrites project.json's own `revision` to
+   * `count` so it stays consistent with the log (matching what a real
+   * sequence of commits would have left behind) — compact() itself never
+   * reads/compares against project.json, but restore()'s baseRev check
+   * does.
+   */
+  async function seedRevisions(dir: string, count: number): Promise<void> {
+    const body = Array.from({ length: count }, (_, i) => JSON.stringify(fixtureEntry(i + 1))).join('\n') + '\n';
+    await fsp.writeFile(path.join(dir, 'revisions.jsonl'), body);
+    await fsp.writeFile(path.join(dir, 'project.json'), JSON.stringify(fixtureManifest(count), null, 2));
+  }
+
+  it('an empty/no revisions.jsonl compacts to a no-op (no error, no .bak)', async () => {
+    const dir = freshDir('compact-empty');
+    const p = await Project.create(dir, 'empty');
+    const res = await p.compact();
+    expect(res).toMatchObject({ totalEntries: 0, recentKept: 0, olderTotal: 0, snapshotsKept: 0, snapshotsDropped: 0, dryRun: false });
+    await expect(fsp.access(path.join(dir, 'revisions.jsonl.bak'))).rejects.toThrow();
+  });
+
+  it('fewer than 100 entries: everything stays in the "recent" window untouched, byte count unchanged', async () => {
+    const dir = freshDir('compact-small');
+    const p = await Project.create(dir, 'small');
+    for (let i = 0; i < 5; i++) await p.commit(i, 'ui', `op${i}`, {}, `s${i}`, (m) => m);
+    const before = await fsp.readFile(path.join(dir, 'revisions.jsonl'), 'utf8');
+
+    const dry = await p.compact({ dryRun: true });
+    expect(dry).toMatchObject({ totalEntries: 5, recentKept: 5, olderTotal: 0, snapshotsKept: 0, snapshotsDropped: 0, dryRun: true });
+    expect(dry.bytesAfter).toBe(dry.bytesBefore);
+    expect(dry.bytesSaved).toBe(0);
+    // dry-run truly never writes anything.
+    expect(await fsp.readFile(path.join(dir, 'revisions.jsonl'), 'utf8')).toBe(before);
+
+    const real = await p.compact();
+    expect(real.dryRun).toBe(false);
+    expect(real.bytesSaved).toBe(0);
+    expect(await fsp.readFile(path.join(dir, 'revisions.jsonl'), 'utf8')).toBe(before); // still byte-identical
+
+    const revs = await p.revisions();
+    expect(revs.map((r) => r.rev)).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it('130 entries: keeps the most recent 100 in full, and every 10th of the older 30 (oldest included)', async () => {
+    const dir = freshDir('compact-130');
+    const p = await Project.create(dir, 'big');
+    await seedRevisions(dir, 130);
+    const raw = await fsp.readFile(path.join(dir, 'revisions.jsonl'), 'utf8');
+    const bytesBefore = Buffer.byteLength(raw, 'utf8');
+
+    const res = await p.compact();
+    expect(res).toMatchObject({
+      totalEntries: 130, recentKept: 100, olderTotal: 30, snapshotsKept: 3, snapshotsDropped: 27, dryRun: false,
+    });
+    expect(res.bytesBefore).toBe(bytesBefore);
+    expect(res.bytesAfter).toBeLessThan(bytesBefore);
+    expect(res.bytesSaved).toBe(bytesBefore - res.bytesAfter);
+    expect(res.backupPath).toBe(path.join(dir, 'revisions.jsonl.bak'));
+    expect(await fsp.readFile(res.backupPath!, 'utf8')).toBe(raw); // backup is the PRE-compaction content
+
+    // Re-parse the compacted file directly (bypassing Project's own
+    // snapshot-stripping accessors) to check exactly which entries kept a
+    // snapshot: rev 1/11/21 (older-subset positions 0/10/20) plus every one
+    // of rev 31..130 (the always-kept recent window).
+    const after = (await fsp.readFile(path.join(dir, 'revisions.jsonl'), 'utf8'))
+      .split('\n').filter(Boolean).map((l) => JSON.parse(l) as RevisionEntry);
+    expect(after).toHaveLength(130);
+    const withSnapshot = new Set(after.filter((e) => e.snapshot).map((e) => e.rev));
+    expect(withSnapshot.has(1)).toBe(true);
+    expect(withSnapshot.has(11)).toBe(true);
+    expect(withSnapshot.has(21)).toBe(true);
+    expect(withSnapshot.has(2)).toBe(false);
+    expect(withSnapshot.has(25)).toBe(false);
+    for (let rev = 31; rev <= 130; rev++) expect(withSnapshot.has(rev)).toBe(true);
+
+    // History display (UI list / `vedit revisions`) never reads .snapshot at
+    // all — revisions() must be byte-for-byte unaffected by compaction.
+    const revs = await p.revisions();
+    expect(revs).toHaveLength(130);
+    expect(revs.map((r) => r.rev)).toEqual(Array.from({ length: 130 }, (_, i) => i + 1));
+    expect(revs[1]).toMatchObject({ rev: 2, actor: 'ui', op: 'op2', summary: 'summary 2' }); // a DROPPED entry's metadata still reads fine
+    expect((revs[1] as any).snapshot).toBeUndefined();
+  });
+
+  it('restore() on a compacted (snapshot-dropped) revision throws pointing at the nearest restorable one', async () => {
+    const dir = freshDir('compact-restore-dropped');
+    const p = await Project.create(dir, 'restore-dropped');
+    await seedRevisions(dir, 130);
+    await p.compact();
+
+    // rev 25 (dropped) sits between kept rev 21 (dist 4) and the always-kept
+    // rev 31 (dist 6) — nearest must be 21, not just "the first one found".
+    await expect(p.restore(25, 'ui', 0)).rejects.toThrow(/no stored snapshot.*nearest restorable revision is 21/s);
+  });
+
+  it('restore() on a still-full (kept) revision works exactly as before compaction', async () => {
+    const dir = freshDir('compact-restore-kept');
+    const p = await Project.create(dir, 'restore-kept');
+    await seedRevisions(dir, 130);
+    await p.compact();
+
+    const restored = await p.restore(21, 'ui', 130); // rev21 kept its snapshot (older-subset position 20); baseRev=130 matches seedRevisions' project.json
+    expect(restored.revision).toBe(131); // restore is itself a new revision
+    expect(restored.name).toBe('rev21'); // fixtureManifest(21)'s content
   });
 });

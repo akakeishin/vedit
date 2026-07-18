@@ -16,7 +16,7 @@ import path from 'node:path';
  * だけで例外を投げない)——記録の欠損より書き出し自体の成功が優先。
  */
 
-export type ExportKind = 'render' | 'otio' | 'srt' | 'ass' | 'fcp7xml' | 'publish-pack';
+export type ExportKind = 'render' | 'render-preview' | 'otio' | 'srt' | 'ass' | 'fcp7xml' | 'publish-pack';
 
 export interface ExportResultRecord {
   /** ISO timestamp。CLI 側で取得して渡す(このモジュールは時計を持たない)。 */

@@ -249,6 +249,26 @@ export async function downloadWhisperModel(name = 'ggml-large-v3-turbo'): Promis
 }
 
 /**
+ * Build whisper.cpp's `--prompt` value from a user-supplied glossary
+ * (`vedit transcribe --glossary "<term1,term2,...>"`, roadmap "whisper 用語集
+ * プロンプト"). whisper's initial-prompt mechanism biases decoding toward
+ * vocabulary that appears in the prompt text — the cheapest lever available
+ * for getting proper nouns/jargon spelled consistently, before a heavier
+ * stable-ts/faster-whisper realignment pass (see docs/polish-backlog.md's
+ * 文字起こし section for that unimplemented alternative). Terms are trimmed
+ * and empty ones dropped; an empty/all-blank glossary produces '' so the
+ * caller omits `--prompt` entirely — byte-for-byte the same whisper
+ * invocation as before this feature existed. Pure and independent of
+ * actually running whisper, so it's unit-testable without a model
+ * installed.
+ */
+export function buildWhisperPrompt(glossary: string[]): string {
+  const terms = glossary.map((t) => t.trim()).filter(Boolean);
+  if (terms.length === 0) return '';
+  return terms.join('、');
+}
+
+/**
  * Word-level transcription via whisper-cli. Tokens are merged into words:
  * latin tokens merge until a leading space; CJK tokens stay as-is (token-level
  * granularity is the natural cut unit for Japanese).
@@ -256,7 +276,7 @@ export async function downloadWhisperModel(name = 'ggml-large-v3-turbo'): Promis
 export async function transcribe(
   file: string,
   sourceId: string,
-  opts: { model?: string; language?: string; sourceDuration?: number } = {},
+  opts: { model?: string; language?: string; sourceDuration?: number; glossary?: string[] } = {},
 ): Promise<Transcript> {
   const model = opts.model ?? (await findWhisperModel());
   if (!model) {
@@ -284,6 +304,8 @@ export async function transcribe(
   ];
   if (opts.language) args.push('-l', opts.language);
   else args.push('-l', 'auto');
+  const prompt = opts.glossary ? buildWhisperPrompt(opts.glossary) : '';
+  if (prompt) args.push('--prompt', prompt);
   await run('whisper-cli', args, { maxBuffer: 256 * 1024 * 1024 });
   const j = JSON.parse(await fs.readFile(outBase + '.json', 'utf8'));
   const words: Word[] = [];

@@ -51,12 +51,15 @@ import {
   setAudioMix,
   setAudioRepair,
   setBackgroundAt,
+  setClipAudio,
   setClipCrop,
   setColorAdjust,
   setColorTransform,
   setComposition,
   setSceneReview,
+  setTranscriptionGlossary,
   shiftComposition,
+  sliceTimelineRange,
   sourceTimeToTimeline,
   spriteGeometry,
   spriteMotionPlan,
@@ -601,6 +604,69 @@ describe('reframe / crop', () => {
     expect(() => setClipCrop(manifest(), 'c1', { x: -0.1 })).toThrow(/x \(-0\.1\)/);
     expect(() => setClipCrop(manifest(), 'c1', { y: NaN })).toThrow(/y \(NaN\)/);
     expect(() => setClipCrop(manifest(), 'c1', { y: Infinity })).toThrow(/y \(Infinity\)/);
+  });
+});
+
+// ---- roadmap "クリップ単位の音量・ミュート" ----
+describe('setClipAudio', () => {
+  it('patches gainDb on one clip without touching others', () => {
+    let m = addClip(manifest(), 's1', {});
+    const [c1, c2] = m.timeline.video;
+    m = setClipAudio(m, c1.id, { gainDb: -6 });
+    expect(m.timeline.video[0].gainDb).toBe(-6);
+    expect(m.timeline.video[0].muted).toBeUndefined();
+    expect(m.timeline.video[1].gainDb).toBeUndefined();
+    void c2;
+  });
+
+  it('muted:true sets the flag; muted:false clears it (never stored as false)', () => {
+    let m = addClip(manifest(), 's1', {});
+    const c1 = m.timeline.video[0];
+    m = setClipAudio(m, c1.id, { muted: true });
+    expect(m.timeline.video[0].muted).toBe(true);
+    m = setClipAudio(m, c1.id, { muted: false });
+    expect(m.timeline.video[0].muted).toBeUndefined();
+  });
+
+  it('omitted fields leave the existing value alone (merge, not replace)', () => {
+    let m = addClip(manifest(), 's1', {});
+    const c1 = m.timeline.video[0];
+    m = setClipAudio(m, c1.id, { gainDb: 3 });
+    m = setClipAudio(m, c1.id, { muted: true });
+    expect(m.timeline.video[0]).toMatchObject({ gainDb: 3, muted: true });
+  });
+
+  it('throws on an unknown clip', () => {
+    expect(() => setClipAudio(manifest(), 'nope', { gainDb: 0 })).toThrow(/unknown clip/);
+  });
+
+  it('rejects gainDb outside -30..12 or non-finite', () => {
+    expect(() => setClipAudio(manifest(), 'c1', { gainDb: 13 })).toThrow(/gainDb \(13\)/);
+    expect(() => setClipAudio(manifest(), 'c1', { gainDb: -31 })).toThrow(/gainDb \(-31\)/);
+    expect(() => setClipAudio(manifest(), 'c1', { gainDb: NaN })).toThrow(/gainDb \(NaN\)/);
+  });
+
+  it('rides Project.commit()\'s optimistic-concurrency contract (--base/409) like any other op', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'vedit-clipaudio-'));
+    const p = await Project.create(path.join(dir, 'proj'), 'test');
+    // Seed a source + clip directly (Project.create() starts with empty
+    // sources/timeline; addClip requires the source to already exist).
+    let m = await p.commit(0, 'claude', 'seed', {}, 'seed', (x) => ({
+      ...x,
+      sources: [{ id: 's1', path: '/x.mp4', duration: 60, fps: 30, width: 1920, height: 1080, hasAudio: true }],
+      timeline: { ...x.timeline, video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 60 }] },
+    }));
+    expect(m.revision).toBe(1);
+
+    m = await p.commit(1, 'claude', 'clip-audio', { clipId: 'c1', gainDb: -6 }, 'set gain', (x) => setClipAudio(x, 'c1', { gainDb: -6 }));
+    expect(m.revision).toBe(2);
+    expect(m.timeline.video[0].gainDb).toBe(-6);
+
+    // A stale baseRev (1, but current is now 2) is rejected — the same
+    // --base/409 guard every other op rides via Project.commit().
+    await expect(
+      p.commit(1, 'claude', 'clip-audio', { clipId: 'c1', muted: true }, 'stale', (x) => setClipAudio(x, 'c1', { muted: true })),
+    ).rejects.toMatchObject({ code: 'STALE_REVISION' });
   });
 });
 
@@ -2178,5 +2244,98 @@ describe('dialogue (addDialogue / updateDialogue / removeDialogue)', () => {
     r = removeDialogue(r, 'dl1');
     expect(r.timeline.dialogue).toEqual([]);
     expect(() => removeDialogue(r, 'dl1')).toThrow(/unknown dialogue item/);
+  });
+});
+
+// ---- roadmap "whisper 用語集プロンプト" ----
+describe('setTranscriptionGlossary', () => {
+  it('trims terms and drops empty ones', () => {
+    const m = setTranscriptionGlossary(manifest(), [' Claude ', '', 'vedit']);
+    expect(m.transcription).toEqual({ glossary: ['Claude', 'vedit'] });
+  });
+
+  it('an empty/all-blank glossary clears manifest.transcription entirely', () => {
+    let m = setTranscriptionGlossary(manifest(), ['term']);
+    expect(m.transcription).toBeDefined();
+    m = setTranscriptionGlossary(m, []);
+    expect(m.transcription).toBeUndefined();
+    m = setTranscriptionGlossary(m, undefined);
+    expect(m.transcription).toBeUndefined();
+  });
+
+  it('is a true no-op (same reference) on a manifest that never had one', () => {
+    const m0 = manifest();
+    expect(setTranscriptionGlossary(m0, [])).toBe(m0);
+  });
+});
+
+// ---- roadmap "範囲指定の下見レンダー": sliceTimelineRange ----
+function twoClipManifest(): Manifest {
+  const m = manifest();
+  return {
+    ...m,
+    timeline: {
+      ...m.timeline,
+      video: [
+        { id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 20 },
+        { id: 'c2', sourceId: 's1', srcIn: 30, srcOut: 50 },
+      ],
+    },
+  };
+}
+
+describe('sliceTimelineRange', () => {
+  it('slices a single clip: duration matches b-a, srcIn/srcOut trimmed to the window', () => {
+    const sliced = sliceTimelineRange(manifest(), 10, 40);
+    expect(timelineDuration(sliced)).toBeCloseTo(30, 5);
+    expect(sliced.timeline.video).toHaveLength(1);
+    expect(sliced.timeline.video[0]).toMatchObject({ sourceId: 's1', srcIn: 10, srcOut: 40 });
+  });
+
+  it('a range spanning a clip boundary trims BOTH edge clips partially', () => {
+    const sliced = sliceTimelineRange(twoClipManifest(), 10, 30);
+    expect(timelineDuration(sliced)).toBeCloseTo(20, 5);
+    expect(sliced.timeline.video).toHaveLength(2);
+    expect(sliced.timeline.video[0]).toMatchObject({ sourceId: 's1', srcIn: 10, srcOut: 20 }); // partial tail of c1
+    expect(sliced.timeline.video[1]).toMatchObject({ sourceId: 's1', srcIn: 30, srcOut: 40 }); // partial head of c2
+  });
+
+  it('issues fresh clip ids rather than reusing the source manifest\'s', () => {
+    const sliced = sliceTimelineRange(manifest(), 10, 40);
+    expect(sliced.timeline.video[0].id).not.toBe('c1');
+  });
+
+  it('clamps a/b to the timeline bounds (order-independent: a>b is treated as b..a)', () => {
+    expect(timelineDuration(sliceTimelineRange(manifest(), -5, 1000))).toBeCloseTo(60, 5);
+    expect(timelineDuration(sliceTimelineRange(manifest(), 40, 10))).toBeCloseTo(30, 5);
+  });
+
+  it('throws on an empty range once clamped to the timeline', () => {
+    expect(() => sliceTimelineRange(manifest(), 70, 80)).toThrow(/empty/);
+  });
+
+  it('trims a music item overlapping the window, shifting tlStart and advancing srcIn by the trimmed head', () => {
+    const m = addMusic(manifest(), '/bgm.mp3', { tlStart: 5, duration: 20, srcIn: 2 });
+    const sliced = sliceTimelineRange(m, 10, 40);
+    expect(sliced.timeline.music).toHaveLength(1);
+    const mu = sliced.timeline.music![0];
+    expect(mu.tlStart).toBeCloseTo(0, 5); // originally at 5, window starts at 10 -> head trimmed, rebased to 0
+    expect(mu.srcIn).toBeCloseTo(7, 5); // 2 + (10-5) trimmed off the head
+    expect(mu.duration).toBeCloseTo(15, 5); // overlap of [5,25) and [10,40) is [10,25) = 15s
+  });
+
+  it('drops music entirely outside the window', () => {
+    const m = addMusic(manifest(), '/bgm.mp3', { tlStart: 45, duration: 5 });
+    expect(sliceTimelineRange(m, 0, 30).timeline.music).toEqual([]);
+  });
+
+  it('composition mode: duration/background/backgroundTrack are windowed and rebased to 0', () => {
+    let m = compositionManifest(); // duration 20, base background black
+    m = setBackgroundAt(m, 5, { type: 'color', hex: '#ff0000' });
+    m = setBackgroundAt(m, 12, { type: 'color', hex: '#00ff00' });
+    const sliced = sliceTimelineRange(m, 8, 15);
+    expect(sliced.composition!.duration).toBeCloseTo(7, 5);
+    expect(sliced.composition!.background).toEqual({ type: 'color', hex: '#ff0000' }); // active background at t=8
+    expect(sliced.composition!.backgroundTrack).toEqual([{ t: 4, ref: { type: 'color', hex: '#00ff00' } }]); // 12-8
   });
 });

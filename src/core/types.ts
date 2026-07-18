@@ -119,6 +119,18 @@ export interface Manifest {
     background: BackgroundRef;
     backgroundTrack?: { t: number; ref: BackgroundRef }[];
   };
+  /**
+   * Transcription configuration that should be remembered across
+   * `vedit transcribe` invocations, rather than re-specified every time.
+   * Today this is just `glossary` (roadmap "whisper 用語集プロンプト"): a
+   * list of proper nouns/jargon terms formatted into whisper.cpp's
+   * `--prompt` (see buildWhisperPrompt in src/ingest/ingest.ts) to bias
+   * decoding toward the right spelling. Set via `vedit transcribe
+   * --glossary "<語1,語2,...>"` (see setTranscriptionGlossary in
+   * core/ops.ts); optional/absent means no prompt at all — full
+   * regression for every project that never sets it.
+   */
+  transcription?: { glossary?: string[] };
 }
 
 /**
@@ -370,6 +382,25 @@ export interface VideoClip {
    * aspect ratios at render time) is used; the other is ignored.
    */
   crop?: { x?: number; y?: number };
+  /**
+   * Per-clip audio override (roadmap "クリップ単位の音量・ミュート"): a
+   * volume filter in dB (-30..+12), applied to just this clip's OWN audio
+   * segment at render time — see setClipAudio in core/ops.ts and the
+   * per-segment audio chain in export/render.ts's buildFilterGraph.
+   * Optional/absent means no gain adjustment at all — full regression for
+   * every clip that never sets it. Set via `vedit clip-audio <clipId>
+   * --gain <dB>`.
+   */
+  gainDb?: number;
+  /**
+   * Silences this clip's own audio segment entirely at render time (takes
+   * priority over `gainDb` when both are set). Optional/absent means not
+   * muted — full regression. Set via `vedit clip-audio <clipId> --mute`.
+   * Preview (web) does not reflect this yet — see renderFinal's
+   * per-render "プレビュー未反映" warning when any clip has either field
+   * set.
+   */
+  muted?: boolean;
 }
 
 export interface MotionItem {
@@ -497,14 +528,29 @@ export interface RevisionEntry {
   ts: string;
   /** Human-readable effect summary, e.g. "removed 3.2s (w120..w134)". */
   summary: string;
-  /** Full manifest snapshot after applying the op (manifests are small). */
+  /**
+   * Full manifest snapshot after applying the op (manifests are small).
+   * Declared required here because every WRITER (commitLocked) always
+   * fills it in — but `vedit compact` (Project.compact(), see project.ts)
+   * physically drops this key (and `motionSpecs` below) from older
+   * revisions.jsonl entries to bound the log's growth, the same way
+   * `motionSpecs` has always been allowed to be absent for entries
+   * predating that field. Every READER of a parsed entry (restore(),
+   * daemon.ts's revisionSnapshot) must therefore still treat `.snapshot`
+   * as possibly missing at runtime despite this static type — restore()
+   * checks explicitly and throws a "nearest restorable revision" error;
+   * `Project.revisions()` (the UI history list, `vedit revisions`) never
+   * touches `snapshot` at all, so compaction never affects history
+   * display.
+   */
   snapshot: Manifest;
   /**
    * Content of every motion/*.json sidecar referenced by
    * `snapshot.timeline.motion`, keyed by MotionItem.id, as of this
    * revision. Lets restore() roll motion sidecars back in lockstep with
    * the manifest. Optional so revisions written before this field existed
-   * still parse; restore() just can't roll sidecars back for those.
+   * still parse (or `vedit compact` dropped it, see `snapshot` above);
+   * restore() just can't roll sidecars back for those.
    */
   motionSpecs?: Record<string, unknown>;
 }

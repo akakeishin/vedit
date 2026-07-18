@@ -3,6 +3,7 @@ import type {
   DialogueItem,
   IntentZoneItem,
   Manifest,
+  MotionItem,
   MusicItem,
   OverlayClip,
   SceneFile,
@@ -675,6 +676,41 @@ export function setClipCrop(m: Manifest, clipId: string, patch: { x?: number; y?
     timeline: {
       ...m.timeline,
       video: m.timeline.video.map((c) => (c.id === clipId ? { ...c, crop: { ...c.crop, ...clean } } : c)),
+    },
+  };
+}
+
+/**
+ * Set (or clear) one clip's audio override — roadmap "クリップ単位の音量・
+ * ミュート". `gainDb` (-30..+12) and `muted` are independently patchable,
+ * same merge-only-what's-given contract as setClipCrop: an omitted field
+ * leaves the clip's existing value alone. `muted: false` explicitly CLEARS
+ * the flag (deletes the key) rather than storing `muted: false`, keeping an
+ * unmuted clip's manifest byte-for-byte the same as before this feature
+ * existed. See export/render.ts's buildFilterGraph for where this is
+ * consumed (a `volume=0` / `volume=<gainDb>dB` clause on that clip's own
+ * audio segment) — preview (web) does not reflect it yet, see renderFinal's
+ * "プレビュー未反映" warning.
+ */
+export function setClipAudio(m: Manifest, clipId: string, patch: { gainDb?: number; muted?: boolean }): Manifest {
+  if (!m.timeline.video.some((c) => c.id === clipId)) throw new Error(`unknown clip: ${clipId}`);
+  if (patch.gainDb !== undefined && (!Number.isFinite(patch.gainDb) || patch.gainDb < -30 || patch.gainDb > 12)) {
+    throw new Error(`clip-audio: gainDb (${patch.gainDb}) must be a finite number between -30 and 12`);
+  }
+  return {
+    ...m,
+    timeline: {
+      ...m.timeline,
+      video: m.timeline.video.map((c) => {
+        if (c.id !== clipId) return c;
+        const next: VideoClip = { ...c };
+        if (patch.gainDb !== undefined) next.gainDb = patch.gainDb;
+        if (patch.muted !== undefined) {
+          if (patch.muted) next.muted = true;
+          else delete next.muted;
+        }
+        return next;
+      }),
     },
   };
 }
@@ -2056,4 +2092,134 @@ export function quietZonesOverlappingTimelineRange(m: Manifest, tlStart: number,
     }
   }
   return hits;
+}
+
+// ---- transcription config (roadmap "whisper 用語集プロンプト") ----
+
+/**
+ * Set (or clear, with `undefined`/an empty array) the glossary applied to
+ * every future `vedit transcribe` on this project — see buildWhisperPrompt
+ * in src/ingest/ingest.ts for how it becomes whisper.cpp's `--prompt`.
+ * Terms are trimmed and empty ones dropped; an empty result clears
+ * `manifest.transcription` entirely (rather than leaving `{glossary: []}`
+ * around) so a project that never sets a glossary stays byte-for-byte
+ * regression-safe.
+ */
+export function setTranscriptionGlossary(m: Manifest, glossary: string[] | undefined): Manifest {
+  const terms = (glossary ?? []).map((t) => t.trim()).filter(Boolean);
+  if (terms.length === 0) {
+    if (!m.transcription) return m;
+    const { transcription: _drop, ...rest } = m;
+    return rest as Manifest;
+  }
+  return { ...m, transcription: { ...m.transcription, glossary: terms } };
+}
+
+// ---- range preview render (roadmap "範囲指定の下見レンダー") ----
+
+/** Structural shape shared by MotionItem/DialogueItem for the generic clip-and-shift helper below. */
+interface TimedItem {
+  tlStart: number;
+  duration: number;
+}
+
+/** Keep only items overlapping [t0,t1), trimmed to it and re-based to a 0-start window (t0 becomes timeline time 0). */
+function clipAndShiftItems<T extends TimedItem>(items: T[] | undefined, t0: number, t1: number): T[] {
+  const out: T[] = [];
+  for (const it of items ?? []) {
+    const s0 = Math.max(t0, it.tlStart);
+    const s1 = Math.min(t1, it.tlStart + it.duration);
+    if (s1 <= s0) continue;
+    out.push({ ...it, tlStart: s0 - t0, duration: s1 - s0 });
+  }
+  return out;
+}
+
+/**
+ * Slice a manifest down to just the timeline window [a,b), remapped to
+ * [0, b-a) — the pure manifest transform behind `vedit export render
+ * --range a..b` (roadmap "範囲指定の下見レンダー"). Everything downstream
+ * (renderFinal/renderComposition, captions, BGM ducking, B-roll/sprite
+ * anchor resolution) runs completely UNCHANGED against the sliced result —
+ * see renderRangePreview in export/render.ts, which is the only thing that
+ * additionally downgrades encode quality for the preview.
+ *
+ * Video (normal, source-driven projects): rebuilt directly from segments()
+ * — the same tlStart/tlEnd/srcStart/clipId math every other consumer
+ * already trusts — into fresh VideoClip entries with srcIn/srcOut trimmed
+ * at both edges (so a and b each land exactly on a clip boundary).
+ *
+ * Composition projects (Manifest.composition, no timeline.video at all):
+ * `duration` becomes b-a, `background` becomes resolvedBackgroundAt(m, a)
+ * (whatever layer was active at the window's start — the new base layer),
+ * and `backgroundTrack` keeps only cuts strictly inside (a,b), shifted by
+ * -a.
+ *
+ * Shared tracks (music/motion/dialogue), in EITHER mode: kept when they
+ * overlap [a,b) at all, trimmed/shifted via clipAndShiftItems. A MusicItem
+ * additionally advances `srcIn` by however much got trimmed off its head,
+ * so the audio content itself doesn't jump on a mid-item cut.
+ *
+ * Overlays (B-roll)/sprites are deliberately left untouched: both are
+ * anchored to a moment (sourceId+srcTime, or COMP_SOURCE_ID+srcTime for a
+ * composition) rather than stored at an absolute timeline position, and the
+ * existing resolveOverlays/resolvedActiveSprites machinery already
+ * re-derives their timeline position against whatever manifest it's given
+ * — an anchor whose moment fell outside [a,b) simply resolves to null and
+ * is excluded from render, exactly like any other edit that cuts an anchor
+ * point away. Caveat: an overlay/sprite anchored just BEFORE `a` whose
+ * `duration` would still be on-screen AT `a` is orphaned rather than
+ * clipped-in — an accepted simplification for a tool scoped to previewing
+ * audio/color/caption changes (see the roadmap item's spec), not full
+ * B-roll/sprite composition fidelity.
+ */
+export function sliceTimelineRange(m: Manifest, a: number, b: number): Manifest {
+  if (!Number.isFinite(a) || !Number.isFinite(b)) {
+    throw new Error(`range preview: a/b (${a}..${b}) must be finite numbers`);
+  }
+  const total = timelineDuration(m);
+  const fps = m.fps;
+  const t0 = snap(Math.max(0, Math.min(a, b)), fps);
+  const t1 = snap(Math.min(total, Math.max(a, b)), fps);
+  if (t1 - t0 < 1 / fps) {
+    throw new Error(`range preview: range ${a}..${b} is empty once clamped to the timeline (0..${total.toFixed(2)}s)`);
+  }
+
+  const timeline: Manifest['timeline'] = { ...m.timeline };
+  let composition = m.composition;
+
+  if (composition) {
+    const background = resolvedBackgroundAt(m, t0);
+    const track = (composition.backgroundTrack ?? [])
+      .filter((e) => e.t > t0 && e.t < t1)
+      .map((e) => ({ t: snap(e.t - t0, fps), ref: e.ref }));
+    composition = { duration: t1 - t0, background, ...(track.length ? { backgroundTrack: track } : {}) };
+  } else {
+    const video: VideoClip[] = [];
+    for (const seg of segments(m)) {
+      const s0 = Math.max(t0, seg.tlStart);
+      const s1 = Math.min(t1, seg.tlEnd);
+      if (s1 <= s0) continue;
+      const srcIn = seg.srcStart + (s0 - seg.tlStart);
+      const srcOut = seg.srcStart + (s1 - seg.tlStart);
+      video.push({ id: freshId('c'), sourceId: seg.sourceId, srcIn, srcOut, ...(seg.crop ? { crop: seg.crop } : {}) });
+    }
+    timeline.video = video;
+  }
+
+  if (m.timeline.motion.length > 0) timeline.motion = clipAndShiftItems<MotionItem>(m.timeline.motion, t0, t1);
+  if (m.timeline.dialogue) timeline.dialogue = clipAndShiftItems<DialogueItem>(m.timeline.dialogue, t0, t1);
+  if (m.timeline.music) {
+    const music: MusicItem[] = [];
+    for (const mu of m.timeline.music) {
+      const s0 = Math.max(t0, mu.tlStart);
+      const s1 = Math.min(t1, mu.tlStart + mu.duration);
+      if (s1 <= s0) continue;
+      const trimmedHead = s0 - mu.tlStart;
+      music.push({ ...mu, tlStart: s0 - t0, duration: s1 - s0, srcIn: mu.srcIn + trimmedHead });
+    }
+    timeline.music = music;
+  }
+
+  return { ...m, timeline, ...(composition ? { composition } : {}) };
 }
