@@ -209,9 +209,11 @@ function isProjectEmpty() {
 }
 function renderStageState() {
   const el = $('stageEmpty');
+  const logo = $('stageEmptyLogo');
   const msg = $('stageEmptyMsg');
   const retry = $('stageEmptyRetry');
   msg.innerHTML = '';
+  logo.hidden = true;
   const addLine = (text, cls) => {
     const p = document.createElement('p');
     if (cls) p.className = cls;
@@ -228,6 +230,7 @@ function renderStageState() {
     retry.hidden = true;
   } else if (isProjectEmpty()) {
     el.hidden = false;
+    logo.hidden = false;
     addLine('最初の動画を追加', 'stageEmptyLead');
     addLine('ここに動画をドロップするか、Claude に「この動画を編集して」と伝えてください');
     addLine('元動画は変更しません');
@@ -278,6 +281,11 @@ function updateFraming() {
   const out = S.manifest?.output;
   if (!out) {
     wrap.classList.remove('customAspect');
+    // W-POLISH High-2: #videoBox now always carries an aspect-ratio
+    // (var(--out-ar, 16/9)) rather than only when .customAspect is set, so a
+    // stale --out-ar from a previously-configured output must be cleared —
+    // otherwise the box would keep the old ratio instead of falling back to 16/9.
+    wrap.style.removeProperty('--out-ar');
     video.style.objectPosition = '';
     return;
   }
@@ -1080,6 +1088,17 @@ function renderTimeline() {
       tile.style.backgroundImage = `url("${t.url}")`;
       d.appendChild(tile);
     }
+    // W-POLISH High-5: 選択中だけ見える左右5pxハンドル(README/v2.dc.html)。
+    // トリム自体は既に端6px(EDGE_PX、attachClipHandlers)で機能済み — これは
+    // 「端を掴める」ことを可視化するだけの装飾要素(pointer-events:none)で、
+    // ドラッグ判定のロジックには一切関与しない。
+    const handleL = document.createElement('span');
+    handleL.className = 'clipHandle clipHandleL';
+    handleL.setAttribute('aria-hidden', 'true');
+    const handleR = document.createElement('span');
+    handleR.className = 'clipHandle clipHandleR';
+    handleR.setAttribute('aria-hidden', 'true');
+    d.append(handleL, handleR);
     attachClipHandlers(d, s);
     makeBlockKeyboardActivatable(d, () => { selectClip(s.clipId); seekTl(s.tlStart, { play: false }); });
     clips.appendChild(d);
@@ -1108,9 +1127,13 @@ function renderTimeline() {
     // tally/warning color — this isn't wrong, just scoped) beats a one-shot
     // toast nobody's watching for.
     if (moType === 'custom-html') {
+      // W-POLISH Low-2: README最小10pxに合わせてfont-sizeを上げた分、20px丈の
+      // モーション行に収まるよう短縮ラベルにする(全文はブロック自体のtitleに
+      // 既にある — 下のtitleText)。
       const badge = document.createElement('span');
       badge.className = 'exportSkipBadge';
-      badge.textContent = '書き出し対象外';
+      badge.textContent = '対象外';
+      badge.title = 'custom-html は書き出しでは焼き込まれません(プレビューのみ)';
       d.appendChild(document.createTextNode(' '));
       d.appendChild(badge);
       titleText += ' — custom-html は書き出しでは焼き込まれません(プレビューのみ)';
@@ -1491,6 +1514,15 @@ function renderTrackGutter() {
   if (hasDialogue) addLabel('セリフ', '#ffffff', { top: '226px', height: '18px' });
 }
 
+// W-POLISH High-1: #wave の canvas 自体は #timelineTracks 全体(inset:0)を
+// 覆っているが、実際に描くのは「本編」行(#clips, style.css: top:30px
+// height:58px — 同じ #timelineTracks 座標系なのでここに定数でそのまま写す)
+// の下部32%のバンドだけに絞る。以前は r.height(トラック全体高)を基準に
+// 62%位置・最大55%で描いていたため、テロップ行(top:94px)まで波形が
+// はみ出して重なって見えていた。色/バー幅(1.4px)はv2.dc.htmlのdrawWaveと
+// 揃える。
+const WAVE_ROW_TOP = 30;
+const WAVE_ROW_HEIGHT = 58;
 function drawWave() {
   const c = $('wave');
   const r = tlEl.getBoundingClientRect();
@@ -1499,8 +1531,9 @@ function drawWave() {
   const g = c.getContext('2d');
   g.scale(devicePixelRatio, devicePixelRatio);
   g.clearRect(0, 0, r.width, r.height);
-  g.fillStyle = '#637287';
-  const mid = r.height * 0.62;
+  g.fillStyle = 'rgba(255, 255, 255, 0.5)';
+  const bandTop = WAVE_ROW_TOP + WAVE_ROW_HEIGHT * 0.68; // 本編行の下部32%開始
+  const bandHeight = WAVE_ROW_HEIGHT * 0.30;
   for (const s of S.segments) {
     const pk = S.peaks.get(s.sourceId);
     if (!pk) continue;
@@ -1509,8 +1542,8 @@ function drawWave() {
     for (let x = x0; x < x1; x += 2) {
       const srcT = s.srcStart + ((x - x0) / (x1 - x0)) * (s.tlEnd - s.tlStart);
       const v = pk.peaks[Math.floor(srcT * pk.rate)] ?? 0;
-      const h = Math.max(1, v * r.height * 0.55);
-      g.fillRect(x, mid - h / 2, 1.4, h);
+      const h = Math.max(1, Math.min(1, v) * bandHeight);
+      g.fillRect(x, bandTop + (bandHeight - h), 1.4, h);
     }
   }
 }
@@ -1820,27 +1853,43 @@ function mediaRow(src) {
   row.setAttribute('aria-selected', String(S.sourcePreview?.sourceId === src.id));
   row.tabIndex = src.id === S.mediaFocusKey ? 0 : -1;
 
+  // W-POLISH Mid-6: colorConverted は常設メタ行(下記)と展開時バッジの両方が
+  // 使うので、expanded の外で1回だけ計算する。
+  const colorConverted = src.colorTransform && src.colorTransform.type && src.colorTransform.type !== 'none';
+
+  const thumbWrap = document.createElement('div');
+  thumbWrap.className = 'srcThumbWrap';
   const img = document.createElement('img');
   img.className = 'srcThumb';
   img.loading = 'lazy';
   img.alt = '';
   img.src = `/media/thumb/${src.id}`;
+  const durChip = document.createElement('span');
+  durChip.className = 'srcDurChip';
+  durChip.textContent = fmt(src.duration);
+  thumbWrap.append(img, durChip);
 
   const info = document.createElement('div');
   info.className = 'srcInfo';
   const nameRow = document.createElement('div');
   nameRow.className = 'srcNameRow';
-  nameRow.innerHTML = `<span class="srcName">${esc(name)}</span><span class="srcDur">${fmt(src.duration)}</span>`;
+  nameRow.innerHTML = `<span class="srcName">${esc(name)}</span>`;
   info.appendChild(nameRow);
+  // W-POLISH Mid-6: 名前行はファイル名専有(以前は時間と同居して2列カードで
+  // 切れていた)。その下の常設メタ行は「警告があるときだけ」中身を持つ
+  // (無ければ空 — CSSの :empty で非表示。存在しない情報をでっち上げない)。
+  const metaBits = [];
+  if (!src.hasAudio) metaBits.push('音声なし');
+  if (!src.proxy) metaBits.push('プロキシ未生成');
+  if (!colorConverted && needsColorTransform(src.color)) metaBits.push('要色変換');
+  const metaRow = document.createElement('div');
+  metaRow.className = 'srcMeta' + (metaBits.length ? ' warn' : '');
+  metaRow.textContent = metaBits.join(' · ');
+  info.appendChild(metaRow);
 
   if (expanded) {
     const badges = document.createElement('div');
     badges.className = 'srcBadges';
-    // W5: a source with an applied colorTransform (type !== 'none') shows
-    // "変換済み" instead of the "要色変換" warning — the warning's purpose
-    // (flag material that will preview/render flat) no longer applies once
-    // `vedit color` has actually set a transform.
-    const colorConverted = src.colorTransform && src.colorTransform.type && src.colorTransform.type !== 'none';
     // W-LAZY: transcription is no longer an ingest-time default, so this is
     // a 3-state badge (なし/処理中/済) always shown, not just an "ok" flag
     // that appears once done — S.transcribing is populated from
@@ -1904,7 +1953,7 @@ function mediaRow(src) {
     actions.appendChild(scenesBtn);
   }
 
-  row.append(img, info, actions);
+  row.append(thumbWrap, info, actions);
   row.addEventListener('pointerdown', () => setMediaFocus(src.id, { focus: false }));
   row.addEventListener('click', (e) => {
     if (e.target.closest('button')) return;
@@ -2069,7 +2118,10 @@ function renderMediaPanel() {
   // 何もない — 空の仮タイムラインを作られても困惑するだけなので隠す)。
   $('buildSelectsBtn').hidden = totalKeepCount() === 0;
   if (sources.length === 0) {
-    el.innerHTML = '<div class="hintText" style="padding:8px">まだ素材がありません — ここに動画をドラッグして取り込み</div>';
+    // W-POLISH Mid-9: README/v2.dc.html の空状態(白16% dashed、radius8、
+    // padding28px 16px)へ — 実装にファイル選択クリックは無いので「クリック
+    // して選択」は謳わず、既存のドラッグ&ドロップ文言のまま2行に分ける。
+    el.innerHTML = '<div class="mediaEmptyHint"><span class="mediaEmptyLead">まだ素材がありません</span><span class="mediaEmptyHintSub">ここに動画をドラッグして取り込み</span></div>';
     return;
   }
   if (S.mediaFocusKey && !sources.some((s) => s.id === S.mediaFocusKey)) S.mediaFocusKey = null;
@@ -2416,7 +2468,7 @@ function buildDialogueInspector(body, id) {
   if (!d) { deselect(); return; }
   const label = document.createElement('div');
   label.className = 'inspLabel';
-  label.textContent = `セリフ: "${d.text}"`;
+  label.textContent = `セリフ: 「${d.text}」`;
   body.appendChild(label);
   body.appendChild(inspField('タイムライン位置', `${fmt(d.tlStart)}–${fmt(d.tlStart + d.duration)}`));
   inspDivider(body);
@@ -2838,33 +2890,51 @@ async function loadFontOptions(selectEl, currentValue) {
 // linked kit's own styles, which are equally valid captions.style ids (see
 // kitStyleFor in renderCaption).
 const CAPTION_STYLE_PRESETS = [['clean', 'クリーン'], ['bold', 'ボールド'], ['outline', 'アウトライン'], ['boxed', 'ボックス']];
-function populateCaptionStylePresetSelect(selectEl, current) {
-  selectEl.innerHTML = '';
+// W-POLISH Mid-11: v2.dc.html の3ボタン式プリセット選択(標準/ボールド/
+// キット)を、可変長対応を保ったまま実装する。ビルトイン(CAPTION_STYLE_
+// PRESETS、固定4種)はボタン化、キットのスタイル(0〜N種、キット次第で
+// 増減する)は native select のまま #capKitStyleField に残し、キット未連携
+// のプロジェクトでは行ごと隠す。一致するボタン/select値が無い(未検出)
+// 現在値は、以前の select の「(未検出)」フォールバックと同じ扱いで
+// #capStylePresetUnknown に小さく表示する。
+function setCaptionStyle(value, triggerEl) {
+  return mutate(
+    { op: 'captions', patch: { style: value } },
+    { conflictMessage: '字幕プリセットの変更は反映されませんでした。最新状態を確認してもう一度実行してください', trigger: triggerEl },
+  );
+}
+function populateCaptionStylePresetControls(current) {
+  const wrap = $('capStylePresetBtns');
+  wrap.innerHTML = '';
   for (const [id, label] of CAPTION_STYLE_PRESETS) {
-    const opt = document.createElement('option');
-    opt.value = id;
-    opt.textContent = label;
-    selectEl.appendChild(opt);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'capPresetBtn' + (current === id ? ' active' : '');
+    btn.textContent = label;
+    btn.setAttribute('aria-pressed', String(current === id));
+    btn.onclick = () => setCaptionStyle(id, btn);
+    wrap.appendChild(btn);
   }
   const kitStyles = S.kit?.kit?.styles ?? [];
+  const kitField = $('capKitStyleField');
+  const kitSelect = $('capKitStyleSelect');
+  const isKitCurrent = kitStyles.some((s) => s.id === current);
   if (kitStyles.length) {
-    const g = document.createElement('optgroup');
-    g.label = 'キット';
-    for (const s of kitStyles) {
-      const opt = document.createElement('option');
-      opt.value = s.id;
-      opt.textContent = s.label || s.id;
-      g.appendChild(opt);
-    }
-    selectEl.appendChild(g);
+    kitField.hidden = false;
+    kitSelect.innerHTML = '<option value="">(キットのスタイルを選択)</option>'
+      + kitStyles.map((s) => `<option value="${esc(s.id)}">${esc(s.label || s.id)}</option>`).join('');
+    kitSelect.value = isKitCurrent ? current : '';
+  } else {
+    kitField.hidden = true;
+    kitSelect.innerHTML = '';
   }
-  selectEl.value = current || 'clean';
-  if (selectEl.value !== current && current) {
-    const opt = document.createElement('option');
-    opt.value = current;
-    opt.textContent = `${current}(未検出)`;
-    selectEl.appendChild(opt);
-    selectEl.value = current;
+  const known = CAPTION_STYLE_PRESETS.some(([id]) => id === current) || isKitCurrent;
+  const unknownEl = $('capStylePresetUnknown');
+  if (current && !known) {
+    unknownEl.hidden = false;
+    unknownEl.textContent = `現在の設定: ${current}(未検出)`;
+  } else {
+    unknownEl.hidden = true;
   }
 }
 
@@ -2924,7 +2994,7 @@ function syncCaptionPopoverControls() {
   // on change (see the 3 onchange handlers below), independent of this
   // view's 適用/キャンセル flow for the overrides fields.
   $('capEnabledToggle').checked = Boolean(S.manifest.captions.enabled);
-  populateCaptionStylePresetSelect($('capStylePreset'), S.manifest.captions.style);
+  populateCaptionStylePresetControls(S.manifest.captions.style);
   $('capMaxChars').value = String(S.manifest.captions.maxChars ?? 24);
   const d = captionOverridesDraft;
   loadFontOptions($('capFont'), d.font);
@@ -3000,11 +3070,9 @@ $('capEnabledToggle').onchange = async (e) => {
     { conflictMessage: '字幕の表示切り替えは反映されませんでした。最新状態を確認してもう一度実行してください', trigger: e.target },
   );
 };
-$('capStylePreset').onchange = async (e) => {
-  await mutate(
-    { op: 'captions', patch: { style: e.target.value } },
-    { conflictMessage: '字幕プリセットの変更は反映されませんでした。最新状態を確認してもう一度実行してください', trigger: e.target },
-  );
+$('capKitStyleSelect').onchange = async (e) => {
+  if (!e.target.value) return;
+  await setCaptionStyle(e.target.value, e.target);
 };
 $('capMaxChars').onchange = async (e) => {
   const v = Number(e.target.value);
@@ -3519,7 +3587,8 @@ function renderTranscript() {
     const heading = document.createElement('div');
     heading.className = 'srcHeading';
     heading.setAttribute('role', 'presentation');
-    heading.textContent = `📄 ${sourceLabel(src)}`;
+    // W-POLISH Low-5: OS依存の絵文字(📄)は無彩色UIに馴染まないため外す。
+    heading.textContent = sourceLabel(src);
     heading.title = basename(src.path);
     el.appendChild(heading);
     const kept = keptSet(src.id);
@@ -3826,14 +3895,15 @@ function candidateTl(t, c) {
 function humanizeCandidateLabel(label, dur) {
   const cutNote = `詰めると −${dur.toFixed(1)}秒`;
   let m;
+  // W-POLISH Low-4: 日本語文中の引用はASCII "…" ではなく「…」を使う。
   if ((m = /^([\d.]+)s silence after "(.*)"$/.exec(label))) {
-    return `"${m[2]}"の後の無音 ${Number(m[1]).toFixed(1)}秒 — ${cutNote}`;
+    return `「${m[2]}」の後の無音 ${Number(m[1]).toFixed(1)}秒 — ${cutNote}`;
   }
   if ((m = /^([\d.]+)s leading silence$/.exec(label))) {
     return `冒頭の無音 ${Number(m[1]).toFixed(1)}秒 — ${cutNote}`;
   }
   if ((m = /^filler "(.*)"$/.exec(label))) {
-    return `フィラー "${m[1]}" — ${cutNote}`;
+    return `フィラー 「${m[1]}」 — ${cutNote}`;
   }
   if ((m = /^([\d.]+)s silence \(waveform(.*)\)$/.exec(label))) {
     const conflict = /transcript disagrees/.test(m[2]);
@@ -3841,6 +3911,11 @@ function humanizeCandidateLabel(label, dur) {
   }
   return `${label} — ${cutNote}`;
 }
+// W-POLISH Mid-7: v2.dc.html の2行構成(1行目=提案文+秒数、2行目=素材名/
+// 時刻+アクション)に合わせる。以前は1行に強制しellipsisしていたため日本語
+// の提案文が窮屈で、素材名まで丸ごとmonoになっていた(素材名はSans、時刻の
+// み.candTimeでMono — Low-4)。ボタン順も「前後を再生→spacer→残す→
+// カット(raised)」へ(以前はカット→残すで右端の視覚的着地点が逆転していた)。
 function candRow(c) {
   const d = document.createElement('div');
   d.className = 'cand';
@@ -3852,11 +3927,17 @@ function candRow(c) {
   const srcTitle = src ? basename(src.path) : c.sourceId;
   const timeRange = `${fmt(c.t0)}–${fmt(c.t1)}`;
   // W-UI IA v2 §4: the humanized label is now a full sentence (kind name +
-  // what/where + the cut-savings meaning of −X.X秒) — long enough that the
-  // compact row's CSS ellipsis (.cand .lbl) can clip it, so a title tooltip
-  // keeps the full sentence one hover away rather than only reachable via
-  // aria-label or the candidate card.
-  d.innerHTML = `<span class="kind ${c.kind}">${esc(KIND_LABEL[c.kind] ?? c.kind)}</span><span class="lbl" title="${esc(label)}">${esc(label)}</span><span class="srcTag" title="${esc(srcTitle)}">${esc(srcName)} ${timeRange}</span><span class="dur">−${dur.toFixed(1)}秒</span>`;
+  // what/where + the cut-savings meaning of −X.X秒) — a title tooltip keeps
+  // the full sentence one hover away too (natural wrap can still run long).
+  d.innerHTML = `<span class="kind ${c.kind}">${esc(KIND_LABEL[c.kind] ?? c.kind)}</span>
+    <div class="candTop">
+      <span class="lbl" title="${esc(label)}">${esc(label)}</span>
+      <span class="dur">−${dur.toFixed(1)}秒</span>
+    </div>
+    <div class="candBottom">
+      <span class="srcTag" title="${esc(srcTitle)}">${esc(srcName)}</span>
+      <span class="candTime">${timeRange}</span>
+    </div>`;
   d.setAttribute('aria-label', `${KIND_LABEL[c.kind] ?? c.kind}: ${label}(${srcName} ${timeRange})`);
   const seekHere = () => {
     const tl = candidateTl(c.t0, c);
@@ -3893,10 +3974,13 @@ function candRow(c) {
   ng.textContent = '残す';
   ng.setAttribute('aria-label', `${label} を残す`);
   ng.onclick = async (e) => { e.stopPropagation(); await decide([c.id], 'reject'); };
-  const actions = document.createElement('div');
-  actions.className = 'candActions';
-  actions.append(preview, ok, ng);
-  d.append(actions);
+  // W-POLISH Mid-7: 「残す」「カット」は1組として.candActionsGroupにまとめ、
+  // margin-left:autoで自分の行の右端に着地させる(幅が足りず折り返しても
+  // 右端の着地点が崩れない — style.css の .candActionsGroup コメント参照)。
+  const group = document.createElement('div');
+  group.className = 'candActionsGroup';
+  group.append(ng, ok);
+  d.querySelector('.candBottom').append(preview, group);
   return d;
 }
 
@@ -4048,8 +4132,10 @@ function renderWarningsGroup(el) {
     // Codex 統合レビュー P2-4: title に生の overlay id / sourceId を出していた
     // — 表示文にすでに素材別名(sourceDisplayName)が入っているので internal
     // id の title は不要、丸ごと削除。
+    // W-POLISH High-3: 行頭の絵文字「⚠」は廃止 — CSS側(.inboxWarn::before)の
+    // 6px琥珀ドットが同じ役割を担う(意味色を面ではなくドットだけに絞る)。
     el.appendChild(inboxWarningRow(
-      `⚠ 配置先を見失ったB-roll: ${sourceDisplayName(ov.sourceId)} — 元の位置(${sourceDisplayName(ov.anchor.sourceId)} ${ov.anchor.srcTime.toFixed(2)}秒)がカットで失われました。Claude に伝えて配置し直してください`,
+      `配置先を見失ったB-roll: ${sourceDisplayName(ov.sourceId)} — 元の位置(${sourceDisplayName(ov.anchor.sourceId)} ${ov.anchor.srcTime.toFixed(2)}秒)がカットで失われました。Claude に伝えて配置し直してください`,
     ));
   }
   for (const r of S.sprites) {
@@ -4057,14 +4143,14 @@ function renderWarningsGroup(el) {
     count++; kindCounts.anchor++;
     const sp = r.sprite;
     el.appendChild(inboxWarningRow(
-      `⚠ 配置先を見失ったキャラクター: ${sp.assetId} — 元の位置(${sourceDisplayName(sp.anchor.sourceId)} ${sp.anchor.srcTime.toFixed(2)}秒)がカットで失われました。Claude に伝えて配置し直してください`,
+      `配置先を見失ったキャラクター: ${sp.assetId} — 元の位置(${sourceDisplayName(sp.anchor.sourceId)} ${sp.anchor.srcTime.toFixed(2)}秒)がカットで失われました。Claude に伝えて配置し直してください`,
     ));
   }
 
   // color warnings
   for (const src of colorWarningSources()) {
     count++; kindCounts.color++;
-    el.appendChild(inboxWarningRow(`⚠ 要色変換: ${sourceLabel(src)} — Log/HLG/PQ 素材のため浅い色で見えています。`, {
+    el.appendChild(inboxWarningRow(`要色変換: ${sourceLabel(src)} — Log/HLG/PQ 素材のため浅い色で見えています。`, {
       title: basename(src.path),
       onClick: () => { activateTab($('tab-mediaPanel'), { focus: false }); setMediaFocus(src.id, { focus: false }); },
       askPrompt: `${sourceLabel(src)}の色を直して`,
@@ -4076,7 +4162,7 @@ function renderWarningsGroup(el) {
     count++; kindCounts.transcript++;
     const src = S.manifest.sources.find((s) => s.id === lc.sourceId);
     const name = sourceLabel(src);
-    el.appendChild(inboxWarningRow(`⚠ 聞き取りを確認したい箇所: ${name} に${lc.count}語(文字起こしタブの"?"付きを確認)`, {
+    el.appendChild(inboxWarningRow(`聞き取りを確認したい箇所: ${name} に${lc.count}語(文字起こしタブの"?"付きを確認)`, {
       title: src ? basename(src.path) : lc.sourceId,
       onClick: () => activateTab($('tab-transcriptPanel'), { focus: false }),
     }));
@@ -4087,7 +4173,7 @@ function renderWarningsGroup(el) {
   for (const issue of S.qc?.issues ?? []) {
     if (!QC_INBOX_CATEGORIES.has(issue.category)) continue;
     count++; kindCounts.qc++;
-    el.appendChild(inboxWarningRow(`⚠ ${issue.message}`, {
+    el.appendChild(inboxWarningRow(issue.message, {
       onClick: issue.category === 'captions' ? () => activateTab($('tab-transcriptPanel'), { focus: false }) : undefined,
     }));
   }
@@ -4507,7 +4593,7 @@ function humanizeRevision(entry) {
       return `タイムラインを一括シフト${bits ? `(${bits})` : ''}`;
     }
     case 'dialogue-add':
-      return `セリフを追加${typeof p.text === 'string' && p.text ? `("${p.text.slice(0, 16)}")` : ''}`;
+      return `セリフを追加${typeof p.text === 'string' && p.text ? `(「${p.text.slice(0, 16)}」)` : ''}`;
     case 'dialogue-update':
       return 'セリフを調整';
     case 'dialogue-remove':
@@ -4545,7 +4631,7 @@ function humanizeRevision(entry) {
     case 'kit-unlink':
       return 'キットの連携を解除';
     case 'intent-add':
-      return `保護区間を追加${typeof p.label === 'string' && p.label ? `("${p.label}")` : ''}`;
+      return `保護区間を追加${typeof p.label === 'string' && p.label ? `(「${p.label}」)` : ''}`;
     case 'intent-remove':
       return '保護区間を削除';
     case 'restore':
@@ -4612,17 +4698,34 @@ function revisionShowTarget(entry) {
   }
   return null;
 }
+// W-POLISH High-6: 塗りカード(bg#26262b、左2px罫線)を廃止し、v2.dc.htmlの
+// 「7pxドット+1px縦線」タイムライン形式へ。本文/アクションのDOM構造・
+// クリックハンドラは無変更 — 各行の先頭に .activityRail(ドット+縦線)を足し、
+// 本文側は #{rev}(mono)/actor/text の3要素に分けて typography を揃える
+// (以前は<b>変更 #N</b>で強調していたが、hifiでは版番号はmonoの弱色)。
 function renderActivityFeed() {
   const el = $('activityFeed');
   el.innerHTML = '';
   for (const r of [...S.revisions].reverse()) {
     const card = document.createElement('div');
     card.className = 'activityCard';
+    const rail = document.createElement('div');
+    rail.className = 'activityRail';
+    rail.setAttribute('aria-hidden', 'true');
+    const dot = document.createElement('span');
+    dot.className = 'activityDot';
+    const rule = document.createElement('span');
+    rule.className = 'activityRule';
+    rail.append(dot, rule);
+    card.appendChild(rail);
+
+    const body = document.createElement('div');
+    body.className = 'activityBody';
     const info = document.createElement('div');
     info.className = 'activityInfo';
     info.title = `${r.op}: ${r.summary}`; // raw op/summary (internal vocabulary) — tooltip only, see humanizeRevision's doc
-    info.innerHTML = `<b>変更 #${r.rev}</b> <span class="activityActor">[${esc(ACTOR_LABEL[r.actor] ?? r.actor)}]</span> ${esc(humanizeRevision(r))}`;
-    card.appendChild(info);
+    info.innerHTML = `<span class="activityRev">#${r.rev}</span> <span class="activityActor">${esc(ACTOR_LABEL[r.actor] ?? r.actor)}</span><br><span class="activityText">${esc(humanizeRevision(r))}</span>`;
+    body.appendChild(info);
 
     const actions = document.createElement('div');
     actions.className = 'activityActions';
@@ -4644,7 +4747,8 @@ function renderActivityFeed() {
       };
       actions.appendChild(btn);
     }
-    if (actions.childElementCount) card.appendChild(actions);
+    if (actions.childElementCount) body.appendChild(actions);
+    card.appendChild(body);
     el.appendChild(card);
   }
 }
@@ -4987,7 +5091,7 @@ function renderTakesCard(sourceId, group) {
     row.className = 'takeRow' + (isRecommended ? ' recommended' : '');
     const confPct = Math.round((1 - u.features.lowConfidenceRatio) * 100);
     row.innerHTML =
-      `<div class="showCardLbl">${isRecommended ? '★ ' : ''}"${esc(u.text)}"</div>` +
+      `<div class="showCardLbl">${isRecommended ? '★ ' : ''}「${esc(u.text)}」</div>` +
       `<div class="hintText">${fmt(u.t0)}–${fmt(u.t1)} conf=${confPct}%</div>`;
     const actions = document.createElement('div');
     actions.className = 'candActions';
@@ -5461,7 +5565,9 @@ async function renderAll() {
   renderStat();
   // W-UI IA v2 用語表: 「変更 #7」→「現在の版 7」(ヘッダー右端の弱表示)。
   // 波2 §7: 「自動保存」を明示 — 「保存」という語が UI に一度も出ない状態の解消。
-  $('revLabel').textContent = `現在の版 ${m.revision} · 自動保存`;
+  // W-POLISH Low-4: 日本語ラベルまで丸ごとmonoにしない — 版番号だけ
+  // <span class="mono"> で包む(.hdrRevLabel は style.css 側で.monoリストから外した)。
+  $('revLabel').innerHTML = `現在の版 <span class="mono">${m.revision}</span> · 自動保存`;
   applyCompositionMode();
   await loadMotionSpecs();
   syncMusicElements();

@@ -47,7 +47,7 @@
       </select>
     </label>
     <button id="shortcutsBtn" class="btnIcon" title="ショートカット一覧 (?)" aria-label="ショートカット一覧を開く">?</button>
-    <span id="conn" class="connDot" title="接続待ち" aria-label="接続状態: 接続待ち">●</span>
+    <span id="conn" class="connDot" title="接続待ち" aria-label="接続状態: 接続待ち"></span>
     <!-- W-DESIGN ディレクター適応1: 実行はしない。クリックで右パネルに
          「書き出し」ビューを開く(openExportView in app.js)。 -->
     <button id="exportBtn" class="btnPrimary" aria-label="書き出しビューを開く">書き出し</button>
@@ -137,6 +137,10 @@
         <div id="dialogueLayer" aria-hidden="true"></div>
         <div id="ingestOverlay" hidden><div class="spin"></div><span id="ingestStep" aria-live="polite"></span></div>
         <div id="stageEmpty" hidden>
+          <!-- W-POLISH Mid-9: 空プロジェクト状態専用の44pxロゴ(README/
+               v2.dc.html)。読み込み失敗/プロジェクト未選択では出さない
+               (renderStageState in app.js が hidden を切り替える)。 -->
+          <div id="stageEmptyLogo" class="stageEmptyLogo" aria-hidden="true" hidden>v</div>
           <div id="stageEmptyMsg"></div>
           <button id="stageEmptyRetry" hidden>再読み込み</button>
         </div>
@@ -337,9 +341,19 @@
       </div>
       <div class="rightViewBody">
         <div class="capPreview"><span id="capPreviewCue" class="capPreviewCue"></span></div>
+        <!-- W-POLISH Mid-11: ビルトイン4種はボタン化(v2.dc.html「標準/
+             ボールド/キット」の3ボタンをCAPTION_STYLE_PRESETS[4種]に拡張)。
+             キットのスタイルは可変長のため native select のまま、キットが
+             無いプロジェクトでは非表示(populateCaptionStylePresetControls
+             in app.js)。 -->
         <div class="capField">
-          <label for="capStylePreset">プリセット</label>
-          <select id="capStylePreset"></select>
+          <label id="capStylePresetLabel">プリセット</label>
+          <div id="capStylePresetBtns" class="capPresetBtns" role="group" aria-labelledby="capStylePresetLabel"></div>
+          <span id="capStylePresetUnknown" class="hintText" hidden></span>
+        </div>
+        <div class="capField" id="capKitStyleField" hidden>
+          <label for="capKitStyleSelect">キットのスタイル</label>
+          <select id="capKitStyleSelect"></select>
         </div>
         <div class="capField">
           <label for="capMaxChars">1行の最大文字数</label>

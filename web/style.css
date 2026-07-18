@@ -27,6 +27,13 @@
   --border: rgba(255, 255, 255, 0.08);
   --border-soft: rgba(255, 255, 255, 0.06);
   --border-hover: rgba(255, 255, 255, 0.2);
+  /* W-POLISH Mid-3: フォーム(input/select)既定10%、戻る/フッター/候補アクション
+     ゴースト既定12% — 同じ階層のコントロール間で線密度を揃える。hoverは両者
+     とも既存の --border-hover(20%)、候補「残す」だけ v2.dc.html が25%を明示
+     しているため個別に rgba(255,255,255,0.25) を使う(下記 .btn-wash:hover)。 */
+  --border-input: rgba(255, 255, 255, 0.1);
+  --border-ghost: rgba(255, 255, 255, 0.12);
+  --accent: #8f8f96;       /* range/checkbox の accent-color(README/v2.dc.html 全域で使用) */
 
   --text: #ececee;
   --text-2: #b9b9bf;
@@ -64,6 +71,11 @@
   --fs-md: 13px;
   --fs-lg: 14px;
   --fs-xl: 16px;
+  /* W-POLISH Mid-5: README のタイプランプに欠けていた10.5px/12pxもトークン化
+     (プレーンな2xs/xs 等の命名だと10.5と12がどちらの間に来るか紛らわしいため、
+     数値そのものを名前にする)。 */
+  --fs-10-5: 10.5px;
+  --fs-12: 12px;
 
   /* legacy alias names kept so every pre-existing component rule below still
      resolves without having to touch each call site individually — same
@@ -123,14 +135,14 @@ header {
 .hdrAppName { font-weight: 600; font-size: var(--fs-md); letter-spacing: 0.01em; white-space: nowrap; }
 .hdrSep { width: 1px; height: 14px; background: rgba(255, 255, 255, 0.1); flex: none; }
 #projName { font-weight: 500; color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.hdrRevLabel { color: var(--text-dim); font-size: var(--fs-xs); white-space: nowrap; }
+.hdrRevLabel { color: var(--text-3); font-size: var(--fs-xs); white-space: nowrap; }
 /* 既存機能: ヘッダー常設のライブタイムコード。v2.dc.html には無いが機能温存のため
    小さく残す(W-DESIGN 既知差分 — 詳細は最終報告参照)。 */
-.hdrTc { color: var(--text-dim); font-size: var(--fs-xs); }
+.hdrTc { color: var(--text-3); font-size: var(--fs-xs); }
 /* W-UI redesign §1: 出力解像度/素材スペック/fps の弱い二次情報。v2.dc.html
    には無い要素だが既存の有用な情報を失わないため残す(W-DESIGN 既知差分)。 */
 #stat.hdrSecondary {
-  color: var(--text-dim); font-size: var(--fs-2xs);
+  color: var(--text-3); font-size: var(--fs-2xs);
   min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .hdrCenter { flex: 1; display: flex; justify-content: center; min-width: 0; }
@@ -162,22 +174,32 @@ header {
 }
 .btnIcon:hover { color: var(--text); border-color: var(--border-hover); }
 /* W-UI redesign §1: connection state is a small dot + title tooltip, not a
-   text label — the color alone (+ title/aria-label for a11y) carries it. */
-.connDot { color: var(--danger); font-size: 10px; line-height: 1; cursor: default; }
-.connDot.up { color: var(--ok); }
+   text label — the color alone (+ title/aria-label for a11y) carries it.
+   W-POLISH Low-5: a real 6x6px circle (README spec) instead of a font-glyph
+   "●" — glyph rendering depends on baseline/font metrics, a drawn dot doesn't. */
+.connDot {
+  display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--danger); cursor: default;
+}
+.connDot.up { background: var(--ok); }
 .btnPrimary {
   background: var(--primary); color: var(--primary-text); border: 0; border-radius: var(--radius);
   padding: 6px 16px; font-size: var(--fs-base); font-weight: 600;
 }
 .btnPrimary:hover { background: var(--primary-hover); }
 .btnPrimary:disabled { opacity: 0.4; }
+/* W-POLISH Mid-5: プライマリボタンのタイプランプ — 用途別に書き出し12px/
+   字幕適用11.5pxへ分ける(README「サイズ」欄の10.5px/12pxトークンを実際に
+   使う箇所)。他の .btnPrimary(モーダル無し等)は既定12.5pxのまま。 */
+#exportBtn.btnPrimary { font-size: var(--fs-12); }
+#capApplyBtn.btnPrimary { font-size: var(--fs-sm); }
 .btnGhost {
-  background: transparent; color: var(--text-2); border: 1px solid var(--border);
+  background: transparent; color: var(--text-2); border: 1px solid var(--border-ghost);
   border-radius: var(--radius); padding: 3px 11px; font-size: var(--fs-xs); white-space: nowrap;
 }
 .btnGhost:hover { color: var(--text); border-color: var(--border-hover); }
 .btnBack {
-  background: none; color: var(--text-3); border: 1px solid var(--border);
+  background: none; color: var(--text-3); border: 1px solid var(--border-ghost);
   border-radius: var(--radius); padding: 3px 10px; font-size: var(--fs-xs);
 }
 .btnBack:hover { color: var(--text); }
@@ -189,18 +211,34 @@ button {
 }
 button:hover { border-color: var(--border-hover); }
 button:disabled { opacity: 0.4; cursor: default; }
-button:focus-visible, [tabindex]:focus-visible, a:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
-input[type="range"], input[type="checkbox"] { accent-color: var(--text-3); }
+/* W-POLISH Mid-8: pressed(:active)を hover と区別する — 白/raised 系の2つの
+   プライマリボタンは既に独自の背景を持つので除外(そのままだと押下時に灰色で
+   一瞬フラッシュしてしまう)。 */
+button:active:not(.btnPrimary):not(.btn-applyAllCandidates) { background: #37373d; }
+button:focus-visible, [tabindex]:focus-visible, a:focus-visible,
+select:focus-visible, input:focus-visible, summary:focus-visible {
+  outline: 2px solid var(--link); outline-offset: 1px;
+}
+/* W-POLISH Low-1: range/checkbox の accent は v2.dc.html 全域で #8f8f96 固定
+   (README の --text-3 転用ではなく専用トークン)。 */
+input[type="range"], input[type="checkbox"] { accent-color: var(--accent); }
 input[type="range"]:disabled, input[type="checkbox"]:disabled { opacity: 0.5; }
+/* W-POLISH Mid-3: 既定10%、hoverのみ20%(--border-hover)へ — 以前は既定から
+   --border-hover(20%)を使っていて「常に少し明るい」状態が固定されていた。 */
 select, input[type="text"], input[type="number"] {
-  background: var(--card); color: var(--text); border: 1px solid var(--border-hover);
+  background: var(--card); color: var(--text); border: 1px solid var(--border-input);
   border-radius: var(--radius); font: inherit; padding: 3px 6px;
 }
+select:hover, input[type="text"]:hover, input[type="number"]:hover { border-color: var(--border-hover); }
 /* タイムコード・フレーム数・秒数値だけ monospace + tabular-nums — every
    numeric readout in the timeline/inbox/media-pool UI shares this one rule
-   rather than repeating font-family per component. */
-.mono, .hdrTc, #tc, #rangeInfo, .hdrRevLabel, #minGapVal,
-.cand .srcTag, .cand .dur, .srcDur, .srcUsageLabel, .btn-sceneSeek, .frameLabel,
+   rather than repeating font-family per component.
+   W-POLISH Low-4: .hdrRevLabel(「現在の版 12・自動保存」)と .cand .srcTag
+   (素材名)は日本語ラベルを含むため外し、数字部分だけ個別に .mono を当てる
+   (revLabel の版番号は app.js 側で <span class="mono"> に包む)。.srcDur は
+   Mid-6でサムネのチップ(.srcDurChip)に置き換わったため削除。 */
+.mono, .hdrTc, #tc, #rangeInfo, #minGapVal,
+.cand .dur, .cand .candTime, .srcDurChip, .srcUsageLabel, .btn-sceneSeek, .frameLabel,
 dialog#shortcutsDialog td:first-child {
   font-family: var(--font-mono); font-variant-numeric: tabular-nums;
 }
@@ -234,11 +272,14 @@ main { flex: 1; display: flex; min-height: 0; }
 .leftTabs { padding: 0 14px; border-bottom: 1px solid var(--border); }
 .tab {
   border: 0; border-radius: 0; background: none; padding: 9px 4px 10px; margin-right: 18px;
-  color: var(--text-dim); font-size: var(--fs-base); font-weight: 500;
+  color: var(--text-3); font-size: var(--fs-base); font-weight: 500;
   border-bottom: 2px solid transparent;
 }
 .tab:last-child { margin-right: 0; }
 .tab.active { color: var(--text); font-weight: 600; border-bottom-color: var(--text); }
+/* W-POLISH Mid-2: 2タブを均等割り(flex:1)にしてパネル幅を二等分 — 内容幅の
+   ままだと active 下線がラベル分しか伸びず孤立して見えていた。 */
+.leftTabs .tab { flex: 1; margin-right: 0; }
 .tab:focus-visible { outline: 2px solid var(--link); outline-offset: -2px; }
 .panel { display: none; flex: 1; min-height: 0; overflow: auto; flex-direction: column; }
 .panel.active { display: flex; }
@@ -246,14 +287,14 @@ main { flex: 1; display: flex; min-height: 0; }
   display: flex; gap: 8px; align-items: center; padding: 8px;
   border-bottom: 1px solid var(--border-soft); position: sticky; top: 0; background: var(--panel); z-index: 2;
 }
-.hintText { color: var(--text-dim); font-size: var(--fs-xs); }
+.hintText { color: var(--text-3); font-size: var(--fs-xs); }
 
 /* ---- 素材パネル ---- */
 #leftPanel .panelbar button { font-size: var(--fs-xs); padding: 3px 9px; }
 .kitStatus {
   margin: 10px 12px 0; padding: 6px 10px; border-radius: var(--radius);
   background: var(--card); border: 1px solid var(--border);
-  color: var(--text-dim); font-size: var(--fs-xs);
+  color: var(--text-3); font-size: var(--fs-xs);
   display: flex; flex-direction: column; align-items: flex-start; gap: 6px;
 }
 .kitStatus > span { white-space: normal; }
@@ -269,12 +310,13 @@ main { flex: 1; display: flex; min-height: 0; }
 .audioField select { align-self: stretch; min-width: 0; }
 .audioField input[type="range"] { width: 100%; }
 .audioCheck { display: flex; align-items: center; gap: 6px; font-size: var(--fs-sm); color: var(--text-3); }
+/* W-POLISH Mid-4: 「書き出しで確認」はREADME/v2.dc.html通り10pxのプレーン
+   テキストへ(以前はピル形のバッジで、その分の存在感が強すぎた)。 */
 .exportOnlyBadge {
-  align-self: flex-start; font-size: 10px; padding: 1px 6px; border-radius: var(--radius-pill);
-  background: transparent; border: 1px solid var(--wash); color: var(--text-dim); cursor: help;
+  align-self: flex-start; font-size: 10px; color: var(--text-3); cursor: help;
 }
 .musicAddForm { display: flex; flex-direction: column; gap: 6px; padding: 8px; border-radius: var(--radius); background: var(--card); border: 1px solid var(--border); }
-.musicAddForm label { display: flex; flex-direction: column; gap: 4px; font-size: var(--fs-xs); color: var(--text-dim); }
+.musicAddForm label { display: flex; flex-direction: column; gap: 4px; font-size: var(--fs-xs); color: var(--text-3); }
 .musicAddForm input[type="text"] { padding: 4px 6px; }
 .musicAddActions { display: flex; gap: 6px; justify-content: flex-end; }
 
@@ -283,27 +325,52 @@ main { flex: 1; display: flex; min-height: 0; }
    メタ行10.5px #616167(警告時#d9a45f)。既存の mediaRow() が作る row/img/
    info/actions の DOM構造は無変更 — グリッド化とサムネ縦横比だけを CSS で。 */
 #mediaList { padding: 12px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; align-content: start; overflow-y: auto; }
+/* W-POLISH Mid-9: 素材が0件のときの案内(README: 白16% dashed、radius8、
+   padding28px 16px、gap6) — 以前は8pxパディングの一行ヒントだけだった。
+   実装にファイル選択クリックは無いため「クリックして選択」は謳わない
+   (ドラッグ&ドロップのみ、既存機能どおり)。 */
+.mediaEmptyHint {
+  grid-column: span 2; display: flex; flex-direction: column; gap: 6px; align-items: center;
+  text-align: center; border: 1px dashed rgba(255, 255, 255, 0.16); border-radius: var(--radius-lg);
+  padding: 28px 16px; margin-top: 6px;
+}
+.mediaEmptyHint .mediaEmptyLead { font-weight: 600; color: var(--text-2); font-size: var(--fs-base); }
+.mediaEmptyHint .mediaEmptyHintSub { font-size: var(--fs-sm); color: var(--text-3); }
 .srcRow {
   grid-column: span 2; display: flex; gap: 10px; align-items: center; padding: 7px 9px; cursor: pointer;
-  background: var(--card); border: 0; outline: 1px solid var(--border-soft); border-radius: var(--radius);
+  background: var(--card); border: 0; outline: 1px solid rgba(255, 255, 255, 0.07); border-radius: var(--radius);
 }
 /* 通常表示(詳細を開いていない)のときだけ縦積みの2列カードに — 詳細
    (badges/usage/シーン)を開くと横1列に戻り、情報が窮屈にならないようにする。 */
 .srcRow:not(:has(.srcBadges)) { grid-column: span 1; flex-direction: column; align-items: stretch; padding: 0; overflow: hidden; }
+.srcRow:not(:has(.srcBadges)) .srcThumbWrap { width: 100%; }
 .srcRow:not(:has(.srcBadges)) .srcThumb { width: 100%; height: auto; aspect-ratio: 16/9; border-radius: 0; }
 .srcRow:not(:has(.srcBadges)) .srcInfo { padding: 7px 9px 2px; }
 .srcRow:not(:has(.srcBadges)) .srcActions { flex-direction: row; flex-wrap: wrap; padding: 0 9px 8px; }
 .srcRow:hover { outline-color: var(--border-hover); }
 .srcRow:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
 .srcRow.previewing { outline-color: var(--link); box-shadow: 0 0 0 1px var(--link); }
+.srcThumbWrap { position: relative; flex: none; }
 .srcThumb {
-  width: 72px; height: 40px; object-fit: cover; border-radius: var(--radius-sm);
-  background: #0a0c10; flex: none;
+  display: block; width: 72px; height: 40px; object-fit: cover; border-radius: var(--radius-sm);
+  background: #0a0c10;
+}
+/* W-POLISH Mid-6: 時間をサムネ右下のチップへ(以前は名前行に同居していて
+   狭い2列カードでファイル名が切れていた)。 */
+.srcDurChip {
+  position: absolute; right: 4px; bottom: 4px; padding: 1px 5px; border-radius: 3px;
+  background: rgba(0, 0, 0, 0.7); color: #ddd; font-size: 10px; line-height: 1.4; pointer-events: none;
 }
 .srcInfo { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .srcNameRow { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
 .srcName { font-size: var(--fs-sm); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
-.srcDur { color: var(--text-dim); font-size: var(--fs-2xs); flex: none; }
+/* 名前行専有(Mid-6)につき常設のメタ行を1本足す — 警告があるときだけ琥珀の
+   6pxドット+中立文字色(High-3: pendingはドット専用)、無ければ何も出さない
+   (存在しないメタ情報をでっち上げない)。 */
+.srcMeta { display: flex; align-items: center; gap: 5px; font-size: 10.5px; color: var(--text-3); }
+.srcMeta:empty { display: none; }
+.srcMeta.warn { color: var(--text-2); }
+.srcMeta.warn::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--pending); flex: none; }
 .srcBadges { display: flex; gap: 4px; flex-wrap: wrap; }
 .badge {
   font-size: 10px; padding: 1px 6px; border-radius: var(--radius-pill); background: var(--card-2); border: 1px solid var(--border); color: var(--text);
@@ -312,8 +379,10 @@ main { flex: 1; display: flex; min-height: 0; }
 .badge.warn { background: rgba(217, 164, 95, 0.18); border-color: transparent; color: var(--pending); }
 .srcUsage { display: flex; align-items: center; gap: 8px; }
 .srcUsageBar { display: block; flex: 1 1 auto; height: 6px; min-width: 40px; border-radius: var(--radius-pill); background: var(--border); overflow: hidden; }
-.srcUsageFill { display: block; height: 100%; background: var(--link); }
-.srcUsageLabel { color: var(--text-dim); font-size: 10px; white-space: nowrap; flex: none; }
+/* W-POLISH High-3: --link はテキストリンク/フォーカス/busyドット専用に絞る
+   — 使用量バーの塗りは意味色ではなく中立トーン(--wash)へ。 */
+.srcUsageFill { display: block; height: 100%; background: var(--wash); }
+.srcUsageLabel { color: var(--text-3); font-size: 10px; white-space: nowrap; flex: none; }
 .srcActions { display: flex; flex-direction: column; gap: 4px; flex: none; }
 .srcActions button { padding: 2px 8px; font-size: var(--fs-xs); white-space: nowrap; }
 
@@ -329,7 +398,7 @@ main { flex: 1; display: flex; min-height: 0; }
 .sceneItem.review-keep { border-color: var(--ok); box-shadow: 0 0 0 1px var(--ok); }
 .sceneItem.review-reject { border-color: var(--danger); opacity: 0.55; }
 .btn-sceneSeek, .btn-sceneAdd { font-size: var(--fs-xs); padding: 2px 6px; }
-.sceneNote { color: var(--text-dim); font-size: var(--fs-xs); font-style: italic; overflow-wrap: break-word; }
+.sceneNote { color: var(--text-3); font-size: var(--fs-xs); font-style: italic; overflow-wrap: break-word; }
 .sceneReview { display: flex; gap: 4px; }
 .btn-sceneKeep, .btn-sceneReject { font-size: var(--fs-xs); padding: 1px 8px; line-height: 1.4; }
 .btn-sceneKeep[aria-pressed="true"] { background: var(--ok); border-color: var(--ok); color: #06210f; }
@@ -342,7 +411,7 @@ main { flex: 1; display: flex; min-height: 0; }
 .transcribeStatusRow { display: flex; align-items: center; justify-content: space-between; gap: 8px; line-height: 1.6; }
 .btn-transcribeSource { font-size: var(--fs-xs); padding: 2px 8px; flex: none; }
 .srcHeading {
-  color: var(--text-dim); font-size: var(--fs-2xs); font-weight: 600; letter-spacing: 0.08em;
+  color: var(--text-3); font-size: var(--fs-2xs); font-weight: 600; letter-spacing: 0.08em;
   padding: 10px 0 8px; margin-top: 6px; border-bottom: 1px solid var(--border-soft);
 }
 .srcHeading:first-child { margin-top: 0; }
@@ -365,20 +434,26 @@ main { flex: 1; display: flex; min-height: 0; }
 /* README: プレビューは padding 20px 28px 10px、比率は常に manifest.output に
    追従(16:9固定にしない — W-DESIGN ディレクター適応3)。既存の updateFraming/
    .customAspect/--out-ar 機構(app.js)をそのまま使う。 */
+/* W-POLISH High-2: 枠線/背景/角丸は「常にアスペクト比を持つ内側の箱」
+   (#videoBox)へ移す。以前は #videoWrap 自体(可変矩形、アスペクト比なし)に
+   これらを付けていたため、黒い枠が16:9にならず映像外の黒面積が支配的に
+   見えていた。比率は manifest.output(--out-ar)追従を維持しつつ、未設定時は
+   16/9 にフォールバック — 9:16等のプロジェクトでは引き続き縦長の箱になる。 */
 #videoWrap {
-  position: relative; flex: 1 1 0; min-height: 0; margin: 20px 28px 0;
-  background: #000; border-radius: var(--radius); overflow: hidden;
-  outline: 1px solid rgba(255, 255, 255, 0.06);
+  position: relative; flex: 1 1 0; min-height: 0; padding: 20px 28px 10px;
   display: flex; align-items: center; justify-content: center;
 }
-#videoBox { position: relative; width: 100%; height: 100%; }
+#videoBox {
+  position: relative; height: 100%; max-width: 100%;
+  aspect-ratio: var(--out-ar, 16/9);
+  background: #000; border-radius: var(--radius); overflow: hidden;
+  outline: 1px solid rgba(255, 255, 255, 0.06);
+}
 #videoBox video { width: 100%; height: 100%; object-fit: contain; }
-/* manifest.output present and its aspect differs from the source: lock the
-   inner box to the OUTPUT aspect (letterboxed within #videoWrap) so the
-   preview matches the framing the export will actually produce — a 9:16
-   project renders as a tall box, not a fixed 16:9 rectangle. No output ->
-   plain letterboxing (videoBox fills videoWrap). */
-#videoWrap.customAspect #videoBox { width: auto; height: 100%; max-width: 100%; aspect-ratio: var(--out-ar, 16/9); margin: 0 auto; }
+/* manifest.output present: the preview crops/positions like the export will
+   (object-fit:cover + crop-driven object-position) rather than plain
+   letterboxing — the box itself is always output-aspect-shaped now (see
+   #videoBox above), this only swaps the fit/position behavior. */
 #videoWrap.customAspect #videoBox video { object-fit: cover; }
 #videoOverlay { position: absolute; inset: 0; z-index: 1; background: #000; pointer-events: none; }
 
@@ -388,7 +463,7 @@ main { flex: 1; display: flex; min-height: 0; }
 .compAmbientMedia { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; opacity: 0.35; mix-blend-mode: screen; }
 .compBgPlaceholder {
   position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
-  text-align: center; padding: 24px; color: var(--text-dim); font-size: var(--fs-sm); background: #14161c;
+  text-align: center; padding: 24px; color: var(--text-3); font-size: var(--fs-sm); background: #14161c;
 }
 
 #spriteLayer { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
@@ -408,7 +483,7 @@ main { flex: 1; display: flex; min-height: 0; }
 #captionLayer .cue, .capPreview .cue {
   display: inline-block; padding: 0.25em 0.8em; border-radius: var(--radius);
   background: rgba(0,0,0,0.6); color: #fff; font-weight: 700;
-  font-size: clamp(14px, 2.6vw, 26px); text-shadow: 0 1px 3px #000;
+  font-size: clamp(14px, 2.4vw, 26px); text-shadow: 0 1px 3px #000;
   pointer-events: auto; cursor: pointer; position: relative;
 }
 #captionLayer .cue:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
@@ -489,7 +564,15 @@ main { flex: 1; display: flex; min-height: 0; }
 #stageEmpty {
   position: absolute; inset: 0; display: flex; flex-direction: column; gap: 14px;
   align-items: center; justify-content: center; text-align: center; padding: 24px;
-  background: var(--bg); color: var(--text-dim);
+  background: var(--bg); color: var(--text-3);
+}
+/* W-POLISH Mid-9: 空プロジェクト状態専用の44pxロゴ(README/v2.dc.html)。
+   読み込み失敗/プロジェクト未選択の他の #stageEmpty 用途では出さない
+   (renderStageState が isProjectEmpty() のときだけ appendChild する)。 */
+.stageEmptyLogo {
+  width: 44px; height: 44px; border-radius: 11px; background: #2a2a2e; flex: none;
+  display: flex; align-items: center; justify-content: center; color: var(--text);
+  font-weight: 700; font-size: 22px;
 }
 #stageEmptyMsg {
   display: flex; flex-direction: column; gap: 8px;
@@ -500,7 +583,7 @@ main { flex: 1; display: flex; min-height: 0; }
 /* ---- トランスポート(README: 左タイムコード mono14px、中央 ⏮▶⏭、右 f番号+fps mono10.5px) ---- */
 #transport { display: flex; align-items: center; gap: 14px; padding: 8px 28px 12px; flex: none; }
 .tcMain { font-family: var(--font-mono); font-size: var(--fs-lg); color: var(--text); font-variant-numeric: tabular-nums; }
-.tcDim, #tcTotal { color: var(--text-dim); }
+.tcDim, #tcTotal { color: var(--text-3); }
 .transportControls { display: flex; align-items: center; gap: 8px; }
 .btnTransportSm {
   width: 28px; height: 28px; border-radius: var(--radius); background: transparent; border: 0;
@@ -513,18 +596,22 @@ main { flex: 1; display: flex; min-height: 0; }
 }
 .btnTransportPlay:hover { background: var(--primary-hover); }
 .btnTransportPlay:disabled { opacity: 0.35; }
-.frameLabel { font-size: 10.5px; color: var(--text-dim); }
+.frameLabel { font-size: 10.5px; color: var(--text-3); }
+/* W-POLISH High-3: --link はテキストリンク/フォーカス/busyドット専用に絞る
+   — 再生速度ピルは意味色ではなく中立トーン(--wash)へ。 */
 #rateLabel {
-  font-size: var(--fs-2xs); font-weight: 700; color: #04101f; background: var(--link);
+  font-size: var(--fs-2xs); font-weight: 700; color: var(--text); background: var(--wash);
   padding: 1px 6px; border-radius: var(--radius-pill);
 }
 
 /* ---- タイムラインツールバー(README: 36px、選択/スナップcheckbox/拡大
-   スライダー/全体表示のみ — 分割・テキストツールは実装しない) ---- */
+   スライダー/全体表示のみ — 分割・テキストツールは実装しない) ----
+   W-POLISH Mid-1: 左右margin/ツールバー直上の余白を0に — 以前は28px+10pxの
+   インセットでNLEの作業幅を56px失い、プレビューと同じ浮遊カードに見えていた。 */
 .tlToolbar {
   display: flex; align-items: center; gap: 8px; height: 36px; padding: 0 12px;
   background: var(--timeline-bg); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border-soft);
-  flex: none; margin: 10px 28px 0;
+  flex: none; margin: 0;
 }
 .tlTool {
   background: none; color: var(--text-3); border: 0; border-radius: var(--radius);
@@ -533,7 +620,7 @@ main { flex: 1; display: flex; min-height: 0; }
 .tlTool.active { background: var(--card-2); color: var(--text); }
 .tlToolbarSep { width: 1px; height: 14px; background: rgba(255, 255, 255, 0.1); flex: none; }
 .tlSnapCheck { display: flex; align-items: center; gap: 5px; font-size: var(--fs-sm); color: var(--text-3); cursor: pointer; }
-.tlZoomLabel { font-size: 10.5px; color: var(--text-dim); }
+.tlZoomLabel { font-size: 10.5px; color: var(--text-3); }
 #tlZoomRange { width: 110px; }
 #tlFitBtn { background: none; color: var(--text-3); border: 1px solid var(--border-hover); border-radius: var(--radius); padding: 2px 9px; font-size: var(--fs-xs); }
 #tlFitBtn:hover { color: var(--text); }
@@ -550,7 +637,7 @@ main { flex: 1; display: flex; min-height: 0; }
 #timeline {
   position: relative; height: 206px; background: var(--timeline-bg);
   border-bottom: 1px solid var(--border); overflow: hidden; cursor: crosshair;
-  flex: none; margin: 0 28px 12px;
+  flex: none; margin: 0 0 12px;
 }
 #timeline.tl-extra { height: 276px; }
 #timeRuler {
@@ -559,13 +646,14 @@ main { flex: 1; display: flex; min-height: 0; }
 }
 .rulerTick {
   position: absolute; top: 0; height: 100%; padding-left: 4px;
-  border-left: 1px solid rgba(255, 255, 255, 0.06); color: var(--text-dim);
+  border-left: 1px solid rgba(255, 255, 255, 0.06); color: var(--text-3);
   font-size: 9.5px; font-family: var(--font-mono); font-variant-numeric: tabular-nums;
   white-space: nowrap; line-height: 24px;
 }
+/* W-POLISH Low-3: ラベル列と時間領域の境目のヘアラインが欠落していた。 */
 #trackGutter {
   position: absolute; left: 0; top: 24px; bottom: 0; width: 96px;
-  background: var(--panel);
+  background: var(--panel); border-right: 1px solid var(--border);
 }
 .gutterLabel {
   position: absolute; left: 0; right: 0; display: flex; align-items: center;
@@ -574,6 +662,10 @@ main { flex: 1; display: flex; min-height: 0; }
 }
 .gutterLabel::before { content: ''; width: 2px; border-radius: 1px; align-self: stretch; background: var(--gutter-color, var(--text-3)); }
 #timelineTracks { position: absolute; left: 96px; right: 0; top: 24px; bottom: 0; }
+/* W-POLISH High-1: canvas 自体は #timelineTracks 全体を覆うが、drawWave()
+   (app.js)側で「本編」58px行の下部32%だけに描画を絞る — 以前は
+   #timelineTracks の全トラック高(62%位置・最大55%)に敷いていたため、
+   「テロップ」行に波形が重なって見えていた。 */
 #wave { position: absolute; inset: 0; width: 100%; height: 100%; }
 
 /* B-roll V2 row: top:4px height:22px (README ピクセル値そのまま) */
@@ -608,7 +700,8 @@ main { flex: 1; display: flex; min-height: 0; }
   background: var(--card); border-radius: var(--radius-sm); outline: 1px solid var(--border);
 }
 .clip.alt { background: #1c1c20; }
-.clip.sel { outline: 1.5px solid #fff; box-shadow: 0 0 0 1px #fff; }
+/* W-POLISH High-5: 1.5px白ボーダーのみ(重複していた1px白shadowは廃止)。 */
+.clip.sel { outline: 1.5px solid #fff; }
 /* README「本編」: 上68%フィルムストリップ、下32% rgba(10,10,12,0.75)+波形。 */
 .clipThumb {
   position: absolute; top: 0; height: 68%; background-size: cover; background-position: center;
@@ -629,9 +722,17 @@ main { flex: 1; display: flex; min-height: 0; }
   outline: 2px solid var(--link); outline-offset: 1px;
 }
 /* README「選択」オーバーレイ: 1.5px白ボーダー+左右5px白ハンドル(v2.dc.html
-   の selOverlayStyle)。クリップ自体の .sel 枠と重ねて、ハンドルの見た目だけ
-   このレイヤーで足す。 */
-.clip.sel::before, .clip.sel::after { z-index: 1; }
+   の selOverlayStyle)。実DOM要素(.clipHandle、renderTimeline が各クリップに
+   常設 — トリムは既に端6px = EDGE_PXで機能済み、これは可視化のみ)を選択時
+   だけ表示する。.clip の overflow:hidden の内側(inset0)に置くため、hifiの
+   -1px食み出しではなく内接(0)にして切り取られないようにしている。 */
+.clipHandle {
+  position: absolute; top: 0; bottom: 0; width: 5px; z-index: 2;
+  background: #fff; display: none; pointer-events: none;
+}
+.clipHandleL { left: 0; border-radius: 4px 0 0 4px; }
+.clipHandleR { right: 0; border-radius: 0 4px 4px 0; }
+.clip.sel .clipHandle { display: block; }
 #dropIndicator {
   position: absolute; top: 30px; height: 58px; width: 2px; background: var(--link);
   pointer-events: none; z-index: 3;
@@ -649,7 +750,7 @@ main { flex: 1; display: flex; min-height: 0; }
   font-size: 10px; line-height: 20px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0 6px; cursor: pointer;
 }
 .capRowBlock.capRowOff, .capRowBlock.capRowEmpty {
-  left: 0; width: 100%; background: var(--card-2); color: var(--text-dim); box-shadow: none;
+  left: 0; width: 100%; background: var(--card-2); color: var(--text-3); box-shadow: none;
   border: 1px dashed var(--border-hover); text-align: center;
 }
 .capRowBlock:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
@@ -661,9 +762,12 @@ main { flex: 1; display: flex; min-height: 0; }
   background: #322e3d; color: #a89dc4; box-shadow: inset 2px 0 0 #7d70a3;
   font-size: 10px; line-height: 20px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0 6px;
 }
+/* W-POLISH Low-2: READMEの最小10pxを下回っていた(8px)ので引き上げ、20px丈の
+   行に収まるよう短縮ラベル(「対象外」— 全文はモーションブロック自体の title
+   に既にある)にする。 */
 .moBlock .exportSkipBadge {
   display: inline-block; margin-left: 3px; padding: 0 3px; border-radius: 2px;
-  background: rgba(0,0,0,0.35); color: #e7e2d8; font-size: 8px; font-weight: 700;
+  background: rgba(0,0,0,0.35); color: #e7e2d8; font-size: 10px; font-weight: 700;
 }
 
 /* BGM(A2): top:146px height:26px */
@@ -758,17 +862,20 @@ main { flex: 1; display: flex; min-height: 0; }
 }
 
 #nowPanel, #historyPanel { padding: 0; }
+/* W-POLISH High-3: --link はテキストリンク/フォーカス/busyドット専用に絞る
+   — 進捗ストリップの塗り背景+リンク色文字は中立トーンへ(意味色ではなく
+   単なる進行中インジケータ)。 */
 .claudeStrip {
   display: flex; align-items: center; gap: 8px; padding: 8px 14px;
-  background: rgba(143, 180, 221, 0.1); border-bottom: 1px solid var(--border-soft);
-  color: var(--link); font-size: var(--fs-base);
+  background: none; border-bottom: 1px solid var(--border-soft);
+  color: var(--text-2); font-size: var(--fs-base);
 }
 .confirmEmptyProject { padding: 32px 16px; text-align: center; font-size: var(--fs-base); }
 .intentZonesInfo { padding: 10px 14px 2px; display: flex; flex-direction: column; gap: 6px; }
 .intentZoneInfoRow {
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
   padding: 6px 8px; border-radius: var(--radius); background: var(--card); border: 1px solid var(--border);
-  font-size: var(--fs-xs); color: var(--text-dim);
+  font-size: var(--fs-xs); color: var(--text-3);
 }
 .intentZoneInfoRow > span { flex-shrink: 0; }
 
@@ -776,7 +883,7 @@ main { flex: 1; display: flex; min-height: 0; }
    actor=Claude から合成)。既存の revision データのみを使い、実在しない
    ユーザー発言はでっち上げない(候補件数・削減秒数・字幕件数など実数のみ)。 ---- */
 .claudeConversation { padding: 12px 14px 4px; display: flex; flex-direction: column; gap: 10px; }
-.coworkCaption { align-self: center; font-size: 10px; color: var(--text-dim); letter-spacing: 0.04em; padding: 2px 0; }
+.coworkCaption { align-self: center; font-size: 10px; color: var(--text-3); letter-spacing: 0.04em; padding: 2px 0; }
 .claudeBubble {
   display: flex; gap: 8px; align-items: flex-start; max-width: 100%;
 }
@@ -797,48 +904,78 @@ main { flex: 1; display: flex; min-height: 0; }
 }
 .inboxHeading .hintText { font-weight: 400; }
 .detectSettings { margin: 2px 8px 4px; }
-.detectSettings summary { cursor: pointer; padding: 4px 4px; color: var(--text-dim); font-size: var(--fs-xs); list-style: revert; }
+.detectSettings summary { cursor: pointer; padding: 4px 4px; color: var(--text-3); font-size: var(--fs-xs); list-style: revert; }
 .detectSettings summary:hover { color: var(--text); }
 .detectSettings[open] summary { color: var(--text); margin-bottom: 2px; }
 .detectSettingsBar { flex-wrap: wrap; position: static; border-bottom: 0; padding: 6px 4px; }
 .inboxEmpty { padding: 4px 14px 12px; }
 #inboxList { padding: 2px 12px 10px; display: flex; flex-direction: column; gap: 10px; }
+/* W-POLISH High-3(意味色の適用範囲): 警告カードが画面唯一の大きな色面に
+   なっていた問題の中心対応。背景/枠を廃止し、6px琥珀ドット+#b9b9bf文字の
+   行形式へ(v2.dc.html「対応が必要」)。--pending はこのドットだけに残す —
+   確認待ちバッジ(タブ/ヘッダーピル)側の琥珀は別途維持(製品の注意システム
+   の核であり、ここで言う「大きな色面」の対象ではない)。 */
 .inboxWarn {
-  padding: 7px 8px; border-radius: var(--radius); background: rgba(217, 164, 95, 0.1);
-  border: 1px solid rgba(217, 164, 95, 0.4); color: var(--pending); font-size: var(--fs-base); line-height: 1.5;
+  display: flex; gap: 8px; align-items: flex-start; padding: 7px 2px;
+  border-radius: 0; background: none; border: 0; border-bottom: 1px solid var(--border-soft);
+  color: var(--text-2); font-size: 12px; line-height: 1.6;
 }
+.inboxWarn::before {
+  content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--pending);
+  flex: none; margin-top: 6px;
+}
+.inboxWarn:last-child { border-bottom: 0; }
 .inboxWarn[role="button"] { cursor: pointer; }
-.inboxWarn[role="button"]:hover { background: rgba(217, 164, 95, 0.18); }
+.inboxWarn[role="button"]:hover { background: rgba(255, 255, 255, 0.04); }
 .inboxWarn:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
-#warningsList { padding: 2px 12px 10px; display: flex; flex-direction: column; gap: 8px; }
+#warningsList { padding: 2px 12px 10px; display: flex; flex-direction: column; gap: 0; }
 
 /* README「提案カード」: bg#202024 radius8 outline白6%。1行目: 提案文12.5px
    #d6d6da + 右端 mono #9b9ba3。2行目: 時刻mono#616167/「前後を再生」/
-   右に「残す」(ゴースト=--wash)「カット」(bg#2e2e33 600)。 */
+   右に「残す」(ゴースト=--wash)「カット」(bg#2e2e33 600)。
+   W-POLISH Mid-7: 1行への強制ellipsis+全メタmono を廃し、v2.dc.html
+   通りの2行(候補文/メタ+アクション)構成に。ボタン順も「前後を再生→
+   spacer→残す→カット(raised)」へ揃える(以前は カット→残す で右端の
+   視覚的着地点が逆転していた)。 */
 .cand {
-  display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 8px; padding: 10px 12px;
+  display: flex; flex-direction: column; gap: 8px; padding: 10px 12px;
   background: var(--card); outline: 1px solid var(--border-soft); border: 0; border-radius: var(--radius-lg); cursor: pointer;
 }
 .cand:hover { outline-color: rgba(255, 255, 255, 0.16); }
 .cand .kind { display: none; } /* README のカードは種別バッジを見出し側だけに出す(グループ見出しの .kind は表示、行内は非表示) */
-.cand .lbl { flex: 1 1 auto; min-width: 60px; color: #d6d6da; font-size: var(--fs-base); line-height: 1.55; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cand .srcTag { color: var(--text-3); font-size: 10px; white-space: nowrap; order: 2; flex: 1 0 100%; }
+.candTop { display: flex; align-items: baseline; gap: 8px; }
+.cand .lbl { flex: 1 1 auto; min-width: 0; color: #d6d6da; font-size: var(--fs-base); line-height: 1.55; white-space: normal; overflow-wrap: break-word; }
 .cand .dur { color: var(--text-3); font-size: var(--fs-xs); flex: none; }
+/* v2.dc.html は1行(時刻→前後を再生→spacer→残す→カット)だが、そのhifiは
+   単一素材デモで「カット」2文字。このアプリは複数素材+既存の「カットする」
+   ラベル(用語変更はスコープ外)で幅が足りないため、flex-wrapで自然に2行へ
+   折り返す — 折り返し先(.candActionsGroup)は margin-left:auto で自分の行の
+   右端に着地するので、幅に余裕があるときは1行、無いときは残す/カットだけが
+   2行目右端に回る(どちらでも「カットが右端の着地点」は崩れない)。 */
+.candBottom { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+.cand .srcTag { color: var(--text-3); font-size: 10px; white-space: nowrap; flex: none; overflow: hidden; text-overflow: ellipsis; max-width: 40%; }
+.cand .candTime { color: var(--text-3); font-size: var(--fs-10-5); white-space: nowrap; flex: none; }
+.candActionsGroup { display: flex; align-items: center; gap: 8px; margin-left: auto; }
 .cand:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
-.candActions { display: flex; align-items: center; gap: 8px; flex: 1 0 100%; }
 .cand button { padding: 3px 12px; white-space: nowrap; }
+/* 汎用アクション行(candRowでは使わなくなったが、フロートカード群
+   (#candidateCard/#takesCard の retake行/#ingestFlowCard)が同じボタン行
+   レイアウトとして共有している既存の共通クラス — 誤って消さないよう独立
+   ルールとして残す)。 */
+.candActions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .btn-preview { background: none; border: 0; color: var(--text-3); font-size: var(--fs-xs); padding: 0; }
 .btn-preview:hover { color: var(--text); }
 .btn-approve, .btn-reject, .btn-wash, .btn-preview { font-size: var(--fs-xs); }
 /* README「意味色規律」: カット/残すの単体アクションは無彩色(装飾グラデー
    ション・カラーピル禁止) — btn-approve は raised(カット)、btn-wash は
    ゴースト(残す)。btn-reject は「タイムラインから外す」「削除」「リセット」
-   のような本当に破壊的な操作 専用(--danger)。 */
-.cand .candActions { justify-content: flex-end; }
+   のような本当に破壊的な操作 専用(--danger)。
+   W-POLISH Mid-3: 候補「残す」の既定ボーダーを20%→12%へ(v2.dc.html は既定
+   12%・hover 25%を明示)。 */
 .btn-approve { background: var(--raised); color: var(--text); border-color: var(--border); font-weight: 600; }
 .btn-approve:hover { background: #37373d; }
-.btn-wash { background: none; color: var(--text-3); border-color: var(--border-hover); }
-.btn-wash:hover { color: var(--text); border-color: rgba(255, 255, 255, 0.4); }
+.btn-wash { background: none; color: var(--text-3); border-color: var(--border-ghost); }
+.btn-wash:hover { color: var(--text); border-color: rgba(255, 255, 255, 0.25); }
 .btn-reject { background: none; color: var(--danger); border-color: var(--danger-border); }
 .btn-reject:hover { background: rgba(201, 138, 128, 0.1); }
 
@@ -853,28 +990,46 @@ main { flex: 1; display: flex; min-height: 0; }
 .candGroupHeader button.btn-approve, .candGroupHeader button.btn-wash {
   background: none; border: 0; color: var(--link); font-size: var(--fs-xs); padding: 0; font-weight: 400;
 }
-.candGroupHeader button.btn-wash { color: var(--text-dim); }
+.candGroupHeader button.btn-wash { color: var(--text-3); }
 .candGroupHeader button.btn-approve:hover, .candGroupHeader button.btn-wash:hover { color: var(--text); }
 /* README「5件すべて適用(−3.5秒)」: 白プライマリ、全種別まとめて — button
    本体は renderInbox が動的に足す(#candidatesSection の末尾)。 */
+/* W-POLISH Mid-5: 一括適用ボタンは書き出しと同じ12pxへ(以前は基準12.5px)。 */
 .btn-applyAllCandidates {
   align-self: stretch; background: var(--primary); color: var(--primary-text); border: 0;
-  border-radius: var(--radius); padding: 7px; font-size: var(--fs-base); font-weight: 600; margin-top: 2px;
+  border-radius: var(--radius); padding: 7px; font-size: var(--fs-12); font-weight: 600; margin-top: 2px;
 }
 .btn-applyAllCandidates:hover { background: var(--primary-hover); }
 
-/* ---- 履歴タブ ---- */
-#activityFeed { padding: 6px 12px 12px; display: flex; flex-direction: column; gap: 6px; }
-.activityCard {
-  padding: 6px 8px; border-radius: var(--radius); border-left: 2px solid var(--border);
-  background: var(--card-2); display: flex; flex-direction: column; gap: 4px;
+/* ---- 履歴タブ ----
+ * W-POLISH High-6: 塗りカード(bg#26262b、左2px罫線、radius6)を廃止し、
+ * v2.dc.html の「7pxドット+1px縦線」タイムライン形式に置き換える
+ * (renderActivityFeed 側は .activityDot/.activityRule の2要素を各行の
+ * 先頭に追加するだけ — 本文/アクションのDOM構造とクリックハンドラは無変更)。
+ */
+#activityFeed { padding: 8px 14px; display: flex; flex-direction: column; }
+.activityCard { display: flex; gap: 10px; }
+.activityRail { display: flex; flex-direction: column; align-items: center; flex: none; width: 8px; }
+.activityDot { width: 7px; height: 7px; border-radius: 50%; margin-top: 6px; flex: none; background: var(--wash); }
+.activityRule { width: 1px; flex: 1; background: var(--border-soft); margin-top: 2px; }
+.activityCard:last-child .activityRule { display: none; }
+.activityBody { flex: 1; min-width: 0; padding-bottom: 14px; display: flex; flex-direction: column; gap: 4px; }
+.activityInfo { font-size: 12px; color: var(--text-2); line-height: 1.55; }
+.activityRev { color: var(--text-3); font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.activityActor { color: var(--text-3); font-size: var(--fs-10-5); }
+.activityText { color: #d6d6da; display: block; }
+.activityActions { display: flex; gap: 10px; }
+/* README「まとめてカット」と同様、罫線なしのテキストリンクに戻す(以前は
+   button の既定ボーダー付き見た目のまま --link 色だけ乗せていた)。「この
+   変更を見る」(btn-activityShow)だけ--link、「この編集より前に戻す」
+   (restoreBtn)は中立トーン(v2.dc.html の#616167→hoverでは高コントラストな
+   var(--text)。High-4と同じ理由で#616167そのものは使わない)。 */
+.activityActions button {
+  background: none; border: 0; color: var(--text-3); font: inherit; font-size: 11px; padding: 0; cursor: pointer;
 }
-.activityInfo { font-size: var(--fs-base); color: var(--text-dim); line-height: 1.5; }
-.activityInfo b { color: var(--text); }
-.activityActor { color: var(--link); }
-.activityActions { display: flex; gap: 6px; flex-wrap: wrap; }
-.activityActions button { font-size: var(--fs-xs); padding: 2px 8px; }
-.btn-activityShow { color: var(--link); border-color: var(--link); }
+.activityActions button:hover { color: var(--text); }
+.btn-activityShow { color: var(--link); }
+.btn-activityShow:hover { color: #aecbe9; }
 
 /* ---- フッター(README: 緑ドット+「Claude Cowork と接続中」+「Cowork を開く」) ---- */
 .claudeFooter {
@@ -890,10 +1045,13 @@ main { flex: 1; display: flex; min-height: 0; }
 .rightViewTitle { font-weight: 600; font-size: var(--fs-base); }
 .rightViewBody { flex: 1; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 14px; }
 
-/* ---- クリップ/B-roll/モーション/スプライト/セリフ/BGM 選択インスペクタ ---- */
-#inspectorBody { gap: 10px; }
-.inspField { display: flex; flex-direction: column; gap: 4px; }
-.inspField label { font-size: var(--fs-xs); color: var(--text-dim); display: flex; justify-content: space-between; gap: 6px; }
+/* ---- クリップ/B-roll/モーション/スプライト/セリフ/BGM 選択インスペクタ ----
+   W-POLISH Mid-4: ラベルを11.5px(--fs-sm)へ、フィールド内gap5px、主要ブロック
+   間gap14pxへ(以前はラベル11px・#616167で値/罫線より弱く見えていた —
+   色は既にHigh-4のtext-dim一掃で--text-3化済み)。 */
+#inspectorBody { gap: 14px; }
+.inspField { display: flex; flex-direction: column; gap: 5px; }
+.inspField label { font-size: var(--fs-sm); color: var(--text-3); display: flex; justify-content: space-between; gap: 6px; }
 .inspRow { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .inspTrimRow { display: flex; align-items: center; gap: 6px; }
 .inspTrimRow button { font-size: var(--fs-xs); padding: 2px 8px; }
@@ -913,7 +1071,7 @@ main { flex: 1; display: flex; min-height: 0; }
 .capField label { font-size: var(--fs-sm); color: var(--text-3); display: flex; justify-content: space-between; gap: 6px; }
 .capField select, .capField input[type="range"] { width: 100%; }
 .capField input[type="color"] {
-  width: 100%; height: 26px; padding: 0; border: 1px solid var(--border-hover); border-radius: var(--radius);
+  width: 100%; height: 26px; padding: 0; border: 1px solid var(--border-input); border-radius: var(--radius);
   background: transparent; cursor: pointer;
 }
 .capColorRow { display: flex; gap: 8px; }
@@ -921,6 +1079,19 @@ main { flex: 1; display: flex; min-height: 0; }
 .capActions { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
 #capResetBtn { color: var(--danger); border-color: var(--danger-border); }
 #capResetBtn:hover { background: rgba(201, 138, 128, 0.1); }
+
+/* W-POLISH Mid-11: 字幕プリセットをnative selectから3(+)等分ボタンへ
+   (v2.dc.html:402-404)。ビルトイン(クリーン/ボールド/アウトライン/ボックス
+   の4種、CAPTION_STYLE_PRESETS)は可変長ではないためボタン化、キットの
+   スタイル(可変長)は #capKitStyleField の select に残す。 */
+.capPresetBtns { display: flex; gap: 6px; }
+.capPresetBtn {
+  flex: 1; min-width: 0; background: var(--card); color: var(--text-3); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 6px 2px; font-size: var(--fs-sm); text-align: center;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.capPresetBtn:hover { color: var(--text); }
+.capPresetBtn.active { background: var(--raised); color: var(--text); border-color: rgba(255, 255, 255, 0.25); font-weight: 600; }
 
 /* ---- 書き出しビュー(README ディレクター適応1) ---- */
 .exportResultCard { display: flex; flex-direction: column; gap: 8px; }
@@ -936,7 +1107,7 @@ main { flex: 1; display: flex; min-height: 0; }
 /* ---- W-UI IA v2 波2 §8: 「Cowork に頼む」チップ ---- */
 .askChip {
   display: inline-flex; align-items: center; gap: 4px; font-size: var(--fs-xs);
-  color: var(--text-dim); border-color: var(--wash); padding: 2px 8px; margin-top: 2px;
+  color: var(--text-3); border-color: var(--wash); padding: 2px 8px; margin-top: 2px;
 }
 .askChip:hover { color: var(--text); border-color: var(--text-dim); }
 .askChip::before { content: '💬'; font-size: 10px; }
@@ -951,9 +1122,12 @@ main { flex: 1; display: flex; min-height: 0; }
 /* =============================================================================
  * フローティングカード(候補/比較/テイク/取り込み確認)・トースト・ダイアログ
  * ========================================================================== */
+/* W-POLISH Low-6: elevation/radius を2段階に限定 — 通常popover=radius8/
+   shadow 0 8px 30px .5、modalのみ=radius10/shadow 0 16px 60px .6
+   (dialog#shortcutsDialog は既にmodal値どおり、下記参照)。 */
 .showCard {
   position: absolute; right: 16px; bottom: 16px; max-width: 340px; min-width: 220px;
-  background: var(--card); border: 1px solid var(--link); border-radius: 10px;
+  background: var(--card); border: 1px solid var(--link); border-radius: var(--radius-lg);
   padding: 14px 16px; box-shadow: 0 8px 30px rgba(0,0,0,0.5); z-index: 5;
   color: var(--text); font-size: var(--fs-base);
 }
@@ -964,7 +1138,7 @@ main { flex: 1; display: flex; min-height: 0; }
   border-radius: var(--radius-sm); background: none; border: 1px solid var(--border-hover);
 }
 .compareOps { list-style: none; margin-top: 8px; display: flex; flex-direction: column; gap: 4px; max-height: 160px; overflow-y: auto; }
-.compareOps li { font-size: var(--fs-xs); color: var(--text-dim); border-left: 2px solid var(--border-hover); padding-left: 6px; }
+.compareOps li { font-size: var(--fs-xs); color: var(--text-3); border-left: 2px solid var(--border-hover); padding-left: 6px; }
 .compareOps li b { color: var(--text); }
 .takeRow { padding: 8px; margin-top: 8px; border-radius: var(--radius); border: 1px solid var(--border-hover); background: var(--card); }
 .takeRow.recommended { border-color: var(--ok); }
@@ -976,14 +1150,14 @@ main { flex: 1; display: flex; min-height: 0; }
   background: rgba(19, 19, 21, 0.75);
 }
 .dropOverlayInner {
-  padding: 24px 40px; background: var(--card); border: 3px dashed var(--link); border-radius: 12px;
-  font-size: var(--fs-xl); font-weight: 600; color: var(--text); box-shadow: 0 8px 40px rgba(0,0,0,0.5);
+  padding: 24px 40px; background: var(--card); border: 3px dashed var(--link); border-radius: 10px;
+  font-size: var(--fs-xl); font-weight: 600; color: var(--text); box-shadow: 0 16px 60px rgba(0,0,0,0.6);
 }
 
 #toast {
   position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
-  background: var(--card); border: 1px solid var(--border-hover); padding: 8px 16px; border-radius: var(--radius);
-  box-shadow: 0 4px 20px rgba(0,0,0,0.5); z-index: 10;
+  background: var(--card); border: 1px solid var(--border-hover); padding: 8px 16px; border-radius: var(--radius-lg);
+  box-shadow: 0 8px 30px rgba(0,0,0,0.5); z-index: 10;
   display: flex; align-items: center; gap: 10px; max-width: 60vw; font-size: var(--fs-base);
 }
 #toast[role="alert"] { border-color: var(--danger); }
@@ -994,10 +1168,13 @@ main { flex: 1; display: flex; min-height: 0; }
    <dialog> のUA既定 `margin: auto`(showModal() 時の中央寄せ)を上書きして
    しまい、ダイアログが画面左上に張り付く既存バグがあった — margin: auto を
    明示的に戻す(この修正はプリexisting、W-DESIGN固有の問題ではない)。 */
+/* W-POLISH Mid-10: モーダルにmax-height/overflow-yを付与(小さい画面で表が
+   ビューポートからはみ出しても閉じるボタンまでスクロールで到達できるように)。 */
 dialog#shortcutsDialog {
   margin: auto;
   background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 10px;
-  padding: 22px 26px; min-width: 340px; max-width: 480px; box-shadow: 0 16px 60px rgba(0,0,0,0.6);
+  padding: 22px 26px; min-width: 340px; max-width: 480px; max-height: 80vh; overflow-y: auto;
+  box-shadow: 0 16px 60px rgba(0,0,0,0.6);
 }
 dialog#shortcutsDialog::backdrop { background: rgba(0,0,0,0.65); }
 dialog#shortcutsDialog h2 { font-size: var(--fs-lg); font-weight: 600; margin-bottom: 14px; }
@@ -1005,4 +1182,5 @@ dialog#shortcutsDialog table { border-collapse: collapse; width: 100%; margin-bo
 dialog#shortcutsDialog td { padding: 6px 2px; font-size: var(--fs-sm); border-bottom: 1px solid var(--border-soft); }
 dialog#shortcutsDialog td:first-child { color: var(--text-2); min-width: 130px; font-weight: 600; }
 dialog#shortcutsDialog td:last-child { color: var(--text-3); }
-dialog#shortcutsDialog .hintText { display: block; margin-bottom: 14px; }
+/* Mid-10: 説明段落を12px・行間1.55へ(色は既に--text-3=#9b9ba3、READMEどおり)。 */
+dialog#shortcutsDialog .hintText { display: block; margin-bottom: 14px; font-size: 12px; line-height: 1.55; }
