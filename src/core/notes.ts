@@ -1,5 +1,6 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { Project } from './project.js';
 
 /**
  * セッションまたぎの編集メモ(`NOTES.md`)。revision ログ(project.ts の
@@ -14,9 +15,10 @@ import path from 'node:path';
  *   ## [2026-07-17 14:20] todo
  *   - [ ] BGMの候補を3曲ユーザーに出す
  *
- * 書き込みは追記のみ(`appendNote`)——既存の見出し・本文は絶対に書き換え
- * ない。唯一の例外が `markTodoDone` で、該当する `- [ ]` 行だけを `- [x]`
- * に置換する(その1行以外は触らない)。パースは寛容: 手編集された
+ * 論理的な書き込みは追記のみ(`appendNote`)——既存の見出し・本文のbytesを
+ * 保った次内容をproject lock下でatomic renameする。唯一の内容変更が
+ * `markTodoDone` で、該当する `- [ ]` 行だけを `- [x]` に置換する
+ * (その1行以外は触らない)。パースは寛容: 手編集された
  * NOTES.md(見出し崩れ、未知の type、チェックボックス以外の本文)でも
  * 例外を投げず、読めるものだけ拾う。
  */
@@ -67,6 +69,17 @@ async function readRaw(projectDir: string): Promise<string> {
   }
 }
 
+async function replaceRawLocked(projectDir: string, raw: string): Promise<void> {
+  const target = notesPath(projectDir);
+  const tmp = `${target}.tmp-${process.pid}-${Math.random().toString(36).slice(2)}`;
+  try {
+    await fs.writeFile(tmp, raw);
+    await fs.rename(tmp, target);
+  } finally {
+    await fs.rm(tmp, { force: true }).catch(() => {});
+  }
+}
+
 /**
  * todo 本文の整形: `text` を改行で割り、各行を `- [ ] <line>` にする
  * (既に `- [ ]`/`- [x]` で始まる行はそのまま——手編集済みテキストを二重に
@@ -85,15 +98,19 @@ function toTodoBody(text: string): string {
  * NOTES.md に1エントリを追記する。既存内容は一切読み替えない —
  * 直前のエントリがどう終わっていても(手編集で改行が崩れていても)、
  * 新エントリの前に空行が1つだけ入るよう調整するためだけに既存末尾を覗く。
+ * read/append publicationはprojectのcross-process lock下で一つのtransaction。
  */
 export async function appendNote(projectDir: string, note: AppendNoteInput): Promise<void> {
   const heading = `## [${formatTimestamp(new Date())}] ${note.type}${note.rev !== undefined ? ` (rev ${note.rev})` : ''}`;
   const body = note.type === 'todo' ? toTodoBody(note.text) : note.text.trim();
   const block = `${heading}\n${body}\n`;
 
-  const existing = await readRaw(projectDir);
-  const prefix = existing.length === 0 ? '' : existing.endsWith('\n\n') ? '' : existing.endsWith('\n') ? '\n' : '\n\n';
-  await fs.appendFile(notesPath(projectDir), prefix + block);
+  const project = new Project(path.resolve(projectDir));
+  await project.withPersistenceLock(async () => {
+    const existing = await readRaw(project.dir);
+    const prefix = existing.length === 0 ? '' : existing.endsWith('\n\n') ? '' : existing.endsWith('\n') ? '\n' : '\n\n';
+    await replaceRawLocked(project.dir, existing + prefix + block);
+  });
 }
 
 interface InternalTodo extends NoteTodoItem {
@@ -171,16 +188,19 @@ export async function markTodoDone(projectDir: string, index: number): Promise<{
   if (!Number.isInteger(index) || index < 1) {
     throw new Error(`todo index must be a positive integer (got ${index})`);
   }
-  const raw = await readRaw(projectDir);
-  if (!raw.trim()) throw new Error('NOTES.md not found (or empty) — nothing to mark done');
+  const project = new Project(path.resolve(projectDir));
+  return project.withPersistenceLock(async () => {
+    const raw = await readRaw(project.dir);
+    if (!raw.trim()) throw new Error('NOTES.md not found (or empty) — nothing to mark done');
 
-  const entries = parseNotes(raw);
-  const pending = entries.flatMap((e) => e.todos.filter((t) => !t.done));
-  const target = pending[index - 1];
-  if (!target) throw new Error(`no incomplete todo #${index} (${pending.length} pending)`);
+    const entries = parseNotes(raw);
+    const pending = entries.flatMap((e) => e.todos.filter((t) => !t.done));
+    const target = pending[index - 1];
+    if (!target) throw new Error(`no incomplete todo #${index} (${pending.length} pending)`);
 
-  const lines = raw.split('\n');
-  lines[target.lineIndex] = lines[target.lineIndex].replace(/^-\s\[ \]/, '- [x]');
-  await fs.writeFile(notesPath(projectDir), lines.join('\n'));
-  return { text: target.text };
+    const lines = raw.split('\n');
+    lines[target.lineIndex] = lines[target.lineIndex].replace(/^-\s\[ \]/, '- [x]');
+    await replaceRawLocked(project.dir, lines.join('\n'));
+    return { text: target.text };
+  });
 }

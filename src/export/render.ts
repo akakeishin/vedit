@@ -1347,6 +1347,12 @@ export async function loadMotionSpecs(p: Project, m: Manifest): Promise<Record<s
   return out;
 }
 
+/** Unique render sidecar path: concurrent CLI/web renders never share ASS files. */
+function temporaryAssPath(outPath: string, kind: 'captions' | 'motion' | 'dialogue'): string {
+  const token = `${process.pid}-${Math.random().toString(36).slice(2)}`;
+  return path.join(path.dirname(outPath), `.${path.basename(outPath)}.${token}.vedit-${kind}.ass`);
+}
+
 /**
  * Run a measurement-only ffmpeg pass (`-f null -`) for a `print_format=json`
  * loudnorm filter and parse the JSON stats block it prints to stderr —
@@ -1359,6 +1365,7 @@ async function measureLoudnorm(
   audioLabel: string,
   videoLabel: string,
   spriteInputIndices?: number[],
+  signal?: AbortSignal,
 ): Promise<LoudnormMeasured> {
   const inputs = ffmpegInputArgs(inputPaths, spriteInputIndices);
   const { stderr } = await runCapture('ffmpeg', [
@@ -1368,7 +1375,7 @@ async function measureLoudnorm(
     '-filter_complex', `${graph};${videoLabel}nullsink`,
     '-map', audioLabel,
     '-f', 'null', '-',
-  ]);
+  ], { signal });
   // loudnorm's print_format=json block is a flat (non-nested) JSON object
   // logged to stderr; take the last brace-delimited block in case earlier
   // ffmpeg log lines happen to contain braces.
@@ -1444,6 +1451,7 @@ export async function renderFinal(
     fastLoudnorm?: boolean;
     noRepair?: boolean;
     motionSpecs?: Record<string, MotionSpec>;
+    signal?: AbortSignal;
   } & RenderParamOverrides = {},
 ): Promise<{
   file: string;
@@ -1464,7 +1472,13 @@ export async function renderFinal(
   const fast = Boolean(opts.fastLoudnorm);
   // Regression clause: nothing (preset / repair / music) actually wants
   // normalization -> skip loudnorm entirely, exactly like before W1.
-  const wantsLoudnorm = !musicless || params.forceLoudnormI !== null || repairActive;
+  // `audio-mix --target-lufs` is an explicit user decision even when the
+  // project has no BGM and repair is off.  Ignoring it in that common
+  // dialogue-only shape made the UI/manifest claim a target that the final
+  // render never attempted to meet.  An entirely untouched legacy manifest
+  // still takes the regression-zero path below (no loudnorm at all).
+  const explicitMixTarget = effectiveM.audioMix?.targetLufs !== undefined;
+  const wantsLoudnorm = !musicless || params.forceLoudnormI !== null || repairActive || explicitMixTarget;
   const musiclessTarget = params.forceLoudnormI ?? (effectiveM.audioMix?.targetLufs ?? -14);
 
   // ---- W8: kit (styles/sprites) — best-effort load ----
@@ -1529,6 +1543,7 @@ export async function renderFinal(
     }
     measured = await measureLoudnorm(
       measureBuilt.inputPaths, measureGraph, measureLabel, measureBuilt.videoLabel, measureBuilt.spriteInputIndices,
+      opts.signal,
     );
   }
 
@@ -1564,6 +1579,8 @@ export async function renderFinal(
   const needsAssBurn = cues.length > 0 || hasDialogue;
 
   let assPath: string | null = null;
+  let motionAssPath: string | null = null;
+  try {
   if (needsAssBurn && !ffmpegHasFilter('ass')) {
     throw new Error(
       'this ffmpeg build lacks the `ass` filter (caption/dialogue burn). Install `brew install ffmpeg-full` or set VEDIT_FFMPEG, or (captions only) export with --no-burn-captions.',
@@ -1571,7 +1588,7 @@ export async function renderFinal(
   }
   let vLabel = built.videoLabel;
   if (needsAssBurn) {
-    assPath = path.join(path.dirname(outPath), '.vedit-captions.ass');
+    assPath = temporaryAssPath(outPath, 'captions');
     await fs.writeFile(assPath, toAss(effectiveM, transcripts, kit, { includeCaptions: burnCaptionsNow }));
     // W8: point libass at the kit's font directory (fontsdir=) instead of
     // `--attach`ing the font, so the ASS Fontname (the font FILE's basename,
@@ -1629,7 +1646,6 @@ export async function renderFinal(
   // above #captionLayer in the web preview — see web/index.html). Only runs
   // when the caller supplied `opts.motionSpecs`; see this function's doc for
   // why that's an opt-in rather than something render.ts resolves itself.
-  let motionAssPath: string | null = null;
   if (opts.motionSpecs) {
     const output = effectiveM.output ?? { width: effectiveM.width, height: effectiveM.height };
     const motionDoc = buildMotionAss(effectiveM, opts.motionSpecs, kit, output);
@@ -1642,7 +1658,7 @@ export async function renderFinal(
           'this ffmpeg build lacks the `ass` filter (motion burn). Install `brew install ffmpeg-full` or set VEDIT_FFMPEG, or render without motionSpecs.',
         );
       }
-      motionAssPath = path.join(path.dirname(outPath), '.vedit-motion.ass');
+      motionAssPath = temporaryAssPath(outPath, 'motion');
       await fs.writeFile(motionAssPath, motionDoc.ass);
       graph += `;${vLabel}ass='${motionAssPath.replace(/'/g, "\\'")}'[voutMotion]`;
       vLabel = '[voutMotion]';
@@ -1668,15 +1684,21 @@ export async function renderFinal(
     '-y', ...inputs,
     '-filter_complex', graph,
     '-map', vLabel, '-map', audioLabel,
+    // Some audio filters (notably loudnorm) add a short padded tail.  Bound
+    // the mux to the captured timeline duration so a normalized render does
+    // not outlive its last video frame merely because of filter latency.
+    '-t', String(timelineDuration(effectiveM)),
     '-c:v', 'libx264', '-preset', params.encPreset, '-crf', String(params.crf),
     '-pix_fmt', 'yuv420p',
-    '-c:a', 'aac', '-b:a', params.audioBitrate,
+    // loudnorm internally upsamples (commonly to 192 kHz).  Without an
+    // explicit output rate ffmpeg can let that leak into AAC as 96 kHz,
+    // producing needlessly large/non-standard delivery audio.  All generated
+    // silence and the editor's delivery contract are 48 kHz, so pin it here.
+    '-c:a', 'aac', '-b:a', params.audioBitrate, '-ar', '48000',
     '-dn', // drop any data streams (e.g. DJI tmcd) that survived the filtergraph
     '-movflags', '+faststart',
     outPath,
-  ]);
-  if (assPath) await fs.rm(assPath, { force: true });
-  if (motionAssPath) await fs.rm(motionAssPath, { force: true });
+  ], { signal: opts.signal });
   return {
     file: outPath,
     warnings,
@@ -1685,6 +1707,13 @@ export async function renderFinal(
     dialogueBurned: hasDialogue,
     dialogueCount,
   };
+  } finally {
+    // Cleanup must never turn a completed MP4 (or the original ffmpeg error)
+    // into a different failure merely because a temp sidecar cannot be
+    // removed. Unique names prevent a leftover from corrupting later jobs.
+    if (assPath) await fs.rm(assPath, { force: true }).catch(() => {});
+    if (motionAssPath) await fs.rm(motionAssPath, { force: true }).catch(() => {});
+  }
 }
 
 /**
@@ -1707,7 +1736,7 @@ export async function renderFinal(
 export async function renderComposition(
   m: Manifest,
   outPath: string,
-  opts: RenderParamOverrides & { motionSpecs?: Record<string, MotionSpec> } = {},
+  opts: RenderParamOverrides & { motionSpecs?: Record<string, MotionSpec>; signal?: AbortSignal } = {},
 ): Promise<{ file: string; warnings: string[] }> {
   if (!m.composition) throw new Error('renderComposition: manifest has no composition');
   const params = resolveRenderParams(m, opts);
@@ -1754,6 +1783,8 @@ export async function renderComposition(
   // sits under speech bubbles (matches #motionLayer < #dialogueLayer in the
   // web DOM). Opt-in via opts.motionSpecs — see renderFinal's doc for why.
   let motionAssPath: string | null = null;
+  let assPath: string | null = null;
+  try {
   if (opts.motionSpecs) {
     const output = m.output ?? { width: m.width, height: m.height };
     const motionDoc = buildMotionAss(m, opts.motionSpecs, kit, output);
@@ -1766,14 +1797,13 @@ export async function renderComposition(
           'this ffmpeg build lacks the `ass` filter (motion burn). Install `brew install ffmpeg-full` or set VEDIT_FFMPEG, or render without motionSpecs.',
         );
       }
-      motionAssPath = path.join(path.dirname(outPath), '.vedit-motion.ass');
+      motionAssPath = temporaryAssPath(outPath, 'motion');
       await fs.writeFile(motionAssPath, motionDoc.ass);
       graph += `;${vLabel}ass='${motionAssPath.replace(/'/g, "\\'")}'[voutMotion]`;
       vLabel = '[voutMotion]';
     }
   }
 
-  let assPath: string | null = null;
   const hasDialogue = (m.timeline.dialogue ?? []).length > 0;
   if (hasDialogue) {
     if (!ffmpegHasFilter('ass')) {
@@ -1781,7 +1811,7 @@ export async function renderComposition(
         'this ffmpeg build lacks the `ass` filter (dialogue burn). Install `brew install ffmpeg-full` or set VEDIT_FFMPEG.',
       );
     }
-    assPath = path.join(path.dirname(outPath), '.vedit-dialogue.ass');
+    assPath = temporaryAssPath(outPath, 'dialogue');
     await fs.writeFile(assPath, toAss(m, [], kit));
     let fontsdirPart = '';
     const activeKitStyle = kit?.styles?.find((s) => s.id === m.captions.style);
@@ -1813,14 +1843,16 @@ export async function renderComposition(
     '-t', String(m.composition.duration),
     '-c:v', 'libx264', '-preset', params.encPreset, '-crf', String(params.crf),
     '-pix_fmt', 'yuv420p',
-    '-c:a', 'aac', '-b:a', params.audioBitrate,
+    '-c:a', 'aac', '-b:a', params.audioBitrate, '-ar', '48000',
     '-dn',
     '-movflags', '+faststart',
     outPath,
-  ]);
-  if (assPath) await fs.rm(assPath, { force: true });
-  if (motionAssPath) await fs.rm(motionAssPath, { force: true });
+  ], { signal: opts.signal });
   return { file: outPath, warnings };
+  } finally {
+    if (assPath) await fs.rm(assPath, { force: true }).catch(() => {});
+    if (motionAssPath) await fs.rm(motionAssPath, { force: true }).catch(() => {});
+  }
 }
 
 // ---- range preview render (roadmap "範囲指定の下見レンダー") ----
@@ -1860,7 +1892,7 @@ export async function renderRangePreview(
   transcripts: Transcript[],
   outPath: string,
   range: { a: number; b: number },
-  opts: { motionSpecs?: Record<string, MotionSpec>; noBurnCaptions?: boolean; noRepair?: boolean } = {},
+  opts: { motionSpecs?: Record<string, MotionSpec>; noBurnCaptions?: boolean; noRepair?: boolean; signal?: AbortSignal } = {},
 ): Promise<RangePreviewResult> {
   const sliced = sliceTimelineRange(m, range.a, range.b);
   const baseOutput = sliced.output ?? { width: sliced.width, height: sliced.height };
@@ -1879,6 +1911,7 @@ export async function renderRangePreview(
     const res = await renderComposition(previewManifest, outPath, {
       encPreset: 'veryfast',
       ...(opts.motionSpecs ? { motionSpecs: opts.motionSpecs } : {}),
+      signal: opts.signal,
     });
     return { file: res.file, warnings: [...warnings, ...res.warnings], range };
   }
@@ -1888,6 +1921,7 @@ export async function renderRangePreview(
     noBurnCaptions: opts.noBurnCaptions,
     noRepair: opts.noRepair,
     ...(opts.motionSpecs ? { motionSpecs: opts.motionSpecs } : {}),
+    signal: opts.signal,
   });
   return {
     file: res.file,

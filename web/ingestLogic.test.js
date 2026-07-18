@@ -13,6 +13,8 @@ describe('isVideoFileName', () => {
     expect(isVideoFileName('clip.mp4')).toBe(true);
     expect(isVideoFileName('CLIP.MOV')).toBe(true);
     expect(isVideoFileName('a.m4v')).toBe(true);
+    expect(isVideoFileName('stock.WEBM')).toBe(true);
+    expect(isVideoFileName('legacy.ogv')).toBe(true);
   });
 
   it('rejects everything else', () => {
@@ -23,7 +25,9 @@ describe('isVideoFileName', () => {
   });
 
   it('mirrors the server-side VIDEO_EXTENSIONS set', () => {
-    expect([...VIDEO_EXTENSIONS].sort()).toEqual(['.m4v', '.mov', '.mp4']);
+    expect([...VIDEO_EXTENSIONS].sort()).toEqual([
+      '.avi', '.m2ts', '.m4v', '.mkv', '.mov', '.mp4', '.mpeg', '.mpg', '.mts', '.ogv', '.webm',
+    ]);
   });
 });
 

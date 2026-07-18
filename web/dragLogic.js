@@ -1,10 +1,8 @@
-// web/dragLogic.js — pure "drop position -> mutation op" functions for the
-// W-UI §2 timeline direct-manipulation feature (clip reorder/trim, and
-// B-roll/sprite/motion/BGM block move). Deliberately dependency-free (no
-// DOM, no fetch) so every export here is a plain data-in/data-out function
-// that app.js's pointer handlers call after doing the DOM measurement, and
-// that this file's colocated dragLogic.test.js can exercise directly under
-// vitest without a browser.
+// web/dragLogic.js — pure browser-interaction helpers for the W-UI timeline
+// and inline editing surfaces. Deliberately dependency-free (no DOM, no
+// fetch) so every export here is a plain data-in/data-out function that
+// app.js can call after reading browser events/measurements, and that this
+// file's colocated dragLogic.test.js can exercise directly under Vitest.
 //
 // `timelineTimeToSource` mirrors src/core/ops.ts's function of the same
 // name — same hand-kept-in-sync duplication convention app.js already uses
@@ -20,6 +18,37 @@ export function timelineTimeToSource(segments, tl) {
     if (tl >= s.tlStart && tl < s.tlEnd) return { sourceId: s.sourceId, srcTime: s.srcStart + (tl - s.tlStart) };
   }
   return null;
+}
+
+const RULER_NICE_STEPS = [
+  0.5, 1, 2, 5, 10, 15, 30,
+  60, 120, 300, 600, 900,
+  1800, 3600, 7200, 14400, 28800, 43200, 86400,
+];
+
+/**
+ * Pick a timeline ruler interval that stays at least `targetPx` apart.
+ * The former fixed list stopped at 15 minutes, so multi-hour projects
+ * rendered dozens of overlapping labels. Durations beyond a day fall back
+ * to whole-day multiples and retain the same no-crowding invariant.
+ */
+export function rulerStepFor(duration, width, targetPx = 70) {
+  if (!(duration > 0) || !(width > 0) || !(targetPx > 0)) return 1;
+  const rawStep = duration / Math.max(1, width / targetPx);
+  return RULER_NICE_STEPS.find((step) => step >= rawStep)
+    ?? Math.ceil(rawStep / 86400) * 86400;
+}
+
+/**
+ * Whether Enter should commit a single-line inline edit. During Japanese
+ * IME conversion Chromium/Safari can emit Enter with either isComposing or
+ * the legacy keyCode 229 marker; neither event is an editing decision.
+ */
+export function shouldCommitInlineEdit(event) {
+  return event?.key === 'Enter'
+    && !event.shiftKey
+    && !event.isComposing
+    && event.keyCode !== 229;
 }
 
 /**

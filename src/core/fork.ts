@@ -1,34 +1,16 @@
-import { promises as fs } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { constants as fsConstants, promises as fs, type Stats } from 'node:fs';
 import path from 'node:path';
-import { Project } from './project.js';
-import type { Manifest } from './types.js';
+import { isDeepStrictEqual } from 'node:util';
+import { Project, resolveWithinDir, type ProjectRenderInputs } from './project.js';
+import { upsertProject } from './registry.js';
+import type { Manifest, SceneFile } from './types.js';
 
 /**
- * `vedit fork --project <src> --to <dir> [--name <名前>]` (roadmap "W6 派生
- * プロジェクトフォーク"). Addresses the pain verification scenario 2 hit
- * directly: deriving a vertical short from a horizontal project used to mean
- * re-ingesting the source footage into a fresh project (re-generating
- * proxy/waveform/scenes/transcript from scratch) just to get an independent
- * editing branch. Forking instead:
- *
- * (a) snapshots the CURRENT manifest as the new project's revision-0 state —
- *     same "freshly created project, but pre-populated" shape as
- *     Project.create(), so `vedit open`/every op works immediately, and the
- *     fork's own revisions.jsonl starts EMPTY (no entries at all until the
- *     first edit lands, exactly like a brand-new project) — the fork's
- *     history is never mixed with the source project's;
- * (b) leaves every Source.path untouched (absolute, pointing at the ORIGINAL
- *     media) — a link-ingested source stays a link, sharing the same file on
- *     disk between both projects, matching every other manifest field that
- *     already treats Source.path as user-owned/never-copied;
- * (c) hardlinks (falling back to a plain copy across filesystems/on
- *     filesystems without hardlink support) every proxy/waveform/scene-
- *     thumbnail/transcript file the cloned manifest references, so the fork
- *     never has to regenerate them.
- *
- * Registers the new project in the cross-project registry (upsertProject,
- * via Project.create()) so it shows up in `vedit projects` like anything
- * else.
+ * A fork is assembled completely in a hidden sibling staging directory and
+ * becomes visible at `--to` with one directory rename. The source media paths
+ * remain external references; only project-managed derived artifacts are
+ * reused. No staging project is added to the registry.
  */
 export interface ForkResult {
   dir: string;
@@ -44,85 +26,550 @@ export interface ForkResult {
     transcripts: number;
     motionSpecs: number;
   };
+  /** A complete fork can still be opened directly if registry refresh failed. */
+  warning?: string;
 }
 
-/** Hardlink `src` to `dest` (falls back to a plain copy on EXDEV/unsupported filesystems). Silently skipped when `src` doesn't exist — a not-yet-generated cache artifact isn't a fork failure, just nothing to carry over. */
-async function linkOrCopy(src: string, dest: string): Promise<boolean> {
+interface CacheArtifact {
+  rel: string;
+  label: string;
+  counter: 'proxies' | 'peaks' | 'sceneThumbs';
+}
+
+interface SceneArtifact {
+  sourceId: string;
+  file: SceneFile;
+}
+
+interface PinnedJsonArtifact {
+  id: string;
+  value: unknown;
+  sourcePath: string;
+  counter: 'transcripts' | 'motionSpecs';
+  label: string;
+}
+
+interface ForkPlan {
+  sourceDir: string;
+  inputs: ProjectRenderInputs;
+  cloned: Manifest;
+  cacheArtifacts: CacheArtifact[];
+  sceneArtifacts: SceneArtifact[];
+  pinnedJson: PinnedJsonArtifact[];
+}
+
+interface PreparedDestination {
+  requested: string;
+  canonical: string;
+  parent: string;
+  basename: string;
+  lockPath: string;
+}
+
+const SAFE_FILE_ID = /^[A-Za-z0-9_-]+$/;
+
+function errorCode(error: unknown): string | undefined {
+  return (error as NodeJS.ErrnoException | undefined)?.code;
+}
+
+function isWithin(parent: string, candidate: string): boolean {
+  return candidate === parent || candidate.startsWith(parent + path.sep);
+}
+
+function assertSafeFileId(value: unknown, label: string): asserts value is string {
+  if (typeof value !== 'string' || !SAFE_FILE_ID.test(value)) {
+    throw new Error(`fork: invalid ${label} id: ${JSON.stringify(value)}`);
+  }
+}
+
+async function lstatIfPresent(file: string): Promise<Stats | undefined> {
   try {
-    await fs.access(src);
+    return await fs.lstat(file);
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return undefined;
+    throw error;
+  }
+}
+
+async function assertRegularFile(file: string, label: string, required = true): Promise<boolean> {
+  const stat = await lstatIfPresent(file);
+  if (!stat) {
+    if (required) throw new Error(`fork: referenced ${label} is missing: ${file}`);
+    return false;
+  }
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new Error(`fork: referenced ${label} must be a regular non-symlink file: ${file}`);
+  }
+  return true;
+}
+
+/** Resolve and enforce the manifest contract that derived media lives below cache/. */
+async function resolveCacheArtifact(projectDir: string, rel: unknown, label: string): Promise<{ rel: string; abs: string }> {
+  if (typeof rel !== 'string' || rel.length === 0 || path.isAbsolute(rel) || rel.includes('\0')) {
+    throw new Error(`fork: invalid ${label} path: ${JSON.stringify(rel)}`);
+  }
+  const normalized = path.normalize(rel);
+  const cachePrefix = `cache${path.sep}`;
+  if (!normalized.startsWith(cachePrefix) || normalized === `cache${path.sep}`) {
+    throw new Error(`fork: ${label} must be a file below cache/: ${rel}`);
+  }
+  // Resolve from the project root, not from cache/ itself: a cache symlink
+  // escaping the project must not redefine the trusted base directory.
+  const abs = await resolveWithinDir(projectDir, normalized);
+  return { rel: normalized, abs };
+}
+
+async function readJsonRegularFile<T>(file: string, label: string): Promise<T> {
+  await assertRegularFile(file, label);
+  try {
+    return JSON.parse(await fs.readFile(file, 'utf8')) as T;
+  } catch (error) {
+    throw new Error(`fork: ${label} is not valid JSON (${(error as Error)?.message ?? String(error)})`);
+  }
+}
+
+async function captureCurrentInputs(source: Project): Promise<ProjectRenderInputs> {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const observed = await source.manifest();
+    try {
+      return await source.captureRenderInputs(observed.revision);
+    } catch (error) {
+      if (errorCode(error) !== 'STALE_REVISION') throw error;
+    }
+  }
+  throw new Error('fork: source project kept changing; retry once current edits have settled');
+}
+
+async function buildForkPlan(source: Project, nameOverride?: string): Promise<ForkPlan> {
+  const inputs = await captureCurrentInputs(source);
+  const manifest = inputs.manifest;
+  if (!Array.isArray(manifest.sources) || !manifest.timeline || !Array.isArray(manifest.timeline.motion)) {
+    throw new Error('fork: source project manifest has an invalid sources/timeline shape');
+  }
+  if (nameOverride !== undefined && typeof nameOverride !== 'string') {
+    throw new Error('fork: --name must be a string');
+  }
+
+  const name = nameOverride ?? `${manifest.name} (fork)`;
+  const cloned = JSON.parse(JSON.stringify({ ...manifest, name, revision: 0 })) as Manifest;
+  const sourceIds = new Set<string>();
+  const motionIds = new Set<string>();
+  const claimedManagedPaths = new Map<string, string>();
+  const cacheArtifacts: CacheArtifact[] = [];
+  const sceneArtifacts: SceneArtifact[] = [];
+  const pinnedJson: PinnedJsonArtifact[] = [];
+
+  const claim = (rel: string, label: string): void => {
+    const normalized = path.normalize(rel);
+    const prior = claimedManagedPaths.get(normalized);
+    if (prior) throw new Error(`fork: managed path collision at ${normalized} (${prior} and ${label})`);
+    claimedManagedPaths.set(normalized, label);
+  };
+
+  const transcriptBySource = new Map(inputs.transcripts.map((transcript) => [transcript.sourceId, transcript]));
+  for (const sourceItem of cloned.sources) {
+    assertSafeFileId(sourceItem?.id, 'source');
+    // Exercise the canonical Project filename builders as a second invariant:
+    // every source id must be safe wherever this fork is opened later.
+    source.transcriptPath(sourceItem.id);
+    source.scenesPath(sourceItem.id);
+    if (sourceIds.has(sourceItem.id)) throw new Error(`fork: duplicate source id: ${sourceItem.id}`);
+    sourceIds.add(sourceItem.id);
+    if (typeof sourceItem.path !== 'string' || !path.isAbsolute(sourceItem.path) || sourceItem.path.includes('\0')) {
+      throw new Error(`fork: source ${sourceItem.id} has an invalid original-media path`);
+    }
+
+    for (const [kind, rel, counter] of [
+      ['proxy', sourceItem.proxy, 'proxies'],
+      ['peaks', sourceItem.peaks, 'peaks'],
+    ] as const) {
+      if (rel === undefined) continue;
+      const resolved = await resolveCacheArtifact(source.dir, rel, `${kind} for source ${sourceItem.id}`);
+      claim(resolved.rel, `${kind} for source ${sourceItem.id}`);
+      await assertRegularFile(resolved.abs, `${kind} for source ${sourceItem.id}`);
+      cacheArtifacts.push({ rel: resolved.rel, label: `${kind} for source ${sourceItem.id}`, counter });
+    }
+
+    if (sourceItem.transcribed) {
+      const transcript = transcriptBySource.get(sourceItem.id);
+      if (!transcript || transcript.sourceId !== sourceItem.id) {
+        throw new Error(`fork: source ${sourceItem.id} is marked transcribed but has no revision-pinned transcript`);
+      }
+      const rel = `transcript-${sourceItem.id}.json`;
+      claim(rel, `transcript for source ${sourceItem.id}`);
+      const sourcePath = source.transcriptPath(sourceItem.id);
+      await assertRegularFile(sourcePath, `transcript for source ${sourceItem.id}`, false);
+      pinnedJson.push({
+        id: sourceItem.id,
+        value: transcript,
+        sourcePath,
+        counter: 'transcripts',
+        label: `transcript for source ${sourceItem.id}`,
+      });
+    }
+
+    const scenePath = source.scenesPath(sourceItem.id);
+    const sceneStat = await lstatIfPresent(scenePath);
+    if (sceneStat) {
+      const sceneFile = await readJsonRegularFile<SceneFile>(scenePath, `scene index for source ${sourceItem.id}`);
+      if (sceneFile?.sourceId !== sourceItem.id || !Array.isArray(sceneFile.scenes)) {
+        throw new Error(`fork: scene index for source ${sourceItem.id} has an invalid shape/sourceId`);
+      }
+      const sceneIds = new Set<string>();
+      for (const scene of sceneFile.scenes) {
+        assertSafeFileId(scene?.id, `scene (${sourceItem.id})`);
+        if (sceneIds.has(scene.id)) throw new Error(`fork: duplicate scene id ${scene.id} for source ${sourceItem.id}`);
+        sceneIds.add(scene.id);
+        const thumb = await resolveCacheArtifact(source.dir, scene.thumb, `thumbnail for scene ${scene.id}`);
+        claim(thumb.rel, `thumbnail for scene ${scene.id}`);
+        await assertRegularFile(thumb.abs, `thumbnail for scene ${scene.id}`);
+        cacheArtifacts.push({ rel: thumb.rel, label: `thumbnail for scene ${scene.id}`, counter: 'sceneThumbs' });
+      }
+      claim(`scenes-${sourceItem.id}.json`, `scene index for source ${sourceItem.id}`);
+      sceneArtifacts.push({ sourceId: sourceItem.id, file: sceneFile });
+    }
+  }
+
+  for (const item of cloned.timeline.motion) {
+    assertSafeFileId(item?.id, 'motion');
+    source.motionSpecPath(item.id);
+    if (motionIds.has(item.id)) throw new Error(`fork: duplicate motion id: ${item.id}`);
+    motionIds.add(item.id);
+    if (item.spec !== `${item.id}.json`) {
+      throw new Error(`fork: motion ${item.id} has an invalid spec path: ${JSON.stringify(item.spec)}`);
+    }
+    if (!Object.prototype.hasOwnProperty.call(inputs.motionSpecs, item.id)) {
+      throw new Error(`fork: motion ${item.id} has no revision-pinned spec`);
+    }
+    const rel = path.join('motion', `${item.id}.json`);
+    claim(rel, `motion spec ${item.id}`);
+    const sourcePath = source.motionSpecPath(item.id);
+    await assertRegularFile(sourcePath, `motion spec ${item.id}`, false);
+    pinnedJson.push({
+      id: item.id,
+      value: inputs.motionSpecs[item.id],
+      sourcePath,
+      counter: 'motionSpecs',
+      label: `motion spec ${item.id}`,
+    });
+  }
+
+  return { sourceDir: source.dir, inputs, cloned, cacheArtifacts, sceneArtifacts, pinnedJson };
+}
+
+async function writeJsonExclusive(file: string, value: unknown, label: string): Promise<void> {
+  let body: string | undefined;
+  try {
+    body = JSON.stringify(value, null, 2);
+  } catch (error) {
+    throw new Error(`fork: cannot serialize ${label} (${(error as Error)?.message ?? String(error)})`);
+  }
+  if (body === undefined) throw new Error(`fork: cannot serialize ${label}`);
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  const handle = await fs.open(file, 'wx', 0o600);
+  try {
+    await handle.writeFile(body);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Give the fork an independent inode. COPYFILE_FICLONE asks APFS/btrfs/etc.
+ * for a copy-on-write clone (near-hardlink disk efficiency without shared
+ * mutations); Node transparently falls back to a regular byte copy when the
+ * filesystem cannot clone.
+ */
+async function cloneOrCopyRegular(src: string, dest: string, label: string): Promise<void> {
+  await assertRegularFile(src, label);
+  const before = await fs.lstat(src);
+  if (!before.isFile() || before.isSymbolicLink()) {
+    throw new Error(`fork: referenced ${label} changed into a non-regular file before copy: ${src}`);
+  }
+  await fs.mkdir(path.dirname(dest), { recursive: true });
+  await fs.copyFile(
+    src,
+    dest,
+    fsConstants.COPYFILE_EXCL | fsConstants.COPYFILE_FICLONE,
+  );
+  const after = await fs.lstat(src);
+  if (
+    !after.isFile() ||
+    after.isSymbolicLink() ||
+    before.dev !== after.dev ||
+    before.ino !== after.ino ||
+    before.size !== after.size ||
+    before.mtimeMs !== after.mtimeMs ||
+    before.ctimeMs !== after.ctimeMs
+  ) {
+    await fs.rm(dest, { force: true }).catch(() => {});
+    throw new Error(`fork: ${label} changed while it was being copied; retry after cache generation finishes`);
+  }
+}
+
+/**
+ * Transcript/motion compatibility files normally CoW-clone/copy, but their
+ * exact revision-pinned JSON is authoritative. If a concurrent atomic sidecar
+ * replacement made the copied value newer/older than the captured revision,
+ * replace the staged copy with the captured value before publication.
+ */
+async function materializePinnedJson(src: string, dest: string, value: unknown, label: string): Promise<void> {
+  if (await assertRegularFile(src, label, false)) {
+    await cloneOrCopyRegular(src, dest, label);
+    try {
+      const materialized = JSON.parse(await fs.readFile(dest, 'utf8')) as unknown;
+      if (isDeepStrictEqual(materialized, value)) return;
+    } catch {
+      // Fall through and materialize the captured revision truth.
+    }
+    await fs.rm(dest, { force: true });
+  }
+  await writeJsonExclusive(dest, value, label);
+}
+
+async function syncDirectory(dir: string): Promise<void> {
+  let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+  try {
+    handle = await fs.open(dir, 'r');
+    await handle.sync();
+  } catch (error) {
+    if (!['EINVAL', 'ENOTSUP', 'EISDIR', 'EPERM', 'EACCES'].includes(errorCode(error) ?? '')) throw error;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+async function canonicalizeMissingPath(input: string): Promise<string> {
+  let cursor = path.resolve(input);
+  const suffix: string[] = [];
+  while (true) {
+    try {
+      return path.join(await fs.realpath(cursor), ...suffix.reverse());
+    } catch (error) {
+      if (!['ENOENT', 'ENOTDIR'].includes(errorCode(error) ?? '')) throw error;
+      const parent = path.dirname(cursor);
+      if (parent === cursor) throw error;
+      suffix.push(path.basename(cursor));
+      cursor = parent;
+    }
+  }
+}
+
+async function prepareDestination(srcDir: string, destDir: string): Promise<PreparedDestination> {
+  if (typeof destDir !== 'string' || destDir.trim().length === 0) throw new Error('fork: --to must not be empty');
+  const requested = path.resolve(destDir);
+  if (requested === path.parse(requested).root) throw new Error('fork: refusing to use a filesystem root as --to');
+  if (await lstatIfPresent(requested)) {
+    throw new Error(`fork: destination already exists (including empty directories and symlinks): ${requested}`);
+  }
+  const realSource = await fs.realpath(srcDir);
+  const projectedDestination = await canonicalizeMissingPath(requested);
+  if (projectedDestination === realSource) {
+    throw new Error('fork: --to must be a different directory from the source project');
+  }
+  if (isWithin(realSource, projectedDestination) || isWithin(projectedDestination, realSource)) {
+    throw new Error('fork: source and destination directories must not contain one another');
+  }
+
+  const parentRequested = path.dirname(requested);
+  await fs.mkdir(parentRequested, { recursive: true });
+  const parent = await fs.realpath(parentRequested);
+  const parentStat = await fs.stat(parent);
+  if (!parentStat.isDirectory()) throw new Error(`fork: destination parent is not a directory: ${parentRequested}`);
+  const basename = path.basename(requested);
+  const canonical = path.join(parent, basename);
+  if (await lstatIfPresent(requested)) {
+    throw new Error(`fork: destination already exists (including empty directories and symlinks): ${requested}`);
+  }
+  if (canonical !== requested && await lstatIfPresent(canonical)) {
+    throw new Error(`fork: canonical destination already exists: ${canonical}`);
+  }
+
+  if (canonical === realSource) throw new Error('fork: --to must be a different directory from the source project');
+  if (isWithin(realSource, canonical) || isWithin(canonical, realSource)) {
+    throw new Error('fork: source and destination directories must not contain one another');
+  }
+  const digest = createHash('sha256').update(canonical).digest('hex').slice(0, 16);
+  return {
+    requested,
+    canonical,
+    parent,
+    basename,
+    lockPath: path.join(parent, `.vedit-fork-${digest}.lock`),
+  };
+}
+
+async function destinationStillAbsent(dest: PreparedDestination): Promise<void> {
+  if (await lstatIfPresent(dest.requested) || (dest.canonical !== dest.requested && await lstatIfPresent(dest.canonical))) {
+    throw new Error(`fork: destination appeared while the fork was being prepared: ${dest.requested}`);
+  }
+}
+
+interface PublishLock {
+  token: string;
+  handle: Awaited<ReturnType<typeof fs.open>>;
+}
+
+async function acquirePublishLock(lockPath: string): Promise<PublishLock> {
+  const token = `${process.pid}-${randomUUID()}`;
+  let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+  try {
+    handle = await fs.open(lockPath, 'wx', 0o600);
+    await handle.writeFile(JSON.stringify({ pid: process.pid, token, acquiredAt: new Date().toISOString() }));
+    await handle.sync();
+    return { token, handle };
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    if (handle) await fs.rm(lockPath, { force: true }).catch(() => {});
+    if (errorCode(error) !== 'EEXIST') throw error;
+    throw new Error(`fork: another fork is already publishing to this destination (${lockPath})`);
+  }
+}
+
+async function releasePublishLock(lockPath: string, lock: PublishLock): Promise<string | undefined> {
+  await lock.handle.close().catch(() => {});
+  try {
+    const current = JSON.parse(await fs.readFile(lockPath, 'utf8')) as { token?: string };
+    if (current.token !== lock.token) return `fork publish lock ownership changed: ${lockPath}`;
+    await fs.rm(lockPath, { force: true });
+    return undefined;
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return undefined;
+    return `could not remove fork publish lock ${lockPath}: ${(error as Error)?.message ?? String(error)}`;
+  }
+}
+
+async function stageFork(plan: ForkPlan, stageDir: string): Promise<ForkResult['linked']> {
+  await fs.mkdir(stageDir, { recursive: false, mode: 0o700 });
+  const staged = new Project(stageDir);
+  await fs.mkdir(staged.cacheDir, { recursive: false });
+  await fs.mkdir(staged.motionDir, { recursive: false });
+  const linked: ForkResult['linked'] = {
+    proxies: 0,
+    peaks: 0,
+    sceneFiles: 0,
+    sceneThumbs: 0,
+    transcripts: 0,
+    motionSpecs: 0,
+  };
+
+  for (const artifact of plan.cacheArtifacts) {
+    // Re-resolve immediately before touching the source so a changed symlink
+    // ancestor cannot reuse the earlier preflight decision.
+    const src = await resolveCacheArtifact(plan.sourceDir, artifact.rel, artifact.label);
+    const dest = await resolveCacheArtifact(stageDir, artifact.rel, artifact.label);
+    await cloneOrCopyRegular(src.abs, dest.abs, artifact.label);
+    linked[artifact.counter]++;
+  }
+  for (const scene of plan.sceneArtifacts) {
+    await writeJsonExclusive(staged.scenesPath(scene.sourceId), scene.file, `scene index ${scene.sourceId}`);
+    linked.sceneFiles++;
+  }
+  for (const artifact of plan.pinnedJson) {
+    const dest = artifact.counter === 'transcripts'
+      ? staged.transcriptPath(artifact.id)
+      : staged.motionSpecPath(artifact.id);
+    await resolveWithinDir(plan.sourceDir, path.relative(plan.sourceDir, artifact.sourcePath));
+    await materializePinnedJson(artifact.sourcePath, dest, artifact.value, artifact.label);
+    linked[artifact.counter]++;
+  }
+
+  // project.json is deliberately written last. Until every referenced
+  // artifact is complete, even the hidden staging directory is not an
+  // openable/discoverable vedit project.
+  await writeJsonExclusive(staged.manifestPath, plan.cloned, 'fork manifest');
+  const verified = await Project.open(stageDir);
+  const stagedManifest = await verified.manifest();
+  if (!isDeepStrictEqual(stagedManifest, plan.cloned)) {
+    throw new Error('fork: staged manifest verification failed');
+  }
+  await Promise.all([syncDirectory(staged.cacheDir), syncDirectory(staged.motionDir)]);
+  await syncDirectory(stageDir);
+  return linked;
+}
+
+async function publishedManifestMatches(dest: string, expected: Manifest): Promise<boolean> {
+  try {
+    const stat = await fs.lstat(dest);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) return false;
+    const parsed = JSON.parse(await fs.readFile(path.join(dest, 'project.json'), 'utf8')) as Manifest;
+    return isDeepStrictEqual(parsed, expected);
   } catch {
     return false;
   }
-  await fs.mkdir(path.dirname(dest), { recursive: true });
-  try {
-    await fs.link(src, dest);
-  } catch {
-    await fs.copyFile(src, dest);
-  }
-  return true;
 }
 
 export async function forkProject(srcDir: string, destDir: string, opts: { name?: string } = {}): Promise<ForkResult> {
   const absSrc = path.resolve(srcDir);
   const absDest = path.resolve(destDir);
+  if (absDest === path.parse(absDest).root) throw new Error('fork: refusing to use a filesystem root as --to');
   if (absSrc === absDest) throw new Error('fork: --to must be a different directory from the source project');
-  try {
-    await fs.access(path.join(absDest, 'project.json'));
-    throw new Error(`fork: ${absDest} already has a project (project.json exists) — choose an empty --to directory`);
-  } catch (e: any) {
-    if (e?.code !== 'ENOENT') throw e; // any other error (including our own thrown Error above) propagates
+
+  const sourceManifestStat = await lstatIfPresent(path.join(absSrc, 'project.json'));
+  if (!sourceManifestStat?.isFile() || sourceManifestStat.isSymbolicLink()) {
+    throw new Error(`fork: source project.json must be a regular non-symlink file: ${absSrc}`);
   }
-
-  const src = await Project.open(absSrc);
-  const srcManifest = await src.manifest();
-  const name = opts.name ?? `${srcManifest.name} (fork)`;
-
-  // Project.create() does the directory/registry boilerplate (mkdir cache/
-  // + motion/, write an empty starter manifest, upsertProject) — then we
-  // overwrite its manifest with the real cloned snapshot. Bypasses commit()
-  // deliberately: this is project CREATION, not a running project's edit,
-  // so there's no baseRev to check against and no revisions.jsonl entry to
-  // write (a fork's log starts genuinely empty, see this module's doc).
-  const dest = await Project.create(absDest, name);
-  const cloned: Manifest = { ...(JSON.parse(JSON.stringify(srcManifest)) as Manifest), name, revision: 0 };
-  const tmp = `${dest.manifestPath}.tmp-fork-${Math.random().toString(36).slice(2)}`;
-  await fs.writeFile(tmp, JSON.stringify(cloned, null, 2));
-  await fs.rename(tmp, dest.manifestPath);
-
-  const linked = { proxies: 0, peaks: 0, sceneFiles: 0, sceneThumbs: 0, transcripts: 0, motionSpecs: 0 };
-
-  for (const s of cloned.sources) {
-    if (s.proxy) {
-      if (await linkOrCopy(path.join(absSrc, s.proxy), path.join(absDest, s.proxy))) linked.proxies++;
-    }
-    if (s.peaks) {
-      if (await linkOrCopy(path.join(absSrc, s.peaks), path.join(absDest, s.peaks))) linked.peaks++;
-    }
-    if (s.transcribed) {
-      if (await linkOrCopy(src.transcriptPath(s.id), dest.transcriptPath(s.id))) linked.transcripts++;
-    }
-    // Scene index (scenes-<sourceId>.json) + every thumbnail it references
-    // (cache/sc-<sourceId>-<sceneId>.jpg) — read from the SOURCE project
-    // directly (not `dest.scenes()`, which would read the not-yet-copied
-    // file and always return empty) since Project.scenes() degrades to
-    // `{sourceId, scenes: []}` when the file doesn't exist rather than
-    // throwing.
-    const sceneFile = await src.scenes(s.id);
-    if (sceneFile.scenes.length > 0) {
-      if (await linkOrCopy(src.scenesPath(s.id), dest.scenesPath(s.id))) linked.sceneFiles++;
-      for (const scene of sceneFile.scenes) {
-        if (scene.thumb && (await linkOrCopy(path.join(absSrc, scene.thumb), path.join(absDest, scene.thumb)))) {
-          linked.sceneThumbs++;
-        }
+  const source = await Project.open(absSrc);
+  const plan = await buildForkPlan(source, opts.name);
+  const destination = await prepareDestination(absSrc, absDest);
+  const publishLock = await acquirePublishLock(destination.lockPath);
+  const stageDir = path.join(
+    destination.parent,
+    `.${destination.basename}.vedit-fork-stage-${process.pid}-${randomUUID()}`,
+  );
+  let published = false;
+  let linked: ForkResult['linked'] | undefined;
+  let warning: string | undefined;
+  try {
+    await destinationStillAbsent(destination);
+    linked = await stageFork(plan, stageDir);
+    await destinationStillAbsent(destination);
+    try {
+      await fs.rename(stageDir, destination.canonical);
+      published = true;
+    } catch (error) {
+      // Some filesystems can report an error after completing rename. Only
+      // convert that ambiguous result to success if the complete staged
+      // manifest is now present at the final path.
+      if (await publishedManifestMatches(destination.canonical, plan.cloned)) {
+        published = true;
+      } else {
+        throw error;
       }
     }
+    try {
+      await syncDirectory(destination.parent);
+    } catch (error) {
+      warning = `fork published, but its parent directory could not be fsynced: ${(error as Error)?.message ?? String(error)}`;
+    }
+
+    // Publication is already complete and atomic. A registry problem must
+    // not turn that success into a reported failure or trigger deletion of a
+    // valid fork; surface it as an actionable warning instead.
+    try {
+      await upsertProject(destination.requested, plan.cloned.name);
+    } catch (error) {
+      const registryWarning = `fork completed, but the project registry could not be updated: ${(error as Error)?.message ?? String(error)}`;
+      warning = warning ? `${warning}; ${registryWarning}` : registryWarning;
+    }
+  } finally {
+    if (!published) {
+      const stageStat = await lstatIfPresent(stageDir).catch(() => undefined);
+      if (stageStat?.isDirectory() && !stageStat.isSymbolicLink()) {
+        await fs.rm(stageDir, { recursive: true, force: true }).catch(() => {});
+      }
+    }
+    const lockWarning = await releasePublishLock(destination.lockPath, publishLock);
+    if (lockWarning) warning = warning ? `${warning}; ${lockWarning}` : lockWarning;
   }
 
-  // Motion sidecars (motion/<id>.json) — every MotionItem in the cloned
-  // timeline needs its spec file to actually render/preview correctly.
-  for (const item of cloned.timeline.motion) {
-    if (await linkOrCopy(src.motionSpecPath(item.id), dest.motionSpecPath(item.id))) linked.motionSpecs++;
-  }
-
-  return { dir: absDest, name, sourceDir: absSrc, sourceRevision: srcManifest.revision, linked };
+  return {
+    dir: destination.requested,
+    name: plan.cloned.name,
+    sourceDir: absSrc,
+    sourceRevision: plan.inputs.manifest.revision,
+    linked: linked!,
+    ...(warning ? { warning } : {}),
+  };
 }

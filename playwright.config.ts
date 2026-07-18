@@ -3,7 +3,7 @@ import { defineConfig } from '@playwright/test';
 // vedit web/ e2e 回帰スイート(docs/HANDOFF.md §5/§6 参照)。
 //
 // テスト対象は毎回それぞれのテストファイルが自前で起動する daemon
-// (e2e/fixtures.ts の setupVedit — 空きポート+隔離 HOME+隔離プロジェクト)
+// (e2e/fixtures.ts の setupVedit — 空きポート+vedit専用状態+隔離プロジェクト)
 // であり、ユーザーの実 daemon(port 7799)には一切触れない。webServer は
 // 使わない — 固定ポート/固定プロジェクトの前提に合わないため。
 export default defineConfig({

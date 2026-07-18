@@ -2,6 +2,7 @@ import path from 'node:path';
 import { COLOR_WARNING_MESSAGE, needsColorTransform, orphanedOverlays, orphanedSprites, timelineDuration } from './ops.js';
 import { kitProfileHighlights, type KitProfileHighlights } from './kit.js';
 import type { NoteEntry } from './notes.js';
+import { isAgentActor } from './types.js';
 import type { CutCandidate, KitFile, Manifest, RevisionEntry, Scene } from './types.js';
 
 /**
@@ -73,7 +74,9 @@ export interface ResumeSummary {
     revisions: ResumeRevisionSummary[];
     updatedAt: string | null;
   };
-  /** Non-claude edits made after the most recent claude-authored revision — the "did the user touch this in the UI" signal. */
+  /** Non-agent edits made after the most recent AI-authored revision. */
+  userEditsSinceAgent: ResumeRevisionSummary[];
+  /** @deprecated Compatibility alias for clients released before provider-neutral actors. */
   userEditsSinceClaude: ResumeRevisionSummary[];
   pendingCandidates: { total: number; byKind: Record<string, number> };
   sources: { id: string; file: string; transcribed: boolean; colorWarning?: string }[];
@@ -119,19 +122,20 @@ export function buildResume(
   const last5 = revisions.slice(-5).map(toSummary);
   const updatedAt = revisions.length ? revisions[revisions.length - 1].ts : null;
 
-  // Non-claude edits since the most recent claude-authored revision: the
+  // Non-agent edits since the most recent AI-authored revision: the
   // "did the user touch this in the UI while I wasn't looking" signal. When
-  // no claude revision exists yet, every non-claude revision counts.
-  let lastClaudeIdx = -1;
+  // no agent revision exists yet, every non-agent revision counts. Legacy
+  // actor="claude" entries are agent edits too.
+  let lastAgentIdx = -1;
   for (let i = revisions.length - 1; i >= 0; i--) {
-    if (revisions[i].actor === 'claude') {
-      lastClaudeIdx = i;
+    if (isAgentActor(revisions[i].actor)) {
+      lastAgentIdx = i;
       break;
     }
   }
-  const userEditsSinceClaude = revisions
-    .slice(lastClaudeIdx + 1)
-    .filter((r) => r.actor !== 'claude')
+  const userEditsSinceAgent = revisions
+    .slice(lastAgentIdx + 1)
+    .filter((r) => !isAgentActor(r.actor))
     .map(toSummary);
 
   const pending = candidates.filter((c) => c.status === 'proposed');
@@ -201,7 +205,8 @@ export function buildResume(
   return {
     project: { name: m.name, dir, revision: m.revision, duration: timelineDuration(m), output: m.output ?? null },
     lastSession: { revisions: last5, updatedAt },
-    userEditsSinceClaude,
+    userEditsSinceAgent,
+    userEditsSinceClaude: userEditsSinceAgent,
     pendingCandidates: { total: pending.length, byKind },
     sources,
     orphanedOverlays: orphans,

@@ -8,8 +8,14 @@
 // the two must stay in sync (same duplication convention as spriteGeometryJS
 // mirroring ops.ts's spriteGeometry).
 
-/** Recognized camera-footage extensions (case-insensitive) — mirrors src/ingest/batch.ts's VIDEO_EXTENSIONS. */
-export const VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.m4v']);
+/** Recognized footage extensions (case-insensitive) — mirrors src/ingest/batch.ts's VIDEO_EXTENSIONS. */
+export const VIDEO_EXTENSIONS = new Set([
+  '.mp4', '.mov', '.m4v',
+  '.mkv', '.webm', '.avi',
+  '.mts', '.m2ts',
+  '.mpg', '.mpeg',
+  '.ogv',
+]);
 
 export function isVideoFileName(name) {
   const i = String(name ?? '').lastIndexOf('.');

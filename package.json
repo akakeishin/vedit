@@ -1,14 +1,31 @@
 {
   "name": "vedit",
   "version": "0.1.0",
-  "description": "",
-  "main": "index.js",
+  "description": "AI-directed, non-destructive local video editing CLI and web NLE",
+  "main": "./dist/cli.js",
+  "files": [
+    "bin/",
+    "dist/",
+    "web/aiRequestLogic.js",
+    "web/app.js",
+    "web/concurrencyLogic.js",
+    "web/dragLogic.js",
+    "web/historyLogic.js",
+    "web/index.html",
+    "web/ingestLogic.js",
+    "web/mediaScaleLogic.js",
+    "web/transcribeJobLogic.js",
+    "web/style.css",
+    "skill/"
+  ],
   "directories": {
     "doc": "docs"
   },
   "scripts": {
     "test": "vitest",
     "build": "tsc -p .",
+    "prepack": "npm run build",
+    "verify:package": "npm run build && node scripts/verify-package.mjs",
     "smoke:export": "node scripts/smoke-export.mjs",
     "smoke:compose": "npm run build && node scripts/smoke-compose.mjs",
     "smoke:overlay": "node scripts/smoke-overlay-stack.mjs",

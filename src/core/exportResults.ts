@@ -1,14 +1,13 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 
 /**
  * 書き出し結果カードのバックエンド永続化。
  *
- * docs/product-bet-sensory-vs-structural.md の賭け:「構造系(書き出し)に
- * 必要なのは操作ではなく結果の可視化」——書き出しウィザードは作らず、CLI
- * (`vedit export *` / `vedit publish-pack`)が書き出しの都度この記録を残し、
- * daemon の読み取り専用ルート(GET /api/export-results)で web の確認タブに
- * 返す。実行系のルートはここにも daemon にも作らない(会話主導の原則)。
+ * CLI とアプリ内ローカルMP4ジョブが書き出しの都度この記録を残し、daemon
+ * の GET /api/export-results が web の確認面へ返す。公開・外部送信を行う
+ * 記録ではなく、あくまでプロジェクト内で完了した成果物の台帳。
  *
  * 保存先: `<projectDir>/cache/export-results.json`。新しい順(先頭が最新)、
  * 直近 EXPORT_RESULTS_LIMIT 件で切り詰め。書き込みは tmp→rename の原子的
@@ -43,6 +42,33 @@ const EXPORT_RESULTS_LIMIT = 20;
 
 function exportResultsPath(projectDir: string): string {
   return path.join(projectDir, 'cache', 'export-results.json');
+}
+
+async function withExportResultsLock<T>(projectDir: string, fn: () => Promise<T>): Promise<T> {
+  const dir = path.join(projectDir, 'cache');
+  await fs.mkdir(dir, { recursive: true });
+  const lockPath = path.join(dir, 'export-results.lock');
+  let handle: Awaited<ReturnType<typeof fs.open>> | null = null;
+  for (let attempt = 0; attempt < 500; attempt++) {
+    try {
+      handle = await fs.open(lockPath, 'wx');
+      break;
+    } catch (e: any) {
+      if (e?.code !== 'EEXIST') throw e;
+      try {
+        const stat = await fs.stat(lockPath);
+        if (Date.now() - stat.mtimeMs > 30_000) await fs.rm(lockPath, { force: true });
+      } catch { /* another writer released it */ }
+      await delay(10 + Math.floor(Math.random() * 10));
+    }
+  }
+  if (!handle) throw new Error('timed out waiting for export result history lock');
+  try {
+    return await fn();
+  } finally {
+    await handle.close().catch(() => {});
+    await fs.rm(lockPath, { force: true }).catch(() => {});
+  }
 }
 
 /**
@@ -92,12 +118,16 @@ export async function readExportResults(projectDir: string): Promise<ExportResul
  * とどめる(書き出し結果の記録は best-effort)。
  */
 export async function appendExportResult(projectDir: string, record: ExportResultRecord): Promise<void> {
-  const existing = await readExportResults(projectDir);
-  const next = [record, ...existing].slice(0, EXPORT_RESULTS_LIMIT);
-  const dir = path.join(projectDir, 'cache');
-  await fs.mkdir(dir, { recursive: true });
-  const target = exportResultsPath(projectDir);
-  const tmp = `${target}.tmp-${process.pid}-${Math.random().toString(36).slice(2)}`;
-  await fs.writeFile(tmp, JSON.stringify(next, null, 2));
-  await fs.rename(tmp, target);
+  await withExportResultsLock(projectDir, async () => {
+    const existing = await readExportResults(projectDir);
+    const next = [record, ...existing].slice(0, EXPORT_RESULTS_LIMIT);
+    const target = exportResultsPath(projectDir);
+    const tmp = `${target}.tmp-${process.pid}-${Math.random().toString(36).slice(2)}`;
+    try {
+      await fs.writeFile(tmp, JSON.stringify(next, null, 2));
+      await fs.rename(tmp, target);
+    } finally {
+      await fs.rm(tmp, { force: true }).catch(() => {});
+    }
+  });
 }

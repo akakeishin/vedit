@@ -5,6 +5,7 @@ import path from 'node:path';
 import { freshId } from '../core/ops.js';
 import type { Project } from '../core/project.js';
 import { detectScenesForSource } from '../core/scenes.js';
+import { resolveWhisperModelDir } from '../core/statePaths.js';
 import type { Manifest, Source, Transcript, Word } from '../core/types.js';
 import { buildColorChain } from '../export/color.js';
 import { run, runBinary } from './run.js';
@@ -47,13 +48,21 @@ function parseFrameRate(s: unknown): number | null {
   return num / den;
 }
 
-export async function probe(file: string): Promise<ProbeResult> {
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  const error = new Error('operation cancelled');
+  error.name = 'AbortError';
+  throw error;
+}
+
+export async function probe(file: string, opts: { signal?: AbortSignal } = {}): Promise<ProbeResult> {
+  throwIfAborted(opts.signal);
   const out = await run('ffprobe', [
     '-v', 'error',
     '-print_format', 'json',
     '-show_format', '-show_streams',
     file,
-  ]);
+  ], { signal: opts.signal });
   const j = JSON.parse(out);
   const v = (j.streams as any[]).find((s) => s.codec_type === 'video');
   const a = (j.streams as any[]).find((s) => s.codec_type === 'audio');
@@ -122,13 +131,14 @@ export interface AudioProbeResult {
  * requires a video stream (music-add's inputs are typically audio-only), it
  * only needs to confirm an audio stream exists and learn its duration.
  */
-export async function probeAudio(file: string): Promise<AudioProbeResult> {
+export async function probeAudio(file: string, opts: { signal?: AbortSignal } = {}): Promise<AudioProbeResult> {
+  throwIfAborted(opts.signal);
   const out = await run('ffprobe', [
     '-v', 'error',
     '-print_format', 'json',
     '-show_format', '-show_streams',
     file,
-  ]);
+  ], { signal: opts.signal });
   const j = JSON.parse(out);
   const a = (j.streams as any[]).find((s) => s.codec_type === 'audio');
   const formatDuration = Number(j.format?.duration);
@@ -187,13 +197,14 @@ export interface ImageProbeResult {
  * a PNG/JPEG with no `format.duration` at all, which is exactly why probe()
  * itself can't be reused here — it would throw "no usable duration").
  */
-export async function probeImage(file: string): Promise<ImageProbeResult> {
+export async function probeImage(file: string, opts: { signal?: AbortSignal } = {}): Promise<ImageProbeResult> {
+  throwIfAborted(opts.signal);
   const out = await run('ffprobe', [
     '-v', 'error',
     '-print_format', 'json',
     '-show_streams',
     file,
-  ]);
+  ], { signal: opts.signal });
   const j = JSON.parse(out);
   const v = (j.streams as any[]).find((s) => s.codec_type === 'video');
   const width = Number(v?.width);
@@ -234,7 +245,14 @@ export function sha256File(file: string): Promise<string> {
  * before this parameter existed. `vedit color` regenerates the proxy by
  * calling this again with the newly-set colorTransform.
  */
-export async function makeProxy(file: string, outPath: string, p: ProbeResult, colorTransform?: Source['colorTransform']): Promise<void> {
+export async function makeProxy(
+  file: string,
+  outPath: string,
+  p: ProbeResult,
+  colorTransform?: Source['colorTransform'],
+  opts: { signal?: AbortSignal } = {},
+): Promise<void> {
+  throwIfAborted(opts.signal);
   const targetH = Math.min(720, p.height);
   const fps = p.fps > 60 ? 30 : p.fps || 30;
   const gop = Math.max(1, Math.round(fps));
@@ -251,20 +269,27 @@ export async function makeProxy(file: string, outPath: string, p: ProbeResult, c
     '-dn', '-map_metadata', '-1', // drop data streams (e.g. DJI tmcd) and source metadata
     '-movflags', '+faststart',
     outPath,
-  ]);
+  ], { signal: opts.signal });
 }
 
 /** Mono peak envelope for waveform display: `rate` values per second, 0..1. */
-export async function makePeaks(file: string, outPath: string, rate = 25): Promise<void> {
+export async function makePeaks(
+  file: string,
+  outPath: string,
+  rate = 25,
+  opts: { signal?: AbortSignal } = {},
+): Promise<void> {
+  throwIfAborted(opts.signal);
   const sr = 8000;
   const buf = await runBinary('ffmpeg', [
     '-v', 'error', '-i', file,
     '-map', 'a:0?', '-ac', '1', '-ar', String(sr), '-f', 's16le', '-',
-  ]);
+  ], { signal: opts.signal });
   const samples = new Int16Array(buf.buffer, buf.byteOffset, Math.floor(buf.byteLength / 2));
   const win = Math.floor(sr / rate);
   const peaks: number[] = [];
   for (let i = 0; i < samples.length; i += win) {
+    if ((peaks.length & 0x3ff) === 0) throwIfAborted(opts.signal);
     let max = 0;
     for (let j = i; j < Math.min(i + win, samples.length); j++) {
       const v = Math.abs(samples[j]);
@@ -272,40 +297,59 @@ export async function makePeaks(file: string, outPath: string, rate = 25): Promi
     }
     peaks.push(Math.round((max / 32768) * 100) / 100);
   }
-  await fs.writeFile(outPath, JSON.stringify({ rate, peaks }));
+  throwIfAborted(opts.signal);
+  await fs.writeFile(outPath, JSON.stringify({ rate, peaks }), { signal: opts.signal });
 }
 
 // ---- transcription (whisper.cpp) ----
 
-const MODEL_DIR = path.join(os.homedir(), '.cache', 'vedit', 'models');
 const MODEL_URL = (name: string) =>
   `https://huggingface.co/ggerganov/whisper.cpp/resolve/main/${name}.bin`;
 
 export async function findWhisperModel(): Promise<string | null> {
   const preferred = process.env.VEDIT_WHISPER_MODEL;
   if (preferred) return preferred;
+  const modelDir = resolveWhisperModelDir();
   try {
-    const files = await fs.readdir(MODEL_DIR);
+    const files = await fs.readdir(modelDir);
     const bins = files.filter((f) => f.startsWith('ggml-') && f.endsWith('.bin'));
     // Prefer larger/turbo models when several are present.
     const order = ['large-v3-turbo', 'large', 'medium', 'small', 'base', 'tiny'];
     bins.sort((a, b) => order.findIndex((o) => a.includes(o)) - order.findIndex((o) => b.includes(o)));
-    return bins.length ? path.join(MODEL_DIR, bins[0]) : null;
+    return bins.length ? path.join(modelDir, bins[0]) : null;
   } catch {
     return null;
   }
 }
 
 export async function downloadWhisperModel(name = 'ggml-large-v3-turbo'): Promise<string> {
-  await fs.mkdir(MODEL_DIR, { recursive: true });
-  const dest = path.join(MODEL_DIR, `${name}.bin`);
+  const modelDir = resolveWhisperModelDir();
+  await fs.mkdir(modelDir, { recursive: true });
+  const dest = path.join(modelDir, `${name}.bin`);
   try {
     await fs.access(dest);
     return dest;
   } catch { /* download below */ }
-  await run('curl', ['-L', '--fail', '-o', dest + '.part', MODEL_URL(name)], { maxBuffer: 1024 });
-  await fs.rename(dest + '.part', dest);
-  return dest;
+  // Never let two Codex/Claude/daemon processes share one `.part` inode.
+  // With a common temp path, the first rename can expose that inode as the
+  // live model while the second curl is still writing to it, silently
+  // corrupting an apparently complete model. Each downloader writes its own
+  // sibling, then hard-links the complete file into place with no-overwrite
+  // semantics. Losing a race is success: the winner already published a
+  // complete model. Failed/cancelled downloads leave neither a live file nor
+  // an accumulating partial.
+  const part = `${dest}.part-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  try {
+    await run('curl', ['-L', '--fail', '-o', part, MODEL_URL(name)], { maxBuffer: 1024 });
+    try {
+      await fs.link(part, dest);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    }
+    return dest;
+  } finally {
+    await fs.rm(part, { force: true }).catch(() => {});
+  }
 }
 
 /**
@@ -336,7 +380,7 @@ export function buildWhisperPrompt(glossary: string[]): string {
 export async function transcribe(
   file: string,
   sourceId: string,
-  opts: { model?: string; language?: string; sourceDuration?: number; glossary?: string[] } = {},
+  opts: { model?: string; language?: string; sourceDuration?: number; glossary?: string[]; signal?: AbortSignal } = {},
 ): Promise<Transcript> {
   const model = opts.model ?? (await findWhisperModel());
   if (!model) {
@@ -345,75 +389,101 @@ export async function transcribe(
     );
   }
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'vedit-asr-'));
-  const wav = path.join(tmp, 'audio.wav');
-  await run('ffmpeg', ['-y', '-v', 'error', '-i', file, '-map', 'a:0', '-ac', '1', '-ar', '16000', wav]);
-  const outBase = path.join(tmp, 'out');
-  const args = [
-    '-m', model,
-    '-f', wav,
-    '-ojf', // full JSON with token-level offsets
-    '-of', outBase,
-    '--threads', String(Math.max(2, os.cpus().length - 2)),
-    // Explicit rather than relying on whatever the installed whisper-cli
-    // build defaults to — beam-size/best-of pin decoding quality, and
-    // split-on-word keeps segment boundaries at word edges (matches how
-    // this pipeline consumes token offsets as word-level timing).
-    '--beam-size', '5',
-    '--best-of', '5',
-    '--split-on-word',
-  ];
-  if (opts.language) args.push('-l', opts.language);
-  else args.push('-l', 'auto');
-  const prompt = opts.glossary ? buildWhisperPrompt(opts.glossary) : '';
-  if (prompt) args.push('--prompt', prompt);
-  await run('whisper-cli', args, { maxBuffer: 256 * 1024 * 1024 });
-  const j = JSON.parse(await fs.readFile(outBase + '.json', 'utf8'));
-  const words: Word[] = [];
-  let n = 0;
-  const push = (text: string, t0: number, t1: number, p: number) => {
-    const clean = text.trim();
-    if (!clean) return;
-    words.push({ id: `w${(n++).toString().padStart(4, '0')}`, text: clean, t0, t1, p });
-  };
-  for (const seg of j.transcription ?? []) {
-    let cur: { text: string; t0: number; t1: number; p: number } | null = null;
-    for (const tok of seg.tokens ?? []) {
-      const text: string = tok.text ?? '';
-      if (text.startsWith('[_') || text.startsWith('<|')) continue; // special tokens
-      const t0 = (tok.offsets?.from ?? 0) / 1000;
-      const t1 = (tok.offsets?.to ?? 0) / 1000;
-      const p = tok.p ?? 1;
-      const startsWord = text.startsWith(' ') || /^[　-鿿！-｠ぁ-んァ-ヶ]/u.test(text);
-      if (cur && startsWord) {
-        push(cur.text, cur.t0, cur.t1, cur.p);
-        cur = null;
-      }
-      if (!cur) cur = { text, t0, t1, p };
-      else {
-        cur.text += text;
-        cur.t1 = t1;
-        cur.p = Math.min(cur.p, p);
-      }
+  try {
+    const wav = path.join(tmp, 'audio.wav');
+    await run(
+      'ffmpeg',
+      ['-y', '-v', 'error', '-i', file, '-map', 'a:0', '-ac', '1', '-ar', '16000', wav],
+      { signal: opts.signal },
+    );
+    const outBase = path.join(tmp, 'out');
+    const args = [
+      '-m', model,
+      '-f', wav,
+      '-ojf', // full JSON with token-level offsets
+      '-of', outBase,
+      '--threads', String(Math.max(2, os.cpus().length - 2)),
+      // Explicit rather than relying on whatever the installed whisper-cli
+      // build defaults to — beam-size/best-of pin decoding quality, and
+      // split-on-word keeps segment boundaries at word edges (matches how
+      // this pipeline consumes token offsets as word-level timing).
+      '--beam-size', '5',
+      '--best-of', '5',
+      '--split-on-word',
+    ];
+    if (opts.language) args.push('-l', opts.language);
+    else args.push('-l', 'auto');
+    const prompt = opts.glossary ? buildWhisperPrompt(opts.glossary) : '';
+    if (prompt) args.push('--prompt', prompt);
+    let actualArgs = args;
+    try {
+      await run('whisper-cli', actualArgs, { maxBuffer: 256 * 1024 * 1024, signal: opts.signal });
+    } catch (error) {
+      // whisper.cpp's Metal backend has been observed to die immediately
+      // with SIGSEGV on otherwise-valid models/audio.  Retry exactly once on
+      // CPU only for a process crash (not a decoding/model error), keeping
+      // ordinary failures fast and preserving cancellation semantics.
+      const child = error as Error & { code?: string | number | null; signal?: string | null };
+      const crashed = child.signal === 'SIGSEGV'
+        || child.signal === 'SIGABRT'
+        || child.code === 134
+        || child.code === 139;
+      if (!crashed || opts.signal?.aborted || child.name === 'AbortError') throw error;
+      actualArgs = [...args, '--no-gpu'];
+      await run('whisper-cli', actualArgs, { maxBuffer: 256 * 1024 * 1024, signal: opts.signal });
     }
-    if (cur) push(cur.text, cur.t0, cur.t1, cur.p);
+    const j = JSON.parse(await fs.readFile(outBase + '.json', 'utf8'));
+    const words: Word[] = [];
+    let n = 0;
+    const push = (text: string, t0: number, t1: number, p: number) => {
+      const clean = text.trim();
+      if (!clean) return;
+      words.push({ id: `w${(n++).toString().padStart(4, '0')}`, text: clean, t0, t1, p });
+    };
+    for (const seg of j.transcription ?? []) {
+      let cur: { text: string; t0: number; t1: number; p: number } | null = null;
+      for (const tok of seg.tokens ?? []) {
+        const text: string = tok.text ?? '';
+        if (text.startsWith('[_') || text.startsWith('<|')) continue; // special tokens
+        const t0 = (tok.offsets?.from ?? 0) / 1000;
+        const t1 = (tok.offsets?.to ?? 0) / 1000;
+        const p = tok.p ?? 1;
+        const startsWord = text.startsWith(' ') || /^[　-鿿！-｠ぁ-んァ-ヶ]/u.test(text);
+        if (cur && startsWord) {
+          push(cur.text, cur.t0, cur.t1, cur.p);
+          cur = null;
+        }
+        if (!cur) cur = { text, t0, t1, p };
+        else {
+          cur.text += text;
+          cur.t1 = t1;
+          cur.p = Math.min(cur.p, p);
+        }
+      }
+      if (cur) push(cur.text, cur.t0, cur.t1, cur.p);
+    }
+    // `meta` is provenance for debugging/reproducibility (which model, what
+    // decoding args, when) — not part of the Transcript type, so any reader
+    // that only knows about `sourceId`/`language`/`words` ignores it
+    // (JSON.stringify/parse round-trips extra own properties just fine; this
+    // is purely additive and backward compatible).
+    const result: Transcript & { meta: { model: string; args: string[]; at: string } } = {
+      sourceId,
+      language: j.result?.language ?? opts.language ?? 'auto',
+      words: sanitizeWords(words, opts.sourceDuration),
+      meta: {
+        model: path.basename(model),
+        args: actualArgs,
+        at: new Date().toISOString(),
+      },
+    };
+    return result;
+  } finally {
+    // ASR can fail during audio extraction, whisper decoding, JSON parsing,
+    // or be cancelled by the daemon. None of those paths may strand a WAV
+    // or whisper JSON in /tmp (long recordings can consume gigabytes).
+    await fs.rm(tmp, { recursive: true, force: true });
   }
-  await fs.rm(tmp, { recursive: true, force: true });
-  // `meta` is provenance for debugging/reproducibility (which model, what
-  // decoding args, when) — not part of the Transcript type, so any reader
-  // that only knows about `sourceId`/`language`/`words` ignores it
-  // (JSON.stringify/parse round-trips extra own properties just fine; this
-  // is purely additive and backward compatible).
-  const result: Transcript & { meta: { model: string; args: string[]; at: string } } = {
-    sourceId,
-    language: j.result?.language ?? opts.language ?? 'auto',
-    words: sanitizeWords(words, opts.sourceDuration),
-    meta: {
-      model: path.basename(model),
-      args,
-      at: new Date().toISOString(),
-    },
-  };
-  return result;
 }
 
 /**
@@ -513,6 +583,41 @@ export interface IngestResult {
 }
 
 /**
+ * Remove files owned exclusively by a video ingest that never became a
+ * manifest source. The source id is freshly generated for this attempt, so
+ * these paths cannot belong to an older successful ingest. Re-check the
+ * manifest first because a very late lock-release error can be reported
+ * after the durable commit already landed; referenced media must win over
+ * cleanup in that ambiguous boundary.
+ */
+async function cleanupFailedVideoIngest(project: Project, sourceId: string, proxyRel: string, peaksRel: string): Promise<void> {
+  try {
+    const current = await project.manifest();
+    if (current.sources.some((source) => source.id === sourceId)) return;
+  } catch {
+    // If durable truth cannot be read, deleting possibly referenced media is
+    // the dangerous choice. GC can recover confirmed orphans later.
+    return;
+  }
+
+  const owned = [
+    path.join(project.dir, proxyRel),
+    path.join(project.dir, peaksRel),
+    project.transcriptPath(sourceId),
+    project.scenesPath(sourceId),
+  ];
+  let cacheNames: string[] = [];
+  try {
+    cacheNames = await fs.readdir(project.cacheDir);
+  } catch { /* no cache directory/files to clean */ }
+  const sceneThumbPrefix = `sc-${sourceId}-`;
+  for (const name of cacheNames) {
+    if (name.startsWith(sceneThumbPrefix)) owned.push(path.join(project.cacheDir, name));
+  }
+  await Promise.all(owned.map((target) => fs.rm(target, { force: true }).catch(() => {})));
+}
+
+/**
  * Lightweight ingest for a still-image overlay source (Source.kind:'image' —
  * see the "オーバーレイ・スタック" section above): probes dimensions only —
  * no proxy, no waveform, no scene detection, no transcription, none of
@@ -530,15 +635,23 @@ export interface IngestResult {
 export async function ingestImageFile(
   project: Project,
   file: string,
-  opts: { sha256?: string; onProgress?: IngestProgress } = {},
+  opts: {
+    sha256?: string;
+    onProgress?: IngestProgress;
+    signal?: AbortSignal;
+    /** Synchronous boundary: after this callback, the manifest commit may land. */
+    onCommitStart?: () => void;
+  } = {},
 ): Promise<IngestResult> {
   const abs = path.resolve(file);
+  throwIfAborted(opts.signal);
   await fs.access(abs);
+  throwIfAborted(opts.signal);
   const notify = opts.onProgress ?? (() => {});
   const timings: Record<string, number> = {};
   const started = Date.now();
   notify('probing (image)');
-  const p = await probeImage(abs);
+  const p = await probeImage(abs, { signal: opts.signal });
   timings.probeMs = Date.now() - started;
   const id = freshId('src');
   const source: Source = {
@@ -561,7 +674,12 @@ export async function ingestImageFile(
   const MAX_STALE_RETRIES = 20;
   for (let attempt = 0; ; attempt++) {
     const cur = await project.manifest();
+    throwIfAborted(opts.signal);
     try {
+      // There is deliberately no await between this notification and commit:
+      // a cancellation endpoint can therefore either abort before the
+      // durable boundary or truthfully report that it is too late.
+      opts.onCommitStart?.();
       await project.commit(cur.revision, 'system', 'ingest-image', { file: abs }, summary, buildNext);
       break;
     } catch (e: any) {
@@ -610,6 +728,10 @@ export async function ingestFile(
      * this option existed.
      */
     sha256?: string;
+    /** Cancels probe/proxy/peaks/transcribe/scene child processes before commit. */
+    signal?: AbortSignal;
+    /** Synchronous boundary: after this callback, the manifest commit may land. */
+    onCommitStart?: () => void;
   } = {},
 ): Promise<IngestResult> {
   // オーバーレイ・スタック: a PNG/JPEG/WebP routes to the lightweight
@@ -618,10 +740,17 @@ export async function ingestFile(
   // (no audio, no scenes, no A-roll role), so they're silently ignored
   // rather than threaded through; sha256/onProgress still apply uniformly.
   if (isImageFile(file)) {
-    return ingestImageFile(project, file, { sha256: opts.sha256, onProgress: opts.onProgress });
+    return ingestImageFile(project, file, {
+      sha256: opts.sha256,
+      onProgress: opts.onProgress,
+      signal: opts.signal,
+      onCommitStart: opts.onCommitStart,
+    });
   }
   const abs = path.resolve(file);
+  throwIfAborted(opts.signal);
   await fs.access(abs);
+  throwIfAborted(opts.signal);
   const notify = opts.onProgress ?? (() => {});
   const timings: Record<string, number> = {};
   const timed = async <T>(name: string, fn: () => Promise<T>): Promise<T> => {
@@ -634,88 +763,121 @@ export async function ingestFile(
   };
 
   notify('probing');
-  const p = await timed('probeMs', () => probe(abs));
+  const p = await timed('probeMs', () => probe(abs, { signal: opts.signal }));
   const id = freshId('src');
   const proxyRel = `cache/proxy-${id}.mp4`;
   const peaksRel = `cache/peaks-${id}.json`;
-  notify('generating proxy');
-  await timed('proxyMs', () => makeProxy(abs, path.join(project.dir, proxyRel), p));
-  if (p.hasAudio) {
-    notify('extracting waveform');
-    await timed('peaksMs', () => makePeaks(abs, path.join(project.dir, peaksRel)));
-  }
-  const source: Source = {
-    id,
-    path: abs,
-    duration: p.duration,
-    fps: p.fps,
-    width: p.width,
-    height: p.height,
-    hasAudio: p.hasAudio,
-    proxy: proxyRel,
-    peaks: p.hasAudio ? peaksRel : undefined,
-    transcribed: false,
-    color: p.color,
-    sha256: opts.sha256,
-  };
-  const addToTimeline = opts.addToTimeline ?? true;
-  const summary = `ingested ${path.basename(abs)} (${p.duration.toFixed(1)}s)${addToTimeline ? '' : ', pool only'}`;
-  // Defined before the transcribe/scenes steps below (rather than only right
-  // before the commit loop, as before W-LAZY) so detectScenesForSource can
-  // be handed a manifest whose timeline already includes this source's own
-  // clip — without that, keptWords() (which hasSpeech is derived from) sees
-  // no segment for `id` at all yet and every scene would come back
-  // hasSpeech:false regardless of the transcript. `buildNext` reads `source`
-  // from the enclosing closure at CALL time, so mutating source.transcribed
-  // below (before the scenes step) is still reflected here.
-  const buildNext = (m: Manifest): Manifest => {
-    const first = m.sources.length === 0;
-    return {
-      ...m,
-      fps: first ? Math.min(60, p.fps) : m.fps,
-      width: first ? p.width : m.width,
-      height: first ? p.height : m.height,
-      sources: [...m.sources, source],
-      timeline: addToTimeline
-        ? {
-            ...m.timeline,
-            video: [
-              ...m.timeline.video,
-              { id: freshId('c'), sourceId: id, srcIn: 0, srcOut: p.duration },
-            ],
-          }
-        : m.timeline,
-    };
-  };
-  if (p.hasAudio && opts.transcribe === true) {
-    notify('transcribing (whisper)');
-    const t = await timed('transcribeMs', () => transcribe(abs, id, { language: opts.language, sourceDuration: p.duration }));
-    await project.writeTranscript(t);
-    source.transcribed = true;
-  }
-  if (opts.scenes !== false) {
-    notify('detecting scenes');
-    await timed('scenesMs', async () => detectScenesForSource(project, buildNext(await project.manifest()), id));
-  }
-  // `ingest-batch` runs up to two ingests concurrently (bounded parallelism
-  // for the slow proxy/transcribe work — see batch.ts) but Project.commit
-  // is optimistic-concurrency-checked: reading `cur.revision` here and then
-  // committing against it is a read-then-write pair, so a second concurrent
-  // ingestFile call can land its commit in between and make this one's
-  // baseRev stale. That's not a real conflict (each ingest only appends its
-  // own source/clip, independent of what the other wrote) — just re-read
-  // the manifest and retry. Bounded so a genuinely stuck/looping caller
-  // still fails loudly instead of spinning forever.
-  const MAX_STALE_RETRIES = 20;
-  for (let attempt = 0; ; attempt++) {
-    const cur = await project.manifest();
-    try {
-      await project.commit(cur.revision, 'system', 'ingest', { file: abs }, summary, buildNext);
-      break;
-    } catch (e: any) {
-      if (e?.code === 'STALE_REVISION' && attempt < MAX_STALE_RETRIES) continue;
-      throw e;
+  let committed = false;
+  try {
+    notify('generating proxy');
+    await timed('proxyMs', () => makeProxy(abs, path.join(project.dir, proxyRel), p, undefined, { signal: opts.signal }));
+    if (p.hasAudio) {
+      notify('extracting waveform');
+      await timed('peaksMs', () => makePeaks(abs, path.join(project.dir, peaksRel), 25, { signal: opts.signal }));
     }
+    const source: Source = {
+      id,
+      path: abs,
+      duration: p.duration,
+      fps: p.fps,
+      width: p.width,
+      height: p.height,
+      hasAudio: p.hasAudio,
+      proxy: proxyRel,
+      peaks: p.hasAudio ? peaksRel : undefined,
+      transcribed: false,
+      color: p.color,
+      sha256: opts.sha256,
+    };
+    const addToTimeline = opts.addToTimeline ?? true;
+    const summary = `ingested ${path.basename(abs)} (${p.duration.toFixed(1)}s)${addToTimeline ? '' : ', pool only'}`;
+    // Defined before the transcribe/scenes steps below (rather than only right
+    // before the commit loop, as before W-LAZY) so detectScenesForSource can
+    // be handed a manifest whose timeline already includes this source's own
+    // clip — without that, keptWords() (which hasSpeech is derived from) sees
+    // no segment for `id` at all yet and every scene would come back
+    // hasSpeech:false regardless of the transcript. `buildNext` reads `source`
+    // from the enclosing closure at CALL time, so mutating source.transcribed
+    // below (before the scenes step) is still reflected here.
+    const buildNext = (m: Manifest): Manifest => {
+      const first = m.sources.length === 0;
+      return {
+        ...m,
+        fps: first ? Math.min(60, p.fps) : m.fps,
+        width: first ? p.width : m.width,
+        height: first ? p.height : m.height,
+        sources: [...m.sources, source],
+        timeline: addToTimeline
+          ? {
+              ...m.timeline,
+              video: [
+                ...m.timeline.video,
+                { id: freshId('c'), sourceId: id, srcIn: 0, srcOut: p.duration },
+              ],
+            }
+          : m.timeline,
+      };
+    };
+    let transcript: Transcript | undefined;
+    if (p.hasAudio && opts.transcribe === true) {
+      notify('transcribing (whisper)');
+      transcript = await timed('transcribeMs', () => transcribe(abs, id, {
+        language: opts.language,
+        sourceDuration: p.duration,
+        signal: opts.signal,
+      }));
+      // The source is not visible in the manifest yet, so this compatibility
+      // sidecar cannot leak into an export. The same value is also recorded on
+      // the ingest revision below for exact undo/redo reproduction.
+      await project.writeTranscript(transcript);
+      source.transcribed = true;
+    }
+    if (opts.scenes !== false) {
+      notify('detecting scenes');
+      await timed('scenesMs', async () => detectScenesForSource(
+        project,
+        buildNext(await project.manifest()),
+        id,
+        { signal: opts.signal },
+      ));
+    }
+    // `ingest-batch` runs up to two ingests concurrently (bounded parallelism
+    // for the slow proxy/transcribe work — see batch.ts) but Project.commit
+    // is optimistic-concurrency-checked: reading `cur.revision` here and then
+    // committing against it is a read-then-write pair, so a second concurrent
+    // ingestFile call can land its commit in between and make this one's
+    // baseRev stale. That's not a real conflict (each ingest only appends its
+    // own source/clip, independent of what the other wrote) — just re-read
+    // the manifest and retry. Bounded so a genuinely stuck/looping caller
+    // still fails loudly instead of spinning forever.
+    const MAX_STALE_RETRIES = 20;
+    for (let attempt = 0; ; attempt++) {
+      const cur = await project.manifest();
+      throwIfAborted(opts.signal);
+      try {
+        // No await until Project.commit owns the operation. The daemon flips
+        // its job to `committing` here, so DELETE never promises a cancellation
+        // after durable manifest publication can begin.
+        opts.onCommitStart?.();
+        await project.commit(
+          cur.revision,
+          'system',
+          'ingest',
+          { file: abs },
+          summary,
+          buildNext,
+          undefined,
+          transcript ? { [id]: transcript } : undefined,
+        );
+        break;
+      } catch (e: any) {
+        if (e?.code === 'STALE_REVISION' && attempt < MAX_STALE_RETRIES) continue;
+        throw e;
+      }
+    }
+    committed = true;
+    return { source, timings };
+  } finally {
+    if (!committed) await cleanupFailedVideoIngest(project, id, proxyRel, peaksRel);
   }
-  return { source, timings };
 }

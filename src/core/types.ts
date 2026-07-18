@@ -576,10 +576,30 @@ export interface Word {
 
 // ---- revision log ----
 
+/**
+ * Who initiated a persisted edit.
+ *
+ * `agent` is the provider-neutral value written by current clients. The
+ * legacy `claude` value remains readable/writable for existing projects and
+ * older clients; both values have identical concurrency semantics. Provider
+ * branding (Codex, Claude Code, etc.) must not decide whether optimistic
+ * locking applies.
+ */
+export type RevisionActor = 'agent' | 'claude' | 'ui' | 'system';
+
+export function isRevisionActor(value: unknown): value is RevisionActor {
+  return value === 'agent' || value === 'claude' || value === 'ui' || value === 'system';
+}
+
+/** True for both current provider-neutral edits and legacy Claude edits. */
+export function isAgentActor(value: unknown): value is Extract<RevisionActor, 'agent' | 'claude'> {
+  return value === 'agent' || value === 'claude';
+}
+
 export interface RevisionEntry {
   rev: number;
   baseRev: number;
-  actor: 'claude' | 'ui' | 'system';
+  actor: RevisionActor;
   op: string;
   params: unknown;
   ts: string;
@@ -610,6 +630,14 @@ export interface RevisionEntry {
    * restore() just can't roll sidecars back for those.
    */
   motionSpecs?: Record<string, unknown>;
+  /**
+   * Transcript values introduced by this revision, keyed by Source.id.
+   * Ordinary edits inherit the effective value through baseRev; restore
+   * revisions record the restored effective set. Keeping transcript changes
+   * in the revision graph makes undo/redo and revision-pinned exports use the
+   * same words instead of whichever transcript sidecar happens to be newest.
+   */
+  transcriptUpdates?: Record<string, Transcript>;
 }
 
 // ---- playback mapping ----
@@ -635,6 +663,34 @@ export interface CutCandidate {
   wordIds: string[];
   label: string;
   status: 'proposed' | 'approved' | 'rejected';
+  /**
+   * Machine-readable corroboration used by the autonomous first-draft gate.
+   * Optional for projects/candidates created before this field existed; an
+   * absent or incomplete value MUST be treated as "ask", never as evidence
+   * that a cut is safe. `edge` keeps leading/trailing room tone out of the
+   * automatic bucket even when both detectors agree, because those pauses
+   * are pacing decisions rather than ordinary interior gaps.
+   */
+  evidence?: {
+    transcriptGap?: boolean;
+    waveform?: boolean;
+    transcriptConflict?: boolean;
+    edge?: 'interior' | 'leading' | 'trailing';
+  };
+  /**
+   * Last autonomous review for this exact proposal. Persisting the reason on
+   * the candidate keeps a no-op first draft and its exception rationale
+   * visible after reload; a later detection pass replaces the proposal and
+   * therefore naturally invalidates this annotation.
+   */
+  aiReview?: {
+    reviewId: string;
+    evaluatedAt: string;
+    baseRev: number;
+    disposition: 'auto-applied' | 'question' | 'excluded';
+    reasonCode: string;
+    reason: string;
+  };
 }
 
 export interface MotionSpec {

@@ -2,8 +2,7 @@
 //
 // 方針(docs/HANDOFF.md §5/§6 準拠):
 // - ユーザーの実 daemon(port 7799, プロジェクト shibuya-final)には絶対に
-//   触れない。空きポート(OS 割当の一時ポート)+隔離 HOME(test/setup.ts と
-//   同じ「レジストリを実 ~/.cache/vedit/projects.json に汚さない」作法)+
+//   触れない。空きポート(OS 割当の一時ポート)+vedit 専用の隔離状態パス+
 //   隔離プロジェクトディレクトリを毎回新規に用意する。
 // - daemon は `serve` を直接 spawn して自前で所有する(detached にしない)。
 //   CLI コマンド(`vedit create`等)の ensureDaemon() は「未起動なら detached
@@ -36,13 +35,18 @@ export interface VeditFixture {
   port: number;
   baseURL: string;
   dir: string;
-  home: string;
+  stateDir: string;
   sourceId: string;
   projectName: string;
   cueA: CueFixture;
   cueB: CueFixture;
   env: NodeJS.ProcessEnv;
   daemon: ChildProcessWithoutNullStreams;
+}
+
+/** Identity precondition required by every write-method daemon API. */
+export function projectIdentityHeaders(projectDir: string): Record<string, string> {
+  return { 'x-vedit-project-dir': encodeURIComponent(path.resolve(projectDir)) };
 }
 
 /** An OS-assigned ephemeral TCP port — never 7799 (either the real daemon already holds it, so the OS won't hand it out, or we retry defensively). */
@@ -118,7 +122,7 @@ const SYNTHETIC_WORDS = [
 
 export async function setupVedit(label: string): Promise<VeditFixture> {
   const port = await findFreePort();
-  const home = mkdtempSync(path.join(tmpdir(), `vedit-e2e-home-${label}-`));
+  const stateDir = mkdtempSync(path.join(tmpdir(), `vedit-e2e-state-${label}-`));
   const workRoot = mkdtempSync(path.join(tmpdir(), `vedit-e2e-work-${label}-`));
   const projectName = `vedit-e2e-${label}`;
   const projectDir = path.join(workRoot, projectName);
@@ -126,7 +130,13 @@ export async function setupVedit(label: string): Promise<VeditFixture> {
   const mediaPath = path.join(workRoot, 'clip.mp4');
   genSyntheticClip(mediaPath, 6);
 
-  const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, VEDIT_PORT: String(port) };
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    VEDIT_REGISTRY_PATH: path.join(stateDir, 'registry', 'projects.json'),
+    VEDIT_PRESETS_PATH: path.join(stateDir, 'presets', 'presets.json'),
+    VEDIT_MODEL_DIR: path.join(stateDir, 'models'),
+    VEDIT_PORT: String(port),
+  };
   const baseURL = `http://localhost:${port}`;
 
   // Own the daemon process directly (not detached) so afterAll can kill it
@@ -182,7 +192,7 @@ export async function setupVedit(label: string): Promise<VeditFixture> {
     port,
     baseURL,
     dir: projectDir,
-    home,
+    stateDir,
     sourceId,
     projectName,
     // captionCues の計算(src/core/captions.ts flush 規則)を手計算した窓。
@@ -202,7 +212,7 @@ export async function teardownVedit(fx: VeditFixture): Promise<void> {
     setTimeout(resolve, 3000);
   });
   rmSync(path.dirname(fx.dir), { recursive: true, force: true });
-  rmSync(fx.home, { recursive: true, force: true });
+  rmSync(fx.stateDir, { recursive: true, force: true });
 }
 
 /** "0:08.4" 形式(web/app.js の fmt())を秒数へ。テストのタイムコード検証で使う。 */

@@ -73,6 +73,20 @@ describe('exportResults: appendExportResult / readExportResults round trip', () 
     expect(results.map((r) => r.file)).toEqual(['third.mp4', 'second.mp4', 'first.mp4']);
   });
 
+  it('does not lose records when 20 appends race concurrently', async () => {
+    const dir = freshDir();
+    const records = Array.from({ length: 20 }, (_, i) => rec({
+      file: `concurrent-${i}.mp4`,
+      revision: i,
+    }));
+
+    await Promise.all(records.map((record) => appendExportResult(dir, record)));
+
+    const results = await readExportResults(dir);
+    expect(results).toHaveLength(20);
+    expect(new Set(results.map((r) => r.file))).toEqual(new Set(records.map((r) => r.file)));
+  });
+
   it('records a failed export with ok=false and an error message', async () => {
     const dir = freshDir();
     const r = rec({ kind: 'render', file: 'out.mp4', ok: false, error: 'ffmpeg exited with code 1' });

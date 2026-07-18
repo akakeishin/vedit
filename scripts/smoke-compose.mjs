@@ -17,9 +17,8 @@
 //
 // Usage: node scripts/smoke-compose.mjs   (or: npm run smoke:compose)
 //
-// Runs entirely inside an isolated temp dir + temp HOME (never touches the
-// real ~/.cache/vedit/projects.json registry — same isolation convention as
-// test/setup.ts) and on a dedicated port, so it's safe to run alongside a
+// Runs entirely inside an isolated temp dir with vedit-specific state paths
+// and on a dedicated port, so it's safe to run alongside a
 // real `vedit serve` on the default port. Always tears down the daemon it
 // starts and removes its scratch dir, even on failure.
 
@@ -173,19 +172,23 @@ function frameStddev(pngPath) {
 
 async function main() {
   const scratch = await mkdtemp(path.join(tmpdir(), 'vedit-smoke-compose-'));
-  const fakeHome = path.join(scratch, 'home');
+  const stateDir = path.join(scratch, 'state');
   const projectDir = path.join(scratch, 'project');
   const kitDir = path.join(scratch, 'kit');
   const outFile = path.join(scratch, 'out.mp4');
   const framePng = path.join(scratch, 'frame.png');
-  await mkdir(fakeHome, { recursive: true });
+  await mkdir(stateDir, { recursive: true });
 
-  // Isolated HOME (never touch the real ~/.cache/vedit/projects.json — same
-  // convention as test/setup.ts) + a dedicated VEDIT_PORT every child
-  // process below (the `serve` daemon AND every one-shot `vedit` subprocess)
-  // inherits, so ensureDaemon()'s daemonUp() check in every subprocess talks
-  // to THIS daemon and never the developer's real one.
-  const env = { ...process.env, HOME: fakeHome, VEDIT_PORT: String(PORT) };
+  // Every child (the `serve` daemon and each one-shot CLI) inherits only
+  // app-specific scratch state plus a dedicated port. HOME remains the real
+  // process value, so unrelated tools and font discovery behave normally.
+  const env = {
+    ...process.env,
+    VEDIT_REGISTRY_PATH: path.join(stateDir, 'registry', 'projects.json'),
+    VEDIT_PRESETS_PATH: path.join(stateDir, 'presets', 'presets.json'),
+    VEDIT_MODEL_DIR: path.join(stateDir, 'models'),
+    VEDIT_PORT: String(PORT),
+  };
   delete env.VEDIT_PROJECT;
 
   let daemon = null;

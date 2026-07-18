@@ -32,6 +32,7 @@ export function detectSilences(t: Transcript, minGap = 0.7, pad = 0.12): CutCand
         wordIds: [],
         label: `${gap.toFixed(1)}s silence after "${w[i].text}"`,
         status: 'proposed',
+        evidence: { transcriptGap: true, waveform: false, transcriptConflict: false, edge: 'interior' },
       });
     }
   }
@@ -46,6 +47,7 @@ export function detectSilences(t: Transcript, minGap = 0.7, pad = 0.12): CutCand
       wordIds: [],
       label: `${w[0].t0.toFixed(1)}s leading silence`,
       status: 'proposed',
+      evidence: { transcriptGap: true, waveform: false, transcriptConflict: false, edge: 'leading' },
     });
   }
   return out;
@@ -271,6 +273,7 @@ export function detectSilencesFromPeaks(
       wordIds: [],
       label: `${(t1 - t0).toFixed(1)}s silence (waveform${conflict ? '; transcript disagrees — preview before approving' : ''})`,
       status: 'proposed',
+      evidence: { transcriptGap: false, waveform: true, transcriptConflict: conflict, edge: 'interior' },
     });
   };
 

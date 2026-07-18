@@ -87,7 +87,7 @@
      フォントへ切り替え。字幕プレビュー等コンテンツ側のフォント選択
      (#capFont, kit フォント)はこのトークンを参照しない別経路なので無影響。 */
   --font-jp: system-ui, -apple-system, 'Hiragino Kaku Gothic ProN', 'Hiragino Sans', sans-serif;
-  --font-mono: ui-monospace, 'SF Mono', Menlo, monospace;
+  --font-mono: var(--font-jp);
 
   /* type scale (README「デザイントークン」): 10/10.5/11/11.5/12/12.5(基準)/13/14/16 */
   --fs-2xs: 10px;
@@ -150,7 +150,7 @@
 .frameCorners .fc-bl { bottom: 10px; left: 10px; border-bottom: 1px solid; border-left: 1px solid; }
 .frameCorners .fc-br { bottom: 10px; right: 10px; border-bottom: 1px solid; border-right: 1px solid; }
 @media (prefers-reduced-motion: reduce) {
-  .mo-chapter-card, .mo-lower-third, .mo-callout, .mo-cta, .badge.tallyPulse, .loadRowIn { animation: none !important; }
+  .mo-chapter-card, .mo-lower-third, .mo-callout, .mo-cta, .badge.tallyPulse, .loadRowIn, .spin { animation: none !important; }
   /* N2 計器盤 §2: 呼吸(opacity 0.55→1.0 の周期アニメ)は止めるが、情報は
      欠けさせない — 「編集中」は消灯ではなく点灯固定(ブリーフ受け入れ基準3)。 */
   .claudeStatus.busy .claudeDot { animation: none !important; opacity: 1; }
@@ -160,14 +160,10 @@ body {
   background: var(--bg); color: var(--text);
   font: var(--fs-base)/1.55 var(--font-jp);
   display: flex; flex-direction: column;
-  /* Codex 最終ゲート P1: min-width より狭いウィンドウでは overflow:hidden
-     のせいで右端UI(書き出しボタン等)に絶対到達できなかった。縦方向の
-     ページスクロールは従来どおり抑止しつつ(内部パネルが各自 overflow-y:auto
-     を持つ)、横方向だけスクロール可能にする — position:fixed の
-     #toast/#dropOverlay/.ingestFlowCard はビューポート基準のままなので
-     この変更で位置がずれることはない。 */
-  overflow-x: auto; overflow-y: hidden;
-  min-width: 1360px;
+  /* 以前の min-width:1360px は右端への到達を守る代わりに、Cowork と
+     半画面で並べたときアプリ全体を横スクロールさせていた。右パネルを
+     狭幅シート化したため、ページ自体は再びビューポート内へ収める。 */
+  overflow: hidden;
 }
 
 /* =============================================================================
@@ -202,6 +198,14 @@ header {
 }
 .hdrCenter { flex: 1; display: flex; justify-content: center; min-width: 0; }
 .hdrRight { display: flex; align-items: center; gap: 10px; flex: none; }
+.historyControls { display: inline-flex; align-items: center; gap: 4px; }
+.historyBtn {
+  min-height: 30px; display: inline-flex; align-items: center; justify-content: center;
+  gap: 4px; padding: 3px 8px; background: transparent; color: var(--text-2);
+}
+.historyBtn:hover:not(:disabled) { color: var(--text); background: var(--card); }
+.historyGlyph { font-size: 16px; line-height: 1; }
+.historyBtnText { font-size: var(--fs-xs); }
 
 /* N2 計器盤 §2「タリーランプ」(README: bg#202024, border
    rgba(255,255,255,0.08), radius 999px, padding 4px 14px の外形は維持)。
@@ -217,7 +221,7 @@ header {
    design-wave-n2 ブリーフ参照)。 */
 .claudeStatus {
   display: flex; align-items: center; gap: 8px; padding: 4px 14px; border-radius: var(--radius-pill);
-  background: var(--card); border: 1px solid var(--border); max-width: 100%; cursor: default;
+  background: var(--card); border: 1px solid var(--border); max-width: 100%; cursor: pointer;
 }
 .claudeStatus .claudeDot {
   width: 8px; height: 8px; border-radius: 50%; flex: none;
@@ -315,11 +319,11 @@ dialog#shortcutsDialog td:first-child {
 /* =============================================================================
  * レイアウト本体: 左パネル 300px / 中央(プレビュー+タイムライン) / 右パネル 344px
  * ========================================================================== */
-main { flex: 1; display: flex; min-height: 0; }
+main { flex: 1; display: flex; min-width: 0; min-height: 0; overflow: hidden; }
 
 /* ---- 左パネル(素材 / 文字起こし) ---- */
 #leftPanel {
-  width: 300px; flex: none; border-right: 1px solid var(--border); background: var(--panel);
+  width: clamp(220px, 22vw, 300px); flex: none; border-right: 1px solid var(--border); background: var(--panel);
   display: flex; flex-direction: column; min-height: 0;
 }
 /* ---- 右パネル(Claude) ---- */
@@ -360,6 +364,22 @@ main { flex: 1; display: flex; min-height: 0; }
 
 /* ---- 素材パネル ---- */
 #leftPanel .panelbar button { font-size: var(--fs-xs); padding: 3px 9px; }
+.mediaSearchTools {
+  flex: none; display: grid; gap: 5px; padding: 9px 12px 8px;
+  border-bottom: 1px solid var(--border-soft); background: var(--panel);
+}
+.mediaSearchField { display: flex; align-items: stretch; gap: 6px; min-width: 0; }
+#mediaSearchInput {
+  flex: 1 1 auto; width: 100%; min-width: 0; min-height: 36px;
+  background: var(--card); color: var(--text); border: 1px solid var(--border-input);
+  border-radius: var(--radius); font: inherit; padding: 5px 8px;
+}
+#mediaSearchInput:hover { border-color: var(--border-hover); }
+#mediaSearchClear { min-height: 36px; padding-inline: 9px; font-size: var(--fs-xs); }
+.mediaSearchStatus {
+  min-height: 1.35em; color: var(--text-3); font-size: var(--fs-xs);
+  font-variant-numeric: tabular-nums;
+}
 .kitStatus {
   margin: 10px 12px 0; padding: 6px 10px; border-radius: var(--radius);
   background: var(--card); border: 1px solid var(--border);
@@ -400,7 +420,16 @@ main { flex: 1; display: flex; min-height: 0; }
    サムネ16:9、右下に時間チップ mono10px bg黒70%)。カード下: 名前11.5px 500 +
    メタ行10.5px #616167(警告時#d9a45f)。既存の mediaRow() が作る row/img/
    info/actions の DOM構造は無変更 — グリッド化とサムネ縦横比だけを CSS で。 */
-#mediaList { padding: 12px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; align-content: start; overflow-y: auto; }
+#mediaList {
+  padding: 12px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+  /* This list is also a flex child of .panel. With many cards, `auto` grid
+     tracks were allowed to shrink with that flex item until every card was
+     only a few pixels tall. Give the list the remaining panel height and
+     keep each implicit row at its content height; the list scrolls instead
+     of erasing names and controls. */
+  flex: 1 1 0; min-height: 0; grid-auto-rows: max-content;
+  align-content: start; overflow-y: auto;
+}
 /* W-POLISH Mid-9: 素材が0件のときの案内(README: 白16% dashed、radius8、
    padding28px 16px、gap6) — 以前は8pxパディングの一行ヒントだけだった。
    実装にファイル選択クリックは無いため「クリックして選択」は謳わない
@@ -412,6 +441,11 @@ main { flex: 1; display: flex; min-height: 0; }
 }
 .mediaEmptyHint .mediaEmptyLead { font-weight: 600; color: var(--text-2); font-size: var(--fs-base); }
 .mediaEmptyHint .mediaEmptyHintSub { font-size: var(--fs-sm); color: var(--text-3); }
+.mediaEmptyHint button { min-height: 40px; margin-top: 5px; }
+.mediaLoadMore {
+  grid-column: span 2; display: flex; justify-content: center; padding: 4px 0 8px;
+}
+.mediaLoadMore button { width: 100%; min-height: 40px; }
 .srcRow {
   grid-column: span 2; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding: 7px 9px; cursor: pointer;
   background: var(--card); border: 0; outline: 1px solid rgba(255, 255, 255, 0.07); border-radius: var(--radius);
@@ -475,12 +509,16 @@ main { flex: 1; display: flex; min-height: 0; }
 .srcActions button { padding: 2px 8px; font-size: var(--fs-xs); white-space: nowrap; }
 
 .sceneGrid {
-  grid-column: span 2; display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 6px;
+  grid-column: span 2; display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); gap: 6px;
   padding: 2px 2px 4px; margin-top: -4px;
 }
 .sceneItem {
   display: flex; flex-direction: column; gap: 4px; padding: 6px; border-radius: var(--radius);
   background: var(--card); border: 1px solid var(--border);
+}
+.sceneThumb {
+  display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: contain;
+  border-radius: calc(var(--radius) - 2px); background: var(--card-2);
 }
 .sceneItem:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
 .sceneItem.review-keep { border-color: var(--ok); box-shadow: 0 0 0 1px var(--ok); }
@@ -616,13 +654,17 @@ main { flex: 1; display: flex; min-height: 0; }
 .dialogueBubble.tail-right::after { left: 100%; top: 50%; margin-top: -8px; border-left-color: inherit; }
 
 #motionLayer { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+.motionCustomHtml {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  border: 0; background: transparent; pointer-events: none;
+}
 .mo-chapter-card {
   position: absolute; inset: 0; display: flex; flex-direction: column;
   align-items: center; justify-content: center; gap: 0.4em;
   background: linear-gradient(135deg, rgba(10,14,22,0.88), rgba(20,30,50,0.88));
   animation: moFade 0.5s ease both;
 }
-.mo-chapter-card h1 { color: #fff; font-size: clamp(22px, 5vw, 54px); letter-spacing: 0.06em; }
+.mo-chapter-card .motionTitle { color: #fff; font-size: clamp(22px, 5vw, 54px); letter-spacing: 0.06em; font-weight: 700; }
 .mo-chapter-card p { color: #9fb6d4; font-size: clamp(12px, 2vw, 20px); }
 .mo-chapter-card .bar { width: 3em; height: 3px; background: #4b9fff; }
 .mo-lower-third {
@@ -630,7 +672,7 @@ main { flex: 1; display: flex; min-height: 0; }
   padding: 0.4em 1em; border-left: 4px solid #4b9fff;
   background: rgba(8,10,14,0.78); animation: moSlide 0.4s ease both;
 }
-.mo-lower-third h1 { color: #fff; font-size: clamp(14px, 2.4vw, 26px); }
+.mo-lower-third .motionTitle { color: #fff; font-size: clamp(14px, 2.4vw, 26px); font-weight: 700; }
 .mo-lower-third p { color: #a9b4c2; font-size: clamp(11px, 1.6vw, 16px); }
 .mo-callout {
   position: absolute; top: 12%; right: 6%;
@@ -1011,7 +1053,7 @@ main { flex: 1; display: flex; min-height: 0; }
 /* =============================================================================
  * 右パネル(Claude): claude / clip / caption / export の4ビュー排他表示
  * ========================================================================== */
-#claudeView, #inspectorView, #captionView, #exportView { display: flex; flex-direction: column; min-height: 0; flex: 1; }
+#claudeView, #inspectorView, #captionView, #exportView, #settingsView { display: flex; flex-direction: column; min-height: 0; flex: 1; }
 
 /* ---- ヘッダー(README: アバター26px円 bg#2a2a2e border白10%「✳」+
    名前/サブライン+セグメント切替) ---- */
@@ -1265,7 +1307,7 @@ main { flex: 1; display: flex; min-height: 0; }
 .btn-activityShow { color: var(--link); }
 .btn-activityShow:hover { color: #aecbe9; }
 
-/* ---- フッター(README: 緑ドット+「Claude Cowork と接続中」+「Cowork を開く」) ---- */
+/* ---- フッター: daemon接続の正直な表示 + Cowork向け依頼文コピー ---- */
 .claudeFooter {
   flex: none; padding: 10px 14px; border-top: 1px solid var(--border); display: flex; align-items: center; gap: 8px;
 }
@@ -1337,11 +1379,39 @@ main { flex: 1; display: flex; min-height: 0; }
 .exportResultRow.fail { border-left-color: var(--danger); }
 .exportResultWarning { color: var(--pending); }
 .exportAskRow { display: flex; flex-direction: column; gap: 8px; padding-top: 4px; border-top: 1px solid var(--border-soft); }
+.exportJobCard { display: flex; flex-direction: column; gap: 7px; }
+.exportJobState {
+  display: flex; flex-direction: column; gap: 5px; padding: 10px;
+  border: 1px solid var(--border); border-radius: var(--radius); background: var(--card);
+}
+.exportJobState.running { border-left: 2px solid var(--pending); }
+.exportJobState.success { border-left: 2px solid var(--ok); }
+.exportJobState.error, .exportJobState.interrupted { border-left: 2px solid var(--danger); }
+.exportJobActions { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.exportJobPrimary { align-self: flex-start; background: var(--raised); color: var(--text); border-color: var(--border-hover); }
+.exportJobPath { overflow-wrap: anywhere; }
+
+.aiWorkSummary {
+  margin: 8px 10px 6px; padding: 9px 10px; display: flex; flex-direction: column; gap: 5px;
+  border: 1px solid var(--border-soft); border-left: 2px solid var(--paper-pressed);
+  border-radius: var(--radius-sm); background: var(--paper-card);
+}
+.aiWorkSummaryHead { display: flex; align-items: baseline; gap: 7px; font-size: var(--fs-xs); font-weight: 650; }
+.aiWorkSummaryMeta { color: var(--text-3); font-size: 10px; line-height: 1.45; }
+.aiWorkSummaryActions { display: flex; gap: 6px; align-items: center; }
+.candidateQuestionIntro { padding: 0 10px 4px; }
+.candReason { color: var(--text-3); font-size: 10px; line-height: 1.4; flex: 1 1 100%; }
+.showCandidateReason { margin-top: 10px; color: var(--pending); font-size: 11px; }
+.showCandidateTradeoff { margin-top: 6px; line-height: 1.5; }
 
 /* ---- W-UI IA v2 波2 §8: 「Cowork に頼む」チップ ---- */
 .askChip {
   display: inline-flex; align-items: center; gap: 4px; font-size: var(--fs-xs);
   color: var(--text-3); border-color: var(--wash); padding: 2px 8px; margin-top: 2px;
+}
+.kitStatus .askChip {
+  max-width: 100%; min-width: 0; flex-shrink: 1; white-space: normal;
+  overflow-wrap: anywhere; text-align: left; line-height: 1.45;
 }
 .askChip:hover { color: var(--text); border-color: var(--text-dim); }
 .askChip::before { content: '💬'; font-size: 10px; }
@@ -1444,7 +1514,7 @@ dialog#shortcutsDialog .hintText { display: block; margin-bottom: 14px; font-siz
    ぶんだけ常に机の縁が見える、既知の意図的差分。最終報告に明記)。 ---- */
 #rightPanel { background: var(--bg); padding: 16px 16px 18px; }
 
-#claudeView, #inspectorView, #captionView, #exportView {
+#claudeView, #inspectorView, #captionView, #exportView, #settingsView {
   /* ---- 紙面トークンの上書き ---- */
   --bg: var(--paper-bg);
   --panel: var(--paper-bg);
@@ -1519,3 +1589,262 @@ dialog#shortcutsDialog .hintText { display: block; margin-bottom: 14px; font-siz
 }
 /* 固定の淡い青 hover(部屋の --link 由来)は紙面に合わないため中立化。 */
 #claudeView .btn-activityShow:hover { color: var(--text); }
+
+/* =============================================================================
+ * UI rethink phase 2: one surface, one job
+ * ========================================================================== */
+
+/* 数字は桁幅だけを揃え、UI全体の書体はシステムゴシックへ統一する。 */
+.mono, .hdrTc, #tc, #rangeInfo, #minGapVal,
+.cand .dur, .cand .candTime, .srcDurChip, .srcUsageLabel, .btn-sceneSeek,
+.frameLabel, dialog#shortcutsDialog td:first-child, .rulerTick,
+.activityRev, .inspMeta {
+  font-family: var(--font-jp);
+  font-variant-numeric: tabular-nums;
+}
+
+/* プレビューよりタイムラインへ高さを譲る。 */
+#videoWrap { flex: 0.82 1 0; padding-top: 12px; }
+#stage { min-width: 360px; }
+.stagePlate, .tlPlate { display: none; }
+.tlToolbar { height: 34px; }
+
+/* ズーム面。ガターは固定し、時間面だけが横スクロールする。 */
+#timeline {
+  --cand-shift: 0px;
+  height: 260px;
+  overflow: hidden;
+  margin-bottom: 4px;
+}
+#timeline.has-candidates { --cand-shift: 32px; height: 292px; }
+#timeline.tl-extra { height: 328px; }
+#timeline.tl-extra.has-candidates { height: 360px; }
+#timelineViewport {
+  position: absolute; left: 96px; right: 0; top: 0; bottom: 0;
+  overflow-x: auto; overflow-y: hidden; scrollbar-color: var(--border-hover) var(--surface-sunk);
+}
+#timeRuler {
+  left: 0; right: auto; top: 0; height: 24px; min-width: 100%;
+}
+#trackGutter { left: 0; top: 24px; width: 96px; z-index: 3; }
+#timelineTracks {
+  left: 0; right: auto; top: 24px; bottom: auto; min-width: 100%; height: calc(100% - 24px);
+  outline: none;
+}
+#timelineTracks:focus-visible { box-shadow: inset 0 0 0 2px var(--link); }
+.rulerTick { color: var(--text-2); }
+.gutterLabel { color: var(--text-3); }
+
+/* 候補レーンは保留があるときだけ timeline.has-candidates と共に現れる。 */
+#candLane { position: absolute; left: 0; right: 0; top: 3px; height: 26px; display: none; }
+#timeline.has-candidates #candLane { display: block; }
+.candMarker {
+  position: absolute; top: 2px; min-width: 5px; height: 20px; padding: 0;
+  border: 0; border-left: 3px solid var(--pending); border-radius: 2px;
+  background: color-mix(in srgb, var(--pending) 25%, transparent); cursor: pointer;
+}
+.candMarker.filler { background: transparent; border: 1px dashed var(--pending); }
+.candMarker:hover, .candMarker.hot, .candMarker:focus-visible {
+  background: color-mix(in srgb, var(--pending) 48%, transparent);
+  outline: 1px solid var(--pending); outline-offset: 1px;
+}
+
+/* 主トラックの高さを上げ、文字とサムネイルを判断できる密度にする。 */
+#overlayRow { top: calc(4px + var(--cand-shift)); height: 26px; }
+#clips, #sceneMarks, #intentZoneRow { top: calc(36px + var(--cand-shift)); height: 74px; }
+#dropIndicator { top: calc(36px + var(--cand-shift)); height: 74px; }
+.clipThumb { filter: brightness(1.18) saturate(1.04); }
+#captionRow { top: calc(116px + var(--cand-shift)); height: 34px; }
+.capRowBlock { line-height: 34px; font-size: 11px; }
+#motionRow { top: calc(156px + var(--cand-shift)); height: 24px; }
+.moBlock { line-height: 24px; }
+#musicRow { top: calc(186px + var(--cand-shift)); height: 30px; }
+.muBlock { line-height: 30px; }
+#spriteRow { top: calc(224px + var(--cand-shift)); height: 20px; }
+#bgRow { top: calc(248px + var(--cand-shift)); height: 20px; }
+#dialogueRow { top: calc(272px + var(--cand-shift)); height: 20px; }
+
+/* 右の紙は「決める」と「記録」の二層。 */
+#rightPanel { position: relative; padding: 10px; min-width: 300px; }
+#rightPanelClose, #leftPanelToggle, #leftPanelClose { display: none; }
+#claudeView { overflow: hidden; }
+.claudeHeader { min-height: 48px; }
+#decideZone {
+  flex: 2.2 1 0; min-height: 260px; display: flex; flex-direction: column;
+  border-bottom: 1px solid var(--border);
+}
+#nowPanel { display: flex; flex: 1; min-height: 0; overflow-y: auto; }
+#recordZone { flex: 0.4 1 0; min-height: 130px; overflow-y: auto; }
+.recordHeader {
+  position: sticky; top: 0; z-index: 2; display: flex; align-items: baseline; gap: 8px;
+  padding: 9px 14px 6px; background: var(--paper-bg); border-bottom: 1px solid var(--border-soft);
+  color: var(--text); font-weight: 600; font-size: var(--fs-xs); letter-spacing: .04em;
+}
+#historyDetails { border-top: 1px solid var(--border-soft); }
+#historyDetails > summary { cursor: pointer; padding: 8px 14px; color: var(--text-3); font-size: var(--fs-xs); }
+#activityFeed { padding-top: 2px; }
+.queueNewSummary { color: var(--text-3); font-size: 10px; white-space: nowrap; }
+.decisionBar {
+  flex: none; min-height: 46px; padding: 8px 10px; display: flex; align-items: center; gap: 6px;
+  background: var(--paper-card); border-top: 1px solid var(--border); font-size: var(--fs-xs);
+  box-shadow: 0 -5px 14px rgba(63, 58, 51, .08);
+}
+.decisionBar .btn-approve { background: var(--paper-pressed); color: var(--paper-bg); border-color: var(--paper-pressed); }
+.decisionBar button { white-space: nowrap; padding: 4px 8px; }
+.pendingTally {
+  border: 0; background: none; color: var(--pending); padding: 2px 0;
+  font-size: 10px; white-space: nowrap; text-decoration: underline; text-underline-offset: 2px;
+}
+
+/* 16件を走査できる一行キュー。詳細とアクションは選んだ一件だけ展開する。 */
+#inboxList { gap: 2px; padding: 2px 10px 6px; }
+.cand {
+  min-height: 27px; display: grid; grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center; gap: 7px; padding: 2px 8px 2px 10px; border-radius: var(--radius-sm);
+}
+.cand .kind {
+  display: inline-flex; font-size: 9px; color: var(--text-3); white-space: nowrap;
+  min-width: 42px;
+}
+.candTop { display: contents; }
+.cand .lbl { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 11px; line-height: 1.35; }
+.cand .dur { font-size: 10px; }
+.candBottom { display: none; grid-column: 1 / -1; padding: 4px 0 2px 48px; }
+.cand.expanded { align-items: start; background: var(--paper-card); outline-color: var(--border-hover); }
+.cand.expanded .candBottom { display: flex; }
+.cand.hot { outline: 2px solid var(--pending); outline-offset: -1px; }
+.cand::after, .cand.candNew::after { display: none; }
+.candGroupHeader, .btn-applyAllCandidates { display: none; }
+
+/* 文字起こし上の即決チップ。単語の pointerdown 経路とは別要素なので
+   既存のその場クリック・選択を再構築しない。 */
+.transcriptDecision {
+  display: inline-flex; align-items: center; gap: 4px; margin: 0 4px; padding: 1px 6px;
+  border: 1px solid var(--pending); border-radius: var(--radius-pill); background: rgba(217, 164, 95, .1);
+  color: var(--pending); font-size: 10px; line-height: 1.7; vertical-align: baseline;
+}
+.transcriptDecision:hover { background: rgba(217, 164, 95, .2); }
+
+/* 設定は棚から分離した同じ紙のドリルイン。 */
+.settingsBody { gap: 8px; }
+.settingsSection { display: flex; flex-direction: column; gap: 7px; }
+.settingsSection .inboxHeading { padding-left: 0; }
+.settingsBody .kitStatus, .settingsBody .audioPanel { margin: 4px 0 0; }
+.settingsBody .reframeCtl { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.exportResultCard > .inboxWarn { flex-direction: column; align-items: stretch; }
+.exportResultCard > .inboxWarn::before { align-self: flex-start; }
+.exportResultCard > .inboxWarn > * { width: 100%; }
+
+/* 960〜1259px: 紙はヘッダータリーから開くオーバーレイシートになる。 */
+@media (max-width: 1259px) {
+  header { flex-wrap: nowrap; }
+  #stat { display: none; }
+  #leftPanel { width: clamp(210px, 26vw, 260px); }
+  #paneDivider { display: none; }
+  #rightPanel {
+    position: fixed; z-index: 24; top: var(--app-header-height, 46px); right: 0; bottom: 0;
+    width: min(390px, calc(100vw - 40px)); max-width: none; min-width: 0;
+    transform: translateX(105%); transition: transform .18s ease; padding: 8px;
+    padding-bottom: calc(8px + env(safe-area-inset-bottom));
+    box-shadow: -18px 0 40px rgba(0,0,0,.5);
+  }
+  #rightPanel.sheetOpen { transform: translateX(0); }
+  #rightPanelClose {
+    display: block; position: absolute; z-index: 4; right: 12px; top: 12px;
+    width: 44px; height: 44px; padding: 0; border-radius: 50%; background: var(--paper-bg);
+    color: var(--paper-ink); border-color: var(--paper-weak); font-size: 18px; line-height: 1;
+  }
+  .claudeHeader, .rightViewHeader { padding-right: 58px; }
+  #videoWrap { padding-left: 14px; padding-right: 14px; }
+  #transport { padding-left: 14px; padding-right: 14px; }
+}
+
+@media (max-width: 1020px) {
+  header { gap: 8px; padding-left: 8px; padding-right: 8px; }
+  .hdrAppName, .hdrSep, .hdrRevLabel { display: none; }
+  .hdrCenter { justify-content: flex-end; }
+  .claudeStatus { padding: 4px 9px; }
+  .historyBtn { width: 30px; padding-left: 0; padding-right: 0; }
+  .historyBtnText { display: none; }
+  #leftPanel { width: 210px; }
+  #stage { min-width: 0; }
+  #prevRevHoldBtn, #frameLabel { display: none; }
+  #transport { gap: 8px; }
+  .tcMain { padding-left: 8px; padding-right: 8px; }
+}
+
+/* Phone: editing stays the primary canvas. The material/transcript surface
+   becomes a deliberate drawer instead of permanently consuming 210px. */
+@media (max-width: 700px) {
+  header {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(120px, auto);
+    grid-template-areas: "identity ai" "actions actions";
+    gap: 6px 8px;
+    padding: calc(6px + env(safe-area-inset-top)) max(8px, env(safe-area-inset-right)) 6px max(8px, env(safe-area-inset-left));
+  }
+  .hdrIdentity { grid-area: identity; min-width: 0; }
+  .hdrIdentity #projName { max-width: 120px; }
+  .hdrCenter { grid-area: ai; min-width: 0; justify-content: stretch; }
+  .claudeStatus { width: 100%; min-height: 44px; justify-content: center; }
+  .hdrRight { grid-area: actions; width: 100%; gap: 4px; justify-content: flex-end; }
+  .hdrRight button { min-height: 44px; }
+  .historyControls { gap: 2px; }
+  .historyBtn { width: 36px; }
+  #conn { display: none; }
+  #leftPanelToggle { display: inline-flex; align-items: center; justify-content: center; }
+  #shortcutsBtn.btnIcon { width: 44px; height: 44px; }
+  #exportBtn { padding-left: 12px; padding-right: 12px; }
+
+  #leftPanel {
+    position: fixed; z-index: 24; top: var(--app-header-height, 98px); left: 0; bottom: 0;
+    width: min(360px, calc(100vw - 24px)); max-width: none;
+    transform: translateX(-105%); transition: transform .18s ease;
+    padding-bottom: env(safe-area-inset-bottom);
+    box-shadow: 18px 0 40px rgba(0,0,0,.5);
+  }
+  #leftPanel.drawerOpen { transform: translateX(0); }
+  #leftPanelClose {
+    display: block; position: absolute; z-index: 4; right: 6px; top: 2px;
+    width: 44px; height: 44px; padding: 0; border-radius: 50%;
+    background: var(--card); color: var(--text); border-color: var(--text-3);
+    font-size: 18px; line-height: 1;
+  }
+  .leftTabs { padding-right: 56px; min-height: 48px; }
+  #stage { flex: 1 1 100%; width: 100%; min-width: 0; }
+  #videoWrap { padding-left: 10px; padding-right: 10px; }
+  #transport { padding-left: 10px; padding-right: 10px; }
+  .tlToolbar { min-width: 0; padding-left: 8px; padding-right: 8px; }
+  #tlZoomRange { width: min(110px, 34vw); }
+
+  /* Preserve track identity while giving 32px back to the editable time
+     surface. The time plane remains independently horizontally scrollable. */
+  #timelineViewport { left: 64px; }
+  #trackGutter { width: 64px; }
+  .gutterLabel { gap: 3px; padding: 0 4px; font-size: 9px; }
+
+  input:not([type="range"]):not([type="checkbox"]), select, textarea,
+  [contenteditable="true"] { font-size: 16px; }
+  #mediaSearchInput, #mediaSearchClear, .mediaEmptyHint button, .mediaLoadMore button { min-height: 44px; }
+  .reframeCtl select { font-size: 16px; }
+}
+
+/* The phone media drawer is genuinely modal and receives this scrim. The
+   narrow right decision sheet is modeless so timeline markers and the paper
+   queue remain interoperable. Pointer input for a modal drawer is blocked by
+   the native inert attribute as well. */
+body.hasPanelOverlay::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 23;
+  background: rgba(0, 0, 0, .55);
+}
+/* Responsive drawers begin below the app bar. Keep global navigation above
+   the scrim so it can switch or close the drawer. */
+body.hasPanelOverlay header { position: relative; z-index: 25; }
+body.hasPanelOverlay #toast { z-index: 26; }
+
+@media (prefers-reduced-motion: reduce) {
+  #rightPanel, #leftPanel { transition: none; }
+}

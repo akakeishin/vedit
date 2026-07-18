@@ -13,6 +13,8 @@ vi.mock('./run.js', () => ({
 }));
 
 import {
+  buildPlanSettled,
+  canResumeSkip,
   copyAndVerify,
   copyPlain,
   createJournal,
@@ -22,6 +24,7 @@ import {
   listVideoFiles,
   probeForPlan,
   readJournal,
+  reusableVerifiedCopy,
   runPool,
   sortByCreationTime,
   VIDEO_EXTENSIONS,
@@ -63,10 +66,13 @@ describe('listVideoFiles', () => {
     await fs.writeFile(path.join(root, '.hiddenDir', 'c.mp4'), 'c');
     await fs.mkdir(path.join(root, 'sub'));
     await fs.writeFile(path.join(root, 'sub', 'd.m4v'), 'd');
+    await fs.writeFile(path.join(root, 'stock.webm'), 'e');
+    await fs.writeFile(path.join(root, 'archive.OGV'), 'f');
+    await fs.writeFile(path.join(root, 'camera.MTS'), 'g');
 
     const files = await listVideoFiles([root]);
     const names = files.map((f) => path.basename(f)).sort();
-    expect(names).toEqual(['a.mp4', 'b.MOV', 'd.m4v']);
+    expect(names).toEqual(['a.mp4', 'archive.OGV', 'b.MOV', 'camera.MTS', 'd.m4v', 'stock.webm']);
   });
 
   it('treats multiple positional args as an explicit file list (no extension filtering)', async () => {
@@ -85,9 +91,9 @@ describe('listVideoFiles', () => {
   });
 
   it('exposes the recognized extension set', () => {
-    expect(VIDEO_EXTENSIONS.has('.mp4')).toBe(true);
-    expect(VIDEO_EXTENSIONS.has('.mov')).toBe(true);
-    expect(VIDEO_EXTENSIONS.has('.m4v')).toBe(true);
+    expect([...VIDEO_EXTENSIONS].sort()).toEqual([
+      '.avi', '.m2ts', '.m4v', '.mkv', '.mov', '.mp4', '.mpeg', '.mpg', '.mts', '.ogv', '.webm',
+    ]);
   });
 });
 
@@ -177,6 +183,33 @@ describe('probeForPlan', () => {
   });
 });
 
+describe('buildPlanSettled', () => {
+  it('isolates a corrupt file and still returns usable peers with a probe-stage failure', async () => {
+    runMock.mockReset();
+    const root = tmpDir('vedit-batch-plan-settled-');
+    const goodA = path.join(root, 'good-a.mp4');
+    const corrupt = path.join(root, 'corrupt.mp4');
+    const goodB = path.join(root, 'good-b.mp4');
+    await Promise.all([
+      fs.writeFile(goodA, 'a'),
+      fs.writeFile(corrupt, 'not-a-container'),
+      fs.writeFile(goodB, 'b'),
+    ]);
+    runMock.mockImplementation(async (_cmd: string, args: string[]) => {
+      if (args.at(-1) === corrupt) throw new Error('ffprobe: invalid data found');
+      return ffprobeJson();
+    });
+
+    const plan = await buildPlanSettled([goodA, corrupt, goodB]);
+
+    expect(plan.entries.map((entry) => entry.file)).toEqual([goodA, goodB]);
+    expect(plan.fileCount).toBe(2);
+    expect(plan.failures).toEqual([
+      { file: corrupt, stage: 'probe', error: 'ffprobe: invalid data found' },
+    ]);
+  });
+});
+
 describe('sortByCreationTime', () => {
   it('orders by format.tags.creation_time ascending, falling back to mtime when absent', async () => {
     const entries = [
@@ -250,6 +283,29 @@ describe('journal (read/write + resume)', () => {
     expect(ingested.has('/b.mp4')).toBe(false); // failed entries are NOT skipped — they're retried
   });
 
+  it('resume skips only the exact bytes recorded as ingested, not a reused path with changed content', async () => {
+    const dir = tmpDir('vedit-batch-resume-bytes-');
+    const file = path.join(dir, 'clip.mp4');
+    await fs.writeFile(file, 'first payload');
+    const firstHash = await sha256File(file);
+    const entry: IngestJournalEntry = { file, sha256: firstHash, status: 'ingested', at: 't1' };
+
+    expect(canResumeSkip(entry, await sha256File(file))).toBe(true);
+    await fs.writeFile(file, 'replacement payload at the same path');
+    expect(canResumeSkip(entry, await sha256File(file))).toBe(false);
+    expect(canResumeSkip(entry, undefined)).toBe(false); // --no-verify cannot make a path-only skip
+    expect(canResumeSkip({ ...entry, sha256: undefined }, firstHash)).toBe(false); // legacy journal entry
+  });
+
+  it('persists the failing pipeline stage for actionable retries', async () => {
+    const dir = tmpDir('vedit-batch-journal-stage-');
+    const journal = createJournal(dir, []);
+    await journal.record({ file: '/bad.mp4', status: 'failed', stage: 'probe', error: 'invalid container', at: 't1' });
+    expect(await readJournal(dir)).toEqual([
+      { file: '/bad.mp4', status: 'failed', stage: 'probe', error: 'invalid container', at: 't1' },
+    ]);
+  });
+
   it('journalPath is <project>/ingest-journal.json', () => {
     expect(journalPath('/proj')).toBe(path.join('/proj', 'ingest-journal.json'));
   });
@@ -285,6 +341,66 @@ describe('copy mode', () => {
     expect(await fs.readFile(dest, 'utf8')).toBe('payload');
   });
 
+  it('reuses an earlier verified copy after ingest failed instead of making numbered duplicate copies', async () => {
+    const srcDir = tmpDir('vedit-batch-reuse-src-');
+    const destDir = path.join(tmpDir('vedit-batch-reuse-dest-'), 'dest');
+    const src = path.join(srcDir, 'clip.mp4');
+    await fs.writeFile(src, 'same verified payload');
+    const hash = await sha256File(src);
+    const dest = await copyAndVerify(src, destDir, hash);
+    const entry: IngestJournalEntry = {
+      file: src,
+      sha256: hash,
+      status: 'failed',
+      stage: 'ingest',
+      destPath: dest,
+      error: 'daemon stopped after copy',
+      at: 't1',
+    };
+
+    await expect(reusableVerifiedCopy(entry, destDir, hash)).resolves.toBe(dest);
+    expect(await fs.readdir(destDir)).toEqual(['clip.mp4']);
+  });
+
+  it('never reuses an outside, symlinked, changed, or unverifiable journal destination', async () => {
+    const root = tmpDir('vedit-batch-reuse-reject-');
+    const destDir = path.join(root, 'dest');
+    const outside = path.join(root, 'outside.mp4');
+    await fs.mkdir(destDir);
+    await fs.writeFile(outside, 'payload');
+    const hash = await sha256File(outside);
+    const base: IngestJournalEntry = {
+      file: '/original/clip.mp4', sha256: hash, status: 'failed', stage: 'ingest', destPath: outside, at: 't1',
+    };
+    await expect(reusableVerifiedCopy(base, destDir, hash)).resolves.toBeNull();
+
+    const symlink = path.join(destDir, 'link.mp4');
+    await fs.symlink(outside, symlink);
+    await expect(reusableVerifiedCopy({ ...base, destPath: symlink }, destDir, hash)).resolves.toBeNull();
+
+    const inside = path.join(destDir, 'clip.mp4');
+    await fs.writeFile(inside, 'changed payload');
+    await expect(reusableVerifiedCopy({ ...base, destPath: inside }, destDir, hash)).resolves.toBeNull();
+    await expect(reusableVerifiedCopy({ ...base, destPath: inside }, destDir, undefined)).resolves.toBeNull();
+  });
+
+  it('atomically reserves distinct destinations for concurrent same-basename copies', async () => {
+    const destDir = path.join(tmpDir('vedit-batch-copy-race-dest-'), 'dest');
+    const payloads = Array.from({ length: 12 }, (_, i) => `distinct-payload-${i}`);
+    const sources = await Promise.all(payloads.map(async (payload, i) => {
+      const sourceDir = tmpDir(`vedit-batch-copy-race-src-${i}-`);
+      const source = path.join(sourceDir, 'clip.mp4');
+      await fs.writeFile(source, payload);
+      return source;
+    }));
+
+    const destinations = await Promise.all(sources.map((source) => copyPlain(source, destDir)));
+
+    expect(new Set(destinations).size).toBe(payloads.length);
+    const copiedPayloads = await Promise.all(destinations.map((dest) => fs.readFile(dest, 'utf8')));
+    expect(copiedPayloads.sort()).toEqual([...payloads].sort());
+  });
+
   it('copyAndVerify throws and removes the bad copy when the expected hash does not match (simulated corruption)', async () => {
     const srcDir = tmpDir('vedit-batch-verify-bad-src-');
     const destDir = path.join(tmpDir('vedit-batch-verify-bad-dest-'), 'dest');
@@ -316,5 +432,24 @@ describe('runPool', () => {
       seen.push(item);
     });
     expect(seen.sort()).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it('isolates a rejected worker, continues remaining items, and waits for slow peers to settle', async () => {
+    const seen: number[] = [];
+    let slowPeerSettled = false;
+    const failures = await runPool([0, 1, 2, 3], 2, async (item) => {
+      seen.push(item);
+      if (item === 0) throw new Error('one file failed');
+      if (item === 1) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        slowPeerSettled = true;
+      }
+    });
+
+    expect(seen.sort()).toEqual([0, 1, 2, 3]);
+    expect(slowPeerSettled).toBe(true);
+    expect(failures).toHaveLength(1);
+    expect(failures[0].item).toBe(0);
+    expect((failures[0].error as Error).message).toBe('one file failed');
   });
 });

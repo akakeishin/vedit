@@ -1,9 +1,12 @@
 import http from 'node:http';
-import { promises as fs, createReadStream, createWriteStream, statSync } from 'node:fs';
+import { promises as fs } from 'node:fs';
+import type { Stats } from 'node:fs';
+import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
+import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
-import { Project, resolveWithinDir } from '../core/project.js';
+import { Project, resolveWithinDir, type ProjectRenderInputs } from '../core/project.js';
 import {
   addClip,
   addDialogue,
@@ -66,47 +69,174 @@ import { upsertProject } from '../core/registry.js';
 import { captionCues } from '../core/captions.js';
 import { detectFillers, detectSilences, detectSilencesFromPeaks } from '../core/detect.js';
 import type { Peaks } from '../core/detect.js';
+import { planAutonomousCandidateBatch, type AutonomousCandidatePlan } from '../core/autonomy.js';
 import { packTranscript } from '../core/pack.js';
 import { detectScenesForSource, packScenes, sceneThumbPath } from '../core/scenes.js';
 import { detectTakes, type TakeGroup } from '../core/takes.js';
 import { staticChecks } from '../export/qc.js';
 import { ingestFile, makeProxy, probeAudio, transcribe } from '../ingest/ingest.js';
 import { run } from '../ingest/run.js';
-import type { BackgroundRef, CaptionSettings, CutCandidate, KitAsset, KitProfile, Manifest, MotionItem, MusicItem, RevisionEntry, SceneFile, Transcript } from '../core/types.js';
+import { isAgentActor, isRevisionActor } from '../core/types.js';
+import type { BackgroundRef, CaptionSettings, CutCandidate, KitAsset, KitProfile, Manifest, MotionItem, MusicItem, RevisionActor, RevisionEntry, SceneFile, Transcript } from '../core/types.js';
 import { freshId } from '../core/ops.js';
 import { applyKitDefaults, readKitFile, recognizedKitSections } from '../core/kit.js';
 import { listSystemFonts, scanKitFonts } from '../core/fonts.js';
 import { locateMedia, type MediaFingerprint } from '../ingest/locate.js';
 import { readExportResults } from '../core/exportResults.js';
+import {
+  claimExportJob,
+  ExportJobConflictError,
+  exportJobPartialPath,
+  readExportJob,
+  recoverInterruptedExportJob,
+  writeOwnedExportJob,
+  type ExportJobState,
+} from '../core/exportJob.js';
+import { renderProjectMp4 } from '../export/projectRender.js';
 import { readNotes } from '../core/notes.js';
 
 const WEB_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'web');
+
+type TranscribeJobStatus = 'queued' | 'running' | 'cancelling' | 'success' | 'error' | 'cancelled';
+
+interface TranscribeJobState {
+  taskId: string;
+  projectDir: string;
+  sourceId: string;
+  status: TranscribeJobStatus;
+  phase: 'queued' | 'transcribing' | 'committing' | 'finished';
+  startedAt: string;
+  /** Monotonic snapshot ordering across HTTP responses and WS events. */
+  updatedAt: string;
+  finishedAt?: string;
+  error?: string;
+}
+
+interface TranscribeJob extends TranscribeJobState {
+  project: Project;
+  controller: AbortController;
+  completion: Promise<void> | null;
+  /** Once commitTranscript starts, cancellation is too late to promise. */
+  commitStarted: boolean;
+}
+
+interface TranscribeWaiter {
+  job: TranscribeJob;
+  resolve: (release: () => void) => void;
+  reject: (error: Error) => void;
+  onAbort: () => void;
+}
+
+type MediaJobKind = 'ingest' | 'scenes';
+type MediaJobStatus = 'running' | 'cancelling' | 'success' | 'error' | 'cancelled';
+
+interface MediaJobState {
+  taskId: string;
+  projectDir: string;
+  kind: MediaJobKind;
+  status: MediaJobStatus;
+  phase: string;
+  startedAt: string;
+  finishedAt?: string;
+  error?: string;
+  file?: string;
+  sourceIds?: string[];
+}
+
+interface MediaJob extends MediaJobState {
+  project: Project;
+  controller: AbortController;
+  completion: Promise<void> | null;
+  /** Once a manifest/scene sidecar publication starts, cancellation is too late. */
+  commitStarted: boolean;
+}
+
+interface UploadLease {
+  token: string;
+  projectDir: string;
+  path: string;
+  dev: number;
+  ino: number;
+  size: number;
+}
 
 interface Ctx {
   project: Project | null;
   clients: Set<WebSocket>;
   /**
-   * sourceIds with an in-flight `vedit transcribe` background job (W-LAZY:
-   * POST /api/transcribe). A plain in-process Set is enough — the daemon is
-   * the sole writer/process, same rationale as Project's own `withLock`.
-   * Used both to reject a duplicate transcribe request for the same source
-   * (see POST /api/transcribe below) and to surface a "processing" state
-   * per source from /api/state (see stateSummary's `transcribing` field).
+   * Last transcription job per (resolved project directory, sourceId).
+   * Keeping the terminal state makes completion/failure/cancellation
+   * inspectable, while the project-scoped key prevents common source ids
+   * such as `s1` from colliding after /api/open or in a fork.
    */
-  transcribeJobs: Set<string>;
+  transcribeJobs: Map<string, TranscribeJob>;
+  /** whisper uses nearly all CPU threads itself; run one decoder at a time. */
+  transcribeRunning: number;
+  transcribeWaiters: TranscribeWaiter[];
+  /** Last terminal + all active ingest/scene work, scoped by project+task id. */
+  mediaJobs: Map<string, MediaJob>;
   /**
-   * sourceId -> detectTakes(transcript) result, memoized. detectTakes (W11)
+   * project+sourceId -> detectTakes(transcript) result, memoized. detectTakes (W11)
    * assigns each TakeGroup a freshId() — regenerated (and therefore
    * DIFFERENT) on every call — so re-running it inside a second request
    * (e.g. POST /api/show's kind='takes' validating a groupId a client just
    * got from GET /api/takes moments earlier) would never find a matching
-   * id. Caching per sourceId gives every route within one daemon lifetime a
-   * stable, comparable id for the same transcript. Cleared on /api/open
-   * (see below) so a project switch can't serve another project's cached
-   * groups under a colliding sourceId.
+   * id. Project-scoped caching gives every route within one daemon lifetime
+   * a stable, comparable id for the same transcript without letting a
+   * colliding sourceId in another project share or invalidate that value.
    */
   takesCache: Map<string, TakeGroup[]>;
+  /** One daemon-owned local MP4 render at a time. Captures its Project so a
+   * concurrent /api/open can never redirect output into another project. */
+  activeExport: {
+    project: Project;
+    state: ExportJobState;
+    partialPath: string;
+    controller: AbortController;
+    /** True once the atomic partial->final rename has committed. */
+    finalCommitted: boolean;
+    /** Settles after terminal state persistence and partial cleanup. */
+    completion: Promise<void> | null;
+    /** A non-lease disk failure left newer in-memory truth to repair. */
+    durableStatePending: boolean;
+  } | null;
+  /** Synchronous reservation covering async export preparation. */
+  exportStarting: boolean;
+  /** Reject new mutations once daemon.close()/SIGINT begins. */
+  closing: boolean;
+  /** Serialize candidate detection per project so candidates.json and its
+   * durable completion marker always describe the same completed run. */
+  detectTails: Map<string, Promise<void>>;
+  /**
+   * Files created exclusively by POST /api/upload and not yet consumed by a
+   * successful ingest.  The inode receipt is what lets a failed ingest
+   * remove only the daemon-created copy, never a pre-existing or replacement
+   * user file that happens to occupy the same pathname later.
+   */
+  uploadLeases: Map<string, UploadLease>;
 }
+
+interface DetectRunRecord {
+  version: 1;
+  completedAt: string;
+  revision: number;
+  proposalCount: number;
+  excludedByIntentZones: number;
+  parameters: {
+    silence: boolean;
+    fillers: boolean;
+    minGap: number;
+    threshold?: number;
+  };
+}
+
+interface DetectRunState extends DetectRunRecord {
+  stale: boolean;
+  staleReason?: 'revision-changed';
+}
+
+const DETECT_RUN_FILENAME = 'detect-run.json';
+const MAX_CONCURRENT_TRANSCRIBES = 1;
 
 async function allTranscripts(p: Project): Promise<Transcript[]> {
   const m = await p.manifest();
@@ -139,7 +269,203 @@ function fragmentAbsorptionNote(fragments: AbsorbedFragment[] | undefined): stri
   return ` (${totalSeconds.toFixed(1)}秒の断片を${fragments.length}件吸収)`;
 }
 
+function stampAutonomyReview(
+  plan: AutonomousCandidatePlan,
+  baseRev: number,
+  reviewId: string,
+  evaluatedAt: string,
+): void {
+  const stamp = (
+    item: AutonomousCandidatePlan['autoApply'][number],
+    disposition: NonNullable<CutCandidate['aiReview']>['disposition'],
+  ) => {
+    item.candidate.aiReview = {
+      reviewId,
+      evaluatedAt,
+      baseRev,
+      disposition,
+      reasonCode: item.reasonCode,
+      reason: item.reason,
+    };
+  };
+  for (const item of plan.autoApply) stamp(item, 'auto-applied');
+  for (const item of plan.needsDecision) stamp(item, 'question');
+  for (const item of plan.excluded) stamp(item, 'excluded');
+}
+
+function isActionableCandidate(candidate: CutCandidate): boolean {
+  return candidate.status === 'proposed' && candidate.aiReview?.disposition !== 'excluded';
+}
+
+function requiresIndividualCandidateDecision(candidate: CutCandidate): boolean {
+  return candidate.aiReview?.disposition === 'question'
+    || (candidate.aiReview?.disposition === 'auto-applied' && candidate.status === 'proposed');
+}
+
 const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10MB
+
+const MUTATING_API_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+const EXPECTED_PROJECT_HEADER = 'x-vedit-project-dir';
+const CORS_SAFELISTED_CONTENT_TYPES = new Set([
+  'application/x-www-form-urlencoded',
+  'multipart/form-data',
+  'text/plain',
+]);
+
+function requestMediaType(req: http.IncomingMessage): string | null {
+  const raw = req.headers['content-type'];
+  if (typeof raw !== 'string') return null;
+  const mediaType = raw.split(';', 1)[0].trim().toLowerCase();
+  return mediaType || null;
+}
+
+function isLoopbackHost(rawHost: unknown): rawHost is string {
+  if (typeof rawHost !== 'string' || rawHost.length === 0) return false;
+  const authority = rawHost.toLowerCase();
+  // Keep the accepted authority syntax intentionally literal. URL would
+  // canonicalize values such as decimal `2130706433` to 127.0.0.1; accepting
+  // those surprising spellings weakens Host allow-list reviewability.
+  if (!/^(?:localhost\.?|127\.0\.0\.1)(?::\d{1,5})?$|^\[::1\](?::\d{1,5})?$/.test(authority)) return false;
+  try {
+    const parsed = new URL(`http://${authority}`);
+    const hostname = parsed.hostname.toLowerCase().replace(/\.$/, '');
+    return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Browser requests may carry an Origin while CLI/Node callers normally do
+ * not. Any Origin-bearing request (reads, media and mutations alike) is
+ * accepted only when it came from the exact loopback origin serving this
+ * daemon. `Sec-Fetch-Site` closes cross-site embed/navigation shapes that do
+ * not carry Origin, while remaining absent for native CLI clients.
+ */
+function hasTrustedRequestOrigin(req: http.IncomingMessage): boolean {
+  if (!isLoopbackHost(req.headers.host)) return false;
+  const fetchSite = req.headers['sec-fetch-site'];
+  if (fetchSite != null && fetchSite !== 'same-origin' && fetchSite !== 'none') return false;
+  const rawOrigin = req.headers.origin;
+  if (rawOrigin == null) return true;
+  if (typeof rawOrigin !== 'string') return false;
+  try {
+    const origin = new URL(rawOrigin);
+    const hostname = origin.hostname.toLowerCase().replace(/\.$/, '');
+    const loopback = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]';
+    return origin.protocol === 'http:' && loopback && origin.host.toLowerCase() === req.headers.host.toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
+/** Reject before routing so even static UI, media, ping and read APIs cannot
+ * be used through an attacker-controlled Host/Origin. */
+function rejectUntrustedHttpRequest(req: http.IncomingMessage, res: http.ServerResponse): boolean {
+  if (!isLoopbackHost(req.headers.host)) {
+    json(res, 403, { error: 'non-loopback Host rejected' });
+    return true;
+  }
+  if (!hasTrustedRequestOrigin(req)) {
+    json(res, 403, { error: 'cross-origin local-daemon request rejected' });
+    return true;
+  }
+  return false;
+}
+
+/**
+ * CSRF boundary for the unauthenticated loopback daemon.
+ *
+ * - A hostile browser origin cannot mutate the project, even if it can reach
+ *   localhost.
+ * - JSON endpoints require a non-simple JSON media type.
+ * - The streaming upload endpoint accepts arbitrary non-simple binary media
+ *   types but rejects HTML-form/fetch "simple request" types (and a missing
+ *   type), ensuring a cross-origin browser must preflight. We deliberately do
+ *   not enable CORS, so that preflight cannot authorize the write.
+ *
+ * Origin-less local CLI calls remain supported; this is a browser boundary,
+ * not an authentication layer for other processes running as the user.
+ */
+function rejectUnsafeApiMutation(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  pathname: string,
+  method: string,
+): boolean {
+  if (!pathname.startsWith('/api/') || !MUTATING_API_METHODS.has(method)) return false;
+
+  if (!hasTrustedRequestOrigin(req)) {
+    json(res, 403, { error: 'cross-origin API mutation rejected' });
+    return true;
+  }
+
+  if (method === 'DELETE') return false;
+  const mediaType = requestMediaType(req);
+  if (pathname === '/api/upload') {
+    if (!mediaType || CORS_SAFELISTED_CONTENT_TYPES.has(mediaType)) {
+      json(res, 415, { error: 'upload requires a non-simple Content-Type such as application/octet-stream or video/*' });
+      return true;
+    }
+    return false;
+  }
+
+  if (mediaType !== 'application/json' && !mediaType?.endsWith('+json')) {
+    json(res, 415, { error: 'API mutation requires Content-Type: application/json' });
+    return true;
+  }
+  return false;
+}
+
+function decodeExpectedProjectDir(req: http.IncomingMessage): string | null {
+  const raw = req.headers[EXPECTED_PROJECT_HEADER];
+  if (typeof raw !== 'string' || raw.length === 0) return null;
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Every write-method API except `/api/open` is bound to the absolute project
+ * identity the caller rendered/read. `/api/open` already carries its target
+ * identity as the mandatory `dir` body field. This precondition is separate
+ * from revision locking: two unrelated projects can legitimately have the
+ * same revision number after A -> B is switched in another tab.
+ */
+function rejectMismatchedProjectIdentity(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  pathname: string,
+  method: string,
+  project: Project,
+): boolean {
+  if (
+    !pathname.startsWith('/api/')
+    || !MUTATING_API_METHODS.has(method)
+    || pathname === '/api/open'
+  ) return false;
+
+  const expected = decodeExpectedProjectDir(req);
+  if (!expected || !path.isAbsolute(expected)) {
+    json(res, 428, {
+      error: `project identity precondition required (${EXPECTED_PROJECT_HEADER})`,
+      code: 'PROJECT_IDENTITY_REQUIRED',
+    });
+    return true;
+  }
+  if (path.resolve(expected) !== path.resolve(project.dir)) {
+    json(res, 409, {
+      error: 'project changed before this operation; reload and retry against the intended project',
+      code: 'PROJECT_IDENTITY_MISMATCH',
+      expectedProjectDir: path.resolve(expected),
+      currentProjectDir: path.resolve(project.dir),
+    });
+    return true;
+  }
+  return false;
+}
 
 class PayloadTooLargeError extends Error {
   code = 'PAYLOAD_TOO_LARGE';
@@ -166,6 +492,15 @@ async function readBody(req: http.IncomingMessage): Promise<any> {
   return raw ? JSON.parse(raw) : {};
 }
 
+/** Parse an untrusted API actor without letting unknown strings bypass locks. */
+function revisionActor(value: unknown, fallback: RevisionActor): RevisionActor {
+  const actor = value ?? fallback;
+  if (!isRevisionActor(actor)) {
+    throw new Error(`invalid actor: ${JSON.stringify(actor)} (use agent/ui/system)`);
+  }
+  return actor;
+}
+
 /**
  * Open an existing project at `dir`, or create a fresh one if none exists
  * yet. Only a missing project.json (ENOENT) counts as "no project here" —
@@ -189,6 +524,68 @@ async function openOrCreateProject(dir: string, name: string): Promise<{ project
 function broadcast(ctx: Ctx, msg: unknown) {
   const data = JSON.stringify(msg);
   for (const ws of ctx.clients) if (ws.readyState === WebSocket.OPEN) ws.send(data);
+}
+
+/** Run one project-scoped job at a time without letting a rejected job poison
+ * the queue. Detection needs this because candidates.json and detect-run.json
+ * are separate atomic files: serial completion keeps their last writer the
+ * same even when two callers press re-detect together. */
+async function serialProjectJob<T>(
+  tails: Map<string, Promise<void>>,
+  projectDir: string,
+  job: () => Promise<T>,
+): Promise<T> {
+  const previous = tails.get(projectDir) ?? Promise.resolve();
+  let release!: () => void;
+  const turn = new Promise<void>((resolve) => { release = resolve; });
+  const tail = previous.then(() => turn);
+  tails.set(projectDir, tail);
+  await previous;
+  try {
+    return await job();
+  } finally {
+    release();
+    if (tails.get(projectDir) === tail) tails.delete(projectDir);
+  }
+}
+
+function detectRunPath(projectDir: string): string {
+  // Project root, alongside candidates.json: cache/ is intentionally pruned
+  // by `vedit gc`, but this is durable decision-state metadata rather than a
+  // regenerable media cache.
+  return path.join(projectDir, DETECT_RUN_FILENAME);
+}
+
+/** Derived detection metadata must never prevent a project from opening. A
+ * missing/corrupt marker means "no trustworthy completed run", not "clean". */
+async function readDetectRun(projectDir: string, currentRevision: number): Promise<DetectRunState | null> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await fs.readFile(detectRunPath(projectDir), 'utf8'));
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
+  const r = parsed as Partial<DetectRunRecord>;
+  if (
+    r.version !== 1
+    || typeof r.completedAt !== 'string'
+    || !Number.isFinite(Date.parse(r.completedAt))
+    || typeof r.revision !== 'number' || !Number.isInteger(r.revision) || r.revision < 0
+    || typeof r.proposalCount !== 'number' || !Number.isInteger(r.proposalCount) || r.proposalCount < 0
+    || typeof r.excludedByIntentZones !== 'number' || !Number.isInteger(r.excludedByIntentZones) || r.excludedByIntentZones < 0
+    || !r.parameters
+    || typeof r.parameters.silence !== 'boolean'
+    || typeof r.parameters.fillers !== 'boolean'
+    || !Number.isFinite(r.parameters.minGap)
+    || (r.parameters.threshold !== undefined && !Number.isFinite(r.parameters.threshold))
+  ) return null;
+  const stale = r.revision !== currentRevision;
+  return {
+    ...(r as DetectRunRecord),
+    stale,
+    ...(stale ? { staleReason: 'revision-changed' as const } : {}),
+  };
 }
 
 /**
@@ -343,7 +740,7 @@ async function revisionSnapshot(p: Project, rev: number): Promise<Manifest | nul
  * Sanitize a browser-supplied filename for `POST /api/upload` (D&D ingest
  * fallback when a dropped file can't be located on disk — see
  * src/ingest/locate.ts): strip any directory components (defense in depth;
- * uniqueDestPath below also always joins under the fixed media/ dir, so a
+ * reserveUniqueUpload below also always joins under the fixed media/ dir, so a
  * "../.." here couldn't escape it either way) and replace anything but a
  * conservative safe-character set.
  */
@@ -353,18 +750,98 @@ function sanitizeUploadName(name: string): string {
   return cleaned || 'upload.bin';
 }
 
-/** Append -1, -2, ... before the extension until `dir/name` doesn't already exist, so a second drop of a same-named file never clobbers the first. */
-async function uniqueDestPath(dir: string, name: string): Promise<string> {
+/**
+ * Atomically reserve `dir/name`, then `dir/name-1`, ... with O_EXCL.
+ *
+ * A prior access()-then-create implementation had a classic TOCTOU window:
+ * same-name uploads could both observe a free candidate and then open it for
+ * truncating writes.  Returning the owning FileHandle also guarantees the
+ * upload stream writes to the exact inode it reserved, even if another local
+ * process renames the pathname while bytes are arriving.
+ */
+async function reserveUniqueUpload(dir: string, name: string): Promise<{ path: string; handle: FileHandle }> {
   const ext = path.extname(name);
   const stem = name.slice(0, name.length - ext.length) || 'upload';
-  let candidate = path.join(dir, name);
-  for (let i = 1; ; i++) {
+  for (let i = 0; ; i++) {
+    const candidate = path.join(dir, i === 0 ? name : `${stem}-${i}${ext}`);
     try {
-      await fs.access(candidate);
-    } catch {
-      return candidate;
+      return { path: candidate, handle: await fs.open(candidate, 'wx', 0o600) };
+    } catch (error: any) {
+      if (error?.code === 'EEXIST') continue;
+      throw error;
     }
-    candidate = path.join(dir, `${stem}-${i}${ext}`);
+  }
+}
+
+function uploadLeaseForPath(
+  leases: Map<string, UploadLease>,
+  projectDir: string,
+  file: string,
+): UploadLease | undefined {
+  const resolvedProject = path.resolve(projectDir);
+  const resolvedFile = path.resolve(file);
+  return [...leases.values()].find((lease) => (
+    path.resolve(lease.projectDir) === resolvedProject && path.resolve(lease.path) === resolvedFile
+  ));
+}
+
+async function uploadLeaseStillOwnsPath(lease: UploadLease): Promise<boolean> {
+  try {
+    const current = await fs.lstat(lease.path);
+    return Boolean(
+      current.isFile()
+      && current.dev === lease.dev
+      && current.ino === lease.ino
+      && current.size === lease.size
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** Conservative recursive reference check: a false positive only retains an orphan; it can never delete live media. */
+function containsExactString(value: unknown, target: string, seen = new Set<object>()): boolean {
+  if (value === target) return true;
+  if (value == null || typeof value !== 'object') return false;
+  if (seen.has(value)) return false;
+  seen.add(value);
+  if (Array.isArray(value)) return value.some((item) => containsExactString(item, target, seen));
+  return Object.values(value as Record<string, unknown>).some((item) => containsExactString(item, target, seen));
+}
+
+/**
+ * Remove a failed-ingest upload only while the path still names the exact
+ * regular-file inode created with O_EXCL.  Any missing, renamed, replaced,
+ * directory, or manifest-referenced path is retained.  This deliberately
+ * prefers a harmless orphan over deleting bytes the daemon cannot prove it
+ * owns.
+ */
+async function cleanupFailedUpload(p: Project, lease: UploadLease): Promise<boolean> {
+  let manifest: Manifest;
+  try {
+    manifest = await p.manifest();
+  } catch {
+    return false;
+  }
+  if (containsExactString(manifest, lease.path)) return false;
+
+  let current: Stats;
+  try {
+    current = await fs.lstat(lease.path);
+  } catch {
+    return false;
+  }
+  if (
+    !current.isFile()
+    || current.dev !== lease.dev
+    || current.ino !== lease.ino
+    || current.size !== lease.size
+  ) return false;
+  try {
+    await fs.unlink(lease.path);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -437,10 +914,81 @@ async function resolveBackgroundArg(raw: string, pathHint: string | undefined, m
   return { ref: { type: 'video', path: abs } };
 }
 
-/** Memoized detectTakes(t) per sourceId — see Ctx.takesCache's doc for why this can't just call detectTakes fresh on every route. */
-function takesFor(ctx: Ctx, sourceId: string, t: Transcript): TakeGroup[] {
-  if (!ctx.takesCache.has(sourceId)) ctx.takesCache.set(sourceId, detectTakes(t));
-  return ctx.takesCache.get(sourceId)!;
+/** Stable in-process ownership key for project-local source ids. */
+function projectSourceKey(projectDir: string, sourceId: string): string {
+  return `${path.resolve(projectDir)}\0${sourceId}`;
+}
+
+function projectTaskKey(projectDir: string, taskId: string): string {
+  return `${path.resolve(projectDir)}\0${taskId}`;
+}
+
+function isActiveTranscribeJob(job: TranscribeJob | undefined): job is TranscribeJob {
+  return job?.status === 'queued' || job?.status === 'running' || job?.status === 'cancelling';
+}
+
+function transcribeJobFor(
+  jobs: Map<string, TranscribeJob>,
+  projectDir: string,
+  sourceId: string,
+): TranscribeJob | undefined {
+  return jobs.get(projectSourceKey(projectDir, sourceId));
+}
+
+function publicTranscribeJob(job: TranscribeJob): TranscribeJobState {
+  return {
+    taskId: job.taskId,
+    projectDir: job.projectDir,
+    sourceId: job.sourceId,
+    status: job.status,
+    phase: job.phase,
+    startedAt: job.startedAt,
+    updatedAt: job.updatedAt,
+    ...(job.finishedAt ? { finishedAt: job.finishedAt } : {}),
+    ...(job.error ? { error: job.error } : {}),
+  };
+}
+
+function isActiveMediaJob(job: MediaJob | undefined): job is MediaJob {
+  return job?.status === 'running' || job?.status === 'cancelling';
+}
+
+function publicMediaJob(job: MediaJob): MediaJobState {
+  return {
+    taskId: job.taskId,
+    projectDir: job.projectDir,
+    kind: job.kind,
+    status: job.status,
+    phase: job.phase,
+    startedAt: job.startedAt,
+    ...(job.finishedAt ? { finishedAt: job.finishedAt } : {}),
+    ...(job.error ? { error: job.error } : {}),
+    ...(job.file ? { file: job.file } : {}),
+    ...(job.sourceIds ? { sourceIds: [...job.sourceIds] } : {}),
+  };
+}
+
+function mediaJobsForProject(jobs: Map<string, MediaJob>, projectDir: string): MediaJob[] {
+  const resolved = path.resolve(projectDir);
+  return [...jobs.values()].filter((job) => path.resolve(job.projectDir) === resolved);
+}
+
+/** Lease identity is daemon-internal; the browser needs only job progress. */
+function publicExportJob(job: ExportJobState): Omit<ExportJobState, 'owner'> {
+  const { owner: _owner, ...publicState } = job;
+  return publicState;
+}
+
+function transcribeJobsForProject(jobs: Map<string, TranscribeJob>, projectDir: string): TranscribeJob[] {
+  const resolved = path.resolve(projectDir);
+  return [...jobs.values()].filter((job) => path.resolve(job.projectDir) === resolved);
+}
+
+/** Memoized detectTakes(t) per project+sourceId — see Ctx.takesCache's doc for why this can't just call detectTakes fresh on every route. */
+function takesFor(ctx: Ctx, p: Project, sourceId: string, t: Transcript): TakeGroup[] {
+  const key = projectSourceKey(p.dir, sourceId);
+  if (!ctx.takesCache.has(key)) ctx.takesCache.set(key, detectTakes(t));
+  return ctx.takesCache.get(key)!;
 }
 
 /**
@@ -468,18 +1016,16 @@ function withReview(f: SceneFile, m: Manifest): { sourceId: string; scenes: (Sce
 }
 
 /**
- * Snapshot the state Claude/UI needs after every mutation. `transcribingIds`
- * (W-LAZY), when given, is `ctx.transcribeJobs` — the set of sourceIds with
- * an in-flight background transcribe job — so each source's `transcribing`
- * field reflects live job state rather than only the durable
- * `transcribed` manifest flag. Defaults to an empty set so any caller that
- * doesn't have a `Ctx` handy (there are none today, but this keeps the
- * function usable standalone) still gets a well-formed response.
+ * Snapshot the state the AI/UI needs after every mutation. `transcribeJobs`
+ * keeps the last state per project-local source. Each source therefore gets
+ * both the backward-compatible `transcribing` boolean and an additive,
+ * explicit terminal/running job state without leaking a same-named source
+ * from another open/forked project.
  */
-async function stateSummary(p: Project, transcribingIds: Set<string> = new Set()) {
+async function stateSummary(p: Project, transcribeJobs: Map<string, TranscribeJob> = new Map()) {
   const m = await p.manifest();
   const cands = await p.candidates();
-  const pending = cands.filter((c) => c.status === 'proposed').length;
+  const pending = cands.filter(isActionableCandidate).length;
   const orphans = orphanedOverlays(m);
   const spriteOrphans = orphanedSprites(m);
   return {
@@ -495,17 +1041,20 @@ async function stateSummary(p: Project, transcribingIds: Set<string> = new Set()
     dialogue: (m.timeline.dialogue ?? []).length,
     composition: m.composition ? { duration: m.composition.duration } : undefined,
     kit: m.kit ? { path: m.kit.path } : undefined,
-    sources: m.sources.map((s) => ({
-      id: s.id,
-      path: s.path,
-      duration: s.duration,
-      transcribed: !!s.transcribed,
-      // W-LAZY: true while `vedit transcribe` has a background job running
-      // for this source; false once it lands (transcribe-done) or fails
-      // (transcribe-error) — see runTranscribeJob below.
-      transcribing: transcribingIds.has(s.id),
-      ...(needsColorTransform(s.color) ? { colorWarning: COLOR_WARNING_MESSAGE } : {}),
-    })),
+    sources: m.sources.map((s) => {
+      const job = transcribeJobFor(transcribeJobs, p.dir, s.id);
+      return {
+        id: s.id,
+        path: s.path,
+        duration: s.duration,
+        transcribed: !!s.transcribed,
+        // Kept for existing CLI/web consumers. `cancelling` stays true until
+        // the child has exited and its temporary files have been removed.
+        transcribing: isActiveTranscribeJob(job),
+        ...(job ? { transcribeJob: publicTranscribeJob(job) } : {}),
+        ...(needsColorTransform(s.color) ? { colorWarning: COLOR_WARNING_MESSAGE } : {}),
+      };
+    }),
     pendingCandidates: pending,
     captions: m.captions,
     // orphaned B-roll overlays (anchor cut away) — see ops.ts's
@@ -521,24 +1070,60 @@ async function stateSummary(p: Project, transcribingIds: Set<string> = new Set()
 
 export async function startDaemon(opts: { port?: number; projectDir?: string } = {}) {
   const port = opts.port ?? Number(process.env.VEDIT_PORT ?? 7799);
-  const ctx: Ctx = { project: null, clients: new Set(), transcribeJobs: new Set(), takesCache: new Map() };
+  const ctx: Ctx = {
+    project: null,
+    clients: new Set(),
+    transcribeJobs: new Map(),
+    transcribeRunning: 0,
+    transcribeWaiters: [],
+    mediaJobs: new Map(),
+    takesCache: new Map(),
+    activeExport: null,
+    exportStarting: false,
+    closing: false,
+    detectTails: new Map(),
+    uploadLeases: new Map(),
+  };
   if (opts.projectDir) {
     const { project } = await openOrCreateProject(opts.projectDir, path.basename(opts.projectDir));
     ctx.project = project;
+    await recoverInterruptedExportJob(project);
     if (project.warning) console.warn(`[vedit] ${project.dir}: ${project.warning}`);
   }
 
   const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url ?? '/', `http://localhost:${port}`);
     try {
+      // The daemon is deliberately unauthenticated because it is local-only.
+      // Validate the network identity before constructing/routing any URL so
+      // a DNS-rebound Host cannot read even `/`, `/media/*`, or `/api/ping`.
+      if (rejectUntrustedHttpRequest(req, res)) return;
+      const url = new URL(req.url ?? '/', `http://localhost:${port}`);
       await route(ctx, req, res, url);
     } catch (e: any) {
-      const status = e?.code === 'STALE_REVISION' ? 409 : e?.code === 'PAYLOAD_TOO_LARGE' ? 413 : 400;
+      const status = e?.code === 'DAEMON_CLOSING'
+        ? 503
+        : (e?.code === 'STALE_REVISION' || e?.code === 'EXPORT_JOB_CONFLICT')
+          ? 409
+          : e?.code === 'PAYLOAD_TOO_LARGE' ? 413 : 400;
       json(res, status, { error: e?.message ?? String(e), code: e?.code });
     }
   });
 
-  const wss = new WebSocketServer({ server, path: '/ws' });
+  // Upgrade requests bypass the normal HTTP request callback, so apply the
+  // same Host/Origin boundary explicitly before handing a socket to `ws`.
+  const wss = new WebSocketServer({ noServer: true });
+  server.on('upgrade', (req, socket, head) => {
+    let pathname = '';
+    try {
+      pathname = new URL(req.url ?? '/', `http://localhost:${port}`).pathname;
+    } catch { /* rejected below */ }
+    if (pathname !== '/ws' || !hasTrustedRequestOrigin(req)) {
+      socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+  });
   wss.on('connection', (ws) => {
     ctx.clients.add(ws);
     ws.on('close', () => ctx.clients.delete(ws));
@@ -551,7 +1136,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
   // onto a different project directory.
   async function mutate(
     p: Project,
-    actor: 'claude' | 'ui' | 'system',
+    actor: RevisionActor,
     baseRev: number,
     op: string,
     params: unknown,
@@ -560,54 +1145,336 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
     motionSpecUpdates?: Record<string, unknown>,
   ) {
     const m = await p.commit(baseRev, actor, op, params, summary, fn, motionSpecUpdates);
-    broadcast(ctx, { type: 'update', revision: m.revision, op, summary });
+    broadcast(ctx, { type: 'update', projectDir: p.dir, revision: m.revision, op, summary });
     return m;
+  }
+
+  function transcribeAbortError(): Error {
+    const error = new Error('operation cancelled');
+    error.name = 'AbortError';
+    return error;
+  }
+
+  function grantTranscribeWaiters(): void {
+    while (ctx.transcribeRunning < MAX_CONCURRENT_TRANSCRIBES && ctx.transcribeWaiters.length > 0) {
+      const waiter = ctx.transcribeWaiters.shift()!;
+      waiter.job.controller.signal.removeEventListener('abort', waiter.onAbort);
+      if (waiter.job.controller.signal.aborted) {
+        waiter.reject(transcribeAbortError());
+        continue;
+      }
+      ctx.transcribeRunning++;
+      let released = false;
+      waiter.resolve(() => {
+        if (released) return;
+        released = true;
+        ctx.transcribeRunning = Math.max(0, ctx.transcribeRunning - 1);
+        grantTranscribeWaiters();
+      });
+    }
+  }
+
+  function acquireTranscribeSlot(job: TranscribeJob): Promise<() => void> {
+    return new Promise((resolve, reject) => {
+      const waiter: TranscribeWaiter = {
+        job,
+        resolve,
+        reject,
+        onAbort: () => {
+          const index = ctx.transcribeWaiters.indexOf(waiter);
+          if (index >= 0) ctx.transcribeWaiters.splice(index, 1);
+          reject(transcribeAbortError());
+        },
+      };
+      if (job.controller.signal.aborted) return reject(transcribeAbortError());
+      job.controller.signal.addEventListener('abort', waiter.onAbort, { once: true });
+      ctx.transcribeWaiters.push(waiter);
+      grantTranscribeWaiters();
+    });
+  }
+
+  /** Request cancellation while it can still prevent the logical commit. */
+  function cancelTranscribeJob(job: TranscribeJob): boolean {
+    if (!isActiveTranscribeJob(job) || job.commitStarted) return false;
+    job.status = 'cancelling';
+    job.updatedAt = new Date().toISOString();
+    job.controller.abort();
+    return true;
   }
 
   /**
    * Background job body for `vedit transcribe` (W-LAZY: POST /api/transcribe
-   * below). Runs whisper on the ORIGINAL file (never the proxy — same as
-   * ingestFile's own transcribe step in src/ingest/ingest.ts), writes the
-   * transcript, then commits Source.transcribed=true as actor 'system'
-   * against whatever the current revision is AT COMMIT TIME — not the
-   * revision read when the job started — via the same
-   * read-cur/commit/retry-on-STALE_REVISION loop ingestFile's own commit
-   * uses (see its doc comment), so this rides Project's mutex instead of
-   * racing a concurrent claude/ui edit. `sourceId` is always removed from
-   * `ctx.transcribeJobs` on the way out (success or failure), so a failed
-   * job can be retried and /api/state's `transcribing` flag never gets
-   * stuck true.
+   * below). Runs whisper on the ORIGINAL file (never the proxy), propagates
+   * cancellation to ffmpeg/whisper, then atomically publishes transcript +
+   * Source.transcribed through Project.commitTranscript(). The job owns a
+   * fixed Project instance and stable taskId, so /api/open cannot redirect
+   * either its output or terminal state to another project/fork.
    */
-  async function runTranscribeJob(p: Project, sourceId: string, language?: string, glossary?: string[]) {
+  async function runTranscribeJob(job: TranscribeJob, language?: string, glossary?: string[]) {
+    const { project: p, sourceId, taskId, controller } = job;
+    let releaseSlot: (() => void) | undefined;
     try {
-      broadcast(ctx, { type: 'transcribe-progress', sourceId, step: 'transcribing (whisper)' });
+      broadcast(ctx, {
+        type: 'transcribe-progress', projectDir: p.dir, sourceId, taskId,
+        status: job.status, step: 'queued for transcription', job: publicTranscribeJob(job),
+      });
+      releaseSlot = await acquireTranscribeSlot(job);
+      if (controller.signal.aborted) throw transcribeAbortError();
+      job.status = 'running';
+      job.phase = 'transcribing';
+      job.updatedAt = new Date().toISOString();
+      broadcast(ctx, {
+        type: 'transcribe-progress', projectDir: p.dir, sourceId, taskId,
+        status: job.status, step: 'transcribing (whisper)', job: publicTranscribeJob(job),
+      });
       const m0 = await p.manifest();
       const src = m0.sources.find((s) => s.id === sourceId);
-      if (!src) throw new Error(`unknown source: ${sourceId}`); // shouldn't happen: caller resolved this against a manifest read moments earlier
-      const t = await transcribe(src.path, sourceId, { language, sourceDuration: src.duration, glossary });
-      await p.writeTranscript(t);
-      ctx.takesCache.delete(sourceId); // a re-transcribe invalidates any memoized take groups for this source (see Ctx.takesCache's doc)
-      const MAX_STALE_RETRIES = 20;
-      for (let attempt = 0; ; attempt++) {
-        const cur = await p.manifest();
-        try {
-          await p.commit(
-            cur.revision, 'system', 'transcribe', { sourceId, language },
-            `transcribed ${path.basename(src.path)}`,
-            (m) => ({ ...m, sources: m.sources.map((s) => (s.id === sourceId ? { ...s, transcribed: true } : s)) }),
-          );
-          break;
-        } catch (e: any) {
-          if (e?.code === 'STALE_REVISION' && attempt < MAX_STALE_RETRIES) continue;
+      if (!src) throw new Error(`unknown source: ${sourceId}`);
+      const t = await transcribe(src.path, sourceId, {
+        language,
+        sourceDuration: src.duration,
+        glossary,
+        signal: controller.signal,
+      });
+      if (controller.signal.aborted) {
+        const cancelled = new Error('operation cancelled');
+        cancelled.name = 'AbortError';
+        throw cancelled;
+      }
+
+      // No await between the abort check and this boundary. Once true, a
+      // DELETE returns 409 instead of claiming it cancelled a transcript
+      // whose atomic project commit may already be landing.
+      job.commitStarted = true;
+      job.phase = 'committing';
+      job.updatedAt = new Date().toISOString();
+      broadcast(ctx, {
+        type: 'transcribe-progress', projectDir: p.dir, sourceId, taskId,
+        status: job.status, step: 'saving transcript', job: publicTranscribeJob(job),
+      });
+      const summary = `transcribed ${path.basename(src.path)}`;
+      const committed = await p.commitTranscript(
+        t,
+        'system',
+        { sourceId, language, taskId },
+        summary,
+      );
+      ctx.takesCache.delete(projectSourceKey(p.dir, sourceId));
+      job.status = 'success';
+      job.phase = 'finished';
+      job.finishedAt = new Date().toISOString();
+      job.updatedAt = job.finishedAt;
+      broadcast(ctx, {
+        type: 'transcribe-done', projectDir: p.dir, sourceId, taskId,
+        status: job.status, job: publicTranscribeJob(job),
+      });
+      broadcast(ctx, {
+        type: 'update', projectDir: p.dir, revision: committed.revision,
+        op: 'transcribe', summary, taskId,
+      });
+    } catch (e: any) {
+      const cancelled = controller.signal.aborted || e?.name === 'AbortError';
+      job.status = cancelled ? 'cancelled' : 'error';
+      job.phase = 'finished';
+      job.finishedAt = new Date().toISOString();
+      job.updatedAt = job.finishedAt;
+      job.error = cancelled ? undefined : (e?.message ?? String(e));
+      // Keep the established error event for compatibility, with explicit
+      // cancelled/status fields so current clients can distinguish a user
+      // stop from a failure without leaving their progress indicator stuck.
+      broadcast(ctx, {
+        type: 'transcribe-error', projectDir: p.dir, sourceId, taskId,
+        status: job.status, cancelled, error: job.error ?? 'operation cancelled',
+        job: publicTranscribeJob(job),
+      });
+    } finally {
+      releaseSlot?.();
+    }
+  }
+
+  async function cancelAndDrainTranscribeJobs(): Promise<void> {
+    const active = [...ctx.transcribeJobs.values()].filter(isActiveTranscribeJob);
+    for (const job of active) cancelTranscribeJob(job);
+    await Promise.allSettled(active.map((job) => job.completion ?? Promise.resolve()));
+  }
+
+  /** Abort only while it can still prevent every logical publication. */
+  function cancelMediaJob(job: MediaJob): boolean {
+    if (!isActiveMediaJob(job) || job.commitStarted) return false;
+    job.status = 'cancelling';
+    job.controller.abort();
+    broadcast(ctx, {
+      type: 'media-job',
+      projectDir: job.projectDir,
+      taskId: job.taskId,
+      job: publicMediaJob(job),
+    });
+    return true;
+  }
+
+  async function cancelAndDrainMediaJobs(): Promise<void> {
+    const active = [...ctx.mediaJobs.values()].filter(isActiveMediaJob);
+    for (const job of active) cancelMediaJob(job);
+    await Promise.allSettled(active.map((job) => job.completion ?? Promise.resolve()));
+  }
+
+  function abortActiveExportBeforeFinalCommit(): void {
+    const active = ctx.activeExport;
+    if (active?.state.status === 'running' && !active.finalCommitted) {
+      active.controller.abort();
+    }
+  }
+
+  async function cancelAndDrainExportJob(): Promise<void> {
+    abortActiveExportBeforeFinalCommit();
+    const completion = ctx.activeExport?.completion;
+    if (completion) await completion;
+  }
+
+  let closePromise: Promise<void> | null = null;
+  function closeDaemon(): Promise<void> {
+    if (closePromise) return closePromise;
+    closePromise = (async () => {
+      // Gate routes before the first await, then abort a not-yet-committed
+      // export before closing listeners. This is the clean SIGINT/SIGTERM
+      // path used by the CLI.
+      ctx.closing = true;
+      abortActiveExportBeforeFinalCommit();
+      const serverClosed = new Promise<void>((resolve, reject) => {
+        if (!server.listening) return resolve();
+        server.close((error) => error ? reject(error) : resolve());
+      });
+      // A browser that stopped servicing the WebSocket close handshake must
+      // not keep SIGTERM shutdown (and ASR cleanup) alive indefinitely.
+      for (const ws of ctx.clients) ws.terminate();
+      const websocketClosed = new Promise<void>((resolve) => wss.close(() => resolve()));
+      // Cancel work already registered while server.close waits for any HTTP
+      // handler that entered just before the gate. Once the server is closed,
+      // repeat cancellation to catch a job that was being claimed by that
+      // final in-flight request, then drain terminal-state writes/cleanup.
+      const firstTranscribeDrain = cancelAndDrainTranscribeJobs();
+      const firstMediaDrain = cancelAndDrainMediaJobs();
+      await serverClosed;
+      await Promise.all([
+        firstTranscribeDrain,
+        firstMediaDrain,
+        cancelAndDrainTranscribeJobs(),
+        cancelAndDrainMediaJobs(),
+        cancelAndDrainExportJob(),
+        websocketClosed,
+      ]);
+    })();
+    return closePromise;
+  }
+
+  // Tests and embedders historically call `server.close()` directly. They
+  // cannot await the richer closeDaemon contract, but must still terminate
+  // children instead of leaving whisper/ffmpeg running after the HTTP server
+  // dies. Callers needing the drain guarantee use the returned close().
+  server.once('close', () => {
+    ctx.closing = true;
+    abortActiveExportBeforeFinalCommit();
+    void cancelAndDrainTranscribeJobs();
+    void cancelAndDrainMediaJobs();
+    void cancelAndDrainExportJob();
+  });
+
+  async function runExportJob(active: NonNullable<Ctx['activeExport']>, inputs: ProjectRenderInputs): Promise<void> {
+    const { project, controller, partialPath } = active;
+    const setState = async (patch: Partial<ExportJobState>) => {
+      const next = { ...active.state, ...patch };
+      try {
+        await writeOwnedExportJob(project, next);
+        active.state = next;
+        active.durableStatePending = false;
+      } catch (e: any) {
+        if (e?.code === 'EXPORT_JOB_LEASE_LOST') {
+          active.durableStatePending = false;
+          controller.abort();
           throw e;
         }
+        const warning = `書き出し状態を保存できませんでした: ${e?.message ?? String(e)}`;
+        active.state = next;
+        if (!active.state.warnings?.includes(warning)) {
+          active.state = { ...active.state, warnings: [...(active.state.warnings ?? []), warning] };
+        }
+        active.durableStatePending = true;
       }
-      broadcast(ctx, { type: 'transcribe-done', sourceId });
-      broadcast(ctx, { type: 'update', revision: (await p.manifest()).revision, op: 'transcribe', summary: `transcribed ${path.basename(src.path)}` });
+      broadcast(ctx, { type: 'export-job', projectDir: project.dir, job: publicExportJob(active.state) });
+    };
+    try {
+      if (controller.signal.aborted) {
+        const error = new Error('operation cancelled');
+        error.name = 'AbortError';
+        throw error;
+      }
+      const rendered = await renderProjectMp4(project, partialPath, {
+        manifest: inputs.manifest,
+        transcripts: inputs.transcripts,
+        motionSpecs: inputs.motionSpecs,
+        signal: controller.signal,
+        recordFile: active.state.file,
+        onPhase: async (phase) => setState({ phase }),
+        finalize: async () => {
+          if (controller.signal.aborted) {
+            const e = new Error('operation cancelled');
+            e.name = 'AbortError';
+            throw e;
+          }
+          await fs.rename(partialPath, active.state.file);
+          // The successful same-directory rename is the commit boundary.
+          // No await between rename continuation and this assignment means a
+          // later DELETE/shutdown truthfully reports cancellation is too late
+          // and never removes a complete final MP4.
+          active.finalCommitted = true;
+        },
+      });
+      await setState({
+        status: 'success',
+        phase: 'finalizing',
+        finishedAt: new Date().toISOString(),
+        warnings: rendered.warnings,
+        error: undefined,
+      });
     } catch (e: any) {
-      broadcast(ctx, { type: 'transcribe-error', sourceId, error: e?.message ?? String(e) });
+      await fs.rm(partialPath, { force: true }).catch(() => {});
+      const cancelled = e?.name === 'AbortError' || controller.signal.aborted;
+      const terminalPatch: Partial<ExportJobState> = cancelled
+        ? { status: 'cancelled', finishedAt: new Date().toISOString(), error: undefined }
+        : { status: 'error', finishedAt: new Date().toISOString(), error: e?.message ?? String(e) };
+      try {
+        await setState(terminalPatch);
+      } catch (stateError: any) {
+        // A lost lease must never be overwritten. Keep an honest in-memory
+        // terminal state for this daemon while the current owner remains the
+        // sole writer of durable state.
+        active.state = {
+          ...active.state,
+          ...terminalPatch,
+          warnings: [
+            ...(active.state.warnings ?? []),
+            `書き出し終了状態を保存できませんでした: ${stateError?.message ?? String(stateError)}`,
+          ],
+        };
+        broadcast(ctx, { type: 'export-job', projectDir: project.dir, job: publicExportJob(active.state) });
+      }
     } finally {
-      ctx.transcribeJobs.delete(sourceId);
+      await fs.rm(partialPath, { force: true }).catch(() => {});
+      // Keep the terminal state in memory. If a later cache write failed,
+      // GET can still report the honest outcome for this daemon lifetime;
+      // the next POST simply replaces this non-running entry.
+    }
+  }
+
+  async function repairPendingExportState(active: NonNullable<Ctx['activeExport']>): Promise<boolean> {
+    if (!active.durableStatePending) return true;
+    try {
+      await writeOwnedExportJob(active.project, active.state);
+      active.durableStatePending = false;
+      return true;
+    } catch (error: any) {
+      if (error?.code === 'EXPORT_JOB_LEASE_LOST') active.durableStatePending = false;
+      return false;
     }
   }
 
@@ -615,19 +1482,37 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
     const { pathname } = url;
     const method = req.method ?? 'GET';
 
+    // This must run before /api/open and before any request body is consumed:
+    // hostile form/fetch requests therefore cannot switch projects, start an
+    // upload, or park a large body in memory before being rejected.
+    if (rejectUnsafeApiMutation(req, res, pathname, method)) return;
+    if (ctx.closing && pathname.startsWith('/api/') && MUTATING_API_METHODS.has(method)) {
+      return json(res, 503, { error: 'daemon is shutting down; new work is not accepted', code: 'DAEMON_CLOSING' });
+    }
+
     // ---- project lifecycle ----
     if (pathname === '/api/open' && method === 'POST') {
       const b = await readBody(req);
       const dir = path.resolve(b.dir);
       const { project, created } = await openOrCreateProject(dir, b.name ?? path.basename(dir));
       ctx.project = project;
+      if (ctx.activeExport?.project.dir !== project.dir) await recoverInterruptedExportJob(project);
       // A switched-to project's sourceIds could collide with the previous
       // project's — clear the take-group memoization so /api/takes and
       // /api/show's kind='takes' never serve another project's cached
       // groups (and their ephemeral ids) under a same-named sourceId.
       ctx.takesCache.clear();
-      if (!created) await upsertProject(dir, (await project.manifest()).name); // Project.create() upserts on its own path
-      broadcast(ctx, { type: 'project', dir });
+      if (!created) {
+        try {
+          await upsertProject(dir, (await project.manifest()).name); // Project.create() upserts on its own path
+        } catch (error: any) {
+          // Opening an explicit project must not depend on the optional
+          // global recent-projects index. Keep the source-of-truth project
+          // open and make the degraded discovery state visible to the user.
+          project.addWarning(`project opened, but project-list registration failed: ${error?.message ?? String(error)}`);
+        }
+      }
+      broadcast(ctx, { type: 'project', projectDir: dir, dir });
       return json(res, 200, { ok: true, dir, state: await stateSummary(ctx.project, ctx.transcribeJobs) });
     }
     if (pathname === '/api/ping') return json(res, 200, { ok: true, project: ctx.project?.dir ?? null });
@@ -637,10 +1522,15 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       if (pathname.startsWith('/api/')) return json(res, 400, { error: 'no project open; POST /api/open {dir}' });
     }
 
+    // Capture `p` once, then require the caller's rendered/read project
+    // identity to match it before consuming any mutation body. This is what
+    // prevents a stale A tab from editing B when both happen to be at rev N.
+    if (p && rejectMismatchedProjectIdentity(req, res, pathname, method, p)) return;
+
     // ---- static web UI + media ----
     if (!pathname.startsWith('/api/') && method === 'GET') {
       if (pathname.startsWith('/media/') && p) return serveMedia(p, pathname, req, res);
-      return serveStatic(pathname, res);
+      return serveStatic(pathname, req, res);
     }
     if (!p) return json(res, 400, { error: 'no project open' });
 
@@ -648,10 +1538,11 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
     if (pathname === '/api/state') return json(res, 200, await stateSummary(p, ctx.transcribeJobs));
     if (pathname === '/api/project') {
       const m = await p.manifest();
+      const detectRun = await readDetectRun(p.dir, m.revision);
       // `overlays`/`sprites` carry every item's resolved tlStart (null =
       // orphan) so the web UI never has to reimplement sourceTimeToTimeline
-      // itself. `transcribing` (W-LAZY) is ctx.transcribeJobs verbatim — live
-      // job state, not part of the manifest — so the web UI can render the
+      // itself. `transcribing` (W-LAZY) is the queued/running subset for THIS
+      // project — live job state, not part of the manifest — so the web UI can render the
       // right "文字起こし: なし/処理中/済" state even for a browser tab that
       // (re)loads mid-job, before the next transcribe-progress WS message.
       // W-ANIME: `backgroundIntervals` gives the web preview/timeline the
@@ -660,11 +1551,17 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       // `dialogue` rides along verbatim (already absolute-placed, no
       // resolution needed — see DialogueItem's doc).
       return json(res, 200, {
+        projectDir: p.dir,
         manifest: m, segments: segments(m), duration: timelineDuration(m),
         overlays: resolveOverlays(m), sprites: resolveSprites(m),
         dialogue: m.timeline.dialogue ?? [],
         backgroundIntervals: backgroundIntervals(m),
-        transcribing: [...ctx.transcribeJobs],
+        transcribing: transcribeJobsForProject(ctx.transcribeJobs, p.dir)
+          .filter(isActiveTranscribeJob)
+          .map((job) => job.sourceId),
+        transcribeJobs: transcribeJobsForProject(ctx.transcribeJobs, p.dir).map(publicTranscribeJob),
+        mediaJobs: mediaJobsForProject(ctx.mediaJobs, p.dir).map(publicMediaJob),
+        detectRun,
       });
     }
     if (pathname === '/api/kit') {
@@ -782,7 +1679,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
     }
     if (pathname === '/api/candidates') {
       const all = await p.candidates();
-      const pending = url.searchParams.get('all') ? all : all.filter((c) => c.status === 'proposed');
+      const pending = url.searchParams.get('all') ? all : all.filter(isActionableCandidate);
       return json(res, 200, pending);
     }
     if (pathname === '/api/scenes' && method === 'GET') {
@@ -890,18 +1787,124 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         return json(res, 400, { error: `source has no transcript: ${sourceId}` });
       }
       const t = await p.transcript(sourceId);
-      return json(res, 200, takesFor(ctx, sourceId, t));
+      return json(res, 200, takesFor(ctx, p, sourceId, t));
     }
     if (pathname === '/api/export-results' && method === 'GET') {
-      // 「書き出し結果カード」read-only route (docs/product-bet-sensory-vs-structural.md:
-      // 構造系〔書き出し〕に必要なのは操作ではなく結果の可視化)。CLI
-      // (`vedit export *` / `vedit publish-pack`) が cache/export-results.json
-      // に書いた記録を直近 N 件返すだけ——実行系ルートはここに作らない
-      // (書き出しは会話主導のまま)。stateSummary には含めない: この
-      // カードのポーリング要否は web 側の判断に委ねる。
+      // CLI とアプリ内ローカルMP4ジョブが残した結果を返す読み取り面。
+      // 公開/送信は扱わず、stateSummaryにも混ぜない。
       const n = Math.min(Math.max(Number(url.searchParams.get('n') ?? 5) || 5, 1), 20);
       const all = await readExportResults(p.dir);
       return json(res, 200, all.slice(0, n));
+    }
+    if (pathname === '/api/export-job' && method === 'GET') {
+      let job: ExportJobState | null;
+      const active = ctx.activeExport?.project.dir === p.dir ? ctx.activeExport : null;
+      if (active?.durableStatePending) await repairPendingExportState(active);
+      const durable = await readExportJob(p.dir);
+      if (active && (active.state.status === 'running' || durable?.id === active.state.id)) {
+        job = active.state;
+      } else {
+        job = durable;
+        if (job?.status === 'running') job = await recoverInterruptedExportJob(p);
+      }
+      if (job?.status === 'running') {
+        try {
+          const candidate = exportJobPartialPath(job);
+          const safePartial = await resolveWithinDir(p.dir, path.relative(p.dir, candidate));
+          const st = await fs.stat(safePartial);
+          job = { ...job, partialBytes: st.size };
+        } catch { /* partial file may not exist during preparation */ }
+      }
+      return json(res, 200, { job: job ? publicExportJob(job) : null });
+    }
+    if (pathname === '/api/export-job' && method === 'POST') {
+      const b = await readBody(req);
+      if (typeof b.baseRev !== 'number') return json(res, 400, { error: 'baseRev is required' });
+      if (ctx.activeExport?.durableStatePending && !(await repairPendingExportState(ctx.activeExport))) {
+        return json(res, 503, {
+          code: 'EXPORT_STATE_PERSISTENCE_PENDING',
+          error: '前の書き出し終了状態を保存できていません。保存先を確認して再試行してください',
+          ...(ctx.activeExport.project.dir === p.dir ? { job: publicExportJob(ctx.activeExport.state) } : {}),
+        });
+      }
+      if (ctx.exportStarting || ctx.activeExport?.state.status === 'running') {
+        const sameProject = ctx.activeExport?.project.dir === p.dir ? ctx.activeExport : null;
+        return json(res, 409, {
+          error: sameProject ? 'このプロジェクトのMP4書き出しが実行中です' : '別のプロジェクトのMP4書き出しが実行中です',
+          ...(sameProject ? { job: publicExportJob(sameProject.state) } : {}),
+        });
+      }
+
+      // Claim the start slot synchronously before any preparation await. Two
+      // concurrent POSTs can no longer both pass the guard above.
+      ctx.exportStarting = true;
+      try {
+        const inputs = await p.captureRenderInputs(b.baseRev);
+        const m = inputs.manifest;
+        const requestedOutDir = path.join(p.dir, 'exports');
+        await fs.mkdir(requestedOutDir, { recursive: true });
+        const outDir = await resolveWithinDir(p.dir, 'exports');
+        const id = freshId('export');
+        const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+        const file = path.join(outDir, `rev-${m.revision}-${stamp}-${id}.mp4`);
+        const proposed: Omit<ExportJobState, 'owner'> = {
+          id,
+          revision: m.revision,
+          status: 'running',
+          phase: 'preparing',
+          startedAt: new Date().toISOString(),
+          file,
+        };
+        let state: ExportJobState;
+        try {
+          state = await claimExportJob(p, proposed);
+        } catch (e) {
+          if (e instanceof ExportJobConflictError) {
+            return json(res, 409, { error: e.message, job: publicExportJob(e.job) });
+          }
+          throw e;
+        }
+        const active: NonNullable<Ctx['activeExport']> = {
+          project: p,
+          state,
+          partialPath: exportJobPartialPath(state),
+          controller: new AbortController(),
+          finalCommitted: false,
+          completion: null,
+          durableStatePending: false,
+        };
+        ctx.activeExport = active;
+        broadcast(ctx, { type: 'export-job', projectDir: p.dir, job: publicExportJob(state) });
+        // closeDaemon may have started while claimExportJob was awaiting the
+        // project lock. Register ownership first, then abort before launching
+        // any encoder work when the closing gate is already set.
+        if (ctx.closing) active.controller.abort();
+        const completion = runExportJob(active, inputs);
+        active.completion = completion;
+        void completion.catch((e) => {
+          console.error(`[vedit] export job ${state.id} failed outside its state handler: ${e?.message ?? String(e)}`);
+        });
+        return json(res, 202, { job: publicExportJob(state) });
+      } finally {
+        ctx.exportStarting = false;
+      }
+    }
+    if ((pathname === '/api/export-job' || pathname.startsWith('/api/export-job/')) && method === 'DELETE') {
+      const requestedId = pathname.split('/')[3] || url.searchParams.get('id');
+      const active = ctx.activeExport;
+      if (
+        !active ||
+        active.state.status !== 'running' ||
+        active.project.dir !== p.dir ||
+        (requestedId && requestedId !== active.state.id)
+      ) {
+        return json(res, 404, { error: '実行中の書き出しはありません' });
+      }
+      if (active.finalCommitted) {
+        return json(res, 409, { error: 'MP4ファイルは確定済みのため中止できません', job: publicExportJob(active.state) });
+      }
+      active.controller.abort();
+      return json(res, 202, { job: publicExportJob(active.state) });
     }
     if (pathname === '/api/notes' && method === 'GET') {
       // IA v3 波B §8: read-only surface for `vedit note`(src/core/notes.ts,
@@ -913,27 +1916,217 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       return json(res, 200, await readNotes(p.dir));
     }
 
+    // Ingest and scene detection remain synchronous for backward-compatible
+    // CLI responses, but their stable task ids and terminal truth are
+    // independently inspectable/cancellable. We intentionally do NOT bind
+    // cancellation to the initiating HTTP socket: a browser reload or brief
+    // disconnect must not discard minutes of valid local processing. DELETE
+    // is the sole cancellation request and survives reconnection.
+    if (pathname === '/api/media-jobs' && method === 'GET') {
+      const requestedKind = url.searchParams.get('kind');
+      if (requestedKind && requestedKind !== 'ingest' && requestedKind !== 'scenes') {
+        return json(res, 400, { error: 'media-jobs: kind must be ingest or scenes' });
+      }
+      return json(res, 200, {
+        jobs: mediaJobsForProject(ctx.mediaJobs, p.dir)
+          .filter((job) => !requestedKind || job.kind === requestedKind)
+          .map(publicMediaJob),
+      });
+    }
+    if ((pathname === '/api/media-jobs' || pathname.startsWith('/api/media-jobs/')) && method === 'DELETE') {
+      const requestedTaskId = pathname.split('/')[3] || url.searchParams.get('id');
+      if (!requestedTaskId) return json(res, 400, { error: 'media-jobs: task id is required' });
+      const job = ctx.mediaJobs.get(projectTaskKey(p.dir, requestedTaskId));
+      if (!job) return json(res, 404, { error: 'このプロジェクトの処理ジョブが見つかりません' });
+      if (!isActiveMediaJob(job)) {
+        return json(res, 409, { error: '処理ジョブはすでに終了しています', job: publicMediaJob(job) });
+      }
+      if (job.commitStarted) {
+        return json(res, 409, { error: '結果の保存が始まっているため中止できません', job: publicMediaJob(job) });
+      }
+      cancelMediaJob(job);
+      return json(res, 202, { job: publicMediaJob(job) });
+    }
+
     // ---- ingest ----
     if (pathname === '/api/ingest' && method === 'POST') {
       const b = await readBody(req);
-      broadcast(ctx, { type: 'ingest-start', file: b.file });
-      const { source: src, timings } = await ingestFile(p, b.file, {
-        language: b.language,
-        transcribe: b.transcribe,
-        // W-LAZY: undefined (the common case — neither `vedit ingest` nor
-        // `ingest-batch` sends this unless `--no-scenes` was given) falls
-        // through to ingestFile's own default (true).
-        scenes: b.scenes,
-        addToTimeline: b.addToTimeline,
-        // Set only by `ingest-batch` (see src/ingest/batch.ts), which
-        // computes the hash itself during its verification pass; a plain
-        // `vedit ingest` never sends this, so `source.sha256` stays unset
-        // exactly as before this option existed.
-        sha256: b.sha256,
-        onProgress: (step) => broadcast(ctx, { type: 'ingest-progress', step }),
+      const explicitUploadToken = b.uploadToken;
+      let uploadLease: UploadLease | undefined;
+      if (explicitUploadToken !== undefined) {
+        if (typeof explicitUploadToken !== 'string' || !explicitUploadToken) {
+          return json(res, 400, { error: 'ingest: uploadToken must be a non-empty string' });
+        }
+        uploadLease = ctx.uploadLeases.get(explicitUploadToken);
+        if (
+          !uploadLease
+          || path.resolve(uploadLease.projectDir) !== path.resolve(p.dir)
+          || path.resolve(uploadLease.path) !== path.resolve(String(b.file ?? ''))
+        ) {
+          return json(res, 400, { error: 'ingest: uploadToken does not own this file in the current project' });
+        }
+      } else if (typeof b.file === 'string') {
+        // Backward-compatible linkage for the existing browser: the exact
+        // path returned by /api/upload is enough to claim its in-memory
+        // ownership receipt.  A pre-existing user path can never enter this
+        // map because upload reservation uses O_EXCL.
+        uploadLease = uploadLeaseForPath(ctx.uploadLeases, p.dir, b.file);
+      }
+      if (uploadLease && !(await uploadLeaseStillOwnsPath(uploadLease))) {
+        // The token/path receipt authorizes the exact inode uploaded by this
+        // daemon, not whatever bytes later occupy the same pathname. Consume
+        // the stale receipt but never unlink the replacement; the browser can
+        // upload again and receive a fresh token.
+        ctx.uploadLeases.delete(uploadLease.token);
+        return json(res, 409, {
+          code: 'UPLOAD_IDENTITY_MISMATCH',
+          error: 'ingest: uploaded file changed before ingest; upload it again',
+        });
+      }
+      // A lease belongs to at most one ingest attempt.  Claim synchronously
+      // before slow probing/proxy work so concurrent duplicate requests
+      // cannot both decide they are entitled to delete the same pathname.
+      if (uploadLease) ctx.uploadLeases.delete(uploadLease.token);
+      const taskId = freshId('ingest');
+      const controller = new AbortController();
+      const job: MediaJob = {
+        taskId,
+        projectDir: p.dir,
+        project: p,
+        kind: 'ingest',
+        status: 'running',
+        phase: 'starting',
+        startedAt: new Date().toISOString(),
+        ...(typeof b.file === 'string' ? { file: b.file } : {}),
+        controller,
+        completion: null,
+        commitStarted: false,
+      };
+      ctx.mediaJobs.set(projectTaskKey(p.dir, taskId), job);
+      broadcast(ctx, {
+        type: 'ingest-start', projectDir: p.dir, taskId, file: b.file,
+        job: publicMediaJob(job),
       });
-      broadcast(ctx, { type: 'update', revision: (await p.manifest()).revision, op: 'ingest', summary: `ingested ${b.file}` });
-      return json(res, 200, { source: src, timings, state: await stateSummary(p, ctx.transcribeJobs) });
+      const operation = (async (): Promise<Awaited<ReturnType<typeof ingestFile>>> => {
+        try {
+          const ingested = await ingestFile(p, b.file, {
+            language: b.language,
+            transcribe: b.transcribe,
+            // W-LAZY: undefined (the common case — neither `vedit ingest` nor
+            // `ingest-batch` sends this unless `--no-scenes` was given) falls
+            // through to ingestFile's own default (true).
+            scenes: b.scenes,
+            addToTimeline: b.addToTimeline,
+            // Set only by `ingest-batch` (see src/ingest/batch.ts), which
+            // computes the hash itself during its verification pass; a plain
+            // `vedit ingest` never sends this, so `source.sha256` stays unset
+            // exactly as before this option existed.
+            sha256: b.sha256,
+            signal: controller.signal,
+            onCommitStart: () => {
+              job.commitStarted = true;
+              job.phase = 'committing';
+              broadcast(ctx, {
+                type: 'ingest-progress', projectDir: p.dir, taskId, file: b.file,
+                step: 'committing', job: publicMediaJob(job),
+              });
+            },
+            onProgress: (step) => {
+              if (!job.commitStarted) job.phase = step;
+              broadcast(ctx, {
+                type: 'ingest-progress', projectDir: p.dir, taskId, file: b.file,
+                step, job: publicMediaJob(job),
+              });
+            },
+          });
+          job.status = 'success';
+          job.phase = 'finished';
+          job.finishedAt = new Date().toISOString();
+          const { source: src } = ingested;
+          broadcast(ctx, {
+            type: 'ingest-done', projectDir: p.dir, taskId, file: b.file,
+            sourceId: src.id, job: publicMediaJob(job),
+          });
+          broadcast(ctx, {
+            type: 'update', projectDir: p.dir, revision: (await p.manifest()).revision,
+            op: 'ingest', summary: `ingested ${b.file}`, taskId,
+          });
+          return ingested;
+        } catch (e: any) {
+          const cancelled = controller.signal.aborted || e?.name === 'AbortError';
+          const removedManagedUpload = uploadLease ? await cleanupFailedUpload(p, uploadLease) : false;
+          job.status = cancelled ? 'cancelled' : 'error';
+          job.phase = 'finished';
+          job.finishedAt = new Date().toISOString();
+          job.error = cancelled ? undefined : (e?.message ?? String(e));
+          broadcast(ctx, {
+            type: 'ingest-error',
+            projectDir: p.dir,
+            taskId,
+            file: b.file,
+            status: job.status,
+            cancelled,
+            error: job.error ?? 'operation cancelled',
+            job: publicMediaJob(job),
+            ...(uploadLease ? { removedManagedUpload } : {}),
+          });
+          throw e;
+        }
+      })();
+      // Completion includes child termination, derived-file cleanup, managed
+      // upload cleanup and terminal event publication. Shutdown drains this,
+      // not merely the initiating HTTP socket.
+      job.completion = operation.then(() => undefined, () => undefined);
+      let ingested: Awaited<ReturnType<typeof ingestFile>>;
+      try {
+        ingested = await operation;
+      } catch (e: any) {
+        if (job.status === 'cancelled') {
+          return json(res, 409, {
+            code: 'OPERATION_CANCELLED',
+            error: 'ingest was cancelled before saving',
+            job: publicMediaJob(job),
+          });
+        }
+        throw e;
+      }
+      const { source: src, timings } = ingested;
+      return json(res, 200, {
+        taskId,
+        job: publicMediaJob(job),
+        source: src,
+        timings,
+        state: await stateSummary(p, ctx.transcribeJobs),
+      });
+    }
+
+    // Explicit transcription job truth. Terminal states remain available
+    // until this source is started again (or the daemon exits), while every
+    // query/cancel is scoped to the currently-open project.
+    if (pathname === '/api/transcribe-jobs' && method === 'GET') {
+      return json(res, 200, {
+        jobs: transcribeJobsForProject(ctx.transcribeJobs, p.dir).map(publicTranscribeJob),
+      });
+    }
+    if ((pathname === '/api/transcribe-jobs' || pathname.startsWith('/api/transcribe-jobs/')) && method === 'DELETE') {
+      const requestedTaskId = pathname.split('/')[3] || url.searchParams.get('id');
+      const requestedSourceId = url.searchParams.get('sourceId');
+      const job = transcribeJobsForProject(ctx.transcribeJobs, p.dir).find((candidate) => (
+        requestedTaskId ? candidate.taskId === requestedTaskId : requestedSourceId ? candidate.sourceId === requestedSourceId : false
+      ));
+      if (!job) return json(res, 404, { error: '実行中の文字起こしジョブが見つかりません' });
+      if (!isActiveTranscribeJob(job)) {
+        return json(res, 409, { error: '文字起こしジョブはすでに終了しています', job: publicTranscribeJob(job) });
+      }
+      if (job.commitStarted) {
+        return json(res, 409, { error: '文字起こし結果の保存が始まっているため中止できません', job: publicTranscribeJob(job) });
+      }
+      cancelTranscribeJob(job);
+      broadcast(ctx, {
+        type: 'transcribe-progress', projectDir: p.dir, sourceId: job.sourceId, taskId: job.taskId,
+        status: job.status, step: 'cancelling', job: publicTranscribeJob(job),
+      });
+      return json(res, 202, { job: publicTranscribeJob(job) });
     }
 
     // ---- W-LAZY: explicit, async transcribe job (decoupled from ingest —
@@ -961,7 +2154,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         if (!src.hasAudio) return json(res, 400, { error: `source has no audio: ${requested}` });
         targets = [requested];
       }
-      const alreadyRunning = targets.filter((id) => ctx.transcribeJobs.has(id));
+      const alreadyRunning = targets.filter((id) => isActiveTranscribeJob(transcribeJobFor(ctx.transcribeJobs, p.dir, id)));
       // A specific sourceId that's already mid-job is a real double-start —
       // reject it outright (the daemon-side "同一ソースの二重起動は拒否"
       // guard). "all" instead just skips whichever of its targets are
@@ -989,7 +2182,10 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
           ? b.glossary.map((t: unknown) => String(t))
           : String(b.glossary).split(',').map((t) => t.trim()).filter(Boolean);
       if (explicitGlossary !== undefined) {
-        const actor = b.actor ?? 'claude';
+        const actor = revisionActor(b.actor, 'agent');
+        if (isAgentActor(actor) && typeof b.baseRev !== 'number') {
+          return json(res, 400, { error: 'baseRev is required; run `vedit status` and pass --base <revision>' });
+        }
         const baseRev = typeof b.baseRev === 'number' ? b.baseRev : m.revision;
         await mutate(
           p, actor, baseRev, 'glossary-set', b,
@@ -999,12 +2195,38 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       }
       const glossary = explicitGlossary ?? m.transcription?.glossary;
 
-      const toStart = targets.filter((id) => !ctx.transcribeJobs.has(id));
+      const toStart = targets.filter((id) => !isActiveTranscribeJob(transcribeJobFor(ctx.transcribeJobs, p.dir, id)));
+      const jobs: TranscribeJob[] = [];
       for (const id of toStart) {
-        ctx.transcribeJobs.add(id);
-        void runTranscribeJob(p, id, b.language, glossary);
+        const startedAt = new Date().toISOString();
+        const job: TranscribeJob = {
+          taskId: freshId('transcribe'),
+          projectDir: p.dir,
+          sourceId: id,
+          status: 'queued',
+          phase: 'queued',
+          startedAt,
+          updatedAt: startedAt,
+          project: p,
+          controller: new AbortController(),
+          completion: null,
+          commitStarted: false,
+        };
+        ctx.transcribeJobs.set(projectSourceKey(p.dir, id), job);
+        jobs.push(job);
+        job.completion = runTranscribeJob(job, b.language, glossary).catch((error) => {
+          // runTranscribeJob owns all expected failure states. This final
+          // guard prevents an accidental handler bug from becoming an
+          // unhandled rejection that could terminate the daemon.
+          console.error(`[vedit] transcribe job ${job.taskId} failed outside its state handler: ${error?.message ?? String(error)}`);
+        });
       }
-      return json(res, 200, { started: toStart, skipped: alreadyRunning, glossary: glossary ?? [] });
+      return json(res, 200, {
+        started: toStart,
+        skipped: alreadyRunning,
+        glossary: glossary ?? [],
+        jobs: jobs.map(publicTranscribeJob),
+      });
     }
 
     // ---- drag-and-drop ingest (W-UI §4): locate the dropped file's real
@@ -1031,34 +2253,89 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       // since a filename can't safely ride inside a header.
       const rawName = url.searchParams.get('name') ?? 'upload.bin';
       const safeName = sanitizeUploadName(rawName);
-      const mediaDir = path.join(p.dir, 'media');
-      await fs.mkdir(mediaDir, { recursive: true });
-      const destPath = await uniqueDestPath(mediaDir, safeName);
-      broadcast(ctx, { type: 'upload-start', name: safeName });
+      const requestedMediaDir = path.join(p.dir, 'media');
+      await fs.mkdir(requestedMediaDir, { recursive: true });
+      const mediaDir = await resolveWithinDir(p.dir, 'media');
+      const reserved = await reserveUniqueUpload(mediaDir, safeName);
+      const destPath = reserved.path;
+      const initialStat = await reserved.handle.stat();
+      const taskId = freshId('upload');
+      broadcast(ctx, { type: 'upload-start', projectDir: p.dir, taskId, name: safeName });
       let written = 0;
       let lastBroadcast = 0;
-      const out = createWriteStream(destPath);
+      // Let the stream close its owning descriptor on finish.  pipeline()
+      // intentionally waits for that close event; autoClose:false would
+      // leave an otherwise successful HTTP upload pending forever.
+      const out = reserved.handle.createWriteStream();
+      req.on('data', (chunk: Buffer) => {
+        written += chunk.length;
+        const now = Date.now();
+        if (now - lastBroadcast > 250) {
+          lastBroadcast = now;
+          broadcast(ctx, { type: 'upload-progress', projectDir: p.dir, taskId, name: safeName, bytes: written, done: false });
+        }
+      });
       try {
-        await new Promise<void>((resolve, reject) => {
-          req.on('data', (chunk: Buffer) => {
-            written += chunk.length;
-            const now = Date.now();
-            if (now - lastBroadcast > 250) {
-              lastBroadcast = now;
-              broadcast(ctx, { type: 'upload-progress', name: safeName, bytes: written, done: false });
-            }
-          });
-          req.on('error', reject);
-          out.on('error', reject);
-          out.on('finish', () => resolve());
-          req.pipe(out);
+        // pipeline rejects on request aborts as well as read/write failures;
+        // req.pipe(out) alone can leave `finish` pending forever after the
+        // browser cancels a large upload.
+        await pipeline(req, out);
+        const completedStat = await fs.lstat(destPath);
+        if (
+          !completedStat.isFile()
+          || completedStat.dev !== initialStat.dev
+          || completedStat.ino !== initialStat.ino
+        ) throw new Error('upload destination changed before completion');
+
+        const uploadToken = freshId('upl');
+        ctx.uploadLeases.set(uploadToken, {
+          token: uploadToken,
+          projectDir: p.dir,
+          path: destPath,
+          dev: completedStat.dev,
+          ino: completedStat.ino,
+          size: completedStat.size,
         });
+        // Receipts are only needed across the immediate upload -> ingest
+        // hand-off.  Bound forgotten BGM/upload-only receipts without ever
+        // deleting their successfully written files.
+        while (ctx.uploadLeases.size > 2048) {
+          const oldest = ctx.uploadLeases.keys().next().value as string | undefined;
+          if (!oldest) break;
+          ctx.uploadLeases.delete(oldest);
+        }
+        broadcast(ctx, { type: 'upload-progress', projectDir: p.dir, taskId, name: safeName, bytes: written, done: true });
+        return json(res, 200, { path: destPath, bytes: written, uploadToken, projectDir: p.dir });
       } catch (e: any) {
-        await fs.rm(destPath, { force: true }).catch(() => {});
+        await reserved.handle.close().catch(() => {});
+        const currentStat = await fs.lstat(destPath).catch(() => null);
+        const ownedSize = currentStat
+          && currentStat.isFile()
+          && currentStat.dev === initialStat.dev
+          && currentStat.ino === initialStat.ino
+          ? currentStat.size
+          : initialStat.size;
+        await cleanupFailedUpload(p, {
+          token: taskId,
+          projectDir: p.dir,
+          path: destPath,
+          // Never adopt the inode found at the pathname after an error: a
+          // local rename/replacement race must turn into a retained orphan,
+          // not ownership of (and deletion of) somebody else's file.
+          dev: initialStat.dev,
+          ino: initialStat.ino,
+          size: ownedSize,
+        });
+        broadcast(ctx, {
+          type: 'upload-error',
+          projectDir: p.dir,
+          taskId,
+          name: safeName,
+          bytes: written,
+          error: e?.message ?? String(e),
+        });
         return json(res, 400, { error: `upload failed: ${e?.message ?? e}` });
       }
-      broadcast(ctx, { type: 'upload-progress', name: safeName, bytes: written, done: true });
-      return json(res, 200, { path: destPath, bytes: written });
     }
 
     // ---- W-UI companion channel (W-UI §0): tell every connected browser to
@@ -1152,7 +2429,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         } catch {
           return json(res, 400, { error: `show takes: source has no transcript: ${sourceId}` });
         }
-        if (!takesFor(ctx, sourceId, t).some((g) => g.id === b.groupId)) {
+        if (!takesFor(ctx, p, sourceId, t).some((g) => g.id === b.groupId)) {
           return json(res, 400, { error: `unknown take group: ${b.groupId}` });
         }
         directive = { kind: 'takes', sourceId, groupId: b.groupId };
@@ -1160,15 +2437,15 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         return json(res, 400, { error: `unknown show kind: ${JSON.stringify(b.kind)} (use range/words/candidate/compare/source/takes)` });
       }
 
-      broadcast(ctx, { type: 'show', directive });
+      broadcast(ctx, { type: 'show', projectDir: p.dir, directive });
       return json(res, 200, { ok: true, directive });
     }
 
     // ---- edits ----
     if (pathname === '/api/edit' && method === 'POST') {
       const b = await readBody(req);
-      const actor = b.actor ?? 'claude';
-      if (actor === 'claude' && typeof b.baseRev !== 'number') {
+      const actor = revisionActor(b.actor, 'agent');
+      if (isAgentActor(actor) && typeof b.baseRev !== 'number') {
         return json(res, 400, { error: 'baseRev is required; run `vedit status` and pass --base <revision>' });
       }
       const m0 = await p.manifest();
@@ -1764,30 +3041,47 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
             return json(res, 400, { error: `color-transform: lut file not found: ${lutAbs}` });
           }
         }
-        const updated = await mutate(
-          p, actor, baseRev, 'color-transform', b,
-          `color-transform ${sourceId} -> ${type}${lutAbs ? ` (${path.basename(lutAbs)})` : ''}`,
-          (m) => setColorTransform(m, sourceId, { type, lut: lutAbs }),
-        );
-        // Proxy regen happens AFTER the commit is durable — same ordering
-        // rationale as the motion sidecar writes in commit() (see its doc
-        // comment): if makeProxy throws here, the manifest already
-        // correctly reflects the new colorTransform even though the proxy
-        // on disk is stale until `vedit color` is retried, rather than a
-        // commit silently failing to apply a setting the user just made.
-        const updatedSrc = updated.sources.find((s) => s.id === sourceId)!;
-        let proxyRegenerated = false;
-        if (updatedSrc.proxy) {
-          broadcast(ctx, { type: 'color-transform-progress', sourceId, step: 'regenerating proxy' });
-          await makeProxy(
-            updatedSrc.path,
-            path.join(p.dir, updatedSrc.proxy),
-            { duration: updatedSrc.duration, fps: updatedSrc.fps, width: updatedSrc.width, height: updatedSrc.height, hasAudio: updatedSrc.hasAudio },
-            updatedSrc.colorTransform,
+        let committed = false;
+        const taskId = freshId('color');
+        broadcast(ctx, { type: 'color-transform-progress', projectDir: p.dir, taskId, sourceId, step: '色変換設定を保存中' });
+        try {
+          const updated = await mutate(
+            p, actor, baseRev, 'color-transform', b,
+            `color-transform ${sourceId} -> ${type}${lutAbs ? ` (${path.basename(lutAbs)})` : ''}`,
+            (m) => setColorTransform(m, sourceId, { type, lut: lutAbs }),
           );
-          proxyRegenerated = true;
+          committed = true;
+          // Proxy regen happens AFTER the commit is durable — same ordering
+          // rationale as the motion sidecar writes in commit() (see its doc
+          // comment): if makeProxy throws here, the manifest already
+          // correctly reflects the new colorTransform even though the proxy
+          // on disk is stale until `vedit color` is retried, rather than a
+          // commit silently failing to apply a setting the user just made.
+          const updatedSrc = updated.sources.find((s) => s.id === sourceId)!;
+          let proxyRegenerated = false;
+          if (updatedSrc.proxy) {
+            broadcast(ctx, { type: 'color-transform-progress', projectDir: p.dir, taskId, sourceId, step: 'プレビューを更新中' });
+            await makeProxy(
+              updatedSrc.path,
+              path.join(p.dir, updatedSrc.proxy),
+              { duration: updatedSrc.duration, fps: updatedSrc.fps, width: updatedSrc.width, height: updatedSrc.height, hasAudio: updatedSrc.hasAudio },
+              updatedSrc.colorTransform,
+            );
+            proxyRegenerated = true;
+          }
+          broadcast(ctx, { type: 'color-transform-done', projectDir: p.dir, taskId, sourceId, proxyRegenerated });
+          return json(res, 200, { proxyRegenerated, state: await stateSummary(p, ctx.transcribeJobs) });
+        } catch (e: any) {
+          broadcast(ctx, {
+            type: 'color-transform-error',
+            projectDir: p.dir,
+            taskId,
+            sourceId,
+            committed,
+            error: e?.message ?? String(e),
+          });
+          throw e;
         }
-        return json(res, 200, { proxyRegenerated, state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'color-adjust') {
         const sourceId = b.sourceId as string | undefined;
@@ -1944,7 +3238,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         // bounce back to the state the first undo just left, instead of
         // walking further back.
         const m = await p.restore(b.rev, actor, baseRev, b.cause);
-        broadcast(ctx, { type: 'update', revision: m.revision, op: 'restore', summary: `restored r${b.rev}` });
+        broadcast(ctx, { type: 'update', projectDir: p.dir, revision: m.revision, op: 'restore', summary: `restored r${b.rev}` });
         return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
       }
       return json(res, 400, { error: `unknown op: ${b.op}` });
@@ -1964,8 +3258,8 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
     // 'ui'/'system' callers. ----
     if (pathname === '/api/undo' && method === 'POST') {
       const b = await readBody(req);
-      const actor = b.actor ?? 'claude';
-      if (actor === 'claude' && typeof b.baseRev !== 'number') {
+      const actor = revisionActor(b.actor, 'agent');
+      if (isAgentActor(actor) && typeof b.baseRev !== 'number') {
         return json(res, 400, { error: 'baseRev is required; run `vedit status` and pass --base <revision>' });
       }
       const m0 = await p.manifest();
@@ -1977,13 +3271,13 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         if (e?.message === 'nothing to undo') return json(res, 400, { error: '戻す対象がありません' });
         throw e;
       }
-      broadcast(ctx, { type: 'update', revision: m.revision, op: 'restore', summary: `undo -> r${m.revision}` });
+      broadcast(ctx, { type: 'update', projectDir: p.dir, revision: m.revision, op: 'restore', summary: `undo -> r${m.revision}` });
       return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
     }
     if (pathname === '/api/redo' && method === 'POST') {
       const b = await readBody(req);
-      const actor = b.actor ?? 'claude';
-      if (actor === 'claude' && typeof b.baseRev !== 'number') {
+      const actor = revisionActor(b.actor, 'agent');
+      if (isAgentActor(actor) && typeof b.baseRev !== 'number') {
         return json(res, 400, { error: 'baseRev is required; run `vedit status` and pass --base <revision>' });
       }
       const m0 = await p.manifest();
@@ -1995,13 +3289,14 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         if (e?.message?.startsWith('nothing to redo')) return json(res, 400, { error: 'やり直す対象がありません' });
         throw e;
       }
-      broadcast(ctx, { type: 'update', revision: m.revision, op: 'restore', summary: `redo -> r${m.revision}` });
+      broadcast(ctx, { type: 'update', projectDir: p.dir, revision: m.revision, op: 'restore', summary: `redo -> r${m.revision}` });
       return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
     }
 
     // ---- detection & candidate queue ----
     if (pathname === '/api/detect' && method === 'POST') {
       const b = await readBody(req);
+      return serialProjectJob(ctx.detectTails, p.dir, async () => {
       const m = await p.manifest();
       const out: CutCandidate[] = [];
       const transcripts = await allTranscripts(p);
@@ -2016,6 +3311,14 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       if (b.silence !== false) {
         for (const src of m.sources) {
           if (!src.peaks) continue;
+          const words = wordsBySource.get(src.id);
+          // Waveform-only valleys in visual-first/untranscribed footage are
+          // not answerable edit questions. A seven-hour stock pool produced
+          // thousands of these and overwhelmed the human queue despite the
+          // same response recommending scene culling. Only corroborate a
+          // source whose transcript contains actual timed words; otherwise
+          // scenes/culling remains the structural workflow.
+          if (!words?.length) continue;
           let peaks: Peaks;
           try {
             peaks = JSON.parse(await fs.readFile(path.join(p.dir, src.peaks), 'utf8'));
@@ -2028,39 +3331,65 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
             // a fixed default here would defeat it on quiet outdoor footage.
             threshold: b.threshold,
             minGap: b.minGap ?? 0.7,
-            words: wordsBySource.get(src.id),
+            words,
           });
           for (const c of waveCands) {
-            const dup = out.some(
+            const dup = out.find(
               (o) => o.kind === 'silence' && o.sourceId === c.sourceId && Math.abs(o.t0 - c.t0) <= 0.2 && Math.abs(o.t1 - c.t1) <= 0.2,
             );
-            if (!dup) out.push(c);
+            if (dup) {
+              // Preserve corroboration instead of silently discarding the
+              // waveform detector when it lands on the same transcript gap.
+              // The autonomous policy requires BOTH signals and therefore
+              // depends on this merge being machine-readable, not inferred
+              // later from the English label.
+              dup.evidence = {
+                transcriptGap: Boolean(dup.evidence?.transcriptGap || c.evidence?.transcriptGap),
+                waveform: Boolean(dup.evidence?.waveform || c.evidence?.waveform),
+                transcriptConflict: Boolean(dup.evidence?.transcriptConflict || c.evidence?.transcriptConflict),
+                edge: dup.evidence?.edge ?? c.evidence?.edge ?? 'interior',
+              };
+            } else out.push(c);
           }
         }
       }
-      // W-INTENT: exclude silence candidates whose range overlaps a
-      // director-flagged protection zone (Manifest.intentZones) — a "余韻"
-      // shouldn't be re-proposed as a cut just because detect() ran again.
-      // Filler candidates are left alone (a filler word inside a protected
-      // zone is still a filler word, not the silence itself).
-      let excludedByIntentZones = 0;
-      const withinIntentZones = out.filter((c) => {
-        if (c.kind !== 'silence') return true;
-        const zones = intentZonesForSource(m, c.sourceId);
-        if (zones.length === 0) return true;
-        if (overlappingIntentZones(zones, c.t0, c.t1).length === 0) return true;
-        excludedByIntentZones++;
-        return false;
-      });
-      // Keep prior decisions: don't resurrect ranges already approved/rejected.
-      const prior = await p.candidates();
-      const decided = prior.filter((c) => c.status !== 'proposed');
-      const fresh = withinIntentZones.filter(
-        (c) => !decided.some((d) => d.sourceId === c.sourceId && Math.abs(d.t0 - c.t0) < 0.05 && Math.abs(d.t1 - c.t1) < 0.05),
+      // W-INTENT + candidate identity: filter against the CURRENT manifest
+      // and merge against the CURRENT decision queue inside one Project lock.
+      // This prevents a detect/decide race from resurrecting a range, and it
+      // reuses matching proposed ids so undo -> re-detect -> redo can still
+      // replay the logged decision onto the queue.
+      const replaced = await p.replaceCandidateProposals(
+        out,
+        (candidate, current) => {
+          return overlappingIntentZones(
+            intentZonesForSource(current, candidate.sourceId),
+            candidate.t0,
+            candidate.t1,
+          ).length === 0;
+        },
+        (result) => ({
+          relativePath: DETECT_RUN_FILENAME,
+          label: 'candidate detection completion marker',
+          value: {
+            version: 1,
+            completedAt: new Date().toISOString(),
+            // `m` is the snapshot detection actually inspected. If an edit
+            // landed during the scan, the published run is deliberately
+            // stale instead of pretending it covered the newer revision.
+            revision: m.revision,
+            proposalCount: result.proposed.length,
+            excludedByIntentZones: result.excluded,
+            parameters: {
+              silence: b.silence !== false,
+              fillers: b.fillers !== false,
+              minGap: typeof b.minGap === 'number' && Number.isFinite(b.minGap) ? b.minGap : 0.7,
+              ...(typeof b.threshold === 'number' && Number.isFinite(b.threshold) ? { threshold: b.threshold } : {}),
+            },
+          } satisfies DetectRunRecord,
+        }),
       );
-      const merged = [...decided, ...fresh];
-      await p.writeCandidates(merged);
-      broadcast(ctx, { type: 'candidates', pending: fresh.length });
+      const fresh = replaced.proposed;
+      const excludedByIntentZones = replaced.excluded;
       // F-s1-3: a soft, non-blocking hint — never refuses to detect, just
       // flags when silence-cutting is likely to fragment the timeline into
       // a lot of tiny slivers (the reported real case: a no-speech street
@@ -2077,7 +3406,10 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       const detectWarnings: string[] = [];
       if (b.silence !== false) {
         const FRAGMENTATION_HINT = '発話が少ない素材では無音カットは断片化しやすい — シーン選別(カリング)の方が向いています';
-        if (transcripts.length === 0) {
+        const hasVisualFirstSource = m.sources.some((source) => (
+          source.peaks && !(wordsBySource.get(source.id)?.length)
+        ));
+        if (hasVisualFirstSource || transcripts.length === 0) {
           detectWarnings.push(FRAGMENTATION_HINT);
         } else {
           let preview = m;
@@ -2090,18 +3422,137 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
           if (absorbedCount >= 3) detectWarnings.push(FRAGMENTATION_HINT);
         }
       }
+      const detectRunRecord = replaced.completionValue as DetectRunRecord;
+      const detectRunWarning = replaced.completionWarning
+        ? `候補の検出は完了しましたが、完了状態を保存できませんでした: ${replaced.completionWarning}`
+        : undefined;
+      const currentRevision = (await p.manifest()).revision;
+      const detectRun: DetectRunState = {
+        ...detectRunRecord,
+        stale: currentRevision !== detectRunRecord.revision,
+        ...(currentRevision !== detectRunRecord.revision ? { staleReason: 'revision-changed' as const } : {}),
+      };
+      broadcast(ctx, {
+        type: 'candidates',
+        projectDir: p.dir,
+        pending: fresh.length,
+        detectRun,
+        ...(detectRunWarning ? { warning: detectRunWarning } : {}),
+      });
       return json(res, 200, {
         pending: fresh.filter((c) => c.status === 'proposed'),
         summary: `${fresh.length} candidates (use approve/reject; approving applies the cut)`,
         revision: m.revision,
+        detectRun,
         ...(excludedByIntentZones > 0 ? { excludedByIntentZones } : {}),
-        ...(detectWarnings.length ? { warnings: detectWarnings } : {}),
+        ...((detectWarnings.length || detectRunWarning) ? {
+          warnings: [...detectWarnings, ...(detectRunWarning ? [detectRunWarning] : [])],
+        } : {}),
+      });
+      });
+    }
+    if (pathname === '/api/first-draft' && method === 'POST') {
+      const b = await readBody(req);
+      const actor = revisionActor(b.actor, 'agent');
+      if (!isAgentActor(actor)) return json(res, 400, { error: 'first-draft actor must be an AI agent' });
+      if (typeof b.baseRev !== 'number') {
+        return json(res, 400, { error: 'baseRev is required; run `vedit status` and pass --base <revision>' });
+      }
+
+      let lockedPlan: AutonomousCandidatePlan | undefined;
+      let approveFragmentsAbsorbed: AbsorbedFragment[] = [];
+      const reviewId = freshId('review');
+      const evaluatedAt = new Date().toISOString();
+      const result = await p.decideCandidates(
+        (all, before) => {
+          if (before!.revision !== b.baseRev) {
+            const err = new Error(`stale base revision ${b.baseRev}; current is ${before!.revision}. Re-read state before editing.`) as Error & { code: string };
+            err.code = 'STALE_REVISION';
+            throw err;
+          }
+          lockedPlan = planAutonomousCandidateBatch(before!, all);
+          stampAutonomyReview(lockedPlan, b.baseRev, reviewId, evaluatedAt);
+          // Preserve the planner's deterministic source/time order. Applying
+          // candidates.json order can absorb a short fragment even when the
+          // simulated order proved the exact same set safe.
+          return lockedPlan.autoApply.map((item) => item.candidate);
+        },
+        'approve',
+        (target, before) => {
+          let preview = before;
+          const fragmentsAbsorbed: AbsorbedFragment[] = [];
+          for (const c of target) {
+            preview = removeSourceRange(preview, c.sourceId, c.t0, c.t1);
+            const abs = (preview as Manifest & { fragmentsAbsorbed?: AbsorbedFragment[] }).fragmentsAbsorbed;
+            if (abs) fragmentsAbsorbed.push(...abs);
+          }
+          approveFragmentsAbsorbed = fragmentsAbsorbed;
+          const removedSeconds = timelineDuration(before) - timelineDuration(preview);
+          const questionCount = lockedPlan?.needsDecision.length ?? 0;
+          return {
+            baseRev: b.baseRev,
+            actor,
+            op: 'apply-candidates',
+            params: {
+              ids: target.map((c) => c.id),
+              mode: 'autonomous',
+              rationale: 'transcript+waveform corroborated; intent-safe; no fragment absorption',
+              autoApplied: target.length,
+              questionCount,
+            },
+            summary: `AI first draft: applied ${target.length} clear cuts (-${removedSeconds.toFixed(1)}s); ${questionCount} need a decision`,
+            mutate: (m: Manifest) => {
+              let cur = m;
+              for (const c of target) cur = removeSourceRange(cur, c.sourceId, c.t0, c.t1);
+              return cur;
+            },
+          };
+        },
+        { allowEmpty: true },
+      );
+      const finalPlan = lockedPlan!;
+      if (!result.manifest || !result.before) {
+        broadcast(ctx, { type: 'candidates', projectDir: p.dir, pending: result.all.filter(isActionableCandidate).length });
+        return json(res, 200, {
+          autoApplied: 0,
+          removedSeconds: 0,
+          questionCount: finalPlan.needsDecision.length,
+          needsDecision: finalPlan.needsDecision,
+          evidenceGate: 'transcript+waveform',
+          state: await stateSummary(p, ctx.transcribeJobs),
+        });
+      }
+      const removedSeconds = result.manifest && result.before
+        ? timelineDuration(result.before) - timelineDuration(result.manifest)
+        : 0;
+      broadcast(ctx, {
+        type: 'update',
+        projectDir: p.dir,
+        revision: result.manifest!.revision,
+        op: 'apply-candidates',
+        summary: `AI first draft: applied ${result.target.length} clear cuts (-${removedSeconds.toFixed(1)}s); ${finalPlan.needsDecision.length} need a decision`,
+      });
+      broadcast(ctx, { type: 'candidates', projectDir: p.dir, pending: result.all.filter(isActionableCandidate).length });
+      return json(res, 200, {
+        autoApplied: result.target.length,
+        removedSeconds,
+        questionCount: finalPlan.needsDecision.length,
+        needsDecision: finalPlan.needsDecision,
+        evidenceGate: 'transcript+waveform',
+        ...(approveFragmentsAbsorbed.length ? { fragmentsAbsorbed: approveFragmentsAbsorbed } : {}),
+        state: await stateSummary(p, ctx.transcribeJobs),
       });
     }
     if (pathname === '/api/candidates/decide' && method === 'POST') {
       const b = await readBody(req); // { ids: string[] | 'all', decision, actor, baseRev }
-      const actor = b.actor ?? 'ui';
-      if (actor === 'claude' && typeof b.baseRev !== 'number') {
+      const actor = revisionActor(b.actor, 'ui');
+      if (b.decision !== 'approve' && b.decision !== 'reject') {
+        return json(res, 400, { error: 'decision must be "approve" or "reject"' });
+      }
+      if (b.ids !== 'all' && (!Array.isArray(b.ids) || b.ids.some((id: unknown) => typeof id !== 'string'))) {
+        return json(res, 400, { error: 'ids must be "all" or an array of candidate ids' });
+      }
+      if (isAgentActor(actor) && typeof b.baseRev !== 'number') {
         return json(res, 400, { error: 'baseRev is required; run `vedit status` and pass --base <revision>' });
       }
       // Candidate selection, the approve-commit, and the candidates.json
@@ -2116,10 +3567,35 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       // summary and this response's own field.
       let approveFragmentsAbsorbed: AbsorbedFragment[] = [];
       const result = await p.decideCandidates(
-        (all) => (b.ids === 'all' ? all.filter((c) => c.status === 'proposed') : all.filter((c) => b.ids.includes(c.id))),
+        (all) => {
+          const selected = b.ids === 'all'
+            ? all.filter(isActionableCandidate)
+            : all.filter((c) => isActionableCandidate(c) && b.ids.includes(c.id));
+          // AI stopped on these proposals precisely because they need a
+          // human judgment. Neither the `all` sentinel nor a multi-id array
+          // may turn that question into an accidental bulk cut; one explicit
+          // id is the only approval shape accepted for a question candidate.
+          if (
+            b.decision === 'approve'
+            && selected.some(requiresIndividualCandidateDecision)
+            && (b.ids === 'all' || b.ids.length !== 1 || selected.length !== 1)
+          ) {
+            throw new Error('AIの確認候補は一件ずつ明示してカットまたは残すを選んでください');
+          }
+          return selected;
+        },
         b.decision,
-        b.decision === 'approve'
-          ? (target, before) => {
+        (target, before) => {
+          if (b.decision === 'reject') {
+            return {
+              baseRev: b.baseRev ?? before.revision,
+              actor,
+              op: 'reject-candidates',
+              params: { ids: target.map((c) => c.id), mode: 'interactive' },
+              summary: `kept ${target.length} candidate range(s)`,
+              mutate: (m: Manifest) => m,
+            };
+          }
               const baseRev = b.baseRev ?? before.revision;
               // Compute the real (frame-snapped) delta against `before` —
               // the manifest as of right now, inside the same critical
@@ -2148,21 +3624,24 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
                   return cur;
                 },
               };
-            }
-          : undefined,
+            },
       );
       if (result.manifest && result.before) {
         const removedSeconds = timelineDuration(result.before) - timelineDuration(result.manifest);
         broadcast(ctx, {
           type: 'update',
+          projectDir: p.dir,
           revision: result.manifest.revision,
-          op: 'apply-candidates',
-          summary: `applied ${result.target.length} cuts (-${removedSeconds.toFixed(1)}s)${fragmentAbsorptionNote(approveFragmentsAbsorbed)}`,
+          op: b.decision === 'approve' ? 'apply-candidates' : 'reject-candidates',
+          summary: b.decision === 'approve'
+            ? `applied ${result.target.length} cuts (-${removedSeconds.toFixed(1)}s)${fragmentAbsorptionNote(approveFragmentsAbsorbed)}`
+            : `kept ${result.target.length} candidate range(s)`,
         });
       }
-      broadcast(ctx, { type: 'candidates', pending: result.all.filter((c) => c.status === 'proposed').length });
+      broadcast(ctx, { type: 'candidates', projectDir: p.dir, pending: result.all.filter(isActionableCandidate).length });
       return json(res, 200, {
         decided: result.target.length,
+        removedSeconds: result.manifest && result.before ? timelineDuration(result.before) - timelineDuration(result.manifest) : 0,
         ...(approveFragmentsAbsorbed.length ? { fragmentsAbsorbed: approveFragmentsAbsorbed } : {}),
         state: await stateSummary(p, ctx.transcribeJobs),
       });
@@ -2173,18 +3652,83 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       const b = await readBody(req);
       const m = await p.manifest();
       const targets: string[] = b.sourceId ? [b.sourceId] : m.sources.map((s) => s.id);
-      const results: SceneFile[] = [];
-      for (const sourceId of targets) {
-        results.push(
-          await detectScenesForSource(p, m, sourceId, {
-            sensitivity: b.sensitivity,
-            maxLen: b.maxLen,
-            minLen: b.minLen,
-          }),
-        );
+      const taskId = freshId('scenes');
+      const controller = new AbortController();
+      const job: MediaJob = {
+        taskId,
+        projectDir: p.dir,
+        project: p,
+        kind: 'scenes',
+        status: 'running',
+        phase: 'starting',
+        startedAt: new Date().toISOString(),
+        sourceIds: [...targets],
+        controller,
+        completion: null,
+        commitStarted: false,
+      };
+      ctx.mediaJobs.set(projectTaskKey(p.dir, taskId), job);
+      broadcast(ctx, { type: 'scenes-start', projectDir: p.dir, taskId, sources: targets, job: publicMediaJob(job) });
+      const operation = (async (): Promise<SceneFile[]> => {
+        try {
+          const results: SceneFile[] = [];
+          for (const sourceId of targets) {
+            results.push(await detectScenesForSource(p, m, sourceId, {
+              sensitivity: b.sensitivity,
+              maxLen: b.maxLen,
+              minLen: b.minLen,
+              signal: controller.signal,
+              onProgress: (phase) => {
+                if (!job.commitStarted) job.phase = `${phase}:${sourceId}`;
+                broadcast(ctx, {
+                  type: 'scenes-progress', projectDir: p.dir, taskId, sourceId,
+                  phase, job: publicMediaJob(job),
+                });
+              },
+              onCommitStart: () => {
+                job.commitStarted = true;
+                job.phase = `committing:${sourceId}`;
+              },
+            }));
+          }
+          job.status = 'success';
+          job.phase = 'finished';
+          job.finishedAt = new Date().toISOString();
+          broadcast(ctx, { type: 'scenes', projectDir: p.dir, sources: targets, taskId, job: publicMediaJob(job) });
+          broadcast(ctx, { type: 'scenes-done', projectDir: p.dir, taskId, sources: targets, job: publicMediaJob(job) });
+          return results;
+        } catch (e: any) {
+          const cancelled = controller.signal.aborted || e?.name === 'AbortError';
+          job.status = cancelled ? 'cancelled' : 'error';
+          job.phase = 'finished';
+          job.finishedAt = new Date().toISOString();
+          job.error = cancelled ? undefined : (e?.message ?? String(e));
+          broadcast(ctx, {
+            type: 'scenes-error', projectDir: p.dir, taskId, sources: targets,
+            status: job.status, cancelled, error: job.error ?? 'operation cancelled',
+            job: publicMediaJob(job),
+          });
+          throw e;
+        }
+      })();
+      job.completion = operation.then(() => undefined, () => undefined);
+      try {
+        const results = await operation;
+        return json(res, 200, {
+          taskId,
+          job: publicMediaJob(job),
+          detected: results.map((f) => ({ sourceId: f.sourceId, count: f.scenes.length })),
+        });
+      } catch (e) {
+        if (job.status === 'cancelled') {
+          return json(res, 409, {
+            code: 'OPERATION_CANCELLED',
+            error: 'scene detection was cancelled before saving',
+            job: publicMediaJob(job),
+          });
+        }
+        throw e;
       }
-      broadcast(ctx, { type: 'scenes', sources: targets });
-      return json(res, 200, { detected: results.map((f) => ({ sourceId: f.sourceId, count: f.scenes.length })) });
     }
     if (pathname === '/api/scenes/note' && method === 'POST') {
       const b = await readBody(req); // { sourceId, id, text, by }
@@ -2195,27 +3739,100 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         return json(res, 400, { error: `by must be "user" or "model" (got ${JSON.stringify(b.by)})` });
       }
       const scene = await p.setSceneNote(b.sourceId, b.id, b.text, b.by);
-      broadcast(ctx, { type: 'scenes', sources: [b.sourceId] });
+      broadcast(ctx, { type: 'scenes', projectDir: p.dir, sources: [b.sourceId] });
       return json(res, 200, { scene });
     }
 
     return json(res, 404, { error: `no route: ${method} ${pathname}` });
   }
 
-  function serveStatic(pathname: string, res: http.ServerResponse) {
-    const file = pathname === '/' ? 'index.html' : pathname.slice(1);
-    const full = path.join(WEB_DIR, path.normalize(file));
-    if (!full.startsWith(WEB_DIR)) return json(res, 403, { error: 'forbidden' });
+  async function openRegularFile(full: string): Promise<{ handle: FileHandle; stat: Stats } | null> {
+    let handle: FileHandle | undefined;
     try {
-      const data = statSync(full);
-      const types: Record<string, string> = {
-        '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml',
-      };
-      res.writeHead(200, { 'content-type': types[path.extname(full)] ?? 'application/octet-stream', 'content-length': data.size });
-      createReadStream(full).pipe(res);
+      // Open first, then fstat the descriptor.  There is no pathname
+      // stat->open window in which a rename can turn a regular file into an
+      // ENOENT or directory stream, and the descriptor pins the selected
+      // inode for the whole response.
+      handle = await fs.open(full, 'r');
+      const stat = await handle.stat();
+      if (!stat.isFile()) {
+        await handle.close();
+        return null;
+      }
+      return { handle, stat };
     } catch {
-      json(res, 404, { error: 'not found' });
+      await handle?.close().catch(() => {});
+      return null;
     }
+  }
+
+  /**
+   * The one response pipeline for static files and every /media variant.
+   * File/HTTP errors are fully consumed here so an EISDIR, disappearing
+   * pathname, read error, or client disconnect can never become an
+   * unhandled stream 'error' that terminates the daemon.
+   */
+  async function serveRegularFile(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    full: string,
+    type: string,
+    notFound: string,
+    opts: { range?: boolean; headers?: Record<string, string> } = {},
+  ): Promise<void> {
+    const opened = await openRegularFile(full);
+    if (!opened) return json(res, 404, { error: notFound });
+    const { handle, stat } = opened;
+    try {
+      let start: number | undefined;
+      let end: number | undefined;
+      if (opts.range !== false && req.headers.range) {
+        const parsed = parseByteRange(req.headers.range, stat.size);
+        if (parsed === 'unsatisfiable') {
+          res.writeHead(416, { 'content-range': `bytes */${stat.size}` });
+          res.end();
+          return;
+        }
+        if (parsed) ({ start, end } = parsed);
+        // Malformed or multi-range header: ignore and serve the full body.
+      }
+
+      const partial = start !== undefined && end !== undefined;
+      res.writeHead(partial ? 206 : 200, {
+        'content-type': type,
+        'content-length': partial ? end! - start! + 1 : stat.size,
+        ...(opts.range !== false ? { 'accept-ranges': 'bytes' } : {}),
+        ...(partial ? { 'content-range': `bytes ${start}-${end}/${stat.size}` } : {}),
+        ...(opts.headers ?? {}),
+      });
+      const stream = handle.createReadStream({
+        autoClose: false,
+        ...(partial ? { start, end } : {}),
+      });
+      await pipeline(stream, res);
+    } catch (error: any) {
+      // pipeline() already destroys both endpoints.  The guard is for rare
+      // failures before it can do so; never ask the outer JSON error handler
+      // to write a second response after file headers have been committed.
+      if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+        json(res, 404, { error: notFound });
+      } else if (!res.destroyed) {
+        res.destroy(error instanceof Error ? error : undefined);
+      }
+    } finally {
+      await handle.close().catch(() => {});
+    }
+  }
+
+  async function serveStatic(pathname: string, req: http.IncomingMessage, res: http.ServerResponse) {
+    const file = pathname === '/' ? 'index.html' : pathname.slice(1);
+    const full = path.resolve(WEB_DIR, path.normalize(file));
+    const relative = path.relative(WEB_DIR, full);
+    if (relative.startsWith('..') || path.isAbsolute(relative)) return json(res, 403, { error: 'forbidden' });
+    const types: Record<string, string> = {
+      '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml',
+    };
+    return serveRegularFile(req, res, full, types[path.extname(full)] ?? 'application/octet-stream', 'not found', { range: false });
   }
 
   /** Guess a browser-playable audio MIME type from a music file's extension. */
@@ -2225,32 +3842,6 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       '.ogg': 'audio/ogg', '.flac': 'audio/flac', '.opus': 'audio/opus',
     };
     return types[path.extname(file).toLowerCase()] ?? 'application/octet-stream';
-  }
-
-  /** Serve a real on-disk file with byte-range support (used by proxy/peaks/music). */
-  function serveFileWithRange(req: http.IncomingMessage, res: http.ServerResponse, full: string, stat: { size: number }, type: string) {
-    const range = req.headers.range;
-    if (range) {
-      const parsed = parseByteRange(range, stat.size);
-      if (parsed === 'unsatisfiable') {
-        res.writeHead(416, { 'content-range': `bytes */${stat.size}` });
-        return res.end();
-      }
-      if (parsed) {
-        const { start, end } = parsed;
-        res.writeHead(206, {
-          'content-type': type,
-          'content-range': `bytes ${start}-${end}/${stat.size}`,
-          'accept-ranges': 'bytes',
-          'content-length': end - start + 1,
-        });
-        createReadStream(full, { start, end }).pipe(res);
-        return;
-      }
-      // Malformed or multi-range header: ignore it and serve the full body.
-    }
-    res.writeHead(200, { 'content-type': type, 'content-length': stat.size, 'accept-ranges': 'bytes' });
-    createReadStream(full).pipe(res);
   }
 
   /** Guess a browser MIME type for a kit-served font/asset file. */
@@ -2280,13 +3871,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
     } catch {
       return json(res, 404, { error: 'invalid kit media path' });
     }
-    let stat: ReturnType<typeof statSync>;
-    try {
-      stat = statSync(full);
-    } catch {
-      return json(res, 404, { error: 'kit media not found' });
-    }
-    return serveFileWithRange(req, res, full, stat, kitMediaMime(full));
+    return serveRegularFile(req, res, full, kitMediaMime(full), 'kit media not found');
   }
 
   async function serveMedia(p: Project, pathname: string, req: http.IncomingMessage, res: http.ServerResponse) {
@@ -2310,13 +3895,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       } catch {
         return json(res, 404, { error: 'invalid scene-thumb path' });
       }
-      let stat: ReturnType<typeof statSync>;
-      try {
-        stat = statSync(full);
-      } catch {
-        return json(res, 404, { error: 'scene thumbnail not found' });
-      }
-      return serveFileWithRange(req, res, full, stat, 'image/jpeg');
+      return serveRegularFile(req, res, full, 'image/jpeg', 'scene thumbnail not found');
     }
     // /media/proxy/<sourceId> | /media/peaks/<sourceId> | /media/thumb/<sourceId> | /media/music/<musicId>
     const [, , kind, id] = pathname.split('/');
@@ -2327,13 +3906,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       // user supplied via the CLI, not sandboxed to the project directory.
       const mu = (m.timeline.music ?? []).find((x) => x.id === id);
       if (!mu) return json(res, 404, { error: 'unknown music item' });
-      let stat: ReturnType<typeof statSync>;
-      try {
-        stat = statSync(mu.path);
-      } catch {
-        return json(res, 404, { error: 'music file not found' });
-      }
-      return serveFileWithRange(req, res, mu.path, stat, audioMime(mu.path));
+      return serveRegularFile(req, res, mu.path, audioMime(mu.path), 'music file not found');
     }
     const sourceId = id;
     const src = m.sources.find((s) => s.id === sourceId);
@@ -2354,8 +3927,10 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         const at = src.kind === 'image' ? 0 : Math.min(src.duration * 0.25, 30);
         await run('ffmpeg', ['-y', '-v', 'error', '-ss', String(at), '-i', media, '-frames:v', '1', '-vf', 'scale=320:-2', '-q:v', '4', fullThumb]);
       }
-      res.writeHead(200, { 'content-type': 'image/jpeg', 'cache-control': 'max-age=3600' });
-      return createReadStream(fullThumb).pipe(res);
+      return serveRegularFile(req, res, fullThumb, 'image/jpeg', 'thumbnail not found', {
+        range: false,
+        headers: { 'cache-control': 'max-age=3600' },
+      });
     }
     const rel = kind === 'proxy' ? src.proxy : src.peaks;
     if (!rel) return json(res, 404, { error: `no ${kind} for source` });
@@ -2367,14 +3942,8 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
     } catch {
       return json(res, 404, { error: `invalid ${kind} path for source` });
     }
-    let stat: ReturnType<typeof statSync>;
-    try {
-      stat = statSync(full);
-    } catch {
-      return json(res, 404, { error: `${kind} file not found` });
-    }
     const type = kind === 'proxy' ? 'video/mp4' : 'application/json';
-    return serveFileWithRange(req, res, full, stat, type);
+    return serveRegularFile(req, res, full, type, `${kind} file not found`);
   }
 
   /**
@@ -2405,5 +3974,5 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
   }
 
   await new Promise<void>((resolve) => server.listen(port, '127.0.0.1', resolve));
-  return { server, port, url: `http://localhost:${port}` };
+  return { server, port, url: `http://localhost:${port}`, close: closeDaemon };
 }

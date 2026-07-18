@@ -2,9 +2,8 @@ import { configDefaults, defineConfig } from 'vitest/config';
 
 export default defineConfig({
   test: {
-    // See test/setup.ts: points HOME at a scratch dir for every test file
-    // so nothing in the suite can write into the developer's real
-    // ~/.cache/vedit/projects.json or ~/.config/vedit/presets.json.
+    // See test/setup.ts: points vedit-specific state paths at a scratch dir
+    // for every test file without changing HOME.
     setupFiles: ['./test/setup.ts'],
     // e2e/**/*.spec.ts are Playwright specs (import '@playwright/test', run
     // via `npm run test:e2e`) — vitest's default include glob matches

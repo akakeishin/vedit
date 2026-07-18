@@ -18,7 +18,12 @@ import { listProjects } from './core/registry.js';
 import { loadPreset, listPresets, savePreset } from './core/presets.js';
 import { renderView, renderSceneSheet } from './export/view.js';
 import { hasOverlayTransform, hasReframe, writeOtio } from './export/otio.js';
-import { loadMotionSpecs, renderComposition, renderFinal, renderRangePreview, toAss } from './export/render.js';
+import { renderRangePreview, toAss } from './export/render.js';
+import {
+  commitRenderedPartial,
+  projectRenderPartialPath,
+  renderProjectMp4Atomic,
+} from './export/projectRender.js';
 import { forkProject } from './core/fork.js';
 import { planGc, runGc } from './core/gc.js';
 import { chaptersFromMotion, loadPeaksBySource, publishPack } from './export/publish.js';
@@ -34,20 +39,25 @@ import { writeSrt } from './export/srt.js';
 import { downloadWhisperModel, findWhisperModel, isImageFile, sha256File } from './ingest/ingest.js';
 import { proposeColorMatch } from './export/color.js';
 import {
-  buildPlan,
+  buildPlanSettled,
+  canResumeSkip,
   copyAndVerify,
   copyPlain,
   createJournal,
   detectDuplicates,
+  type BatchFailureStage,
   type DuplicateResult,
   journalPath,
   listVideoFiles,
   readJournal,
+  reusableVerifiedCopy,
   runPool,
   sortByCreationTime,
+  VIDEO_EXTENSIONS,
 } from './ingest/batch.js';
 import { ffmpegBin, ffmpegHasFilter, run } from './ingest/run.js';
 import { buildResume } from './core/resume.js';
+import { summarizeFirstDraftForCli } from './core/autonomy.js';
 import { appendNote, markTodoDone, readNotes, type NoteType } from './core/notes.js';
 import { detectTakes, packTakes } from './core/takes.js';
 import { buildRetrospective, parseRetentionCsv } from './core/analytics.js';
@@ -150,8 +160,27 @@ function projectDir(): string {
 }
 
 // ---- daemon client ----
+let expectedDaemonProjectDir: string | null = null;
+
+function apiRequestInit(pathname: string, init?: RequestInit): RequestInit | undefined {
+  if (!init) return init;
+  const headers = new Headers(init.headers);
+  if (typeof init.body === 'string' && !headers.has('content-type')) headers.set('content-type', 'application/json');
+  const method = (init.method ?? 'GET').toUpperCase();
+  if (
+    ['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)
+    && pathname !== '/api/open'
+    && expectedDaemonProjectDir
+  ) {
+    // Percent-encode so Unicode project paths remain valid Fetch header
+    // values; the daemon decodes before comparing absolute identities.
+    headers.set('x-vedit-project-dir', encodeURIComponent(expectedDaemonProjectDir));
+  }
+  return { ...init, headers };
+}
+
 async function api(pathname: string, init?: RequestInit): Promise<any> {
-  const res = await fetch(BASE + pathname, init);
+  const res = await fetch(BASE + pathname, apiRequestInit(pathname, init));
   const text = await res.text();
   let body: any;
   try {
@@ -161,6 +190,9 @@ async function api(pathname: string, init?: RequestInit): Promise<any> {
   }
   if (!res.ok) {
     const msg = body?.error ?? text;
+    if (res.status === 409 && body?.code === 'PROJECT_IDENTITY_MISMATCH') {
+      fail(`REJECTED (project changed): ${msg}`);
+    }
     if (res.status === 409) fail(`REJECTED (stale revision): ${msg}`);
     fail(msg);
   }
@@ -177,7 +209,7 @@ async function api(pathname: string, init?: RequestInit): Promise<any> {
  */
 async function apiTry(pathname: string, init?: RequestInit): Promise<{ ok: true; body: any } | { ok: false; error: string }> {
   try {
-    const res = await fetch(BASE + pathname, init);
+    const res = await fetch(BASE + pathname, apiRequestInit(pathname, init));
     const text = await res.text();
     let body: any;
     try {
@@ -215,7 +247,11 @@ async function ensureDaemon(dir?: string): Promise<void> {
     }
     if (!(await daemonUp())) fail('failed to start vedit daemon');
   }
-  if (dir) await api('/api/open', { method: 'POST', body: JSON.stringify({ dir }) });
+  if (dir) {
+    const resolved = path.resolve(dir);
+    await api('/api/open', { method: 'POST', body: JSON.stringify({ dir: resolved }) });
+    expectedDaemonProjectDir = resolved;
+  }
 }
 
 function baseRevOf(state: any): number {
@@ -228,7 +264,7 @@ function baseRevOf(state: any): number {
 async function editRaw(baseRev: number, body: Record<string, unknown>) {
   const res = await api('/api/edit', {
     method: 'POST',
-    body: JSON.stringify({ baseRev, actor: flags.actor ?? 'claude', ...body }),
+    body: JSON.stringify({ baseRev, actor: flags.actor ?? 'agent', ...body }),
   });
   out({ ...res, hint: MUTATE_HINT });
 }
@@ -377,7 +413,7 @@ project:   create <dir> [--name n] | status | resume | revisions | undo [--rev N
              # undo/redo スタック(revision ログの形から都度再計算、実装は core/project.ts の
              # resolveUndoTarget/resolveRedoTarget)。redo は直前が undo の時だけ有効 — 間に通常編集や
              # --rev 指定の手動 restore が入ると破棄される。--rev N は従来どおり指定revisionへ直接ジャンプ
-           fork --project <src> --to <dir> [--name n]   # 派生プロジェクト作成(revision 独立、cache/transcriptをhardlink流用)
+           fork --project <src> --to <dir> [--name n]   # 派生プロジェクト作成(revision 独立、cache/transcriptをCoW clone/copy流用)
 maintenance: compact [--dry-run]   # revisions.jsonl の世代圧縮(直近100件は全量、以降は10件毎に1件のみ全量保持)
            gc [--yes]              # cache/ の孤児(未参照プロキシ・波形・シーンサムネ等)+ orphan transcript を列挙/削除(既定 dry-run)
 notes:     note "<text>" [--type policy|decision|todo|pref]   # 低摩擦メモ(既定 decision; revision が読めれば rev N も記録)
@@ -394,8 +430,10 @@ ingest:    ingest <file...> [--language ja] [--transcribe] [--no-scenes] [--no-a
 transcribe: transcribe <sourceId|all> [--language ja] [--glossary "語1,語2,..."]
              # 文字起こしを裏で非同期実行(即座に返る; WSで transcribe-progress/-done/-error を配信)
              # --glossary は whisper の --prompt に整形して渡し、manifest に保存して以後の transcribe にも自動適用
+           transcribe-cancel <taskId|sourceId>   # 保存開始前の文字起こしを安全に中止
 read:      transcript [--full] [--source id] | candidates [--all] | sources
 detect:    detect [--min-gap 0.7] [--threshold 0.06] [--no-fillers] [--no-silence]
+           first-draft [same detection flags]   # AI初稿: 両検出が一致した低リスク無音だけ自律適用し、好みが要る候補だけ残す
 cut:       remove-words <w1 w5..w9 ...> [--source id] [--pad 0.08] | remove-range <t0> <t1> [--source id]
            approve <id...|all> | reject <id...> | trim <clipId> <in|out> <±frames>
 clips:     clip-add <sourceId> [--in s] [--out s] [--at index] | clip-remove <clipId>
@@ -535,7 +573,23 @@ async function main() {
 
     case 'serve': {
       const dir = (flags.project as string) ? path.resolve(flags.project as string) : undefined;
-      const { url } = await startDaemon({ port: numFlag('port', flags.port) ?? PORT, projectDir: dir });
+      const daemon = await startDaemon({ port: numFlag('port', flags.port) ?? PORT, projectDir: dir });
+      const { url } = daemon;
+      let shuttingDown = false;
+      const shutdown = async () => {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        process.off('SIGINT', shutdown);
+        process.off('SIGTERM', shutdown);
+        try {
+          await daemon.close();
+        } catch (error: any) {
+          console.error(`failed to shut down vedit daemon cleanly: ${error?.message ?? String(error)}`);
+          process.exitCode = 1;
+        }
+      };
+      process.once('SIGINT', shutdown);
+      process.once('SIGTERM', shutdown);
       console.log(`vedit daemon on ${url}${dir ? ` (project: ${dir})` : ''}`);
       return; // keeps running
     }
@@ -577,7 +631,7 @@ async function main() {
         await api('/api/edit', {
           method: 'POST',
           body: JSON.stringify({
-            baseRev: state0.revision, actor: flags.actor ?? 'claude',
+            baseRev: state0.revision, actor: flags.actor ?? 'agent',
             op: 'kit-link', path: path.resolve(String(flags.kit)),
           }),
         });
@@ -590,7 +644,7 @@ async function main() {
           // itself just above, so demanding --base here would only add
           // friction with nothing to protect (like `create`, unlike edits).
           baseRev: flags.base !== undefined ? Number(flags.base) : state.revision,
-          actor: flags.actor ?? 'claude',
+          actor: flags.actor ?? 'agent',
           op: 'compose', duration, width: size.width, height: size.height,
           background: flags.background,
           // Resolved against THIS process's cwd (the user's actual shell),
@@ -673,7 +727,7 @@ async function main() {
     case 'open': {
       const dir = projectDir();
       await ensureDaemon(dir);
-      return out({ url: BASE, hint: 'open this URL in a browser (or Claude browser pane) for live preview' });
+      return out({ url: BASE, hint: 'open this URL in a browser (or your AI client browser pane) for live preview' });
     }
 
     case 'status': {
@@ -811,13 +865,14 @@ async function main() {
       const dir = projectDir();
 
       const files = await listVideoFiles(pos);
-      if (files.length === 0) fail('no video files found (recognized extensions: .mp4/.mov/.m4v)');
+      if (files.length === 0) fail(`no video files found (recognized extensions: ${[...VIDEO_EXTENSIONS].join('/')})`);
       console.error(`scanning ${files.length} file(s)...`);
-      const plan = await buildPlan(files);
+      const plan = await buildPlanSettled(files);
       const sorted = await sortByCreationTime(plan.entries);
 
       if (flags.plan) {
         return out({
+          selectedFileCount: files.length,
           fileCount: plan.fileCount,
           totalSize: plan.totalSize,
           totalDuration: Number(plan.totalDuration.toFixed(1)),
@@ -829,8 +884,11 @@ async function main() {
             hasAudio: e.hasAudio,
             warnings: e.warnings.map((w) => w.message),
           })),
+          failed: plan.failures,
           applied: false,
-          hint: '読み取り専用プラン(重複検出・取り込みは未実行)。実行するには --plan を外して再実行してください',
+          hint: plan.failures.length > 0
+            ? '読み取り専用プラン。一部ファイルはprobeに失敗しましたが、正常なファイルの下見は完了しています。実行するには --plan を外してください'
+            : '読み取り専用プラン(重複検出・取り込みは未実行)。実行するには --plan を外して再実行してください',
         });
       }
 
@@ -845,31 +903,65 @@ async function main() {
       const existingBySha = new Map<string, string>();
       for (const s of m0.sources) if (s.sha256) existingBySha.set(s.sha256, s.id);
 
-      // Journal resume: skip files already fully ingested by a prior
-      // (possibly interrupted) run of this same command.
+      // Journal failures are per-file. A corrupt container must not hide
+      // usable peers selected in the same run.
       const priorJournal = await readJournal(dir);
-      const alreadyIngested = new Set(priorJournal.filter((e) => e.status === 'ingested').map((e) => e.file));
+      const priorByFile = new Map(priorJournal.map((e) => [e.file, e]));
       const journal = createJournal(dir, priorJournal);
-      const toProcess = sorted.filter((e) => !alreadyIngested.has(e.file));
-      const resumeSkipped = sorted.length - toProcess.length;
-      if (resumeSkipped > 0) console.error(`skipping ${resumeSkipped} already-ingested file(s) (journal resume: ${journalPath(dir)})`);
+      const preflightFailures = [...plan.failures];
+      for (const failure of plan.failures) {
+        await journal.record({
+          file: failure.file,
+          status: 'failed',
+          stage: failure.stage,
+          error: failure.error,
+          at: new Date().toISOString(),
+        });
+      }
 
       // Hashing (unless --no-verify): sequential with N/M progress, since a
       // multi-GB file can take real wall-clock time to hash and interleaving
-      // hash progress with 2-wide ingest progress would be unreadable.
+      // hash progress with 2-wide ingest progress would be unreadable. Resume
+      // skips happen only AFTER this hash proves the path still has the same
+      // bytes that were recorded as ingested.
       const fileHashes = new Map<string, string>();
-      if (verify) {
-        for (let i = 0; i < toProcess.length; i++) {
-          const f = toProcess[i].file;
-          console.error(`hashing ${i + 1}/${toProcess.length}: ${path.basename(f)}`);
-          const hash = await sha256File(f);
-          fileHashes.set(f, hash);
-          await journal.record({ file: f, sha256: hash, status: 'planned', at: new Date().toISOString() });
+      const toProcess: typeof sorted = [];
+      const reprocessedChangedFiles: string[] = [];
+      let resumeSkipped = 0;
+      for (let i = 0; i < sorted.length; i++) {
+        const entry = sorted[i];
+        const previous = priorByFile.get(entry.file);
+        let hash: string | undefined;
+        if (verify) {
+          console.error(`hashing ${i + 1}/${sorted.length}: ${path.basename(entry.file)}`);
+          try {
+            hash = await sha256File(entry.file);
+          } catch (error: any) {
+            const failure = { file: entry.file, stage: 'hash' as const, error: error?.message ?? String(error) };
+            preflightFailures.push(failure);
+            await journal.record({ ...failure, status: 'failed', at: new Date().toISOString() });
+            continue;
+          }
+          fileHashes.set(entry.file, hash);
+          if (canResumeSkip(previous, hash)) {
+            resumeSkipped++;
+            continue;
+          }
+          if (previous?.status === 'ingested' && previous.sha256 && previous.sha256 !== hash) {
+            reprocessedChangedFiles.push(entry.file);
+            console.error(`bytes changed since prior ingest; reprocessing: ${path.basename(entry.file)}`);
+          }
+          await journal.record({ file: entry.file, sha256: hash, status: 'planned', at: new Date().toISOString() });
+        } else {
+          // With no current hash, path-only resume would silently skip a new
+          // file that reused an old camera/download filename. Retry instead.
+          await journal.record({ file: entry.file, status: 'planned', at: new Date().toISOString() });
         }
-      } else {
-        for (const e of toProcess) {
-          await journal.record({ file: e.file, status: 'planned', at: new Date().toISOString() });
-        }
+        toProcess.push(entry);
+      }
+      if (resumeSkipped > 0) console.error(`skipping ${resumeSkipped} byte-identical already-ingested file(s) (journal resume: ${journalPath(dir)})`);
+      if (!verify && sorted.some((e) => priorByFile.get(e.file)?.status === 'ingested')) {
+        console.error('--no-verify: journal resume cannot prove byte identity; previously ingested paths will be retried');
       }
 
       // Duplicate detection (batch-internal + against existing sources) —
@@ -892,66 +984,102 @@ async function main() {
       if (targets.length === 0) {
         return out({
           ingested: 0,
-          failed: [],
+          failed: preflightFailures,
           skippedDuplicates: skippedDuplicates.map((d) => ({ file: d.file, kind: d.kind, duplicateOf: d.duplicateOf })),
           skippedAlreadyIngested: resumeSkipped,
+          reprocessedChangedFiles,
           journal: journalPath(dir),
-          hint: '取り込み対象なし(全件が重複または取り込み済み)',
+          hint: preflightFailures.length > 0
+            ? '正常にprobe/hashできた取り込み対象はありません。失敗ファイルはstageを確認して再試行できます'
+            : '取り込み対象なし(全件が重複または取り込み済み)',
         });
       }
 
       await ensureDaemon(dir);
 
-      const results: { file: string; ok: boolean; error?: string }[] = [];
+      const results = new Map<string, { file: string; ok: boolean; stage?: BatchFailureStage; error?: string }>();
       // Bounded to 2 concurrent files: proxy generation + scene detection
       // (+ transcription when --transcribe is given) are the expensive part
       // of each /api/ingest call (see runPool in batch.ts). Copy-then-verify
       // happens inside the same worker so it's
       // bounded by the same concurrency limit.
-      await runPool(targets, 2, async (entry) => {
+      const workerFailures = await runPool(targets, 2, async (entry) => {
         const hash = fileHashes.get(entry.file);
+        const previous = priorByFile.get(entry.file);
         let ingestPath = entry.file;
-        if (copyDest) {
-          try {
-            ingestPath = hash ? await copyAndVerify(entry.file, copyDest, hash) : await copyPlain(entry.file, copyDest);
-          } catch (e: any) {
-            await journal.record({ file: entry.file, sha256: hash, status: 'failed', error: e?.message ?? String(e), at: new Date().toISOString() });
-            // Copy verification failure means the copy (or the read of the
-            // original) is corrupt — a data-integrity problem, not a
-            // per-file quirk — so abort the whole batch rather than risk
-            // silently ingesting bad footage from the rest of the run.
-            fail(`copy verification failed for ${entry.file}, aborting batch: ${e?.message ?? e}`);
+        let stage: BatchFailureStage = copyDest ? 'copy' : 'ingest';
+        try {
+          if (copyDest) {
+            const reusable = await reusableVerifiedCopy(previous, copyDest, hash);
+            ingestPath = reusable
+              ?? (hash ? await copyAndVerify(entry.file, copyDest, hash) : await copyPlain(entry.file, copyDest));
+            if (reusable) console.error(`reusing verified copy after interrupted/failed ingest: ${path.basename(reusable)}`);
+            await journal.record({ file: entry.file, sha256: hash, status: 'copied', destPath: ingestPath, at: new Date().toISOString() });
           }
-          await journal.record({ file: entry.file, sha256: hash, status: 'copied', destPath: ingestPath, at: new Date().toISOString() });
-        }
-        console.error(`ingesting ${path.basename(entry.file)}...`);
-        const res = await apiTry('/api/ingest', {
-          method: 'POST',
-          body: JSON.stringify({
-            file: ingestPath,
+          stage = 'ingest';
+          console.error(`ingesting ${path.basename(entry.file)}...`);
+          const res = await apiTry('/api/ingest', {
+            method: 'POST',
+            body: JSON.stringify({
+              file: ingestPath,
+              sha256: hash,
+              language: flags.language,
+              transcribe: flags.transcribe ? true : flags['no-transcribe'] ? false : undefined,
+              scenes: flags['no-scenes'] ? false : undefined,
+              addToTimeline: flags['no-add'] ? false : undefined,
+            }),
+          });
+          if (res.ok) {
+            await journal.record({ file: entry.file, sha256: hash, status: 'ingested', destPath: copyDest ? ingestPath : undefined, at: new Date().toISOString() });
+            results.set(entry.file, { file: entry.file, ok: true });
+          } else {
+            await journal.record({ file: entry.file, sha256: hash, status: 'failed', stage, destPath: copyDest ? ingestPath : undefined, error: res.error, at: new Date().toISOString() });
+            results.set(entry.file, { file: entry.file, ok: false, stage, error: res.error });
+          }
+        } catch (error: any) {
+          const message = error?.message ?? String(error);
+          await journal.record({
+            file: entry.file,
             sha256: hash,
-            language: flags.language,
-            transcribe: flags.transcribe ? true : flags['no-transcribe'] ? false : undefined,
-            scenes: flags['no-scenes'] ? false : undefined,
-            addToTimeline: flags['no-add'] ? false : undefined,
-          }),
-        });
-        if (res.ok) {
-          await journal.record({ file: entry.file, sha256: hash, status: 'ingested', destPath: copyDest ? ingestPath : undefined, at: new Date().toISOString() });
-          results.push({ file: entry.file, ok: true });
-        } else {
-          await journal.record({ file: entry.file, sha256: hash, status: 'failed', error: res.error, at: new Date().toISOString() });
-          results.push({ file: entry.file, ok: false, error: res.error });
+            status: 'failed',
+            stage,
+            destPath: copyDest && ingestPath !== entry.file ? ingestPath : undefined,
+            error: message,
+            at: new Date().toISOString(),
+          });
+          results.set(entry.file, { file: entry.file, ok: false, stage, error: message });
         }
       });
 
+      // runPool waits for every peer even when a worker rejects unexpectedly.
+      // Most errors are caught above with a precise stage; this is the final
+      // guard for e.g. a journal write failure inside that catch path.
+      for (const failure of workerFailures) {
+        const entry = failure.item;
+        if (results.has(entry.file)) continue;
+        const error = failure.error instanceof Error ? failure.error.message : String(failure.error);
+        try {
+          await journal.record({ file: entry.file, sha256: fileHashes.get(entry.file), status: 'failed', stage: 'worker', error, at: new Date().toISOString() });
+        } catch (journalError: any) {
+          console.error(`journal write also failed for ${entry.file}: ${journalError?.message ?? journalError}`);
+        }
+        results.set(entry.file, { file: entry.file, ok: false, stage: 'worker', error });
+      }
+
+      const settledResults = targets.map((entry) => results.get(entry.file)!).filter(Boolean);
+      const failures = [
+        ...preflightFailures,
+        ...settledResults.filter((r) => !r.ok).map((r) => ({ file: r.file, stage: r.stage, error: r.error })),
+      ];
+
       return out({
-        ingested: results.filter((r) => r.ok).length,
-        failed: results.filter((r) => !r.ok).map((r) => ({ file: r.file, error: r.error })),
+        ingested: settledResults.filter((r) => r.ok).length,
+        failed: failures,
         skippedDuplicates: skippedDuplicates.map((d) => ({ file: d.file, kind: d.kind, duplicateOf: d.duplicateOf })),
         skippedAlreadyIngested: resumeSkipped,
+        reprocessedChangedFiles,
         journal: journalPath(dir),
-        hint: results.some((r) => !r.ok) ? '失敗したファイルは同じコマンドを再実行すれば再試行される(ジャーナルで完了済みはスキップ)' : undefined,
+        hint: failures.length > 0 ? '失敗したファイルはstageごとに隔離されました。同じコマンドの再実行で失敗分だけ再試行できます(同一bytesの完了済みはスキップ)' : undefined,
       });
     }
 
@@ -980,9 +1108,19 @@ async function main() {
         } catch { /* project not open yet — nothing stored to fall back to */ }
       }
       await ensureDaemon(dir);
+      const glossaryState = explicitGlossary !== undefined ? await api('/api/state') : undefined;
       const res = await api('/api/transcribe', {
         method: 'POST',
-        body: JSON.stringify({ sourceId: target, language: flags.language, glossary }),
+        body: JSON.stringify({
+          sourceId: target,
+          language: flags.language,
+          // Omitted means "reuse the stored glossary"; sending the resolved
+          // value here used to manufacture a no-op revision on every run.
+          glossary: explicitGlossary,
+          ...(glossaryState
+            ? { actor: flags.actor ?? 'agent', baseRev: glossaryState.revision }
+            : {}),
+        }),
       });
       return out({
         ...res,
@@ -991,6 +1129,20 @@ async function main() {
           ? '裏で実行中。完了は `vedit status` の sources[].transcribed、または web の存在感ストリップで確認できる'
           : '対象なし(既に文字起こし済み、または全て実行中)',
       });
+    }
+
+    case 'transcribe-cancel': {
+      const target = pos[0] ?? fail('usage: vedit transcribe-cancel <taskId|sourceId>');
+      const dir = projectDir();
+      await ensureDaemon(dir);
+      const listed = await api('/api/transcribe-jobs');
+      const job = (listed.jobs ?? []).find((candidate: any) => (
+        (candidate.taskId === target || candidate.sourceId === target)
+        && (candidate.status === 'queued' || candidate.status === 'running' || candidate.status === 'cancelling')
+      ));
+      if (!job) fail(`no running transcribe job for ${target}`);
+      const res = await api(`/api/transcribe-jobs/${encodeURIComponent(job.taskId)}`, { method: 'DELETE' });
+      return out({ ...res, hint: '中止処理を開始しました。子プロセス終了と一時ファイル削除後に status=cancelled になります' });
     }
 
     case 'transcript': {
@@ -1017,6 +1169,29 @@ async function main() {
         }),
       });
       return out(res);
+    }
+
+    case 'first-draft': {
+      const dir = projectDir();
+      await ensureDaemon(dir);
+      const state = await api('/api/state');
+      // Detection does not advance the manifest revision. The subsequent
+      // first-draft POST revalidates this exact baseRev and applies every
+      // independently corroborated cut as one undoable AI revision.
+      const detected = await api('/api/detect', {
+        method: 'POST',
+        body: JSON.stringify({
+          minGap: numFlag('min-gap', flags['min-gap']),
+          threshold: numFlag('threshold', flags.threshold),
+          fillers: flags['no-fillers'] ? false : undefined,
+          silence: flags['no-silence'] ? false : undefined,
+        }),
+      });
+      const draft = await api('/api/first-draft', {
+        method: 'POST',
+        body: JSON.stringify({ actor: flags.actor ?? 'agent', baseRev: state.revision }),
+      });
+      return out(summarizeFirstDraftForCli(draft, detected));
     }
 
     case 'candidates': {
@@ -1076,7 +1251,7 @@ async function main() {
       if (!ids || (Array.isArray(ids) && ids.length === 0)) fail(`usage: vedit ${cmd} <candidateId...|all>`);
       const res = await api('/api/candidates/decide', {
         method: 'POST',
-        body: JSON.stringify({ ids, decision: cmd === 'approve' ? 'approve' : 'reject', actor: flags.actor ?? 'claude', baseRev: baseRevOf(state) }),
+        body: JSON.stringify({ ids, decision: cmd === 'approve' ? 'approve' : 'reject', actor: flags.actor ?? 'agent', baseRev: baseRevOf(state) }),
       });
       return out({ ...res, hint: MUTATE_HINT });
     }
@@ -1281,7 +1456,7 @@ async function main() {
       const state = await api('/api/state');
       const res = await api('/api/edit', {
         method: 'POST',
-        body: JSON.stringify({ baseRev: baseRevOf(state), actor: flags.actor ?? 'claude', op: 'selects', raw }),
+        body: JSON.stringify({ baseRev: baseRevOf(state), actor: flags.actor ?? 'agent', op: 'selects', raw }),
       });
       return out({ ...res, ...preview, applied: true, hint: MUTATE_HINT });
     }
@@ -2097,32 +2272,27 @@ async function main() {
         }
       }
       if (kind === 'render') {
+        // One optimistic-lock checked capture owns every mutable render input.
+        // If an edit lands between the manifest read above and this call, fail
+        // stale instead of combining an old timeline with newer transcript or
+        // motion sidecars.
+        const inputs = await p.captureRenderInputs(m.revision);
+        const renderManifest = inputs.manifest;
+        const capturedMotionSpecs = renderManifest.timeline.motion.length > 0
+          ? inputs.motionSpecs
+          : undefined;
         let presetRaw = flags.preset as string | undefined;
         // kit defaults.export_preset (W8): consulted only when --preset is
         // omitted AND a kit is linked — never overrides an explicit flag.
-        if (presetRaw === undefined && m.kit) {
+        if (presetRaw === undefined && renderManifest.kit) {
           try {
-            const kit = await readKitFile(m.kit.path);
+            const kit = await readKitFile(renderManifest.kit.path);
             if (kit.defaults?.export_preset) presetRaw = kit.defaults.export_preset;
           } catch { /* kit unreadable — fall back to no preset */ }
         }
         if (presetRaw !== undefined && !['youtube', 'shorts', 'x'].includes(presetRaw)) {
           fail(`unknown --preset: ${presetRaw} (use youtube, shorts, or x)`);
         }
-        // W-ANIME: a composition project has no A-roll at all — renderFinal
-        // (segments()-based) would throw "empty timeline"; renderComposition
-        // is the dedicated background/sprite/dialogue pipeline instead. The
-        // existing export presets (crf/audio-bitrate/resize/loudnorm target)
-        // apply unchanged either way (resolveRenderParams is shared).
-        // W7 motion burn-in: resolve motion sidecars (motion/<id>.json) and
-        // opt in to the burn for both render pipelines. Loaded only when the
-        // timeline actually has motion items — a motion-less project passes
-        // no motionSpecs at all, keeping its filtergraph byte-for-byte on
-        // the pre-W7 regression contract (see renderFinal's doc). Warnings
-        // (e.g. 「custom-html は焼き込み対象外(N件)」) come back on
-        // res.warnings and flow into the JSON output below like every other
-        // render warning.
-        const motionSpecs = m.timeline.motion.length > 0 ? await loadMotionSpecs(p, m) : undefined;
         // 範囲下見レンダー(roadmap "範囲指定の下見レンダー"): 既存パイプ
         // ラインをタイムライン範囲 [a,b) に制約するだけ(sliceTimelineRange,
         // core/ops.ts)で、音・色・字幕の変更を数秒で A/B できる。下見品質
@@ -2136,43 +2306,32 @@ async function main() {
           const b = numArg('range b', rangeMatch[2]);
           console.error(`rendering range preview [${a}s..${b}s] (下見品質)...`);
           const options = { range: rangeRaw };
+          const finalPath = path.resolve(dest);
+          const partialPath = projectRenderPartialPath(finalPath);
           try {
-            const res = await renderRangePreview(m, await transcriptsOf(), path.resolve(dest), { a, b }, {
+            const res = await renderRangePreview(renderManifest, inputs.transcripts, partialPath, { a, b }, {
               noBurnCaptions: Boolean(flags['no-burn-captions']),
               noRepair: Boolean(flags['no-repair']),
-              ...(motionSpecs ? { motionSpecs } : {}),
+              ...(capturedMotionSpecs ? { motionSpecs: capturedMotionSpecs } : {}),
             });
+            await commitRenderedPartial(partialPath, finalPath);
             await recordExportResult(dir, {
-              kind: 'render-preview', file: dest, ok: true, revision: m.revision, options,
+              kind: 'render-preview', file: dest, ok: true, revision: renderManifest.revision, options,
               warnings: res.warnings,
             });
             return out({ ok: true, file: dest, range: res.range, warnings: res.warnings });
           } catch (e: any) {
-            await recordExportResult(dir, { kind: 'render-preview', file: dest, ok: false, revision: m.revision, options, error: e?.message ?? String(e) });
+            await recordExportResult(dir, { kind: 'render-preview', file: dest, ok: false, revision: renderManifest.revision, options, error: e?.message ?? String(e) });
             throw e;
+          } finally {
+            await fs.rm(partialPath, { force: true }).catch(() => {});
           }
         }
-        if (m.composition) {
+        if (renderManifest.composition) {
           console.error('rendering composition (background + sprites + dialogue)...');
-          const options = { preset: presetRaw };
-          try {
-            const res = await renderComposition(m, path.resolve(dest), {
-              preset: presetRaw as 'youtube' | 'shorts' | 'x' | undefined,
-              ...(motionSpecs ? { motionSpecs } : {}),
-            });
-            const dialogueCount = (m.timeline.dialogue ?? []).length;
-            await recordExportResult(dir, {
-              kind: 'render', file: dest, ok: true, revision: m.revision, options,
-              ...(res.warnings.length ? { warnings: res.warnings } : {}),
-              ...(dialogueCount > 0 ? { dialogueBurned: true, dialogueCount } : {}),
-            });
-            return out({ ok: true, file: dest, ...(res.warnings.length ? { warnings: res.warnings } : {}) });
-          } catch (e: any) {
-            await recordExportResult(dir, { kind: 'render', file: dest, ok: false, revision: m.revision, options, error: e?.message ?? String(e) });
-            throw e;
-          }
+        } else {
+          console.error('rendering from original sources (this encodes the full timeline)...');
         }
-        console.error('rendering from original sources (this encodes the full timeline)...');
         // Captions now burn by DEFAULT whenever captions.enabled + there's
         // something to caption — --no-burn-captions opts out (clean hand-off
         // render for an NLE/editor). --burn-captions is accepted for
@@ -2181,39 +2340,27 @@ async function main() {
         const noBurnCaptions = Boolean(flags['no-burn-captions']);
         const noRepair = Boolean(flags['no-repair']);
         const fastLoudnorm = Boolean(flags['fast-loudnorm']);
-        const renderOptions = { preset: presetRaw, noBurnCaptions, noRepair, fastLoudnorm };
-        let res;
-        try {
-          res = await renderFinal(m, await transcriptsOf(), path.resolve(dest), {
-            burnCaptions: Boolean(flags['burn-captions']),
-            noBurnCaptions,
-            preset: presetRaw as 'youtube' | 'shorts' | 'x' | undefined,
-            noRepair,
-            fastLoudnorm,
-            ...(motionSpecs ? { motionSpecs } : {}),
-          });
-        } catch (e: any) {
-          await recordExportResult(dir, { kind: 'render', file: dest, ok: false, revision: m.revision, options: renderOptions, error: e?.message ?? String(e) });
-          throw e;
-        }
+        const res = await renderProjectMp4Atomic(p, path.resolve(dest), {
+          manifest: renderManifest,
+          transcripts: inputs.transcripts,
+          ...(capturedMotionSpecs ? { motionSpecs: capturedMotionSpecs } : {}),
+          preset: presetRaw as 'youtube' | 'shorts' | 'x' | undefined,
+          noBurnCaptions,
+          noRepair,
+          fastLoudnorm,
+        });
         if (res.captionsBurned) {
           console.error(`字幕を焼き込み(${res.captionCueCount} cues)`);
         } else if (noBurnCaptions) {
           console.error('字幕は焼き込みなし(--no-burn-captions)');
-        } else if (!m.captions.enabled) {
+        } else if (!renderManifest.composition && !renderManifest.captions.enabled) {
           console.error('字幕は焼き込みなし(captions.enabled=false)');
-        } else {
+        } else if (!renderManifest.composition) {
           console.error('字幕は焼き込みなし(cue 0件 — transcript未取得等)');
         }
         if (res.dialogueBurned) {
           console.error(`セリフを焼き込み(${res.dialogueCount}件)`);
         }
-        await recordExportResult(dir, {
-          kind: 'render', file: dest, ok: true, revision: m.revision, options: renderOptions,
-          ...(res.warnings.length ? { warnings: res.warnings } : {}),
-          captionsBurned: res.captionsBurned, captionCueCount: res.captionCueCount,
-          dialogueBurned: res.dialogueBurned, dialogueCount: res.dialogueCount,
-        });
         return out({ ok: true, file: dest, ...(res.warnings.length ? { warnings: res.warnings } : {}) });
       }
       if (kind === 'fcp7xml') {

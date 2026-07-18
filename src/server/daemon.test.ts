@@ -8,6 +8,11 @@ import { Project, resolveRedoTarget, resolveUndoTarget } from '../core/project.j
 import { startDaemon } from './daemon.js';
 import { writeKitFile } from '../core/kit.js';
 import { appendExportResult, type ExportResultRecord } from '../core/exportResults.js';
+import {
+  exportJobPartialPath as exportJobPartialPathForTest,
+  readExportJob as readExportJobForTest,
+  writeExportJob as writeExportJobForTest,
+} from '../core/exportJob.js';
 import { appendNote } from '../core/notes.js';
 import type { CutCandidate, KitFile, Word } from '../core/types.js';
 
@@ -35,7 +40,7 @@ const { probeAudioMock, makeProxyMock, transcribeMock } = vi.hoisted(() => ({
     return { duration: 300, hasAudio: true };
   }),
   makeProxyMock: vi.fn(async () => undefined),
-  transcribeMock: vi.fn(async (_file: string, sourceId: string, opts?: { language?: string }) => ({
+  transcribeMock: vi.fn(async (_file: string, sourceId: string, opts?: { language?: string; glossary?: string[]; signal?: AbortSignal }) => ({
     sourceId,
     language: opts?.language ?? 'ja',
     words: [{ id: 'w0000', text: 'hello', t0: 0, t1: 1, p: 0.9 }],
@@ -73,6 +78,23 @@ vi.mock('../core/fonts.js', async (importOriginal) => {
   return { ...actual, listSystemFonts: listSystemFontsMock, scanKitFonts: scanKitFontsMock };
 });
 
+// App-triggered MP4 jobs call the shared render orchestration. Daemon route
+// tests exercise job lifecycle/path/revision/cancellation; actual ffmpeg and
+// result-record behavior is covered by projectRender/render tests and the
+// real smoke, so keep this file deterministic with a tiny partial file.
+const { renderProjectMp4Mock } = vi.hoisted(() => ({
+  renderProjectMp4Mock: vi.fn(async (_project: any, outPath: string, opts: any) => {
+    await opts.onPhase?.('preparing');
+    await opts.onPhase?.('encoding');
+    const { promises: fs } = await import('node:fs');
+    await fs.writeFile(outPath, 'mock-mp4');
+    await opts.onPhase?.('finalizing');
+    await opts.finalize?.();
+    return { file: opts.recordFile ?? outPath, revision: opts.manifest.revision, warnings: [] };
+  }),
+}));
+vi.mock('../export/projectRender.js', () => ({ renderProjectMp4: renderProjectMp4Mock }));
+
 // GET /media/thumb/<sourceId> shells out to ffmpeg via run() (src/ingest/run.ts)
 // to extract a poster frame — stub it so the "daemon: GET /media/thumb" suite
 // is deterministic and doesn't need real ffmpeg/media files. The mock records
@@ -82,17 +104,21 @@ vi.mock('../core/fonts.js', async (importOriginal) => {
 // ffmpeg's contract of "produces a file there" so the route's downstream
 // createReadStream still succeeds. No other suite in this file hits
 // /media/thumb, so this stub can't affect them.
-const { runMock } = vi.hoisted(() => ({
+const { runMock, sceneRunCaptureMock } = vi.hoisted(() => ({
   runMock: vi.fn(async (_cmd: string, args: string[]) => {
+    if (args.some((arg) => arg.includes('managed-ingest-fail'))) {
+      throw new Error('forced probe failure for managed-upload cleanup');
+    }
     const outPath = args[args.length - 1];
     const { promises: fs } = await import('node:fs');
     await fs.writeFile(outPath, Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
     return '';
   }),
+  sceneRunCaptureMock: vi.fn(async () => ({ stdout: '', stderr: '' })),
 }));
 vi.mock('../ingest/run.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../ingest/run.js')>();
-  return { ...actual, run: runMock };
+  return { ...actual, run: runMock, runCapture: (...args: unknown[]) => sceneRunCaptureMock(...args) };
 });
 
 function wordsFor(prefix: string, count: number, spacing = 1, dur = 0.8): Word[] {
@@ -106,7 +132,15 @@ function wordsFor(prefix: string, count: number, spacing = 1, dur = 0.8): Word[]
 }
 
 async function postJson(base: string, pathname: string, body: unknown) {
-  const res = await fetch(base + pathname, { method: 'POST', body: JSON.stringify(body) });
+  const project = pathname === '/api/open' ? null : (await (await fetch(base + '/api/ping')).json()).project;
+  const res = await fetch(base + pathname, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      ...(project ? { 'x-vedit-project-dir': encodeURIComponent(project) } : {}),
+    },
+    body: JSON.stringify(body),
+  });
   return { status: res.status, body: await res.json() };
 }
 
@@ -115,9 +149,57 @@ async function getJson(base: string, pathname: string) {
   return { status: res.status, body: await res.json() };
 }
 
+async function deleteJson(base: string, pathname: string) {
+  const project = (await (await fetch(base + '/api/ping')).json()).project;
+  const res = await fetch(base + pathname, {
+    method: 'DELETE',
+    headers: project ? { 'x-vedit-project-dir': encodeURIComponent(project) } : undefined,
+  });
+  return { status: res.status, body: await res.json() };
+}
+
 async function getText(base: string, pathname: string) {
   const res = await fetch(base + pathname);
   return { status: res.status, text: await res.text() };
+}
+
+function websocketHandshakeStatus(base: string, options: ConstructorParameters<typeof WebSocket>[1] = {}): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(base.replace(/^http/, 'ws') + '/ws', options);
+    let settled = false;
+    ws.once('open', () => {
+      settled = true;
+      resolve(101);
+      ws.close();
+    });
+    ws.once('unexpected-response', (_req, response) => {
+      settled = true;
+      resolve(response.statusCode ?? 0);
+      response.resume();
+    });
+    ws.once('error', (error) => {
+      if (!settled) reject(error);
+    });
+  });
+}
+
+function rawHttpGet(base: string, pathname: string, hostHeader: string): Promise<{ status: number; body: any }> {
+  const target = new URL(base);
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      hostname: target.hostname,
+      port: target.port,
+      path: pathname,
+      method: 'GET',
+      headers: { host: hostHeader },
+    }, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += String(chunk); });
+      res.on('end', () => resolve({ status: res.statusCode ?? 0, body: data ? JSON.parse(data) : null }));
+    });
+    req.on('error', reject);
+    req.end();
+  });
 }
 
 /**
@@ -128,7 +210,7 @@ async function getText(base: string, pathname: string) {
  * still "parked" inside readBody(). Returns the eventual response promise
  * plus a promise that resolves once headers have been flushed locally.
  */
-function postJsonDelayedBody(base: string, pathname: string, body: unknown, delayMs: number) {
+function postJsonDelayedBody(base: string, pathname: string, body: unknown, delayMs: number, expectedProjectDir: string) {
   const bodyStr = JSON.stringify(body);
   const u = new URL(base + pathname);
   let resolveHeadersSent: () => void;
@@ -142,7 +224,11 @@ function postJsonDelayedBody(base: string, pathname: string, body: unknown, dela
         port: u.port,
         path: u.pathname + u.search,
         method: 'POST',
-        headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(bodyStr) },
+        headers: {
+          'content-type': 'application/json',
+          'content-length': Buffer.byteLength(bodyStr),
+          'x-vedit-project-dir': encodeURIComponent(expectedProjectDir),
+        },
       },
       (res) => {
         let data = '';
@@ -157,6 +243,208 @@ function postJsonDelayedBody(base: string, pathname: string, body: unknown, dela
   });
   return { promise, headersSent };
 }
+
+describe('daemon: browser mutation boundary', () => {
+  const PORT = 18263;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let projectDir: string;
+  let alternateDir: string;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-browser-boundary-'));
+    // Exercise the percent-encoded header contract used by Fetch/CLI for
+    // real-world Unicode project paths, not only ASCII temp directories.
+    projectDir = path.join(root, '案件-a');
+    alternateDir = path.join(root, '案件-b');
+    await Project.create(projectDir, 'project-a');
+    await Project.create(alternateDir, 'project-b');
+    server = (await startDaemon({ port: PORT, projectDir })).server;
+  });
+
+  afterAll(() => server.close());
+
+  it('rejects a cross-origin JSON edit before it can advance the revision', async () => {
+    const before = (await getJson(BASE, '/api/state')).body;
+    const res = await fetch(`${BASE}/api/edit`, {
+      method: 'POST',
+      headers: { origin: 'https://attacker.example', 'content-type': 'application/json' },
+      body: JSON.stringify({ actor: 'ui', baseRev: before.revision, op: 'captions', patch: { style: 'bold' } }),
+    });
+    expect(res.status).toBe(403);
+    expect((await res.json()).error).toMatch(/cross-origin/);
+    expect((await getJson(BASE, '/api/state')).body.revision).toBe(before.revision);
+  });
+
+  it('rejects a simple text/plain mutation even when it has no Origin header', async () => {
+    const before = (await getJson(BASE, '/api/state')).body;
+    const res = await fetch(`${BASE}/api/edit`, {
+      method: 'POST',
+      headers: { 'content-type': 'text/plain' },
+      body: JSON.stringify({ actor: 'ui', baseRev: before.revision, op: 'captions', patch: { style: 'bold' } }),
+    });
+    expect(res.status).toBe(415);
+    expect((await res.json()).error).toMatch(/application\/json/);
+    expect((await getJson(BASE, '/api/state')).body.revision).toBe(before.revision);
+  });
+
+  it('accepts same-origin browser JSON and Origin-less CLI JSON with project identity, including /api/open', async () => {
+    const before = (await getJson(BASE, '/api/state')).body;
+    const edit = await fetch(`${BASE}/api/edit`, {
+      method: 'POST',
+      headers: {
+        origin: BASE,
+        'content-type': 'application/json',
+        'x-vedit-project-dir': encodeURIComponent(projectDir),
+      },
+      body: JSON.stringify({ actor: 'ui', baseRev: before.revision, op: 'captions', patch: { style: 'bold' } }),
+    });
+    expect(edit.status).toBe(200);
+
+    const hostileOpen = await fetch(`${BASE}/api/open`, {
+      method: 'POST',
+      headers: { origin: 'http://attacker.example', 'content-type': 'text/plain' },
+      body: JSON.stringify({ dir: alternateDir }),
+    });
+    expect(hostileOpen.status).toBe(403);
+    expect((await getJson(BASE, '/api/ping')).body.project).toBe(projectDir);
+
+    const cliOpen = await fetch(`${BASE}/api/open`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dir: alternateDir }),
+    });
+    expect(cliOpen.status).toBe(200);
+    expect((await getJson(BASE, '/api/ping')).body.project).toBe(alternateDir);
+  });
+
+  it('rejects cross-origin and simple uploads, while same-origin binary upload still streams', async () => {
+    expect((await postJson(BASE, '/api/open', { dir: alternateDir })).status).toBe(200);
+    const blockedOrigin = await fetch(`${BASE}/api/upload?name=origin-blocked.mp4`, {
+      method: 'POST',
+      headers: { origin: 'https://attacker.example', 'content-type': 'application/octet-stream' },
+      body: 'blocked',
+    });
+    expect(blockedOrigin.status).toBe(403);
+
+    const blockedSimple = await fetch(`${BASE}/api/upload?name=simple-blocked.mp4`, {
+      method: 'POST',
+      headers: { 'content-type': 'text/plain' },
+      body: 'blocked',
+    });
+    expect(blockedSimple.status).toBe(415);
+
+    const accepted = await fetch(`${BASE}/api/upload?name=accepted.mp4`, {
+      method: 'POST',
+      headers: {
+        origin: BASE,
+        'content-type': 'application/octet-stream',
+        'x-vedit-project-dir': encodeURIComponent(alternateDir),
+      },
+      body: 'video-bytes',
+    });
+    expect(accepted.status).toBe(200);
+    const acceptedBody = await accepted.json();
+    expect(await fsp.readFile(acceptedBody.path, 'utf8')).toBe('video-bytes');
+    await expect(fsp.stat(path.join(alternateDir, 'media', 'origin-blocked.mp4'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(fsp.stat(path.join(alternateDir, 'media', 'simple-blocked.mp4'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('rejects non-loopback Host and cross-site Origin on reads and static UI', async () => {
+    const hostileHost = await rawHttpGet(BASE, '/api/state', 'attacker.example');
+    expect(hostileHost.status).toBe(403);
+    expect(hostileHost.body.error).toMatch(/Host/);
+
+    const hostileOrigin = await fetch(`${BASE}/api/state`, { headers: { origin: 'https://attacker.example' } });
+    expect(hostileOrigin.status).toBe(403);
+    expect((await hostileOrigin.json()).error).toMatch(/cross-origin/);
+
+    const crossSiteStatic = await fetch(`${BASE}/`, { headers: { 'sec-fetch-site': 'cross-site' } });
+    expect(crossSiteStatic.status).toBe(403);
+
+    const sameOrigin = await fetch(`${BASE}/api/state`, { headers: { origin: BASE, 'sec-fetch-site': 'same-origin' } });
+    expect(sameOrigin.status).toBe(200);
+  });
+
+  it('applies the same loopback Host/Origin boundary to WebSocket upgrades', async () => {
+    expect(await websocketHandshakeStatus(BASE, { headers: { host: 'attacker.example' } })).toBe(403);
+    expect(await websocketHandshakeStatus(BASE, { origin: 'https://attacker.example' })).toBe(403);
+    expect(await websocketHandshakeStatus(BASE, { origin: BASE })).toBe(101);
+    // Native local clients have no Origin and remain compatible.
+    expect(await websocketHandshakeStatus(BASE)).toBe(101);
+  });
+
+  it('requires project identity and rejects a stale A mutation after switching to same-revision B', async () => {
+    expect((await postJson(BASE, '/api/open', { dir: projectDir })).status).toBe(200);
+    const stateA = (await getJson(BASE, '/api/state')).body;
+    const projectB = await Project.open(alternateDir);
+    let manifestB = await projectB.manifest();
+    while (manifestB.revision < stateA.revision) {
+      manifestB = await projectB.commit(
+        manifestB.revision,
+        'system',
+        'test-align-revision',
+        {},
+        'align B revision with A',
+        (manifest) => manifest,
+      );
+    }
+    expect((await postJson(BASE, '/api/open', { dir: alternateDir })).status).toBe(200);
+    const beforeB = (await getJson(BASE, '/api/state')).body;
+    expect(beforeB.revision).toBe(stateA.revision);
+
+    const missing = await fetch(`${BASE}/api/edit`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ actor: 'ui', baseRev: beforeB.revision, op: 'captions', patch: { style: 'missing-id' } }),
+    });
+    expect(missing.status).toBe(428);
+    expect((await missing.json()).code).toBe('PROJECT_IDENTITY_REQUIRED');
+
+    const staleA = await fetch(`${BASE}/api/edit`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-vedit-project-dir': encodeURIComponent(projectDir),
+      },
+      // A and B genuinely have the same revision. Revision locking alone
+      // would accept this even though the old control belonged to A.
+      body: JSON.stringify({ actor: 'ui', baseRev: stateA.revision, op: 'captions', patch: { style: 'must-not-land-on-b' } }),
+    });
+    expect(staleA.status).toBe(409);
+    expect((await staleA.json()).code).toBe('PROJECT_IDENTITY_MISMATCH');
+    expect((await getJson(BASE, '/api/state')).body.revision).toBe(beforeB.revision);
+  });
+
+  it('binds upload -> ingest to the project where the upload started', async () => {
+    expect((await postJson(BASE, '/api/open', { dir: projectDir })).status).toBe(200);
+    const uploaded = await fetch(`${BASE}/api/upload?name=bound.mp4`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'x-vedit-project-dir': encodeURIComponent(projectDir),
+      },
+      body: 'uploaded-to-a',
+    });
+    expect(uploaded.status).toBe(200);
+    const uploadBody = await uploaded.json();
+    expect(uploadBody.projectDir).toBe(projectDir);
+
+    expect((await postJson(BASE, '/api/open', { dir: alternateDir })).status).toBe(200);
+    const beforeB = (await getJson(BASE, '/api/state')).body;
+    const staleSecondStep = await fetch(`${BASE}/api/ingest`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-vedit-project-dir': encodeURIComponent(projectDir),
+      },
+      body: JSON.stringify({ file: uploadBody.path }),
+    });
+    expect(staleSecondStep.status).toBe(409);
+    expect((await staleSecondStep.json()).code).toBe('PROJECT_IDENTITY_MISMATCH');
+    expect((await getJson(BASE, '/api/state')).body).toMatchObject({ revision: beforeB.revision, sources: [] });
+  });
+});
 
 // ---- Suite 1: two transcribed sources (id collision / ambiguity surface) ----
 describe('daemon: multi-source project', () => {
@@ -209,6 +497,27 @@ describe('daemon: multi-source project', () => {
     const state = (await getJson(BASE, '/api/state')).body;
     const { status } = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'captions', patch: { style: 'bold' } });
     expect(status).toBe(200);
+  });
+
+  it('#1 applies the same optimistic-lock contract to the provider-neutral agent actor', async () => {
+    const missing = await postJson(BASE, '/api/edit', { actor: 'agent', op: 'captions', patch: { style: 'bold' } });
+    expect(missing.status).toBe(400);
+    expect(missing.body.error).toMatch(/baseRev is required/);
+
+    const state = (await getJson(BASE, '/api/state')).body;
+    const accepted = await postJson(BASE, '/api/edit', {
+      actor: 'agent', baseRev: state.revision, op: 'captions', patch: { style: 'bold' },
+    });
+    expect(accepted.status).toBe(200);
+  });
+
+  it('#1 rejects unknown actors instead of letting them bypass agent locking', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/edit', {
+      actor: 'codex-pretending-to-be-ui', baseRev: state.revision, op: 'captions', patch: { style: 'clean' },
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/invalid actor/);
   });
 
   it('#1 does not require baseRev for actor=ui', async () => {
@@ -1133,8 +1442,13 @@ describe('daemon: http robustness', () => {
 
   it('POST /api/edit rejects a body over the 10MB limit with 413', async () => {
     const huge = 'x'.repeat(10 * 1024 * 1024 + 1);
+    const project = (await (await fetch(`${BASE}/api/ping`)).json()).project;
     const res = await fetch(`${BASE}/api/edit`, {
       method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-vedit-project-dir': encodeURIComponent(project),
+      },
       body: JSON.stringify({ actor: 'ui', op: 'captions', patch: { note: huge } }),
     });
     expect(res.status).toBe(413);
@@ -1181,6 +1495,70 @@ describe('daemon: http robustness', () => {
   });
 });
 
+describe('daemon: static/media regular-file streaming resilience', () => {
+  const PORT = 18316;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let staticDir: string;
+  let staticRoute: string;
+  let racePath: string;
+  let movedRacePath: string;
+  const raceContent = Buffer.alloc(2 * 1024 * 1024, 0x5a);
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-file-serving-'));
+    const projectDir = path.join(root, 'proj');
+    const project = await Project.create(projectDir, 'file-serving');
+    await fsp.mkdir(project.cacheDir, { recursive: true });
+    await fsp.mkdir(path.join(project.cacheDir, 'proxy-is-directory'));
+    racePath = path.join(project.cacheDir, 'race.bin');
+    movedRacePath = path.join(project.cacheDir, 'race-moved.bin');
+    await fsp.writeFile(racePath, raceContent);
+    await project.commit(0, 'system', 'setup', {}, 'seed file-serving sources', (m) => ({
+      ...m,
+      sources: [
+        { id: 'sdir', path: '/media/dir.mp4', duration: 1, fps: 30, width: 16, height: 16, hasAudio: false, proxy: 'cache/proxy-is-directory' },
+        { id: 'smissing', path: '/media/missing.mp4', duration: 1, fps: 30, width: 16, height: 16, hasAudio: false, proxy: 'cache/disappeared.bin' },
+        { id: 'srace', path: '/media/race.mp4', duration: 1, fps: 30, width: 16, height: 16, hasAudio: false, proxy: 'cache/race.bin' },
+      ],
+    }));
+
+    // A static directory is the deterministic EISDIR case that previously
+    // escaped the surrounding statSync try/catch from createReadStream's
+    // asynchronous 'error' event.
+    staticDir = await fsp.mkdtemp(path.join(process.cwd(), 'web', '.daemon-static-dir-'));
+    staticRoute = `/${path.basename(staticDir)}/`;
+    server = (await startDaemon({ port: PORT, projectDir })).server;
+  });
+
+  afterAll(async () => {
+    if (server) await new Promise<void>((resolve) => server.close(() => resolve()));
+    if (staticDir) await fsp.rm(staticDir, { recursive: true, force: true });
+  });
+
+  it('404s for static and media directories without an unhandled EISDIR or daemon crash', async () => {
+    const staticResponse = await fetch(BASE + staticRoute);
+    expect(staticResponse.status).toBe(404);
+    expect((await fetch(`${BASE}/media/proxy/sdir`)).status).toBe(404);
+    expect((await getJson(BASE, '/api/ping')).body.ok).toBe(true);
+  });
+
+  it('404s a disappeared media path and remains healthy', async () => {
+    expect((await fetch(`${BASE}/media/proxy/smissing`)).status).toBe(404);
+    expect((await getJson(BASE, '/api/ping')).body.ok).toBe(true);
+  });
+
+  it('keeps streaming the opened inode when its pathname is renamed and replaced by a directory', async () => {
+    const response = await fetch(`${BASE}/media/proxy/srace`);
+    expect(response.status).toBe(200);
+    await fsp.rename(racePath, movedRacePath);
+    await fsp.mkdir(racePath);
+    expect(Buffer.from(await response.arrayBuffer())).toEqual(raceContent);
+    expect((await fetch(`${BASE}/media/proxy/srace`)).status).toBe(404);
+    expect((await getJson(BASE, '/api/ping')).body.ok).toBe(true);
+  });
+});
+
 // ---- Suite 9: project-switch mid-edit race (item 3 in the revision-store audit) ----
 describe('daemon: project switch does not redirect an in-flight edit', () => {
   const PORT = 18190;
@@ -1212,6 +1590,7 @@ describe('daemon: project switch does not redirect an in-flight edit', () => {
       '/api/edit',
       { actor: 'claude', baseRev: state.revision, op: 'captions', patch: { style: 'race-should-land-here' } },
       150,
+      dir,
     );
     await headersSent;
     await new Promise((r) => setTimeout(r, 30)); // give the server time to actually receive/parse the headers
@@ -1814,6 +2193,48 @@ describe('daemon: color-transform and color-adjust ops', () => {
     expect(project.manifest.sources.find((s: any) => s.id === 's2').colorTransform).toEqual({ type: 'lut', lut: lutPath });
   });
 
+  it('color-transform emits an explicit terminal done event after proxy regeneration', async () => {
+    makeProxyMock.mockClear();
+    const ws = await openWs(BASE);
+    try {
+      const terminal = nextWsMessage(ws, (m) => m.type === 'color-transform-done');
+      const state = (await getJson(BASE, '/api/state')).body;
+      const response = await postJson(BASE, '/api/edit', {
+        actor: 'agent', baseRev: state.revision, op: 'color-transform', sourceId: 's1', type: 'pq',
+      });
+      expect(response.status).toBe(200);
+      const message = await terminal;
+      expect(message).toMatchObject({
+        type: 'color-transform-done', projectDir: dir, sourceId: 's1', proxyRegenerated: true,
+      });
+      expect(message.taskId).toMatch(/^color/);
+    } finally {
+      ws.close();
+    }
+  });
+
+  it('color-transform emits a terminal error that says the setting committed when proxy regeneration fails', async () => {
+    makeProxyMock.mockRejectedValueOnce(new Error('proxy regeneration exploded'));
+    const ws = await openWs(BASE);
+    try {
+      const terminal = nextWsMessage(ws, (m) => m.type === 'color-transform-error');
+      const state = (await getJson(BASE, '/api/state')).body;
+      const response = await postJson(BASE, '/api/edit', {
+        actor: 'agent', baseRev: state.revision, op: 'color-transform', sourceId: 's1', type: 'hlg',
+      });
+      expect(response.status).toBe(400);
+      expect(response.body.error).toMatch(/proxy regeneration exploded/);
+      await expect(terminal).resolves.toMatchObject({
+        type: 'color-transform-error', projectDir: dir, sourceId: 's1', committed: true,
+        error: 'proxy regeneration exploded',
+      });
+      const project = (await getJson(BASE, '/api/project')).body;
+      expect(project.manifest.sources.find((s: any) => s.id === 's1').colorTransform).toEqual({ type: 'hlg' });
+    } finally {
+      ws.close();
+    }
+  });
+
   it('color-adjust rejects an unknown source', async () => {
     const state = (await getJson(BASE, '/api/state')).body;
     const { status, body } = await postJson(BASE, '/api/edit', {
@@ -2258,7 +2679,7 @@ describe('daemon: show channel (W-UI §0, single transcribed source)', () => {
       expect(status).toBe(200);
       expect(body.directive).toEqual({ kind: 'range', tlStart: 6.3, tlEnd: 7.5 });
       const msg = await waiting;
-      expect(msg).toEqual({ type: 'show', directive: { kind: 'range', tlStart: 6.3, tlEnd: 7.5 } });
+      expect(msg).toMatchObject({ type: 'show', directive: { kind: 'range', tlStart: 6.3, tlEnd: 7.5 } });
     } finally {
       ws.close();
     }
@@ -2494,6 +2915,42 @@ describe('daemon: locate-media', () => {
   });
 });
 
+describe('daemon: ingest task terminal state', () => {
+  const PORT = 18310;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let projectDir: string;
+  let brokenFile: string;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-ingest-terminal-'));
+    projectDir = path.join(root, 'proj');
+    brokenFile = path.join(root, 'broken.mp4');
+    await Project.create(projectDir, 'ingest-terminal');
+    server = (await startDaemon({ port: PORT, projectDir })).server;
+  });
+
+  afterAll(() => server.close());
+
+  it('emits ingest-error after ingest-start when probing fails, so browser busy state can settle', async () => {
+    const ws = await openWs(BASE);
+    try {
+      const started = nextWsMessage(ws, (m) => m.type === 'ingest-start');
+      const terminal = nextWsMessage(ws, (m) => m.type === 'ingest-error');
+      const response = await postJson(BASE, '/api/ingest', { file: brokenFile, scenes: false });
+      expect(response.status).toBe(400);
+      const startMessage = await started;
+      expect(startMessage).toMatchObject({ type: 'ingest-start', projectDir, file: brokenFile });
+      const message = await terminal;
+      expect(message).toMatchObject({ type: 'ingest-error', projectDir, file: brokenFile });
+      expect(message.taskId).toBe(startMessage.taskId);
+      expect(message.error).toBeTruthy();
+    } finally {
+      ws.close();
+    }
+  });
+});
+
 describe('daemon: upload', () => {
   const PORT = 18213;
   const BASE = `http://localhost:${PORT}`;
@@ -2514,6 +2971,10 @@ describe('daemon: upload', () => {
     const content = 'x'.repeat(5000);
     const res = await fetch(`${BASE}/api/upload?${new URLSearchParams({ name: 'my clip.mp4' })}`, {
       method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'x-vedit-project-dir': encodeURIComponent(projectDir),
+      },
       body: content,
     });
     expect(res.status).toBe(200);
@@ -2527,6 +2988,10 @@ describe('daemon: upload', () => {
   it('sanitizes a path-traversal-y filename down to a safe basename inside media/', async () => {
     const res = await fetch(`${BASE}/api/upload?${new URLSearchParams({ name: '../../etc/evil.mp4' })}`, {
       method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'x-vedit-project-dir': encodeURIComponent(projectDir),
+      },
       body: 'hi',
     });
     const body = await res.json();
@@ -2537,8 +3002,18 @@ describe('daemon: upload', () => {
 
   it('de-duplicates a second upload of the same filename instead of clobbering the first', async () => {
     const params = new URLSearchParams({ name: 'dup.mp4' });
-    const first = await fetch(`${BASE}/api/upload?${params}`, { method: 'POST', body: 'first' });
-    const second = await fetch(`${BASE}/api/upload?${params}`, { method: 'POST', body: 'second-longer' });
+    const first = await fetch(`${BASE}/api/upload?${params}`, {
+      method: 'POST', headers: {
+        'content-type': 'application/octet-stream',
+        'x-vedit-project-dir': encodeURIComponent(projectDir),
+      }, body: 'first',
+    });
+    const second = await fetch(`${BASE}/api/upload?${params}`, {
+      method: 'POST', headers: {
+        'content-type': 'application/octet-stream',
+        'x-vedit-project-dir': encodeURIComponent(projectDir),
+      }, body: 'second-longer',
+    });
     const firstBody = await first.json();
     const secondBody = await second.json();
     expect(firstBody.path).not.toBe(secondBody.path);
@@ -2546,11 +3021,173 @@ describe('daemon: upload', () => {
     expect(await fsp.readFile(secondBody.path, 'utf8')).toBe('second-longer');
   });
 
+  it('atomically reserves 24 concurrent same-name uploads without path collisions or overwritten payloads', async () => {
+    const payloads = Array.from({ length: 24 }, (_, i) => `parallel-payload-${i}-${'x'.repeat(i * 17)}`);
+    const responses = await Promise.all(payloads.map(async (payload) => {
+      const res = await fetch(`${BASE}/api/upload?${new URLSearchParams({ name: 'parallel.mp4' })}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/octet-stream',
+          'x-vedit-project-dir': encodeURIComponent(projectDir),
+        },
+        body: payload,
+      });
+      expect(res.status).toBe(200);
+      return res.json();
+    }));
+
+    const paths = responses.map((body) => body.path as string);
+    expect(new Set(paths).size).toBe(payloads.length);
+    expect(responses.every((body) => typeof body.uploadToken === 'string' && body.uploadToken.length > 0)).toBe(true);
+    await Promise.all(responses.map(async (body, i) => {
+      expect(await fsp.readFile(body.path, 'utf8')).toBe(payloads[i]);
+    }));
+  });
+
+  it('removes only the managed upload when its token-linked ingest fails', async () => {
+    const uploaded = await fetch(`${BASE}/api/upload?name=managed-ingest-fail.mp4`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'x-vedit-project-dir': encodeURIComponent(projectDir),
+      },
+      body: 'not a real video',
+    });
+    expect(uploaded.status).toBe(200);
+    const receipt = await uploaded.json();
+    expect(await fsp.readFile(receipt.path, 'utf8')).toBe('not a real video');
+
+    const ingest = await postJson(BASE, '/api/ingest', {
+      file: receipt.path,
+      uploadToken: receipt.uploadToken,
+      scenes: false,
+    });
+    expect(ingest.status).toBe(400);
+    await expect(fsp.access(receipt.path)).rejects.toThrow();
+  });
+
+  it('never deletes a pre-existing user file after an unrelated ingest failure', async () => {
+    const userFile = path.join(projectDir, 'media', 'user-owned-invalid.mp4');
+    await fsp.writeFile(userFile, 'user bytes must remain');
+    const before = await fsp.stat(userFile);
+    const ingest = await postJson(BASE, '/api/ingest', { file: userFile, scenes: false });
+    expect(ingest.status).toBe(400);
+    // daemon.test's ffprobe stub writes a tiny placeholder to its final arg,
+    // so byte equality is intentionally not meaningful in this mocked
+    // harness.  The ownership invariant is that the pre-existing inode was
+    // not unlinked by failed-upload cleanup.
+    const after = await fsp.stat(userFile);
+    expect(after.isFile()).toBe(true);
+    expect(after.ino).toBe(before.ino);
+  });
+
+  it('rejects a replacement before ingest and never deletes it when presented with the original upload token', async () => {
+    const uploaded = await fetch(`${BASE}/api/upload?name=managed-ingest-fail-replaced.mp4`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'x-vedit-project-dir': encodeURIComponent(projectDir),
+      },
+      body: 'daemon-owned bytes',
+    });
+    const receipt = await uploaded.json();
+    expect(uploaded.status).toBe(200);
+
+    await fsp.unlink(receipt.path);
+    const replacement = 'replacement user bytes that must not be deleted';
+    await fsp.writeFile(receipt.path, replacement);
+    const ingest = await postJson(BASE, '/api/ingest', {
+      file: receipt.path,
+      uploadToken: receipt.uploadToken,
+      scenes: false,
+    });
+    expect(ingest.status).toBe(409);
+    expect(ingest.body).toMatchObject({ code: 'UPLOAD_IDENTITY_MISMATCH' });
+    expect(await fsp.readFile(receipt.path, 'utf8')).toBe(replacement);
+
+    // The stale one-shot token is consumed and cannot authorize a later
+    // replacement at the same path either.
+    const retry = await postJson(BASE, '/api/ingest', {
+      file: receipt.path,
+      uploadToken: receipt.uploadToken,
+      scenes: false,
+    });
+    expect(retry.status).toBe(400);
+    expect(retry.body.error).toMatch(/does not own/);
+  });
+
   it('defaults to a safe filename when none is given', async () => {
-    const res = await fetch(`${BASE}/api/upload`, { method: 'POST', body: 'no-name-given' });
+    const res = await fetch(`${BASE}/api/upload`, {
+      method: 'POST', headers: {
+        'content-type': 'application/octet-stream',
+        'x-vedit-project-dir': encodeURIComponent(projectDir),
+      }, body: 'no-name-given',
+    });
     const body = await res.json();
     expect(res.status).toBe(200);
     expect(path.basename(body.path)).toMatch(/^upload(-\d+)?\.bin$/);
+  });
+
+  it('emits upload-error and removes the partial file when the client interrupts the stream', async () => {
+    const ws = await openWs(BASE);
+    const name = 'interrupted.mp4';
+    try {
+      const started = nextWsMessage(ws, (m) => m.type === 'upload-start' && m.name === name);
+      const terminal = nextWsMessage(ws, (m) => m.type === 'upload-error' && m.name === name);
+      const req = http.request(`${BASE}/api/upload?${new URLSearchParams({ name })}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-length': 8 * 1024 * 1024,
+          'x-vedit-project-dir': encodeURIComponent(projectDir),
+        },
+      });
+      req.on('error', () => {}); // expected: this test deliberately aborts the socket
+      req.write(Buffer.alloc(64 * 1024, 0x61));
+      const startMessage = await started;
+      req.destroy(new Error('test interrupted upload'));
+
+      const message = await terminal;
+      expect(message).toMatchObject({ type: 'upload-error', projectDir, name });
+      expect(message.taskId).toBe(startMessage.taskId);
+      expect(message.bytes).toBeGreaterThan(0);
+      expect(message.error).toBeTruthy();
+      await expect(fsp.access(path.join(projectDir, 'media', name))).rejects.toThrow();
+    } finally {
+      ws.close();
+    }
+  });
+});
+
+describe('daemon: upload directory containment', () => {
+  const PORT = 18227;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let outside: string;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-upload-containment-'));
+    const projectDir = path.join(root, 'proj');
+    outside = path.join(root, 'outside');
+    await Project.create(projectDir, 'upload-containment');
+    await fsp.mkdir(outside);
+    await fsp.symlink(outside, path.join(projectDir, 'media'));
+    server = (await startDaemon({ port: PORT, projectDir })).server;
+  });
+
+  afterAll(() => server.close());
+
+  it('rejects a media symlink that escapes the project before streaming bytes', async () => {
+    const project = (await (await fetch(`${BASE}/api/ping`)).json()).project;
+    const response = await fetch(`${BASE}/api/upload?name=escape.mp4`, {
+      method: 'POST', headers: {
+        'content-type': 'application/octet-stream',
+        'x-vedit-project-dir': encodeURIComponent(project),
+      }, body: 'blocked',
+    });
+    expect(response.status).toBe(400);
+    expect((await response.json()).error).toMatch(/path escapes directory \(symlink\)/);
+    expect(await fsp.readdir(outside)).toEqual([]);
   });
 });
 
@@ -2883,14 +3520,68 @@ describe('daemon: transcribe job (W-LAZY)', () => {
       expect(status).toBe(200);
       expect(body.started).toEqual(['s1']);
       expect(body.skipped).toEqual([]);
+      expect(body.jobs).toEqual([
+        expect.objectContaining({
+          taskId: expect.stringMatching(/^transcribe/),
+          projectDir: expect.any(String),
+          sourceId: 's1',
+          status: 'queued',
+          phase: 'queued',
+        }),
+      ]);
 
       // still running: /api/state reflects it via the per-source `transcribing` flag
       const mid = (await getJson(BASE, '/api/state')).body;
       expect(mid.sources.find((s: any) => s.id === 's1').transcribing).toBe(true);
       expect(mid.sources.find((s: any) => s.id === 's1').transcribed).toBe(false);
+      expect(mid.sources.find((s: any) => s.id === 's1').transcribeJob.taskId).toBe(body.jobs[0].taskId);
+
+      const listed = await getJson(BASE, '/api/transcribe-jobs');
+      expect(listed.status).toBe(200);
+      expect(listed.body.jobs).toContainEqual(expect.objectContaining({ taskId: body.jobs[0].taskId, status: 'running' }));
 
       releaseJob({ sourceId: 's1', language: 'ja', words: [{ id: 'w0000', text: 'hi', t0: 0, t1: 1, p: 0.9 }] });
       await done;
+    } finally {
+      ws.close();
+    }
+  });
+
+  it('cancels by stable taskId, reports an explicit cancelled terminal state, and allows retry', async () => {
+    const ws = await openWs(BASE);
+    try {
+      let signalSeen: AbortSignal | undefined;
+      transcribeMock.mockImplementationOnce((_file, sourceId, opts) => new Promise((resolve, reject) => {
+        signalSeen = opts?.signal;
+        opts?.signal?.addEventListener('abort', () => {
+          const error = new Error('operation cancelled');
+          error.name = 'AbortError';
+          reject(error);
+        }, { once: true });
+      }));
+      const terminal = nextWsMessage(ws, (m) => m.type === 'transcribe-error' && m.sourceId === 's2' && m.cancelled === true);
+      const started = await postJson(BASE, '/api/transcribe', { sourceId: 's2' });
+      expect(started.status).toBe(200);
+      const taskId = started.body.jobs[0].taskId;
+      await expect.poll(() => signalSeen).toBeDefined();
+      expect(signalSeen).toBeDefined();
+      expect(signalSeen!.aborted).toBe(false);
+
+      const cancelled = await deleteJson(BASE, `/api/transcribe-jobs/${taskId}`);
+      expect(cancelled.status).toBe(202);
+      expect(cancelled.body.job).toMatchObject({ taskId, sourceId: 's2', status: 'cancelling' });
+      expect(signalSeen!.aborted).toBe(true);
+
+      const terminalMsg = await terminal;
+      expect(terminalMsg).toMatchObject({ taskId, sourceId: 's2', status: 'cancelled', cancelled: true });
+      const after = (await getJson(BASE, '/api/state')).body;
+      const s2 = after.sources.find((s: any) => s.id === 's2');
+      expect(s2).toMatchObject({ transcribed: false, transcribing: false });
+      expect(s2.transcribeJob).toMatchObject({ taskId, status: 'cancelled', phase: 'finished' });
+
+      const secondCancel = await deleteJson(BASE, `/api/transcribe-jobs/${taskId}`);
+      expect(secondCancel.status).toBe(409);
+      expect(secondCancel.body.job.status).toBe('cancelled');
     } finally {
       ws.close();
     }
@@ -2930,7 +3621,7 @@ describe('daemon: transcribe job (W-LAZY)', () => {
   it('broadcasts transcribe-progress then transcribe-done, and commits Source.transcribed=true as actor "system"', async () => {
     const ws = await openWs(BASE);
     try {
-      const progress = nextWsMessage(ws, (m) => m.type === 'transcribe-progress' && m.sourceId === 's5');
+      const progress = nextWsMessage(ws, (m) => m.type === 'transcribe-progress' && m.sourceId === 's5' && m.status === 'running');
       const done = nextWsMessage(ws, (m) => m.type === 'transcribe-done' && m.sourceId === 's5');
       const updated = nextWsMessage(ws, (m) => m.type === 'update' && m.op === 'transcribe');
 
@@ -2963,7 +3654,10 @@ describe('daemon: transcribe job (W-LAZY)', () => {
     const ws = await openWs(BASE);
     try {
       const done = nextWsMessage(ws, (m) => m.type === 'transcribe-done' && m.sourceId === 's1');
-      const { status, body } = await postJson(BASE, '/api/transcribe', { sourceId: 's1', glossary: ['Claude', 'vedit'] });
+      const state = (await getJson(BASE, '/api/state')).body;
+      const { status, body } = await postJson(BASE, '/api/transcribe', {
+        sourceId: 's1', glossary: ['Claude', 'vedit'], actor: 'agent', baseRev: state.revision,
+      });
       expect(status).toBe(200);
       expect(body.glossary).toEqual(['Claude', 'vedit']);
       await done;
@@ -2981,7 +3675,10 @@ describe('daemon: transcribe job (W-LAZY)', () => {
     const ws = await openWs(BASE);
     try {
       const done = nextWsMessage(ws, (m) => m.type === 'transcribe-done' && m.sourceId === 's1');
-      const { status, body } = await postJson(BASE, '/api/transcribe', { sourceId: 's1', glossary: ' Anthropic , Cowork ' });
+      const state = (await getJson(BASE, '/api/state')).body;
+      const { status, body } = await postJson(BASE, '/api/transcribe', {
+        sourceId: 's1', glossary: ' Anthropic , Cowork ', actor: 'agent', baseRev: state.revision,
+      });
       expect(status).toBe(200);
       expect(body.glossary).toEqual(['Anthropic', 'Cowork']);
       await done;
@@ -3087,6 +3784,157 @@ describe('daemon: transcribe job failure (W-LAZY)', () => {
       await done;
     } finally {
       ws.close();
+    }
+  });
+});
+
+describe('daemon: transcribe ownership and shutdown isolation', () => {
+  const restoreDefaultTranscribe = () => {
+    transcribeMock.mockImplementation(async (_file: string, sourceId: string, opts?: { language?: string }) => ({
+      sourceId,
+      language: opts?.language ?? 'ja',
+      words: [{ id: 'w0000', text: 'hello', t0: 0, t1: 1, p: 0.9 }],
+    }));
+  };
+
+  it('allows the same sourceId to run independently in two projects/forks and reports only the current project', async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-transcribe-project-scope-'));
+    const dirA = path.join(root, 'project-a');
+    const dirB = path.join(root, 'project-b');
+    for (const [dir, media] of [[dirA, '/media/a.mp4'], [dirB, '/media/b.mp4']] as const) {
+      const project = await Project.create(dir, path.basename(dir));
+      await project.commit(0, 'system', 'setup', {}, 'seed same-id source', (m) => ({
+        ...m,
+        sources: [{ id: 's1', path: media, duration: 8, fps: 30, width: 640, height: 360, hasAudio: true, transcribed: false }],
+        timeline: { video: [], motion: [] },
+      }));
+    }
+
+    const releases: ((transcript: unknown) => void)[] = [];
+    transcribeMock.mockImplementation((_file, _sourceId, _opts) => new Promise((resolve) => releases.push(resolve)));
+    const BASE = 'http://localhost:18313';
+    const startedDaemon = await startDaemon({ port: 18313, projectDir: dirA });
+    const ws = await openWs(BASE);
+    try {
+      const first = await postJson(BASE, '/api/transcribe', { sourceId: 's1' });
+      expect(first.status).toBe(200);
+      await expect.poll(() => releases.length).toBe(1);
+
+      const openedB = await postJson(BASE, '/api/open', { dir: dirB });
+      expect(openedB.status).toBe(200);
+      const beforeB = (await getJson(BASE, '/api/state')).body;
+      expect(beforeB.sources[0]).toMatchObject({ id: 's1', transcribing: false, transcribed: false });
+      expect((await getJson(BASE, '/api/transcribe-jobs')).body.jobs).toEqual([]);
+
+      const second = await postJson(BASE, '/api/transcribe', { sourceId: 's1' });
+      expect(second.status).toBe(200);
+      expect(second.body.jobs[0].taskId).not.toBe(first.body.jobs[0].taskId);
+      // whisper itself uses nearly every CPU thread. The second project is
+      // independently owned and cancellable, but waits for the one decoder
+      // slot instead of oversubscribing the machine.
+      expect(releases).toHaveLength(1);
+      const runningB = (await getJson(BASE, '/api/state')).body;
+      expect(runningB.sources[0].transcribeJob.taskId).toBe(second.body.jobs[0].taskId);
+      expect(runningB.sources[0].transcribeJob.status).toBe('queued');
+
+      await postJson(BASE, '/api/open', { dir: dirA });
+      const runningA = (await getJson(BASE, '/api/state')).body;
+      expect(runningA.sources[0]).toMatchObject({ id: 's1', transcribing: true, transcribed: false });
+      expect(runningA.sources[0].transcribeJob.taskId).toBe(first.body.jobs[0].taskId);
+
+      const doneA = nextWsMessage(ws, (m) => m.type === 'transcribe-done' && m.projectDir === dirA);
+      const doneB = nextWsMessage(ws, (m) => m.type === 'transcribe-done' && m.projectDir === dirB);
+      releases[0]({ sourceId: 's1', language: 'ja', words: [] });
+      await doneA;
+      await expect.poll(() => releases.length).toBe(2);
+      releases[1]({ sourceId: 's1', language: 'ja', words: [] });
+      await doneB;
+
+      for (const dir of [dirA, dirB]) {
+        await postJson(BASE, '/api/open', { dir });
+        const state = (await getJson(BASE, '/api/state')).body;
+        expect(state.sources[0]).toMatchObject({ id: 's1', transcribing: false, transcribed: true });
+        expect(state.sources[0].transcribeJob.status).toBe('success');
+      }
+    } finally {
+      ws.close();
+      await startedDaemon.close();
+      restoreDefaultTranscribe();
+    }
+  });
+
+  it('aborts and drains an in-flight child before the daemon close promise resolves', async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-transcribe-shutdown-'));
+    const dir = path.join(root, 'project');
+    const project = await Project.create(dir, 'shutdown');
+    await project.commit(0, 'system', 'setup', {}, 'seed source', (m) => ({
+      ...m,
+      sources: [{ id: 's1', path: '/media/shutdown.mp4', duration: 8, fps: 30, width: 640, height: 360, hasAudio: true, transcribed: false }],
+      timeline: { video: [], motion: [] },
+    }));
+
+    let signal: AbortSignal | undefined;
+    transcribeMock.mockImplementationOnce((_file, _sourceId, opts) => new Promise((_resolve, reject) => {
+      signal = opts?.signal;
+      opts?.signal?.addEventListener('abort', () => {
+        const error = new Error('operation cancelled');
+        error.name = 'AbortError';
+        reject(error);
+      }, { once: true });
+    }));
+    const startedDaemon = await startDaemon({ port: 18314, projectDir: dir });
+    try {
+      const started = await postJson('http://localhost:18314', '/api/transcribe', { sourceId: 's1' });
+      expect(started.status).toBe(200);
+      await expect.poll(() => signal).toBeDefined();
+      await startedDaemon.close();
+      expect(signal!.aborted).toBe(true);
+      expect((await project.manifest()).sources[0].transcribed).toBe(false);
+    } finally {
+      if (startedDaemon.server.listening) await startedDaemon.close();
+      restoreDefaultTranscribe();
+    }
+  });
+
+  it('cancels a queued project job immediately without ever spawning its whisper child', async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-transcribe-queued-cancel-'));
+    const dirA = path.join(root, 'project-a');
+    const dirB = path.join(root, 'project-b');
+    for (const [dir, sourceId] of [[dirA, 'a1'], [dirB, 'b1']] as const) {
+      const project = await Project.create(dir, path.basename(dir));
+      await project.commit(0, 'system', 'setup', {}, 'seed source', (m) => ({
+        ...m,
+        sources: [{ id: sourceId, path: `/media/${sourceId}.mp4`, duration: 8, fps: 30, width: 640, height: 360, hasAudio: true, transcribed: false }],
+        timeline: { video: [], motion: [] },
+      }));
+    }
+
+    const releases: ((transcript: unknown) => void)[] = [];
+    transcribeMock.mockImplementation((_file, _sourceId, _opts) => new Promise((resolve) => releases.push(resolve)));
+    const BASE = 'http://localhost:18315';
+    const startedDaemon = await startDaemon({ port: 18315, projectDir: dirA });
+    const ws = await openWs(BASE);
+    try {
+      await postJson(BASE, '/api/transcribe', { sourceId: 'a1' });
+      await expect.poll(() => releases.length).toBe(1);
+      await postJson(BASE, '/api/open', { dir: dirB });
+      const queued = await postJson(BASE, '/api/transcribe', { sourceId: 'b1' });
+      expect(queued.body.jobs[0]).toMatchObject({ sourceId: 'b1', status: 'queued' });
+      const terminal = nextWsMessage(ws, (m) => m.type === 'transcribe-error' && m.taskId === queued.body.jobs[0].taskId);
+      const cancelled = await deleteJson(BASE, `/api/transcribe-jobs/${queued.body.jobs[0].taskId}`);
+      expect(cancelled.status).toBe(202);
+      expect(await terminal).toMatchObject({ sourceId: 'b1', status: 'cancelled', cancelled: true });
+      expect(releases).toHaveLength(1);
+      const bState = (await getJson(BASE, '/api/state')).body;
+      expect(bState.sources[0]).toMatchObject({ id: 'b1', transcribed: false, transcribing: false });
+
+      const doneA = nextWsMessage(ws, (m) => m.type === 'transcribe-done' && m.projectDir === dirA);
+      releases[0]({ sourceId: 'a1', language: 'ja', words: [] });
+      await doneA;
+    } finally {
+      ws.close();
+      await startedDaemon.close();
+      restoreDefaultTranscribe();
     }
   });
 });
@@ -3222,6 +4070,559 @@ describe('daemon: /api/detect excludes silence candidates inside intent zones', 
   });
 });
 
+// ---- AI-first autonomy experiment: corroborated low-risk work is applied
+// in one revision; preference-sensitive items remain as the only questions.
+describe('daemon: autonomous first draft', () => {
+  const PORT = 18220;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-autonomy-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'autonomy');
+    await project.commit(0, 'system', 'setup', {}, 'seed source', (m) => ({
+      ...m,
+      fps: 30,
+      sources: [{ id: 's1', path: '/media/one.mp4', duration: 60, fps: 30, width: 1920, height: 1080, hasAudio: true }],
+      timeline: { video: [{ id: 'clip1', sourceId: 's1', srcIn: 0, srcOut: 60 }], motion: [] },
+    }));
+    const safe: CutCandidate[] = Array.from({ length: 12 }, (_, i) => ({
+      id: `safe${i}`,
+      kind: 'silence',
+      sourceId: 's1',
+      t0: 1 + i * 3,
+      t1: 2 + i * 3,
+      wordIds: [],
+      label: '1.2s silence after "x"',
+      status: 'proposed',
+      evidence: { transcriptGap: true, waveform: true, transcriptConflict: false, edge: 'interior' },
+    }));
+    const fillers: CutCandidate[] = Array.from({ length: 3 }, (_, i) => ({
+      id: `filler${i}`,
+      kind: 'filler',
+      sourceId: 's1',
+      t0: 40 + i * 2,
+      t1: 40.4 + i * 2,
+      wordIds: [`w${i}`],
+      label: 'filler "えーと"',
+      status: 'proposed',
+      evidence: { transcriptGap: true, waveform: false, transcriptConflict: false, edge: 'interior' },
+    }));
+    await project.writeCandidates([...safe, ...fillers]);
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('applies 12 corroborated silences in one AI revision and leaves exactly 3 real questions', async () => {
+    const before = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/first-draft', { actor: 'agent', baseRev: before.revision });
+    expect(status).toBe(200);
+    expect(body.autoApplied).toBe(12);
+    expect(body.questionCount).toBe(3);
+    expect(body.needsDecision).toHaveLength(3);
+    expect(body.needsDecision.every((x: any) => x.reasonCode === 'preference-required')).toBe(true);
+    expect(body.removedSeconds).toBeCloseTo(12, 5);
+    expect(body.state.revision).toBe(before.revision + 1);
+    expect(body.state.pendingCandidates).toBe(3);
+
+    const all = (await getJson(BASE, '/api/candidates?all=1')).body as CutCandidate[];
+    expect(all.filter((c) => c.status === 'approved')).toHaveLength(12);
+    expect(all.filter((c) => c.status === 'proposed')).toHaveLength(3);
+    expect(all.filter((c) => c.status === 'proposed').map((c) => c.aiReview?.disposition)).toEqual([
+      'question', 'question', 'question',
+    ]);
+    const revs = (await getJson(BASE, '/api/revisions')).body;
+    const last = revs.at(-1);
+    expect(last.actor).toBe('agent');
+    expect(last.op).toBe('apply-candidates');
+    expect(last.params).toMatchObject({ mode: 'autonomous', autoApplied: 12, questionCount: 3 });
+  });
+
+  it('is idempotent: rerunning does not reapply decided ids or create another revision', async () => {
+    const before = (await getJson(BASE, '/api/state')).body;
+    const { status, body } = await postJson(BASE, '/api/first-draft', { actor: 'claude', baseRev: before.revision });
+    expect(status).toBe(200);
+    expect(body.autoApplied).toBe(0);
+    expect(body.questionCount).toBe(3);
+    const after = (await getJson(BASE, '/api/state')).body;
+    expect(after.revision).toBe(before.revision);
+
+    const duplicate = await postJson(BASE, '/api/candidates/decide', {
+      actor: 'ui', baseRev: after.revision, ids: ['safe0'], decision: 'approve',
+    });
+    expect(duplicate.status).toBe(400);
+    expect(duplicate.body.error).toMatch(/no matching pending candidates/);
+    expect((await getJson(BASE, '/api/state')).body.revision).toBe(after.revision);
+  });
+
+  it('rejects bulk approval of AI question candidates and leaves the queue untouched', async () => {
+    const before = (await getJson(BASE, '/api/state')).body;
+    const bulk = await postJson(BASE, '/api/candidates/decide', {
+      actor: 'ui',
+      baseRev: before.revision,
+      ids: ['filler0', 'filler1'],
+      decision: 'approve',
+    });
+    expect(bulk.status).toBe(400);
+    expect(bulk.body.error).toMatch(/一件ずつ明示/);
+    expect((await getJson(BASE, '/api/state')).body.revision).toBe(before.revision);
+    const all = (await getJson(BASE, '/api/candidates?all=1')).body as CutCandidate[];
+    expect(all.filter((candidate) => candidate.id.startsWith('filler') && candidate.status === 'proposed')).toHaveLength(3);
+  });
+
+  it('one undo restores both the original duration and the 12 candidate questions; redo reapplies both', async () => {
+    const applied = (await getJson(BASE, '/api/state')).body;
+    const undone = await postJson(BASE, '/api/undo', { actor: 'ui', baseRev: applied.revision });
+    expect(undone.status).toBe(200);
+    expect(undone.body.state.duration).toBeCloseTo(60, 5);
+    let all = (await getJson(BASE, '/api/candidates?all=1')).body as CutCandidate[];
+    expect(all.filter((c) => c.status === 'proposed')).toHaveLength(15);
+
+    const redone = await postJson(BASE, '/api/redo', { actor: 'ui', baseRev: undone.body.state.revision });
+    expect(redone.status).toBe(200);
+    expect(redone.body.state.duration).toBeCloseTo(48, 5);
+    all = (await getJson(BASE, '/api/candidates?all=1')).body as CutCandidate[];
+    expect(all.filter((c) => c.status === 'approved')).toHaveLength(12);
+    expect(all.filter((c) => c.status === 'proposed')).toHaveLength(3);
+  });
+});
+
+describe('daemon: excluded autonomy findings are diagnostic, not human questions', () => {
+  const PORT = 18224;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-autonomy-excluded-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'autonomy-excluded');
+    await project.commit(0, 'system', 'setup', {}, 'seed source', (m) => ({
+      ...m,
+      sources: [{ id: 's1', path: '/media/one.mp4', duration: 10, fps: 30, width: 1920, height: 1080, hasAudio: true }],
+      timeline: { video: [{ id: 'clip1', sourceId: 's1', srcIn: 0, srcOut: 10 }], motion: [] },
+    }));
+    await project.writeCandidates([{
+      id: 'zero', kind: 'silence', sourceId: 's1', t0: 3, t1: 3,
+      wordIds: [], label: 'invalid zero range', status: 'proposed',
+      evidence: { transcriptGap: true, waveform: true, transcriptConflict: false, edge: 'interior' },
+    }]);
+    server = (await startDaemon({ port: PORT, projectDir: dir })).server;
+  });
+
+  afterAll(() => server.close());
+
+  it('records the AI review but exposes zero actionable questions and refuses a no-op cut', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const draft = await postJson(BASE, '/api/first-draft', { actor: 'claude', baseRev: state.revision });
+    expect(draft.status).toBe(200);
+    expect(draft.body.autoApplied).toBe(0);
+    expect(draft.body.questionCount).toBe(0);
+    expect(draft.body.state.pendingCandidates).toBe(0);
+    expect((await getJson(BASE, '/api/candidates')).body).toEqual([]);
+    const all = (await getJson(BASE, '/api/candidates?all=1')).body as CutCandidate[];
+    expect(all[0].aiReview).toMatchObject({ disposition: 'excluded', reasonCode: 'invalid-range' });
+
+    const decide = await postJson(BASE, '/api/candidates/decide', {
+      actor: 'ui', baseRev: state.revision, ids: ['zero'], decision: 'approve',
+    });
+    expect(decide.status).toBe(400);
+    expect(decide.body.error).toMatch(/no matching pending candidates/);
+    expect((await getJson(BASE, '/api/state')).body.revision).toBe(state.revision);
+  });
+});
+
+describe('daemon: app-owned local MP4 export job', () => {
+  const PORT = 18221;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let dir: string;
+
+  async function waitForJob(status: string): Promise<any> {
+    const deadline = Date.now() + 3000;
+    let last: any;
+    while (Date.now() < deadline) {
+      last = (await getJson(BASE, '/api/export-job')).body.job;
+      if (last?.status === status) return last;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error(`job did not reach ${status}: ${JSON.stringify(last)}`);
+  }
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-export-job-'));
+    dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'export-job');
+    await project.commit(0, 'system', 'setup', {}, 'seed composition', (m) => ({
+      ...m,
+      width: 640,
+      height: 360,
+      composition: { duration: 2, background: { type: 'color', hex: '#000000' } },
+    }));
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('requires the exact visible revision and writes only to project/exports with a server-generated name', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const stale = await postJson(BASE, '/api/export-job', { baseRev: state.revision - 1 });
+    expect(stale.status).toBe(409);
+
+    const started = await postJson(BASE, '/api/export-job', { baseRev: state.revision });
+    expect(started.status).toBe(202);
+    expect(started.body.job.status).toBe('running');
+    const done = await waitForJob('success');
+    expect(done.revision).toBe(state.revision);
+    expect(done.file.startsWith(path.join(dir, 'exports') + path.sep)).toBe(true);
+    expect(path.extname(done.file)).toBe('.mp4');
+    await expect(fsp.access(done.file)).resolves.toBeUndefined();
+  });
+
+  it('atomically reserves concurrent starts so exactly one POST receives 202', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    renderProjectMp4Mock.mockImplementationOnce(async (_project: any, outPath: string, opts: any) => {
+      await opts.onPhase?.('encoding');
+      await gate;
+      await fsp.writeFile(outPath, 'mock-mp4');
+      await opts.finalize?.();
+      return { file: opts.recordFile, revision: opts.manifest.revision, warnings: [] };
+    });
+    const state = (await getJson(BASE, '/api/state')).body;
+    const [first, second] = await Promise.all([
+      postJson(BASE, '/api/export-job', { baseRev: state.revision }),
+      postJson(BASE, '/api/export-job', { baseRev: state.revision }),
+    ]);
+    expect([first.status, second.status].sort()).toEqual([202, 409]);
+    release();
+    await waitForJob('success');
+  });
+
+  it('cancels the owned render, removes the partial, and can retry successfully', async () => {
+    renderProjectMp4Mock.mockImplementationOnce(async (_project: any, _outPath: string, opts: any) => {
+      await opts.onPhase?.('encoding');
+      await new Promise<void>((_resolve, reject) => {
+        const abort = () => {
+          const e = new Error('operation cancelled');
+          e.name = 'AbortError';
+          reject(e);
+        };
+        if (opts.signal.aborted) abort();
+        else opts.signal.addEventListener('abort', abort, { once: true });
+      });
+      throw new Error('unreachable');
+    });
+    const state = (await getJson(BASE, '/api/state')).body;
+    const started = await postJson(BASE, '/api/export-job', { baseRev: state.revision });
+    expect(started.status).toBe(202);
+    const cancelRes = await deleteJson(BASE, `/api/export-job/${started.body.job.id}`);
+    expect(cancelRes.status).toBe(202);
+    const cancelled = await waitForJob('cancelled');
+    await expect(fsp.access(cancelled.file)).rejects.toThrow();
+
+    const retry = await postJson(BASE, '/api/export-job', { baseRev: state.revision });
+    expect(retry.status).toBe(202);
+    await waitForJob('success');
+  });
+
+  it('surfaces a real render failure and permits a clean retry', async () => {
+    renderProjectMp4Mock.mockRejectedValueOnce(new Error('disk full'));
+    const state = (await getJson(BASE, '/api/state')).body;
+    expect((await postJson(BASE, '/api/export-job', { baseRev: state.revision })).status).toBe(202);
+    const failed = await waitForJob('error');
+    expect(failed.error).toContain('disk full');
+    await expect(fsp.access(failed.file)).rejects.toThrow();
+
+    expect((await postJson(BASE, '/api/export-job', { baseRev: state.revision })).status).toBe(202);
+    await waitForJob('success');
+  });
+
+  it('repairs a failed terminal-state write before allowing the next export claim', async () => {
+    const statePath = path.join(dir, 'cache', 'export-job.json');
+    const realRename = fsp.rename.bind(fsp);
+    let blockTerminal = true;
+    const rename = vi.spyOn(fsp, 'rename').mockImplementation(async (from, to) => {
+      if (blockTerminal && String(to) === statePath) {
+        try {
+          const staged = JSON.parse(await fsp.readFile(from, 'utf8'));
+          if (staged.status !== 'running') {
+            const error = new Error('injected terminal-state disk failure') as NodeJS.ErrnoException;
+            error.code = 'EIO';
+            throw error;
+          }
+        } catch (error) {
+          if ((error as Error).message.includes('injected terminal-state')) throw error;
+        }
+      }
+      return realRename(from, to);
+    });
+    try {
+      const state = (await getJson(BASE, '/api/state')).body;
+      expect((await postJson(BASE, '/api/export-job', { baseRev: state.revision })).status).toBe(202);
+      const visibleSuccess = await waitForJob('success');
+      expect(visibleSuccess.warnings.join(' ')).toMatch(/状態を保存できませんでした/);
+      expect((await readExportJobForTest(dir))?.status).toBe('running');
+
+      const blocked = await postJson(BASE, '/api/export-job', { baseRev: state.revision });
+      expect(blocked.status).toBe(503);
+      expect(blocked.body.code).toBe('EXPORT_STATE_PERSISTENCE_PENDING');
+
+      blockTerminal = false;
+      const retry = await postJson(BASE, '/api/export-job', { baseRev: state.revision });
+      expect(retry.status).toBe(202);
+      await waitForJob('success');
+    } finally {
+      blockTerminal = false;
+      rename.mockRestore();
+    }
+  });
+
+  it('releases the start reservation when the initial job-state write fails', async () => {
+    await fsp.rm(path.join(dir, 'cache'), { recursive: true, force: true });
+    await fsp.writeFile(path.join(dir, 'cache'), 'not-a-directory');
+    const state = (await getJson(BASE, '/api/state')).body;
+    const failed = await postJson(BASE, '/api/export-job', { baseRev: state.revision });
+    expect(failed.status).toBe(400);
+
+    await fsp.rm(path.join(dir, 'cache'), { force: true });
+    await fsp.mkdir(path.join(dir, 'cache'), { recursive: true });
+    const retry = await postJson(BASE, '/api/export-job', { baseRev: state.revision });
+    expect(retry.status).toBe(202);
+    await waitForJob('success');
+  });
+
+  it('makes cancellation too late immediately after the atomic final rename', async () => {
+    let finalized!: () => void;
+    let releaseResult!: () => void;
+    const finalizedPromise = new Promise<void>((resolve) => { finalized = resolve; });
+    const resultGate = new Promise<void>((resolve) => { releaseResult = resolve; });
+    renderProjectMp4Mock.mockImplementationOnce(async (_project: any, outPath: string, opts: any) => {
+      await opts.onPhase?.('encoding');
+      await fsp.writeFile(outPath, 'complete-final-mp4');
+      await opts.onPhase?.('finalizing');
+      await opts.finalize?.();
+      finalized();
+      await resultGate;
+      return { file: opts.recordFile, revision: opts.manifest.revision, warnings: [] };
+    });
+    const state = (await getJson(BASE, '/api/state')).body;
+    const started = await postJson(BASE, '/api/export-job', { baseRev: state.revision });
+    expect(started.status).toBe(202);
+    await finalizedPromise;
+
+    const cancel = await deleteJson(BASE, `/api/export-job/${started.body.job.id}`);
+    expect(cancel.status).toBe(409);
+    expect(cancel.body.error).toMatch(/確定済み/);
+    await expect(fsp.readFile(started.body.job.file, 'utf8')).resolves.toBe('complete-final-mp4');
+
+    releaseResult();
+    await waitForJob('success');
+  });
+});
+
+describe('daemon: cross-daemon export lease', () => {
+  const PORT_A = 18316;
+  const PORT_B = 18317;
+  const BASE_A = `http://localhost:${PORT_A}`;
+  const BASE_B = `http://localhost:${PORT_B}`;
+  let daemonA: Awaited<ReturnType<typeof startDaemon>>;
+  let daemonB: Awaited<ReturnType<typeof startDaemon>>;
+  let dir: string;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-export-lease-'));
+    dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'two-daemon-export');
+    await project.commit(0, 'system', 'setup', {}, 'seed composition', (m) => ({
+      ...m,
+      width: 640,
+      height: 360,
+      composition: { duration: 2, background: { type: 'color', hex: '#000000' } },
+    }));
+    daemonA = await startDaemon({ port: PORT_A, projectDir: dir });
+    daemonB = await startDaemon({ port: PORT_B, projectDir: dir });
+  });
+
+  afterAll(async () => {
+    await Promise.all([daemonA.close(), daemonB.close()]);
+  });
+
+  it('returns one 202/one 409 and a GET never steals the live owner\'s partial', async () => {
+    let entered!: () => void;
+    let release!: () => void;
+    const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    renderProjectMp4Mock.mockImplementationOnce(async (_project: any, outPath: string, opts: any) => {
+      await opts.onPhase?.('encoding');
+      await fsp.writeFile(outPath, 'daemon-a-live-partial');
+      entered();
+      await gate;
+      await opts.onPhase?.('finalizing');
+      await opts.finalize?.();
+      return { file: opts.recordFile, revision: opts.manifest.revision, warnings: [] };
+    });
+
+    const state = (await getJson(BASE_A, '/api/state')).body;
+    const [attemptA, attemptB] = await Promise.all([
+      postJson(BASE_A, '/api/export-job', { baseRev: state.revision }),
+      postJson(BASE_B, '/api/export-job', { baseRev: state.revision }),
+    ]);
+    expect([attemptA.status, attemptB.status].sort()).toEqual([202, 409]);
+    const first = attemptA.status === 202 ? attemptA : attemptB;
+    const second = attemptA.status === 409 ? attemptA : attemptB;
+    const observerBase = attemptA.status === 409 ? BASE_A : BASE_B;
+    expect(second.body.job).toMatchObject({ id: first.body.job.id, status: 'running' });
+    await enteredPromise;
+
+    const observed = await getJson(observerBase, '/api/export-job');
+    expect(observed.status).toBe(200);
+    expect(observed.body.job).toMatchObject({ id: first.body.job.id, status: 'running' });
+    expect(observed.body.job).not.toHaveProperty('owner');
+    expect(observed.body.job.partialBytes).toBeGreaterThan(0);
+    await expect(fsp.readFile(exportJobPartialPathForTest(first.body.job), 'utf8')).resolves.toBe('daemon-a-live-partial');
+
+    // Opening another daemon after encoding has started exercises startup
+    // recovery, not just GET recovery: it must observe the owner as live and
+    // leave both the running state and partial bytes untouched.
+    const startupObserver = await startDaemon({ port: 18319, projectDir: dir });
+    try {
+      const afterStartup = await getJson('http://localhost:18319', '/api/export-job');
+      expect(afterStartup.body.job).toMatchObject({ id: first.body.job.id, status: 'running' });
+      await expect(fsp.readFile(exportJobPartialPathForTest(first.body.job), 'utf8')).resolves.toBe('daemon-a-live-partial');
+    } finally {
+      await startupObserver.close();
+    }
+
+    release();
+    await expect.poll(async () => (await getJson(observerBase, '/api/export-job')).body.job?.status).toBe('success');
+  });
+
+  it('recovers on startup only after the recorded PID/start-token owner is provably dead', async () => {
+    const dead = {
+      id: 'dead-daemon-export',
+      revision: 1,
+      status: 'running' as const,
+      phase: 'encoding' as const,
+      startedAt: '2026-07-18T00:00:00.000Z',
+      file: path.join(dir, 'exports', 'dead-daemon.mp4'),
+      owner: {
+        pid: 2_147_483_647,
+        processStartToken: 'dead-process-start',
+        leaseToken: 'dead-daemon-lease',
+        acquiredAt: '2026-07-18T00:00:00.000Z',
+      },
+    };
+    const partial = exportJobPartialPathForTest(dead);
+    await fsp.mkdir(path.dirname(partial), { recursive: true });
+    await fsp.writeFile(partial, 'abandoned-partial');
+    await writeExportJobForTest(dir, dead);
+
+    const restarted = await startDaemon({ port: 18320, projectDir: dir });
+    try {
+      const recovered = await getJson('http://localhost:18320', '/api/export-job');
+      expect(recovered.body.job).toMatchObject({ id: dead.id, status: 'interrupted' });
+      expect(recovered.body.job).not.toHaveProperty('owner');
+      await expect(fsp.access(partial)).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      await restarted.close();
+    }
+  });
+});
+
+describe('daemon: shutdown drains active export', () => {
+  const PORT = 18318;
+  const BASE = `http://localhost:${PORT}`;
+
+  it('gates closing, aborts before final commit, and resolves only after cleanup + cancelled persistence', async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-export-shutdown-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'shutdown-export');
+    await project.commit(0, 'system', 'setup', {}, 'seed composition', (m) => ({
+      ...m,
+      composition: { duration: 2, background: { type: 'color', hex: '#000000' } },
+    }));
+    const daemon = await startDaemon({ port: PORT, projectDir: dir });
+    let entered!: () => void;
+    let aborted!: () => void;
+    let releaseCleanup!: () => void;
+    const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+    const abortedPromise = new Promise<void>((resolve) => { aborted = resolve; });
+    const cleanupGate = new Promise<void>((resolve) => { releaseCleanup = resolve; });
+    renderProjectMp4Mock.mockImplementationOnce(async (_project: any, outPath: string, opts: any) => {
+      await opts.onPhase?.('encoding');
+      await fsp.writeFile(outPath, 'shutdown-partial');
+      entered();
+      await new Promise<void>((_resolve, reject) => {
+        const onAbort = async () => {
+          aborted();
+          await cleanupGate;
+          const error = new Error('operation cancelled');
+          error.name = 'AbortError';
+          reject(error);
+        };
+        if (opts.signal.aborted) void onAbort();
+        else opts.signal.addEventListener('abort', onAbort, { once: true });
+      });
+      throw new Error('unreachable');
+    });
+
+    const state = (await getJson(BASE, '/api/state')).body;
+    const started = await postJson(BASE, '/api/export-job', { baseRev: state.revision });
+    expect(started.status).toBe(202);
+    await enteredPromise;
+    const partial = exportJobPartialPathForTest(started.body.job);
+
+    let closeResolved = false;
+    const closing = daemon.close().then(() => { closeResolved = true; });
+    await abortedPromise;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(closeResolved).toBe(false);
+    await expect(fsp.readFile(partial, 'utf8')).resolves.toBe('shutdown-partial');
+
+    releaseCleanup();
+    await closing;
+    expect(closeResolved).toBe(true);
+    expect((await readExportJobForTest(dir))?.status).toBe('cancelled');
+    await expect(fsp.access(partial)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(fsp.access(started.body.job.file)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+});
+
+describe('daemon: export directory containment', () => {
+  const PORT = 18225;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let outside: string;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-export-containment-'));
+    const dir = path.join(root, 'proj');
+    outside = path.join(root, 'outside');
+    const project = await Project.create(dir, 'export-containment');
+    await project.commit(0, 'system', 'setup', {}, 'seed composition', (m) => ({
+      ...m,
+      composition: { duration: 1, background: { type: 'color', hex: '#000000' } },
+    }));
+    await fsp.mkdir(outside);
+    await fsp.symlink(outside, path.join(dir, 'exports'));
+    server = (await startDaemon({ port: PORT, projectDir: dir })).server;
+  });
+
+  afterAll(() => server.close());
+
+  it('rejects an exports symlink that escapes the project', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const response = await postJson(BASE, '/api/export-job', { baseRev: state.revision });
+    expect(response.status).toBe(400);
+    expect(response.body.error).toMatch(/path escapes directory \(symlink\)/);
+    expect(await fsp.readdir(outside)).toEqual([]);
+  });
+});
+
 // ---- F-s1-3: /api/detect's non-blocking "silence cut fragments this
 // material" hint (verification: a no-speech street-walk source turned into
 // dozens of 0.1-0.4s clips; scenes/culling fits that footage better) ----
@@ -3234,11 +4635,15 @@ describe('daemon: /api/detect fragmentation hint (F-s1-3)', () => {
     const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-detect-hint-'));
     const dir = path.join(root, 'proj');
     const project = await Project.create(dir, 'detect-hint');
+    await fsp.writeFile(path.join(project.cacheDir, 'peaks-s1.json'), JSON.stringify({
+      rate: 1,
+      peaks: Array.from({ length: 12 }, () => 0),
+    }));
     await project.commit(0, 'system', 'setup', {}, 'seed source', (m) => ({
       ...m,
       fps: 30,
       // No transcript at all — untranscribed source (the street-walk case).
-      sources: [{ id: 's1', path: '/media/one.mp4', duration: 12, fps: 30, width: 1920, height: 1080, hasAudio: true }],
+      sources: [{ id: 's1', path: '/media/one.mp4', duration: 12, fps: 30, width: 1920, height: 1080, hasAudio: true, peaks: 'cache/peaks-s1.json' }],
       timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 12 }], motion: [] },
     }));
     const started = await startDaemon({ port: PORT, projectDir: dir });
@@ -3250,6 +4655,7 @@ describe('daemon: /api/detect fragmentation hint (F-s1-3)', () => {
   it('hints at scene culling when no source has a transcript at all — never blocks the detect', async () => {
     const { status, body } = await postJson(BASE, '/api/detect', {});
     expect(status).toBe(200); // advisory only — detect still runs and returns normally
+    expect(body.pending).toEqual([]); // waveform-only visual footage never floods the human question queue
     expect(body.warnings).toEqual(['発話が少ない素材では無音カットは断片化しやすい — シーン選別(カリング)の方が向いています']);
   });
 
@@ -3302,6 +4708,137 @@ describe('daemon: /api/detect fragmentation hint (F-s1-3) — candidate-fragment
     expect(status).toBe(200);
     expect(body.pending.length).toBeGreaterThanOrEqual(6); // 7 gap candidates expected
     expect(body.warnings).toEqual(['発話が少ない素材では無音カットは断片化しやすい — シーン選別(カリング)の方が向いています']);
+  });
+});
+
+describe('daemon: durable candidate-detection completion marker', () => {
+  const PORT = 18311;
+  const SECOND_PORT = 18312;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let dir: string;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-detect-run-'));
+    dir = path.join(root, 'proj');
+    await Project.create(dir, 'detect-run');
+    server = (await startDaemon({ port: PORT, projectDir: dir })).server;
+  });
+
+  afterAll(() => server.close());
+
+  it('persists a successful zero-result run, survives another daemon, and becomes explicitly stale after a revision change', async () => {
+    const detected = await postJson(BASE, '/api/detect', { silence: false, fillers: false, minGap: 1.1 });
+    expect(detected.status).toBe(200);
+    expect(detected.body.pending).toEqual([]);
+    expect(detected.body.detectRun).toMatchObject({
+      version: 1,
+      revision: 0,
+      proposalCount: 0,
+      stale: false,
+      parameters: { silence: false, fillers: false, minGap: 1.1 },
+    });
+
+    const markerPath = path.join(dir, 'detect-run.json');
+    const onDisk = JSON.parse(await fsp.readFile(markerPath, 'utf8'));
+    expect(onDisk).toMatchObject({ version: 1, revision: 0, proposalCount: 0 });
+
+    const second = (await startDaemon({ port: SECOND_PORT, projectDir: dir })).server;
+    try {
+      const reopened = (await getJson(`http://localhost:${SECOND_PORT}`, '/api/project')).body;
+      expect(reopened.detectRun).toMatchObject({ revision: 0, proposalCount: 0, stale: false });
+    } finally {
+      await new Promise<void>((resolve) => second.close(() => resolve()));
+    }
+
+    const edited = await postJson(BASE, '/api/edit', {
+      actor: 'ui', baseRev: 0, op: 'captions', patch: { maxChars: 30 },
+    });
+    expect(edited.status).toBe(200);
+    const stale = (await getJson(BASE, '/api/project')).body.detectRun;
+    expect(stale).toMatchObject({ revision: 0, proposalCount: 0, stale: true, staleReason: 'revision-changed' });
+
+    const refreshed = await postJson(BASE, '/api/detect', { silence: false, fillers: false });
+    expect(refreshed.status).toBe(200);
+    expect(refreshed.body.detectRun).toMatchObject({ revision: 1, proposalCount: 0, stale: false });
+    expect((await getJson(BASE, '/api/project')).body.detectRun.stale).toBe(false);
+  });
+
+  it('treats a corrupt derived marker as unknown, never as a clean verdict', async () => {
+    await fsp.writeFile(path.join(dir, 'detect-run.json'), '{broken');
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.detectRun).toBeNull();
+  });
+
+  it('also rejects structurally valid but impossible marker values', async () => {
+    await fsp.writeFile(path.join(dir, 'detect-run.json'), JSON.stringify({
+      version: 1,
+      completedAt: 'not-a-date',
+      revision: 1,
+      proposalCount: -1,
+      excludedByIntentZones: 0,
+      parameters: { silence: true, fillers: true, minGap: 0.7 },
+    }));
+    const project = (await getJson(BASE, '/api/project')).body;
+    expect(project.detectRun).toBeNull();
+  });
+});
+
+describe('daemon: cross-daemon candidate/marker publication', () => {
+  const FIRST_PORT = 18315;
+  const SECOND_PORT = 18316;
+  const FIRST = `http://localhost:${FIRST_PORT}`;
+  const SECOND = `http://localhost:${SECOND_PORT}`;
+
+  it('never leaves one daemon\'s candidates paired with the other daemon\'s completion marker', async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-detect-publish-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'detect-publish');
+    await project.commit(0, 'system', 'seed', {}, 'seed transcribed source', (m) => ({
+      ...m,
+      fps: 30,
+      sources: [
+        { id: 's1', path: '/media/one.mp4', duration: 4, fps: 30, width: 1920, height: 1080, hasAudio: true, transcribed: true },
+      ],
+      timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 4 }], motion: [] },
+    }));
+    await project.writeTranscript({
+      sourceId: 's1',
+      language: 'en',
+      words: [
+        { id: 'w1', text: 'hello', t0: 0, t1: 0.3, p: 0.99 },
+        { id: 'w2', text: 'um', t0: 0.5, t1: 0.7, p: 0.99 },
+        { id: 'w3', text: 'world', t0: 1.6, t1: 2, p: 0.99 },
+      ],
+    });
+
+    const first = (await startDaemon({ port: FIRST_PORT, projectDir: dir })).server;
+    const second = (await startDaemon({ port: SECOND_PORT, projectDir: dir })).server;
+    try {
+      // Opposite publications deliberately have distinguishable truth: one
+      // clears every proposal, the other detects filler/silence candidates.
+      for (let i = 0; i < 12; i++) {
+        const responses = await Promise.all([
+          postJson(FIRST, '/api/detect', { silence: false, fillers: false }),
+          postJson(SECOND, '/api/detect', {}),
+        ]);
+        expect(responses.every((response) => response.status === 200)).toBe(true);
+
+        const marker = JSON.parse(await fsp.readFile(path.join(dir, 'detect-run.json'), 'utf8'));
+        const proposed = (await project.candidates()).filter((candidate) => candidate.status === 'proposed');
+        expect(marker.proposalCount).toBe(proposed.length);
+        if (marker.parameters.silence === false && marker.parameters.fillers === false) {
+          expect(proposed).toHaveLength(0);
+        } else {
+          expect(proposed.length).toBeGreaterThan(0);
+        }
+      }
+    } finally {
+      await Promise.all([
+        new Promise<void>((resolve) => first.close(() => resolve())),
+        new Promise<void>((resolve) => second.close(() => resolve())),
+      ]);
+    }
   });
 });
 
@@ -3525,7 +5062,7 @@ describe('daemon: show takes directive', () => {
       expect(status).toBe(200);
       expect(body.directive).toEqual({ kind: 'takes', sourceId: 's1', groupId });
       const msg = await waiting;
-      expect(msg).toEqual({ type: 'show', directive: { kind: 'takes', sourceId: 's1', groupId } });
+      expect(msg).toMatchObject({ type: 'show', directive: { kind: 'takes', sourceId: 's1', groupId } });
     } finally {
       ws.close();
     }
@@ -4550,5 +6087,331 @@ describe('daemon: GET /media/thumb (image-kind -ss fix)', () => {
     const args = call[1] as string[];
     const ssIdx = args.indexOf('-ss');
     expect(args[ssIdx + 1]).toBe('30');
+  });
+});
+
+// ---- Long media work: stable project-scoped identity, explicit cancellation,
+// child AbortSignal propagation, commit-too-late truth, and shutdown drain. ----
+describe('daemon: cancellable ingest media jobs', () => {
+  const PORT = 18330;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let dirA: string;
+  let dirB: string;
+  let root: string;
+
+  const fakeProbe = () => JSON.stringify({
+    format: { duration: '6' },
+    streams: [{ codec_type: 'video', avg_frame_rate: '30/1', width: 640, height: 360, duration: '6' }],
+  });
+  const installFastIngest = () => {
+    runMock.mockReset().mockImplementation(async (cmd: string, args: string[]) => {
+      if (cmd === 'ffprobe') return fakeProbe();
+      const output = String(args.at(-1));
+      if (cmd === 'ffmpeg' && output.includes('proxy-')) await fsp.writeFile(output, 'complete proxy');
+      return '';
+    });
+  };
+
+  beforeAll(async () => {
+    root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-media-job-ingest-'));
+    dirA = path.join(root, 'a');
+    dirB = path.join(root, 'b');
+    await Project.create(dirA, 'a');
+    await Project.create(dirB, 'b');
+    server = (await startDaemon({ port: PORT, projectDir: dirA })).server;
+  });
+
+  afterAll(() => server.close());
+
+  it('scopes a running task to its project, explicitly cancels before commit, cleans partials, and retries', async () => {
+    const file = path.join(root, 'cancel.mp4');
+    await fsp.writeFile(file, 'source');
+    let proxyStarted!: () => void;
+    const proxyIsRunning = new Promise<void>((resolve) => { proxyStarted = resolve; });
+    runMock.mockReset().mockImplementation(async (cmd: string, args: string[], opts?: { signal?: AbortSignal }) => {
+      if (cmd === 'ffprobe') return fakeProbe();
+      const output = String(args.at(-1));
+      if (cmd === 'ffmpeg' && output.includes('proxy-')) {
+        await fsp.writeFile(output, 'partial proxy');
+        proxyStarted();
+        return new Promise<string>((_resolve, reject) => {
+          opts?.signal?.addEventListener('abort', () => {
+            const error = new Error('operation cancelled');
+            error.name = 'AbortError';
+            reject(error);
+          }, { once: true });
+        });
+      }
+      return '';
+    });
+
+    const request = postJson(BASE, '/api/ingest', { file, scenes: false });
+    await proxyIsRunning;
+    const active = await getJson(BASE, '/api/media-jobs?kind=ingest');
+    expect(active.status).toBe(200);
+    expect(active.body.jobs).toHaveLength(1);
+    expect(active.body.jobs[0]).toMatchObject({ projectDir: dirA, kind: 'ingest', status: 'running' });
+    const taskId = active.body.jobs[0].taskId;
+
+    await postJson(BASE, '/api/open', { dir: dirB });
+    const wrongProject = await deleteJson(BASE, `/api/media-jobs/${taskId}`);
+    expect(wrongProject.status).toBe(404);
+    await postJson(BASE, '/api/open', { dir: dirA });
+
+    const cancelled = await deleteJson(BASE, `/api/media-jobs/${taskId}`);
+    expect(cancelled.status).toBe(202);
+    expect(cancelled.body.job).toMatchObject({ taskId, status: 'cancelling' });
+    const terminalResponse = await request;
+    expect(terminalResponse).toMatchObject({ status: 409, body: { code: 'OPERATION_CANCELLED' } });
+    expect((await Project.open(dirA).then((p) => p.manifest())).revision).toBe(0);
+    expect((await Project.open(dirA).then((p) => p.manifest())).sources).toEqual([]);
+    expect(await fsp.readdir(path.join(dirA, 'cache'))).toEqual([]);
+    const terminal = await getJson(BASE, '/api/media-jobs?kind=ingest');
+    expect(terminal.body.jobs[0]).toMatchObject({ taskId, status: 'cancelled', phase: 'finished' });
+
+    installFastIngest();
+    const retry = await postJson(BASE, '/api/ingest', { file, scenes: false });
+    expect(retry.status).toBe(200);
+    expect(retry.body).toMatchObject({ job: { status: 'success', kind: 'ingest' } });
+    expect((await Project.open(dirA).then((p) => p.manifest())).revision).toBe(1);
+  });
+
+  it('keeps processing after the initiating HTTP client disconnects; only explicit DELETE cancels', async () => {
+    const file = path.join(root, 'disconnect.mp4');
+    await fsp.writeFile(file, 'source');
+    let proxyStarted!: () => void;
+    let finishProxy!: () => void;
+    const proxyIsRunning = new Promise<void>((resolve) => { proxyStarted = resolve; });
+    const finish = new Promise<void>((resolve) => { finishProxy = resolve; });
+    runMock.mockReset().mockImplementation(async (cmd: string, args: string[], opts?: { signal?: AbortSignal }) => {
+      if (cmd === 'ffprobe') return fakeProbe();
+      const output = String(args.at(-1));
+      if (cmd === 'ffmpeg' && output.includes('proxy-')) {
+        proxyStarted();
+        await new Promise<void>((resolve, reject) => {
+          finish.then(resolve);
+          opts?.signal?.addEventListener('abort', () => reject(new Error('unexpected abort')), { once: true });
+        });
+        await fsp.writeFile(output, 'complete proxy');
+      }
+      return '';
+    });
+    const body = JSON.stringify({ file, scenes: false });
+    const target = new URL(BASE);
+    const req = http.request({
+      hostname: target.hostname,
+      port: target.port,
+      path: '/api/ingest',
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(body),
+        'x-vedit-project-dir': encodeURIComponent(dirA),
+      },
+    });
+    req.on('error', () => {});
+    req.end(body);
+    await proxyIsRunning;
+    req.destroy();
+    finishProxy();
+
+    const deadline = Date.now() + 2_000;
+    while ((await Project.open(dirA).then((p) => p.manifest())).revision < 2 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect((await Project.open(dirA).then((p) => p.manifest())).revision).toBe(2);
+    const jobs = await getJson(BASE, '/api/media-jobs?kind=ingest');
+    expect(jobs.body.jobs.at(-1)).toMatchObject({ file, status: 'success' });
+  });
+});
+
+describe('daemon: ingest commit-too-late cancellation boundary', () => {
+  const PORT = 18331;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let projectDir: string;
+  let file: string;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-ingest-commit-boundary-'));
+    projectDir = path.join(root, 'proj');
+    file = path.join(root, 'clip.mp4');
+    await fsp.writeFile(file, 'source');
+    await Project.create(projectDir, 'commit-boundary');
+    runMock.mockReset().mockImplementation(async (cmd: string, args: string[]) => {
+      if (cmd === 'ffprobe') return JSON.stringify({
+        format: { duration: '6' },
+        streams: [{ codec_type: 'video', avg_frame_rate: '30/1', width: 640, height: 360, duration: '6' }],
+      });
+      const output = String(args.at(-1));
+      if (cmd === 'ffmpeg' && output.includes('proxy-')) await fsp.writeFile(output, 'proxy');
+      return '';
+    });
+    server = (await startDaemon({ port: PORT, projectDir })).server;
+  });
+
+  afterAll(() => server.close());
+
+  it('returns 409 instead of claiming cancellation once Project.commit has been invoked', async () => {
+    const original = Project.prototype.commit;
+    let commitEntered!: () => void;
+    let releaseCommit!: () => void;
+    const entered = new Promise<void>((resolve) => { commitEntered = resolve; });
+    const release = new Promise<void>((resolve) => { releaseCommit = resolve; });
+    const spy = vi.spyOn(Project.prototype, 'commit').mockImplementation(async function (...args: Parameters<Project['commit']>) {
+      if (args[2] === 'ingest') {
+        commitEntered();
+        await release;
+      }
+      return original.apply(this, args);
+    });
+    try {
+      const request = postJson(BASE, '/api/ingest', { file, scenes: false });
+      await entered;
+      const jobs = await getJson(BASE, '/api/media-jobs?kind=ingest');
+      const taskId = jobs.body.jobs[0].taskId;
+      const cancel = await deleteJson(BASE, `/api/media-jobs/${taskId}`);
+      expect(cancel.status).toBe(409);
+      expect(cancel.body.error).toMatch(/保存が始まっている/);
+      expect(cancel.body.job).toMatchObject({ taskId, phase: 'committing', status: 'running' });
+      releaseCommit();
+      expect((await request).status).toBe(200);
+      expect((await Project.open(projectDir).then((p) => p.manifest())).revision).toBe(1);
+    } finally {
+      releaseCommit();
+      spy.mockRestore();
+    }
+  });
+});
+
+describe('daemon: cancellable scene jobs', () => {
+  const PORT = 18332;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+  let projectDir: string;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-scene-job-'));
+    projectDir = path.join(root, 'proj');
+    const media = path.join(root, 'clip.mp4');
+    await fsp.writeFile(media, 'source');
+    const project = await Project.create(projectDir, 'scene-job');
+    await project.commit(0, 'system', 'setup', {}, 'source', (m) => ({
+      ...m,
+      sources: [{ id: 's1', path: media, duration: 6, fps: 30, width: 640, height: 360, hasAudio: false }],
+    }));
+    server = (await startDaemon({ port: PORT, projectDir })).server;
+  });
+
+  afterAll(() => server.close());
+
+  it('aborts detection before publication, leaves no sidecar/temp, records terminal truth, and retries', async () => {
+    let detectorStarted!: () => void;
+    const detectorIsRunning = new Promise<void>((resolve) => { detectorStarted = resolve; });
+    sceneRunCaptureMock.mockReset().mockImplementation(async (_cmd: string, _args: string[], opts?: { signal?: AbortSignal }) => {
+      detectorStarted();
+      return new Promise((_resolve, reject) => {
+        opts?.signal?.addEventListener('abort', () => {
+          const error = new Error('operation cancelled');
+          error.name = 'AbortError';
+          reject(error);
+        }, { once: true });
+      });
+    });
+    const request = postJson(BASE, '/api/scenes/detect', { sourceId: 's1' });
+    await detectorIsRunning;
+    const active = await getJson(BASE, '/api/media-jobs?kind=scenes');
+    const taskId = active.body.jobs[0].taskId;
+    expect(active.body.jobs[0]).toMatchObject({ projectDir, sourceIds: ['s1'], status: 'running' });
+    expect((await deleteJson(BASE, `/api/media-jobs/${taskId}`)).status).toBe(202);
+    expect((await request).status).toBe(409);
+    await expect(fsp.access(path.join(projectDir, 'scenes-s1.json'))).rejects.toThrow();
+    expect((await fsp.readdir(path.join(projectDir, 'cache'))).filter((name) => name.includes('.tmp-') || name.includes('.bak-'))).toEqual([]);
+    expect((await Project.open(projectDir).then((p) => p.manifest())).revision).toBe(1);
+    const terminal = await getJson(BASE, '/api/media-jobs?kind=scenes');
+    expect(terminal.body.jobs[0]).toMatchObject({ taskId, status: 'cancelled', phase: 'finished' });
+
+    sceneRunCaptureMock.mockReset().mockResolvedValue({ stdout: '', stderr: '' });
+    runMock.mockReset().mockImplementation(async (_cmd: string, args: string[]) => {
+      const output = String(args.at(-1));
+      if (output.includes('.tmp-') && output.endsWith('.jpg')) {
+        await fsp.writeFile(output, Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+      }
+      return '';
+    });
+    const retry = await postJson(BASE, '/api/scenes/detect', { sourceId: 's1' });
+    expect(retry.status).toBe(200);
+    expect(retry.body).toMatchObject({ job: { kind: 'scenes', status: 'success' } });
+    expect((await Project.open(projectDir).then((p) => p.scenes('s1'))).scenes).toHaveLength(1);
+    expect((await Project.open(projectDir).then((p) => p.manifest())).revision).toBe(1);
+  });
+});
+
+describe('daemon: shutdown drains cancelled ingest cleanup', () => {
+  const PORT = 18333;
+  const BASE = `http://localhost:${PORT}`;
+
+  it('aborts a real registered ingest job before commit and resolves close only after partial cleanup', async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-ingest-shutdown-'));
+    const projectDir = path.join(root, 'proj');
+    const file = path.join(root, 'clip.mp4');
+    await fsp.writeFile(file, 'source');
+    await Project.create(projectDir, 'shutdown');
+    let proxyStarted!: () => void;
+    const proxyIsRunning = new Promise<void>((resolve) => { proxyStarted = resolve; });
+    runMock.mockReset().mockImplementation(async (cmd: string, args: string[], opts?: { signal?: AbortSignal }) => {
+      if (cmd === 'ffprobe') return JSON.stringify({
+        format: { duration: '6' },
+        streams: [{ codec_type: 'video', avg_frame_rate: '30/1', width: 640, height: 360, duration: '6' }],
+      });
+      const output = String(args.at(-1));
+      if (cmd === 'ffmpeg' && output.includes('proxy-')) {
+        await fsp.writeFile(output, 'partial');
+        proxyStarted();
+        return new Promise<string>((_resolve, reject) => {
+          opts?.signal?.addEventListener('abort', () => {
+            setTimeout(() => {
+              const error = new Error('operation cancelled');
+              error.name = 'AbortError';
+              reject(error);
+            }, 40);
+          }, { once: true });
+        });
+      }
+      return '';
+    });
+    const started = await startDaemon({ port: PORT, projectDir });
+    const request = postJson(BASE, '/api/ingest', { file, scenes: false });
+    await proxyIsRunning;
+    const closing = started.close();
+    expect(await Promise.race([
+      closing.then(() => 'closed'),
+      new Promise<string>((resolve) => setTimeout(() => resolve('draining'), 10)),
+    ])).toBe('draining');
+    await closing;
+    expect((await request).status).toBe(409);
+    expect((await Project.open(projectDir).then((p) => p.manifest())).revision).toBe(0);
+    expect(await fsp.readdir(path.join(projectDir, 'cache'))).toEqual([]);
+
+    // A clean daemon can immediately retry the same source after the drained
+    // shutdown; no lock, child, or derived partial remains behind.
+    runMock.mockReset().mockImplementation(async (cmd: string, args: string[]) => {
+      if (cmd === 'ffprobe') return JSON.stringify({
+        format: { duration: '6' },
+        streams: [{ codec_type: 'video', avg_frame_rate: '30/1', width: 640, height: 360, duration: '6' }],
+      });
+      const output = String(args.at(-1));
+      if (cmd === 'ffmpeg' && output.includes('proxy-')) await fsp.writeFile(output, 'complete');
+      return '';
+    });
+    const restarted = await startDaemon({ port: 18334, projectDir });
+    try {
+      const retry = await postJson('http://localhost:18334', '/api/ingest', { file, scenes: false });
+      expect(retry.status).toBe(200);
+      expect((await Project.open(projectDir).then((p) => p.manifest())).revision).toBe(1);
+    } finally {
+      await restarted.close();
+    }
   });
 });

@@ -1561,10 +1561,30 @@ describe('renderFinal: regression (no preset, no repair, no music)', () => {
     const args = runMock.mock.calls[0][1] as string[];
     const graph = args[args.indexOf('-filter_complex') + 1];
     expect(graph).not.toMatch(/loudnorm/);
+    expect(args.slice(args.indexOf('-t'), args.indexOf('-t') + 2)).toEqual(['-t', '15']);
+    expect(args.slice(args.indexOf('-c:a'), args.indexOf('-c:a') + 6))
+      .toEqual(['-c:a', 'aac', '-b:a', '192k', '-ar', '48000']);
   });
 });
 
 describe('renderFinal: 2-pass loudnorm (musicless, repair-triggered)', () => {
+  it('honors an explicit audioMix.targetLufs in a dialogue-only project', async () => {
+    runMock.mockClear();
+    runCaptureMock.mockClear();
+    runCaptureMock.mockResolvedValueOnce({ stdout: '', stderr: loudnormStderr() });
+    const m = baseManifest({ audioMix: { targetLufs: -16 } });
+    await renderFinal(m, [], outPathIn('/tmp'));
+
+    expect(runCaptureMock).toHaveBeenCalledTimes(1);
+    const measureArgs = runCaptureMock.mock.calls[0][1] as string[];
+    const measureGraph = measureArgs[measureArgs.indexOf('-filter_complex') + 1];
+    expect(measureGraph).toContain('loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json');
+
+    const renderArgs = runMock.mock.calls[0][1] as string[];
+    const renderGraph = renderArgs[renderArgs.indexOf('-filter_complex') + 1];
+    expect(renderGraph).toContain('loudnorm=I=-16:TP=-1.5:LRA=11:measured_I=-23.5');
+  });
+
   it('runs a measurement pass first, then feeds measured_* into the real render', async () => {
     runMock.mockClear();
     runCaptureMock.mockClear();

@@ -74,6 +74,18 @@ describe('buildResume', () => {
     expect(r.userEditsSinceClaude.map((x) => x.rev)).toEqual([1, 2]);
   });
 
+  it('uses current and legacy AI actors for user-edit detection and keeps the old response alias', () => {
+    const revs = [
+      rev({ rev: 1, actor: 'claude' }),
+      rev({ rev: 2, actor: 'ui' }),
+      rev({ rev: 3, actor: 'agent' }),
+      rev({ rev: 4, actor: 'ui' }),
+    ];
+    const r = buildResume(manifest(), '/d', revs, []);
+    expect(r.userEditsSinceAgent.map((x) => x.rev)).toEqual([4]);
+    expect(r.userEditsSinceClaude).toEqual(r.userEditsSinceAgent);
+  });
+
   it('pendingCandidates counts only status=proposed, broken down by kind', () => {
     const cands = [
       candidate({ id: 'c1', kind: 'silence', status: 'proposed' }),

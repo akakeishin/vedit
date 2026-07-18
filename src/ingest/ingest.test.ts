@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, promises as fs } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -17,20 +17,34 @@ import type { Word } from '../core/types.js';
 // it into a zero-length peaks array) rather than being left unconfigured,
 // since ingestFile now always at least probes+proxies+scene-detects even a
 // hasAudio:true source without any test explicitly opting into transcribe.
-const { runMock, runCaptureMock, hasFilterMock } = vi.hoisted(() => ({
+const { runMock, runBinaryMock, runCaptureMock, hasFilterMock } = vi.hoisted(() => ({
   runMock: vi.fn().mockResolvedValue(''),
+  runBinaryMock: vi.fn().mockResolvedValue(Buffer.alloc(0)),
   runCaptureMock: vi.fn().mockResolvedValue({ stdout: '', stderr: '' }),
   hasFilterMock: vi.fn(() => true),
 }));
 vi.mock('./run.js', () => ({
-  run: (...args: unknown[]) => runMock(...args),
-  runBinary: vi.fn().mockResolvedValue(Buffer.alloc(0)),
+  run: async (...args: unknown[]) => {
+    const result = await runMock(...args);
+    const [cmd, argv] = args as [string, string[]];
+    const output = argv?.at(-1);
+    // Scene thumbnails now publish temp->rename atomically. The production
+    // ffmpeg contract creates that temp JPEG; preserve it in this shell mock.
+    if (cmd === 'ffmpeg' && typeof output === 'string' && output.endsWith('.jpg') && output.includes('.tmp-')) {
+      const { promises: fs } = await import('node:fs');
+      await fs.writeFile(output, Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+    }
+    return result;
+  },
+  runBinary: (...args: unknown[]) => runBinaryMock(...args),
   runCapture: (...args: unknown[]) => runCaptureMock(...args),
   ffmpegHasFilter: (...args: unknown[]) => hasFilterMock(...args),
 }));
 
 import {
   buildWhisperPrompt,
+  downloadWhisperModel,
+  findWhisperModel,
   IMAGE_SOURCE_DURATION,
   ingestFile,
   ingestImageFile,
@@ -41,6 +55,82 @@ import {
   sanitizeWords,
   transcribe,
 } from './ingest.js';
+import { detectScenesForSource } from '../core/scenes.js';
+
+describe('whisper model path isolation', () => {
+  it('discovers models from VEDIT_MODEL_DIR without changing HOME', async () => {
+    const modelDir = mkdtempSync(path.join(tmpdir(), 'vedit-model-dir-'));
+    const previousDir = process.env.VEDIT_MODEL_DIR;
+    const previousModel = process.env.VEDIT_WHISPER_MODEL;
+    process.env.VEDIT_MODEL_DIR = modelDir;
+    delete process.env.VEDIT_WHISPER_MODEL;
+    try {
+      await fs.writeFile(path.join(modelDir, 'ggml-base.bin'), 'base');
+      await fs.writeFile(path.join(modelDir, 'ggml-large-v3-turbo.bin'), 'turbo');
+      await expect(findWhisperModel()).resolves
+        .toBe(path.join(modelDir, 'ggml-large-v3-turbo.bin'));
+    } finally {
+      if (previousDir === undefined) delete process.env.VEDIT_MODEL_DIR;
+      else process.env.VEDIT_MODEL_DIR = previousDir;
+      if (previousModel === undefined) delete process.env.VEDIT_WHISPER_MODEL;
+      else process.env.VEDIT_WHISPER_MODEL = previousModel;
+      await fs.rm(modelDir, { recursive: true, force: true });
+    }
+  });
+
+  it('publishes one complete model atomically when two downloads race and cleans both private partials', async () => {
+    const modelDir = mkdtempSync(path.join(tmpdir(), 'vedit-model-race-'));
+    const previousDir = process.env.VEDIT_MODEL_DIR;
+    process.env.VEDIT_MODEL_DIR = modelDir;
+    let arrivals = 0;
+    let release!: () => void;
+    const bothStarted = new Promise<void>((resolve) => { release = resolve; });
+    runMock.mockReset().mockImplementation(async (cmd: string, args: string[]) => {
+      expect(cmd).toBe('curl');
+      const out = args[args.indexOf('-o') + 1];
+      arrivals++;
+      if (arrivals === 2) release();
+      await bothStarted;
+      await fs.writeFile(out, `complete-model-${path.basename(out)}`);
+      return '';
+    });
+    try {
+      const [a, b] = await Promise.all([
+        downloadWhisperModel('ggml-race'),
+        downloadWhisperModel('ggml-race'),
+      ]);
+      expect(a).toBe(path.join(modelDir, 'ggml-race.bin'));
+      expect(b).toBe(a);
+      expect(await fs.readFile(a, 'utf8')).toMatch(/^complete-model-/);
+      expect((await fs.readdir(modelDir)).filter((name) => name.includes('.part-'))).toEqual([]);
+    } finally {
+      runMock.mockReset().mockResolvedValue('');
+      if (previousDir === undefined) delete process.env.VEDIT_MODEL_DIR;
+      else process.env.VEDIT_MODEL_DIR = previousDir;
+      await fs.rm(modelDir, { recursive: true, force: true });
+    }
+  });
+
+  it('removes a failed download partial without exposing it as a model', async () => {
+    const modelDir = mkdtempSync(path.join(tmpdir(), 'vedit-model-failure-'));
+    const previousDir = process.env.VEDIT_MODEL_DIR;
+    process.env.VEDIT_MODEL_DIR = modelDir;
+    runMock.mockReset().mockImplementation(async (_cmd: string, args: string[]) => {
+      const out = args[args.indexOf('-o') + 1];
+      await fs.writeFile(out, 'truncated');
+      throw new Error('network interrupted');
+    });
+    try {
+      await expect(downloadWhisperModel('ggml-failure')).rejects.toThrow(/network interrupted/);
+      expect(await fs.readdir(modelDir)).toEqual([]);
+    } finally {
+      runMock.mockReset().mockResolvedValue('');
+      if (previousDir === undefined) delete process.env.VEDIT_MODEL_DIR;
+      else process.env.VEDIT_MODEL_DIR = previousDir;
+      await fs.rm(modelDir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('sanitizeWords', () => {
   it('leaves well-formed words untouched', () => {
@@ -281,6 +371,7 @@ describe('probe', () => {
 
 describe('transcribe', () => {
   it('passes explicit --beam-size/--best-of/--split-on-word and records provenance meta on the transcript', async () => {
+    const controller = new AbortController();
     runMock.mockReset();
     runMock.mockImplementation(async (cmd: string, args: string[]) => {
       if (cmd === 'whisper-cli') {
@@ -295,9 +386,12 @@ describe('transcribe', () => {
       }
       return '';
     });
-    const t = await transcribe('/in.mp4', 'src1', { model: '/models/ggml-small.bin' });
-    const whisperCall = runMock.mock.calls.find(([cmd]) => cmd === 'whisper-cli') as [string, string[]];
+    const t = await transcribe('/in.mp4', 'src1', { model: '/models/ggml-small.bin', signal: controller.signal });
+    const ffmpegCall = runMock.mock.calls.find(([cmd]) => cmd === 'ffmpeg') as [string, string[], { signal?: AbortSignal }];
+    const whisperCall = runMock.mock.calls.find(([cmd]) => cmd === 'whisper-cli') as [string, string[], { signal?: AbortSignal }];
     const [, args] = whisperCall;
+    expect(ffmpegCall[2].signal).toBe(controller.signal);
+    expect(whisperCall[2].signal).toBe(controller.signal);
     expect(args).toEqual(expect.arrayContaining(['--beam-size', '5', '--best-of', '5', '--split-on-word']));
     const meta = (t as any).meta;
     expect(meta.model).toBe('ggml-small.bin');
@@ -305,6 +399,66 @@ describe('transcribe', () => {
     expect(meta.at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     expect(t.words).toHaveLength(1);
     expect(t.words[0].text).toBe('hello');
+  });
+
+  it('retries a crashed whisper Metal process once on CPU and records the effective args', async () => {
+    runMock.mockReset();
+    let whisperCalls = 0;
+    runMock.mockImplementation(async (cmd: string, args: string[]) => {
+      if (cmd !== 'whisper-cli') return '';
+      whisperCalls++;
+      if (whisperCalls === 1) {
+        throw Object.assign(new Error('whisper-cli failed'), { signal: 'SIGSEGV' });
+      }
+      const outBase = args[args.indexOf('-of') + 1];
+      await fs.writeFile(
+        `${outBase}.json`,
+        JSON.stringify({ transcription: [], result: { language: 'en' } }),
+      );
+      return '';
+    });
+
+    const t = await transcribe('/in.mp4', 'src1', { model: '/models/ggml-small.bin' });
+    const whisperInvocations = runMock.mock.calls.filter(([cmd]) => cmd === 'whisper-cli');
+    expect(whisperInvocations).toHaveLength(2);
+    expect(whisperInvocations[0][1]).not.toContain('--no-gpu');
+    expect(whisperInvocations[1][1]).toContain('--no-gpu');
+    expect((t as any).meta.args).toContain('--no-gpu');
+  });
+
+  it('does not retry ordinary whisper errors as CPU work', async () => {
+    runMock.mockReset();
+    runMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'whisper-cli') throw new Error('invalid model');
+      return '';
+    });
+
+    await expect(transcribe('/in.mp4', 'src1', { model: '/models/bad.bin' }))
+      .rejects.toThrow('invalid model');
+    expect(runMock.mock.calls.filter(([cmd]) => cmd === 'whisper-cli')).toHaveLength(1);
+  });
+
+  it('removes its ASR temp directory when extraction fails or is cancelled', async () => {
+    const controller = new AbortController();
+    let asrTmp: string | undefined;
+    runMock.mockReset();
+    runMock.mockImplementation(async (cmd: string, args: string[], opts?: { signal?: AbortSignal }) => {
+      if (cmd === 'ffmpeg') {
+        asrTmp = path.dirname(args[args.length - 1]);
+        expect(opts?.signal).toBe(controller.signal);
+        const error = new Error('operation cancelled');
+        error.name = 'AbortError';
+        throw error;
+      }
+      return '';
+    });
+
+    await expect(transcribe('/in.mp4', 'src1', {
+      model: '/models/ggml-small.bin',
+      signal: controller.signal,
+    })).rejects.toMatchObject({ name: 'AbortError' });
+    expect(asrTmp).toMatch(/vedit-asr-/);
+    await expect(fs.access(asrTmp!)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   // ---- roadmap "whisper 用語集プロンプト": buildWhisperPrompt is pure
@@ -395,6 +549,21 @@ describe('ingestFile concurrency', () => {
 });
 
 describe('ingestFile defaults (W-LAZY: transcribe off, scenes on)', () => {
+  let previousWhisperModel: string | undefined;
+
+  beforeAll(() => {
+    previousWhisperModel = process.env.VEDIT_WHISPER_MODEL;
+    // The subprocess runner is mocked in this suite, so a stable explicit
+    // model path keeps the tests independent of any model installed for the
+    // developer account.
+    process.env.VEDIT_WHISPER_MODEL = '/models/ggml-test.bin';
+  });
+
+  afterAll(() => {
+    if (previousWhisperModel === undefined) delete process.env.VEDIT_WHISPER_MODEL;
+    else process.env.VEDIT_WHISPER_MODEL = previousWhisperModel;
+  });
+
   function fakeFfprobe(hasAudioStream: boolean, duration = '6') {
     return JSON.stringify({
       format: { duration },
@@ -414,6 +583,163 @@ describe('ingestFile defaults (W-LAZY: transcribe off, scenes on)', () => {
       }),
     );
   }
+
+  it('removes a partial proxy when ffmpeg fails before the source is committed', async () => {
+    runMock.mockReset().mockImplementation(async (cmd: string, args: string[]) => {
+      if (cmd === 'ffprobe') return fakeFfprobe(false);
+      if (cmd === 'ffmpeg' && String(args.at(-1)).includes('proxy-')) {
+        await fs.writeFile(args.at(-1)!, 'partial proxy bytes');
+        throw new Error('proxy encoder failed');
+      }
+      return '';
+    });
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-ingest-proxy-cleanup-'));
+    const project = await Project.create(path.join(root, 'proj'), 'proxy-cleanup');
+    const file = path.join(root, 'clip.mp4');
+    await fs.writeFile(file, 'x');
+
+    await expect(ingestFile(project, file, { scenes: false })).rejects.toThrow(/proxy encoder failed/);
+    expect((await project.manifest()).sources).toEqual([]);
+    expect(await fs.readdir(project.cacheDir)).toEqual([]);
+  });
+
+  it('removes proxy, waveform, transcript and scene sidecars when late scene detection fails', async () => {
+    runMock.mockReset().mockImplementation(async (cmd: string, args: string[]) => {
+      if (cmd === 'ffprobe') return fakeFfprobe(true);
+      if (cmd === 'whisper-cli') await fakeWhisperOutput(args);
+      if (cmd === 'ffmpeg' && String(args.at(-1)).includes('proxy-')) {
+        await fs.writeFile(args.at(-1)!, 'complete proxy bytes');
+      }
+      return '';
+    });
+    runCaptureMock.mockReset().mockRejectedValue(new Error('scene detector failed'));
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-ingest-late-cleanup-'));
+    const project = await Project.create(path.join(root, 'proj'), 'late-cleanup');
+    const file = path.join(root, 'clip.mp4');
+    await fs.writeFile(file, 'x');
+
+    await expect(ingestFile(project, file, { transcribe: true })).rejects.toThrow(/scene detector failed/);
+    expect((await project.manifest()).sources).toEqual([]);
+    const rootNames = await fs.readdir(project.dir);
+    expect(rootNames.some((name) => name.startsWith('transcript-') || name.startsWith('scenes-'))).toBe(false);
+    expect(await fs.readdir(project.cacheDir)).toEqual([]);
+  });
+
+  it('cancels an in-flight proxy child, removes every partial, leaves revision truth untouched, and can retry', async () => {
+    let proxyStarted!: () => void;
+    const proxyIsRunning = new Promise<void>((resolve) => { proxyStarted = resolve; });
+    runMock.mockReset().mockImplementation(async (cmd: string, args: string[], runOpts?: { signal?: AbortSignal }) => {
+      if (cmd === 'ffprobe') return fakeFfprobe(false);
+      if (cmd === 'ffmpeg' && String(args.at(-1)).includes('proxy-')) {
+        await fs.writeFile(args.at(-1)!, 'partial proxy bytes');
+        proxyStarted();
+        return new Promise<string>((_resolve, reject) => {
+          runOpts?.signal?.addEventListener('abort', () => {
+            const error = new Error('operation cancelled');
+            error.name = 'AbortError';
+            reject(error);
+          }, { once: true });
+        });
+      }
+      return '';
+    });
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-ingest-cancel-cleanup-'));
+    const project = await Project.create(path.join(root, 'proj'), 'cancel-cleanup');
+    const file = path.join(root, 'clip.mp4');
+    await fs.writeFile(file, 'x');
+    const controller = new AbortController();
+
+    const first = ingestFile(project, file, { scenes: false, signal: controller.signal });
+    await proxyIsRunning;
+    controller.abort();
+    await expect(first).rejects.toMatchObject({ name: 'AbortError' });
+    expect((await project.manifest()).revision).toBe(0);
+    expect((await project.manifest()).sources).toEqual([]);
+    expect(await fs.readdir(project.cacheDir)).toEqual([]);
+
+    runMock.mockReset().mockImplementation(async (cmd: string) => (cmd === 'ffprobe' ? fakeFfprobe(false) : ''));
+    const retry = await ingestFile(project, file, { scenes: false });
+    expect(retry.source.path).toBe(file);
+    expect((await project.manifest()).revision).toBe(1);
+    expect((await project.manifest()).sources).toHaveLength(1);
+  });
+
+  it('threads one AbortSignal through probe, proxy, peaks, scene analysis and thumbnail children', async () => {
+    runMock.mockReset().mockImplementation(async (cmd: string) => (cmd === 'ffprobe' ? fakeFfprobe(true) : ''));
+    runBinaryMock.mockReset().mockResolvedValue(Buffer.alloc(0));
+    runCaptureMock.mockReset().mockResolvedValue({ stdout: '', stderr: '' });
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-ingest-signal-chain-'));
+    const project = await Project.create(path.join(root, 'proj'), 'signal-chain');
+    const file = path.join(root, 'clip.mp4');
+    await fs.writeFile(file, 'x');
+    const controller = new AbortController();
+
+    await ingestFile(project, file, { signal: controller.signal });
+
+    const ffprobe = runMock.mock.calls.find(([cmd]) => cmd === 'ffprobe');
+    const proxy = runMock.mock.calls.find(([cmd, args]) => cmd === 'ffmpeg' && String(args.at(-1)).includes('proxy-'));
+    const thumb = runMock.mock.calls.find(([cmd, args]) => cmd === 'ffmpeg' && String(args.at(-1)).includes('.tmp-'));
+    expect(ffprobe?.[2]).toMatchObject({ signal: controller.signal });
+    expect(proxy?.[2]).toMatchObject({ signal: controller.signal });
+    expect(runBinaryMock.mock.calls[0]?.[2]).toMatchObject({ signal: controller.signal });
+    expect(runCaptureMock.mock.calls[0]?.[2]).toMatchObject({ signal: controller.signal });
+    expect(thumb?.[2]).toMatchObject({ signal: controller.signal });
+  });
+
+  it('keeps the previous scene index/thumbnails intact when thumbnail generation is cancelled, then retries cleanly', async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-scenes-cancel-staging-'));
+    const project = await Project.create(path.join(root, 'proj'), 'scene-cancel-staging');
+    const media = path.join(root, 'clip.mp4');
+    await fs.writeFile(media, 'x');
+    await project.commit(0, 'system', 'setup', {}, 'source', (m) => ({
+      ...m,
+      sources: [{ id: 's1', path: media, duration: 6, fps: 30, width: 640, height: 360, hasAudio: false }],
+    }));
+    const oldThumb = path.join(project.cacheDir, 'sc-s1-s0001.jpg');
+    await fs.writeFile(oldThumb, 'old-thumb');
+    await project.writeScenes({
+      sourceId: 's1',
+      scenes: [{
+        id: 's0001', t0: 0, t1: 6, thumb: 'cache/sc-s1-s0001.jpg',
+        hasSpeech: false, energy: 0,
+        note: { text: 'keep this note', by: 'user', at: new Date().toISOString() },
+      }],
+    });
+    const before = await project.scenes('s1');
+    runCaptureMock.mockReset().mockResolvedValue({ stdout: '', stderr: 'pts_time:3.000' });
+    let secondStarted!: () => void;
+    const secondIsRunning = new Promise<void>((resolve) => { secondStarted = resolve; });
+    let thumbnail = 0;
+    runMock.mockReset().mockImplementation(async (_cmd: string, args: string[], runOpts?: { signal?: AbortSignal }) => {
+      if (!String(args.at(-1)).includes('.tmp-')) return '';
+      thumbnail++;
+      if (thumbnail === 1) return '';
+      await fs.writeFile(args.at(-1)!, 'partial-new-thumb');
+      secondStarted();
+      return new Promise<string>((_resolve, reject) => {
+        runOpts?.signal?.addEventListener('abort', () => {
+          const error = new Error('operation cancelled');
+          error.name = 'AbortError';
+          reject(error);
+        }, { once: true });
+      });
+    });
+    const controller = new AbortController();
+    const detection = detectScenesForSource(project, await project.manifest(), 's1', { signal: controller.signal });
+    await secondIsRunning;
+    controller.abort();
+    await expect(detection).rejects.toMatchObject({ name: 'AbortError' });
+
+    expect(await project.scenes('s1')).toEqual(before);
+    expect(await fs.readFile(oldThumb, 'utf8')).toBe('old-thumb');
+    expect((await fs.readdir(project.cacheDir)).filter((name) => name.includes('.tmp-') || name.includes('.bak-'))).toEqual([]);
+
+    runMock.mockReset().mockResolvedValue('');
+    const retried = await detectScenesForSource(project, await project.manifest(), 's1');
+    expect(retried.scenes).toHaveLength(2);
+    expect(retried.scenes[0].note?.text).toBe('keep this note');
+    expect((await fs.readdir(project.cacheDir)).some((name) => name.includes('.tmp-') || name.includes('.bak-'))).toBe(false);
+  });
 
   it('does not transcribe by default even when the source has audio', async () => {
     runMock.mockReset();

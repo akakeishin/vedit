@@ -85,12 +85,17 @@ function check(label, cond, detail) {
 
 async function main() {
   const scratch = await mkdtemp(path.join(tmpdir(), 'vedit-smoke-overlay-stack-'));
-  const fakeHome = path.join(scratch, 'home');
-  await mkdir(fakeHome, { recursive: true });
-  // Isolated HOME so Project.create's upsertProject() never touches the
-  // real ~/.cache/vedit/projects.json registry (same convention as
-  // test/setup.ts / smoke-compose.mjs).
-  process.env.HOME = fakeHome;
+  const stateDir = path.join(scratch, 'state');
+  await mkdir(stateDir, { recursive: true });
+  const stateEnv = {
+    VEDIT_REGISTRY_PATH: path.join(stateDir, 'registry', 'projects.json'),
+    VEDIT_PRESETS_PATH: path.join(stateDir, 'presets', 'presets.json'),
+    VEDIT_MODEL_DIR: path.join(stateDir, 'models'),
+  };
+  const previousStateEnv = Object.fromEntries(
+    Object.keys(stateEnv).map((name) => [name, process.env[name]]),
+  );
+  Object.assign(process.env, stateEnv);
 
   const projectDir = path.join(scratch, 'project');
   const arollPath = path.join(scratch, 'aroll.mp4');
@@ -224,6 +229,10 @@ async function main() {
     }
     console.log('[smoke-overlay-stack] PASS — z-order, rect placement, and real PNG alpha blending all verified via a real ffmpeg render.');
   } finally {
+    for (const [name, value] of Object.entries(previousStateEnv)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
     await rm(scratch, { recursive: true, force: true });
   }
 }

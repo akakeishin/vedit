@@ -146,6 +146,12 @@ describe('cli: vedit export render wires motion sidecars into the render (W7)', 
         '  exit 0\n' +
         'fi\n' +
         'if [ -n "$FFMPEG_ARGS_LOG" ]; then printf "%s\\n" "$@" >> "$FFMPEG_ARGS_LOG"; fi\n' +
+        'if [ -n "$ASS_CAPTURE_LOG" ] && [ -n "$ASS_CAPTURE_DIR" ]; then\n' +
+        '  shopt -s nullglob dotglob\n' +
+        '  for f in "$ASS_CAPTURE_DIR"/*.vedit-*.ass; do cat "$f" >> "$ASS_CAPTURE_LOG"; done\n' +
+        'fi\n' +
+        'last="${@: -1}"\n' +
+        'if [[ "$last" == *.mp4 ]]; then printf "stub mp4" > "$last"; fi\n' +
         'exit 0\n',
       { mode: 0o755 },
     );
@@ -200,6 +206,63 @@ describe('cli: vedit export render wires motion sidecars into the render (W7)', 
     const logged = await fsp.readFile(argsLog, 'utf8');
     expect(logged).toMatch(/\.vedit-motion\.ass/); // the burn filter reached ffmpeg — motionSpecs were wired through
   });
+
+  it('renders transcript and motion sidecars from the same captured revision, not newer loose files', async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-cli-render-pinned-inputs-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'pinned-inputs');
+    const transcriptV1 = {
+      sourceId: 's1',
+      language: 'en',
+      words: [{ id: 'w0', text: 'CAPTURED_CAPTION', t0: 1, t1: 2, p: 0.99 }],
+    };
+    const motionV1 = { id: 'm1', type: 'callout', params: { text: 'CAPTURED_MOTION' } };
+    await project.commit(
+      0,
+      'system',
+      'seed-pinned-render',
+      {},
+      'seed pinned render inputs',
+      (m) => ({
+        ...m,
+        sources: [{ id: 's1', path: '/media/one.mp4', duration: 10, fps: 30, width: 1920, height: 1080, hasAudio: true, transcribed: true }],
+        timeline: {
+          ...m.timeline,
+          video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 10 }],
+          motion: [{ id: 'm1', spec: 'motion/m1.json', tlStart: 0, duration: 2 }],
+        },
+      }),
+      { m1: motionV1 },
+      { s1: transcriptV1 },
+    );
+
+    // Simulate a loose/newer sidecar becoming visible without a matching
+    // manifest revision. A revision-pinned export must use the committed V1
+    // snapshot for both kinds instead of mixing these values into revision 1.
+    await project.writeTranscript({
+      ...transcriptV1,
+      words: [{ id: 'w0', text: 'NEWER_CAPTION', t0: 1, t1: 2, p: 0.99 }],
+    });
+    await fsp.writeFile(
+      project.motionSpecPath('m1'),
+      JSON.stringify({ ...motionV1, params: { text: 'NEWER_MOTION' } }),
+    );
+
+    const assLog = path.join(root, 'captured-ass.txt');
+    const outFile = path.join(root, 'out.mp4');
+    const { status, stdout, stderr } = runCli(
+      ['export', 'render', outFile, '--project', dir],
+      { VEDIT_FFMPEG: stub, ASS_CAPTURE_DIR: root, ASS_CAPTURE_LOG: assLog },
+    );
+
+    expect(status, stderr).toBe(0);
+    expect(JSON.parse(stdout).ok).toBe(true);
+    const burned = await fsp.readFile(assLog, 'utf8');
+    expect(burned).toContain('CAPTURED_CAPTION');
+    expect(burned).toContain('CAPTURED_MOTION');
+    expect(burned).not.toContain('NEWER_CAPTION');
+    expect(burned).not.toContain('NEWER_MOTION');
+  });
 });
 
 /**
@@ -230,6 +293,8 @@ describe('cli: vedit export render — caption/dialogue default-burn gate (Criti
         '  exit 0\n' +
         'fi\n' +
         'if [ -n "$FFMPEG_ARGS_LOG" ]; then printf "%s\\n" "$@" >> "$FFMPEG_ARGS_LOG"; fi\n' +
+        'last="${@: -1}"\n' +
+        'if [[ "$last" == *.mp4 ]]; then printf "stub mp4" > "$last"; fi\n' +
         'exit 0\n',
       { mode: 0o755 },
     );
@@ -338,6 +403,8 @@ describe('cli: vedit export records to cache/export-results.json', () => {
         '  printf " T.. drawtext          Draw text\\n T.. ass               Render ASS\\n"\n' +
         '  exit 0\n' +
         'fi\n' +
+        'last="${@: -1}"\n' +
+        'if [[ "$last" == *.mp4 ]]; then printf "stub mp4" > "$last"; fi\n' +
         'exit 0\n',
       { mode: 0o755 },
     );
@@ -349,6 +416,8 @@ describe('cli: vedit export records to cache/export-results.json', () => {
         '  printf " T.. drawtext          Draw text\\n T.. ass               Render ASS\\n"\n' +
         '  exit 0\n' +
         'fi\n' +
+        'last="${@: -1}"\n' +
+        'if [[ "$last" == *.mp4 ]]; then printf "incomplete new export" > "$last"; fi\n' +
         'echo "synthetic encode failure" >&2\n' +
         'exit 1\n',
       { mode: 0o755 },
@@ -385,11 +454,14 @@ describe('cli: vedit export records to cache/export-results.json', () => {
     expect(results[0].options).toMatchObject({ preset: 'youtube', fastLoudnorm: true });
     expect(typeof results[0].ts).toBe('string');
     expect(new Date(results[0].ts).toString()).not.toBe('Invalid Date');
+    await expect(fsp.readFile(outFile, 'utf8')).resolves.toBe('stub mp4');
+    expect((await fsp.readdir(root)).filter((name) => name.includes('.vedit-partial-'))).toEqual([]);
   });
 
   it('a failed `export render` (ffmpeg exits non-zero) appends an ok:false record with the error, and the CLI itself still fails', async () => {
     const { root, dir } = await seedSimpleProject('render-fail');
     const outFile = path.join(root, 'out.mp4');
+    await fsp.writeFile(outFile, 'previous good export');
     const { status, stderr } = runCli(
       ['export', 'render', outFile, '--project', dir],
       { VEDIT_FFMPEG: failStub },
@@ -400,6 +472,24 @@ describe('cli: vedit export records to cache/export-results.json', () => {
     expect(results[0]).toMatchObject({ kind: 'render', file: outFile, ok: false });
     expect(results[0].error).toMatch(/synthetic encode failure|failed/);
     expect(stderr).toBeTruthy();
+    await expect(fsp.readFile(outFile, 'utf8')).resolves.toBe('previous good export');
+    expect((await fsp.readdir(root)).filter((name) => name.includes('.vedit-partial-'))).toEqual([]);
+  });
+
+  it('a failed range preview also preserves an existing destination and cleans its partial', async () => {
+    const { root, dir } = await seedSimpleProject('range-fail');
+    const outFile = path.join(root, 'range.mp4');
+    await fsp.writeFile(outFile, 'previous range preview');
+    const { status, stderr } = runCli(
+      ['export', 'render', outFile, '--project', dir, '--range', '0..2'],
+      { VEDIT_FFMPEG: failStub },
+    );
+
+    expect(status).toBe(1);
+    expect(stderr).toMatch(/synthetic encode failure|failed/);
+    await expect(fsp.readFile(outFile, 'utf8')).resolves.toBe('previous range preview');
+    expect((await fsp.readdir(root)).filter((name) => name.includes('.vedit-partial-'))).toEqual([]);
+    expect((await readResults(dir))[0]).toMatchObject({ kind: 'render-preview', file: outFile, ok: false, revision: 1 });
   });
 
   it('`export otio` (no ffmpeg involved) also records ok:true', async () => {

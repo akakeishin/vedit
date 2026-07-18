@@ -4,9 +4,46 @@ import {
   blockMoveOp,
   clipMoveOp,
   dropIndexForX,
+  rulerStepFor,
+  shouldCommitInlineEdit,
   timelineTimeToSource,
   trimDragOp,
 } from './dragLogic.js';
+
+describe('shouldCommitInlineEdit', () => {
+  it('commits an ordinary unmodified Enter', () => {
+    expect(shouldCommitInlineEdit({ key: 'Enter', shiftKey: false, isComposing: false, keyCode: 13 })).toBe(true);
+  });
+
+  it('does not commit Enter while an IME composition is active', () => {
+    expect(shouldCommitInlineEdit({ key: 'Enter', shiftKey: false, isComposing: true, keyCode: 13 })).toBe(false);
+    expect(shouldCommitInlineEdit({ key: 'Enter', shiftKey: false, isComposing: false, keyCode: 229 })).toBe(false);
+  });
+
+  it('keeps Shift+Enter available for multiline/native editing behavior', () => {
+    expect(shouldCommitInlineEdit({ key: 'Enter', shiftKey: true, isComposing: false, keyCode: 13 })).toBe(false);
+  });
+});
+
+describe('rulerStepFor', () => {
+  it('keeps short-project ticks dense enough to be useful', () => {
+    expect(rulerStepFor(60, 700)).toBe(10);
+  });
+
+  it('uses hour-scale ticks instead of overlapping labels on a 7.6-hour timeline', () => {
+    expect(rulerStepFor(27_294, 560)).toBe(3600);
+  });
+
+  it('continues scaling beyond the fixed nice-step table', () => {
+    expect(rulerStepFor(10 * 86400, 700)).toBe(86400);
+    expect(rulerStepFor(100 * 86400, 700)).toBe(10 * 86400);
+  });
+
+  it('returns a safe interval for missing layout inputs', () => {
+    expect(rulerStepFor(0, 700)).toBe(1);
+    expect(rulerStepFor(60, 0)).toBe(1);
+  });
+});
 
 describe('timelineTimeToSource', () => {
   const segments = [

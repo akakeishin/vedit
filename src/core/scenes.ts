@@ -40,13 +40,25 @@ export function parseSceneChangeTimes(showinfoOutput: string): number[] {
  * flags frames whose difference from the previous frame exceeds `sensitivity`
  * (0..1); `showinfo` logs the timestamp of each selected frame to stderr.
  */
-export async function detectSceneChangeTimes(mediaPath: string, sensitivity = 0.3): Promise<number[]> {
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  const error = new Error('operation cancelled');
+  error.name = 'AbortError';
+  throw error;
+}
+
+export async function detectSceneChangeTimes(
+  mediaPath: string,
+  sensitivity = 0.3,
+  opts: { signal?: AbortSignal } = {},
+): Promise<number[]> {
+  throwIfAborted(opts.signal);
   const { stderr } = await runCapture('ffmpeg', [
     '-v', 'info',
     '-i', mediaPath,
     '-vf', `select='gt(scene,${sensitivity})',showinfo`,
     '-f', 'null', '-',
-  ]);
+  ], { signal: opts.signal });
   return parseSceneChangeTimes(stderr);
 }
 
@@ -191,6 +203,10 @@ export interface DetectScenesOpts {
   sensitivity?: number;
   maxLen?: number;
   minLen?: number;
+  signal?: AbortSignal;
+  onProgress?: (phase: 'detecting' | 'thumbnails' | 'committing') => void;
+  /** Synchronous boundary: after this callback, sidecar publication may land. */
+  onCommitStart?: () => void;
 }
 
 /**
@@ -206,57 +222,102 @@ export async function detectScenesForSource(
   sourceId: string,
   opts: DetectScenesOpts = {},
 ): Promise<SceneFile> {
-  const src = m.sources.find((s) => s.id === sourceId);
-  if (!src) throw new Error(`unknown source: ${sourceId}`);
-  const media = src.proxy ? path.join(project.dir, src.proxy) : src.path;
+  return project.withWorkLock(`scenes-${sourceId}`, async () => {
+    throwIfAborted(opts.signal);
+    const src = m.sources.find((s) => s.id === sourceId);
+    if (!src) throw new Error(`unknown source: ${sourceId}`);
+    const media = src.proxy ? path.join(project.dir, src.proxy) : src.path;
 
-  const existing = await project.scenes(sourceId);
-  const times = await detectSceneChangeTimes(media, opts.sensitivity ?? 0.3);
-  const ranges = buildSceneRanges(src.duration, times, opts);
-  const withIds = assignSceneIds(ranges, existing.scenes);
-  const existingById = new Map(existing.scenes.map((s) => [s.id, s]));
+    const existing = await project.scenes(sourceId);
+    opts.onProgress?.('detecting');
+    const times = await detectSceneChangeTimes(media, opts.sensitivity ?? 0.3, { signal: opts.signal });
+    const ranges = buildSceneRanges(src.duration, times, opts);
+    const withIds = assignSceneIds(ranges, existing.scenes);
+    const existingById = new Map(existing.scenes.map((s) => [s.id, s]));
 
-  let keptTranscriptWords: Word[] = [];
-  if (src.transcribed) {
+    let keptTranscriptWords: Word[] = [];
+    if (src.transcribed) {
+      try {
+        const t = await project.transcript(sourceId);
+        keptTranscriptWords = keptWords(m, sourceId, t.words);
+      } catch { /* transcript flagged but file missing; treat as silent */ }
+    }
+    let peaks: Peaks | null = null;
+    if (src.peaks) {
+      try {
+        peaks = JSON.parse(await fs.readFile(path.join(project.dir, src.peaks), 'utf8'));
+      } catch { /* peaks flagged but file missing; treat as zero energy */ }
+    }
+
+    opts.onProgress?.('thumbnails');
+    const scenes: Scene[] = [];
+    const staged: Array<{ tmp: string; abs: string; backup: string; hadPrevious: boolean }> = [];
+    const nonce = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
     try {
-      const t = await project.transcript(sourceId);
-      keptTranscriptWords = keptWords(m, sourceId, t.words);
-    } catch { /* transcript flagged but file missing; treat as silent */ }
-  }
-  let peaks: Peaks | null = null;
-  if (src.peaks) {
-    try {
-      peaks = JSON.parse(await fs.readFile(path.join(project.dir, src.peaks), 'utf8'));
-    } catch { /* peaks flagged but file missing; treat as zero energy */ }
-  }
+      for (const r of withIds) {
+        throwIfAborted(opts.signal);
+        const { rel: thumbRel, abs: thumbAbs } = await sceneThumbPath(project, sourceId, r.id);
+        const thumbTmp = `${thumbAbs}.tmp-${nonce}.jpg`;
+        const backup = `${thumbAbs}.bak-${nonce}`;
+        const mid = (r.t0 + r.t1) / 2;
+        staged.push({ tmp: thumbTmp, abs: thumbAbs, backup, hadPrevious: false });
+        await run('ffmpeg', [
+          '-y', '-v', 'error',
+          '-ss', String(mid),
+          '-i', media,
+          '-frames:v', '1',
+          '-vf', 'scale=160:-2',
+          '-q:v', '4',
+          thumbTmp,
+        ], { signal: opts.signal });
+        scenes.push({
+          id: r.id,
+          t0: r.t0,
+          t1: r.t1,
+          thumb: thumbRel,
+          hasSpeech: computeHasSpeech(r.t0, r.t1, keptTranscriptWords),
+          energy: peaks ? computeEnergy(peaks, r.t0, r.t1) : 0,
+          note: existingById.get(r.id)?.note,
+        });
+      }
 
-  const scenes: Scene[] = [];
-  for (const r of withIds) {
-    const { rel: thumbRel, abs: thumbAbs } = await sceneThumbPath(project, sourceId, r.id);
-    const mid = (r.t0 + r.t1) / 2;
-    await run('ffmpeg', [
-      '-y', '-v', 'error',
-      '-ss', String(mid),
-      '-i', media,
-      '-frames:v', '1',
-      '-vf', 'scale=160:-2',
-      '-q:v', '4',
-      thumbAbs,
-    ]);
-    scenes.push({
-      id: r.id,
-      t0: r.t0,
-      t1: r.t1,
-      thumb: thumbRel,
-      hasSpeech: computeHasSpeech(r.t0, r.t1, keptTranscriptWords),
-      energy: peaks ? computeEnergy(peaks, r.t0, r.t1) : 0,
-      note: existingById.get(r.id)?.note,
-    });
-  }
-
-  const file: SceneFile = { sourceId, scenes };
-  await project.writeScenes(file);
-  return file;
+      throwIfAborted(opts.signal);
+      opts.onProgress?.('committing');
+      // No await between the cancellation check/callback and the first
+      // publication operation. Callers can now reject DELETE as too late.
+      opts.onCommitStart?.();
+      const replaced: typeof staged = [];
+      try {
+        for (const item of staged) {
+          try {
+            await fs.copyFile(item.abs, item.backup);
+            item.hadPrevious = true;
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+          }
+          await fs.rename(item.tmp, item.abs);
+          replaced.push(item);
+        }
+        const published = await project.publishDetectedScenes({ sourceId, scenes });
+        await Promise.all(staged.map((item) => fs.rm(item.backup, { force: true }).catch(() => {})));
+        return published;
+      } catch (error) {
+        // Detection is derived state, but replacing only half its thumbnails
+        // still makes the old, valid sidecar visually lie. Roll every renamed
+        // file back before surfacing the error.
+        for (const item of replaced.reverse()) {
+          if (item.hadPrevious) await fs.rename(item.backup, item.abs).catch(() => {});
+          else await fs.rm(item.abs, { force: true }).catch(() => {});
+        }
+        throw error;
+      }
+    } finally {
+      await Promise.all(staged.flatMap((item) => [
+        fs.rm(item.tmp, { force: true }).catch(() => {}),
+        fs.rm(item.backup, { force: true }).catch(() => {}),
+      ]));
+    }
+  }, opts.signal);
 }
 
 // ---- text rendering (pure) ----

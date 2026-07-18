@@ -17,6 +17,8 @@ import {
   blockMoveOp,
   clipMoveOp,
   dropIndexForX,
+  rulerStepFor,
+  shouldCommitInlineEdit,
   trimDragOp,
 } from './dragLogic.js';
 import {
@@ -26,6 +28,19 @@ import {
   isVideoFileName,
   planSummary,
 } from './ingestLogic.js';
+import { mapWithConcurrency } from './concurrencyLogic.js';
+import {
+  MEDIA_PAGE_SIZE,
+  mediaFocusTarget,
+  mediaPage,
+  repairMediaFocus,
+} from './mediaScaleLogic.js';
+import { buildAiRequestEnvelope } from './aiRequestLogic.js';
+import {
+  isTerminalTranscribeJob,
+  mergeTranscribeJob,
+} from './transcribeJobLogic.js';
+import { historyControlState } from './historyLogic.js';
 
 const $ = (id) => document.getElementById(id);
 const video = $('video');
@@ -33,6 +48,19 @@ const videoOverlay = $('videoOverlay');
 const basename = (p) => String(p ?? '').split('/').pop();
 
 const S = {
+  projectDir: null,
+  // Identity of the project whose controls are actually painted. During an
+  // A -> B reload, S.projectDir/S.manifest may already describe B while A's
+  // old DOM is still clickable. Mutations bind to this rendered identity so
+  // that stale controls cannot land on B just because both revisions match.
+  renderedProjectDir: null,
+  // Revision of the frame whose controls are actually painted.  S.manifest
+  // intentionally advances earlier while reload() assembles the next frame;
+  // using it as a mutation base lets an old button act on an unseen revision.
+  // This value advances only after renderAll() has completed.
+  renderedRevision: null,
+  renderedCandidateIds: new Set(),
+  wsConnected: false,
   manifest: null,
   segments: [],
   duration: 0,
@@ -46,6 +74,11 @@ const S = {
   revisions: [],
   peaks: new Map(), // sourceId -> {rate, peaks}
   scenes: new Map(), // sourceId -> Scene[]
+  sceneDetailsLoaded: new Set(), // includes sources whose scene result is known-empty
+  sourceDetailErrors: new Map(), // sourceId -> failed detail kinds; failures stay retryable, never masquerade as empty
+  sourceDetailAbort: null, // AbortController for the current progressive hydration generation
+  sourceDetailRenderPending: false,
+  sourceDetailDirty: new Set(),
   currentSeg: -1,
   playing: false,
   // Transcript selection: composite "sourceId:wordId" keys throughout, since
@@ -62,11 +95,14 @@ const S = {
   // selectItem/renderInspector). Caption cues are NOT tracked here — they
   // open the existing captionStyleDialog directly (see buildCueEl).
   selection: null,
-  // W-DESIGN: 右パネルの排他表示モード — 'claude'(会話/履歴セグメント) |
-  // 'clip'(選択インスペクタ) | 'caption'(字幕スタイル) | 'export'(書き出し)。
+  // 右パネルの排他表示モード — 'claude'(決める/記録) | 'clip' |
+  // 'caption' | 'export' | 'settings'。
   // selectItem/openCaptionStylePopover/openExportView/closeExportView/
   // handleShowDirective が更新し、renderInspector が hidden を切り替える。
   rightMode: 'claude',
+  timelineZoom: 1,
+  timelineAutoFollow: true,
+  timelineProgrammaticScroll: false,
   // W-UI IA v2 波2 §9/追補#3, 波2.5: revision a mutate() response's
   // `warning` field (or a committed-but-refresh-failed notice) was already
   // surfaced for, via toast — connectWs()'s generic "変更 #N" confirmation
@@ -74,12 +110,10 @@ const S = {
   // warning with a bland confirmation.
   lastWarningRevision: null,
   detectMinGap: 0.7,
-  // W-UI IA v2 §5(c): best-effort "which of the 4 zero-candidate empty
-  // states are we in" signal — see renderCandidatesGroup's doc for why this
-  // is only an approximation (daemon exposes no "has detection ever run"
-  // flag, so a fresh page load can't distinguish 未検出 from 問題なし).
   detecting: false, // true only while THIS tab's own redetectBtn click is in flight
-  detectRanEmpty: false, // true once THIS session has seen a completed detect that found nothing
+  // Durable /api/project marker for the last successfully completed detect.
+  // `stale` is true when the project revision has advanced since that run.
+  detectRun: null,
   rateIdx: 0, // index into PLAY_RATES, cycled by repeated L presses
   rangeIn: null, // timeline seconds
   rangeOut: null, // timeline seconds
@@ -97,16 +131,26 @@ const S = {
   // returnTl is the timeline position to restore on exit.
   sourcePreview: null, // { sourceId, returnTl } | null
   mediaFocusKey: null, // sourceId — roving-tabindex focus stop in #mediaList
+  mediaSearchQuery: '', // raw user query; normalization is comparison-only in mediaScaleLogic.js
+  mediaVisibleLimit: MEDIA_PAGE_SIZE, // explicit progressive render chunk, never all sources by default
   expandedScenes: new Set(), // sourceIds whose scene grid is expanded
   sceneFocus: new Map(), // sourceId -> sceneId, roving-tabindex focus stop within one expanded scene grid
   musicEls: new Map(), // musicItemId -> <audio> element driving background-music preview
   expandedMedia: new Set(), // W-UI §3: sourceIds whose row detail (badges/usage bar/scene button) is expanded
+  sourceDetailsLoading: 0, // progressive transcript/peaks/scene hydration still in flight
   showWordKeys: new Set(), // "sourceId:wordId" — W-UI §0 "show words" highlight, separate from selWords (no delete side effect)
-  activeTask: null, // W-UI §1 claudeStrip: { label } | null — current long-running background task, from WS progress events
+  activeTask: null, // latest visible entry derived from activeTasks
+  activeTasks: new Map(), // taskId -> {label, order}; terminal events clear only their own task
+  activeTaskOrder: 0,
   transcribing: new Set(), // W-LAZY: sourceIds with an in-flight `vedit transcribe` background job (seeded from /api/project's `transcribing`, kept live via transcribe-progress/-done/-error WS messages)
+  transcribeJobs: new Map(), // taskId -> durable daemon job snapshot, including missed error/cancel terminal truth
+  transcribeStartInFlight: new Set(), // sourceIds whose POST has not returned yet (double-click single-flight)
   timelineDrag: null, // in-progress timeline drag/trim (see startClipReorderDrag/startTrimDrag/startBlockDrag)
   fontsList: null, // W-CAP: /api/fonts response ({kit:[{name,family?,path}], system:[{family}]}), refreshed every reload()
   qc: { issues: [], counts: { errors: 0, warnings: 0, infos: 0 } }, // W9: /api/qc static report, refreshed every reload()
+  // Never collapse a failed /api/qc fetch into an empty/clean report. The
+  // failure remains an actionable inbox row with an explicit retry.
+  qcError: null,
   // 波2.5: GET /api/export-results — NOT refreshed by reload()/every mutate();
   // fetched only when the 確認 tab is shown + a light 30s poll while it stays
   // active (see fetchExportResults). Holds at most 1 record (the latest).
@@ -116,6 +160,10 @@ const S = {
   // flag drives a small "更新できませんでした" note instead — see
   // fetchExportResults/renderExportResultCard.
   exportResultsStale: false,
+  // App-owned local MP4 job. Kept separate from activeTask: a button the
+  // user pressed is an application operation, not "Claude is editing".
+  exportJob: null,
+  exportJobUnavailable: false,
   takesCache: new Map(), // W-INTENT/W11: sourceId -> TakeGroup[], fetched on demand (GET /api/takes) when a "show takes" directive arrives
   // ---- W-ANIME: composition (source-less "sprite anime" production mode) ----
   backgroundIntervals: [], // [{t0,t1,ref}] from /api/project — the resolved "紙芝居"; empty for a non-composition project
@@ -172,23 +220,223 @@ function playLoadInAnimationOnce() {
 
 // ---------- data ----------
 async function api(path, init) {
-  const r = await fetch(path, init);
+  const requestInit = init ? { ...init } : undefined;
+  const explicitlyExpected = requestInit?.expectedProjectDir;
+  if (requestInit) delete requestInit.expectedProjectDir;
+  let request = requestInit;
+  const method = (requestInit?.method ?? 'GET').toUpperCase();
+  const isApiMutation = path.startsWith('/api/')
+    && ['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)
+    && path.split('?', 1)[0] !== '/api/open';
+  if (requestInit && path.startsWith('/api/')) {
+    const headers = new Headers(requestInit.headers);
+    if (typeof requestInit.body === 'string' && !headers.has('content-type')) {
+      headers.set('content-type', 'application/json');
+    }
+    if (isApiMutation) {
+      const expectedProjectDir = explicitlyExpected ?? S.renderedProjectDir;
+      if (!expectedProjectDir) {
+        throw Object.assign(new Error('プロジェクトの確認が完了していません。画面を再読み込みしてください'), { status: 409 });
+      }
+      // Header values are ByteStrings in Fetch. Percent-encoding preserves
+      // absolute identities even when a project path contains Japanese.
+      headers.set('x-vedit-project-dir', encodeURIComponent(expectedProjectDir));
+    }
+    request = { ...requestInit, headers };
+  }
+  const r = await fetch(path, request);
   const t = await r.text();
   const b = t ? JSON.parse(t) : {};
   if (!r.ok) throw Object.assign(new Error(b.error || r.statusText), { status: r.status });
   return b;
 }
 
-async function reload() {
+let reloadRequestSeq = 0;
+let reloadTail = Promise.resolve();
+function setFrameAssembling(assembling) {
+  const main = document.querySelector('main');
+  if (!main) return;
+  if (assembling) main.setAttribute('aria-busy', 'true');
+  else main.removeAttribute('aria-busy');
+}
+function reload() {
+  const requestId = ++reloadRequestSeq;
+  // This is an accessibility/status signal, not the concurrency boundary.
+  // Old controls remain usable but stay bound to renderedRevision, so a
+  // click during assembly rejects against the server instead of landing on
+  // a newer, not-yet-visible frame.
+  setFrameAssembling(true);
+  const run = reloadTail.catch(() => {}).then(() => reloadOnce(requestId));
+  reloadTail = run.catch(() => {});
+  return run;
+}
+
+const SOURCE_DETAIL_CONCURRENCY = 8;
+const SOURCE_DETAIL_TIMEOUT_MS = 10000;
+
+async function fetchDetailPart(load, parentSignal) {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (parentSignal?.aborted) controller.abort();
+  else parentSignal?.addEventListener('abort', abort, { once: true });
+  const timer = setTimeout(() => controller.abort(), SOURCE_DETAIL_TIMEOUT_MS);
+  try {
+    return { attempted: true, ok: true, value: await load(controller.signal) };
+  } catch (error) {
+    return { attempted: true, ok: false, aborted: Boolean(parentSignal?.aborted), error };
+  } finally {
+    clearTimeout(timer);
+    parentSignal?.removeEventListener('abort', abort);
+  }
+}
+
+async function fetchSourceDetail(src, signal) {
+  const needsScenes = !S.sceneDetailsLoaded.has(src.id);
+  const [transcript, peaks, scenes] = await Promise.all([
+    src.transcribed
+      && !S.transcribing.has(src.id)
+      && !S.transcribeStartInFlight.has(src.id)
+      && !S.transcripts.has(src.id)
+      ? fetchDetailPart(
+          (partSignal) => api(`/api/transcript?full=1&source=${encodeURIComponent(src.id)}`, { signal: partSignal })
+            .then((value) => value.words),
+          signal,
+        )
+      : Promise.resolve({ attempted: false, ok: true }),
+    src.peaks && !S.peaks.has(src.id)
+      ? fetchDetailPart((partSignal) => api(`/media/peaks/${encodeURIComponent(src.id)}`, { signal: partSignal }), signal)
+      : Promise.resolve({ attempted: false, ok: true }),
+    needsScenes
+      ? fetchDetailPart(
+          (partSignal) => api(`/api/scenes?source=${encodeURIComponent(src.id)}&full=1`, { signal: partSignal })
+            .then((value) => value.scenes ?? []),
+          signal,
+        )
+      : Promise.resolve({ attempted: false, ok: true }),
+  ]);
+  return { sourceId: src.id, transcript, peaks, scenes };
+}
+
+function renderMediaPanelPreservingView() {
+  const list = $('mediaList');
+  const active = document.activeElement;
+  const focusedRow = active?.closest?.('.srcRow');
+  const focusedScene = active?.closest?.('.sceneItem');
+  const sourceId = focusedRow?.dataset.source ?? focusedScene?.dataset.source;
+  const sceneId = focusedScene?.dataset.scene;
+  const actionLabel = active?.getAttribute?.('aria-label');
+  const hadListFocus = Boolean(active && list.contains(active));
+  const scrollTop = list.scrollTop;
+  renderMediaPanel();
+  list.scrollTop = scrollTop;
+  if (!hadListFocus || !sourceId) return;
+  const scope = sceneId
+    ? document.querySelector(`.sceneItem[data-source="${CSS.escape(sourceId)}"][data-scene="${CSS.escape(sceneId)}"]`)
+    : document.querySelector(`.srcRow[data-source="${CSS.escape(sourceId)}"]`);
+  const target = actionLabel
+    ? [...(scope?.querySelectorAll('button') ?? [])].find((button) => button.getAttribute('aria-label') === actionLabel)
+    : scope;
+  target?.focus({ preventScroll: true });
+}
+
+function scheduleSourceDetailRender(kinds = []) {
+  for (const kind of kinds) S.sourceDetailDirty.add(kind);
+  if (S.sourceDetailRenderPending) return;
+  S.sourceDetailRenderPending = true;
+  requestAnimationFrame(() => {
+    S.sourceDetailRenderPending = false;
+    if (!S.manifest) return;
+    const dirty = new Set(S.sourceDetailDirty);
+    S.sourceDetailDirty.clear();
+    renderMediaPanelPreservingView();
+    if (dirty.has('transcript')) {
+      renderTranscript();
+      renderInbox();
+      renderClaudeStatus();
+    }
+    if (dirty.has('scenes')) renderTimeline();
+    if (dirty.has('peaks')) drawWave();
+  });
+}
+
+function applySourceDetail(detail) {
+  const dirty = [];
+  const errors = [];
+  if (detail.transcript.attempted) {
+    // A re-transcribe may start while this older request is in flight. Never
+    // put its old word ids/text back into the editable DOM once that source
+    // is known to be processing a replacement transcript.
+    if (detail.transcript.ok && !S.transcribing.has(detail.sourceId) && !S.transcribeStartInFlight.has(detail.sourceId)) {
+      S.transcripts.set(detail.sourceId, detail.transcript.value);
+      dirty.push('transcript');
+    } else if (!detail.transcript.aborted) errors.push('文字起こし');
+  }
+  if (detail.peaks.attempted) {
+    if (detail.peaks.ok) {
+      S.peaks.set(detail.sourceId, detail.peaks.value);
+      dirty.push('peaks');
+    } else if (!detail.peaks.aborted) errors.push('波形');
+  }
+  if (detail.scenes.attempted) {
+    if (detail.scenes.ok) {
+      S.sceneDetailsLoaded.add(detail.sourceId);
+      if (detail.scenes.value.length) S.scenes.set(detail.sourceId, detail.scenes.value);
+      else S.scenes.delete(detail.sourceId);
+      dirty.push('scenes');
+    } else if (!detail.scenes.aborted) errors.push('シーン');
+  }
+  if (errors.length) S.sourceDetailErrors.set(detail.sourceId, errors);
+  else S.sourceDetailErrors.delete(detail.sourceId);
+  scheduleSourceDetailRender(dirty);
+}
+
+async function hydrateSourceDetails({ requestId, projectDir, revision, sources }) {
+  const current = () => requestId === reloadRequestSeq;
+  S.sourceDetailAbort?.abort();
+  const controller = new AbortController();
+  S.sourceDetailAbort = controller;
+  await mapWithConcurrency(
+    sources,
+    SOURCE_DETAIL_CONCURRENCY,
+    async (source) => {
+      const detail = await fetchSourceDetail(source, controller.signal);
+      if (!current() || controller.signal.aborted) return;
+      applySourceDetail(detail);
+      S.sourceDetailsLoading = Math.max(0, S.sourceDetailsLoading - 1);
+      scheduleSourceDetailRender();
+    },
+    current,
+  );
+  if (!current()) return;
+  const verified = await api('/api/project');
+  if (!current()) return;
+  const verifiedProjectDir = verified.projectDir ?? verified.manifest?.name ?? null;
+  if (verifiedProjectDir !== projectDir || verified.manifest?.revision !== revision) {
+    setTimeout(() => reload().catch(() => {}), 0);
+    return;
+  }
+  S.sourceDetailsLoading = 0;
+  scheduleSourceDetailRender();
+}
+
+async function reloadOnce(requestId) {
+  if (requestId !== reloadRequestSeq) return;
   let pr;
   try {
     pr = await api('/api/project');
   } catch (e) {
+    if (requestId !== reloadRequestSeq) return;
     S.loadState = e.status === 400 && /no project open/.test(e.message ?? '') ? 'no-project' : 'error';
     renderStageState();
+    setFrameAssembling(false);
     throw e;
   }
+  if (requestId !== reloadRequestSeq) return;
   try {
+    const nextProjectDir = pr.projectDir ?? pr.manifest?.name ?? null;
+    const projectChanged = Boolean(S.projectDir && nextProjectDir && S.projectDir !== nextProjectDir);
+    if (projectChanged) resetProjectScopedState();
+    S.projectDir = nextProjectDir;
     S.manifest = pr.manifest;
     S.segments = pr.segments;
     S.duration = pr.duration;
@@ -196,8 +444,29 @@ async function reload() {
     S.sprites = pr.sprites ?? [];
     S.dialogue = pr.dialogue ?? []; // W-ANIME
     S.backgroundIntervals = pr.backgroundIntervals ?? []; // W-ANIME
-    S.transcribing = new Set(pr.transcribing ?? []); // W-LAZY: live job state (see /api/project in daemon.ts), not part of the manifest
-    S.kit = await api('/api/kit').catch(() => ({ path: null, kit: null }));
+    syncTranscribeJobTruth(pr.transcribeJobs ?? [], pr.transcribing ?? []);
+    S.detectRun = pr.detectRun ?? null;
+    const qcRequest = api('/api/qc')
+      .then((value) => ({ value, error: null }))
+      .catch((error) => ({ value: { issues: [], counts: { errors: 0, warnings: 0, infos: 0 } }, error }));
+    const [kit, fontsList, cues, candidates, candidatesAll, revisions, qcResult, notes] = await Promise.all([
+      api('/api/kit').catch(() => ({ path: null, kit: null })),
+      api('/api/fonts').catch(() => ({ kit: [], system: [] })),
+      api('/api/captions'),
+      api('/api/candidates'),
+      api('/api/candidates?all=1'),
+      api('/api/revisions'),
+      qcRequest,
+      api('/api/notes').catch(() => []),
+    ]);
+    // Transcript contents are revisioned sidecars. Keep the cache for an
+    // ordinary forward edit, but invalidate exactly the sources touched by
+    // a transcribe revision; a restore can change any source's effective
+    // sidecar, so it deliberately invalidates all. Missing/gapped history is
+    // treated conservatively. This happens before renderAll(), ensuring old
+    // word controls disappear before the new frame is declared painted.
+    invalidateTranscriptCacheForRevision(nextProjectDir, pr.manifest?.revision, revisions);
+    S.kit = kit;
     // W-ANIME: derive the speech-bubble palette once per reload — a kit
     // style tagged use_for:['dialogue'|'speech-bubble'] wins, else the
     // active captions style, else a neutral default (see
@@ -214,59 +483,175 @@ async function reload() {
     // GET /api/fonts in daemon.ts) rather than only on popover-open, so
     // renderCaption can resolve an ALREADY-set overrides.font's @font-face
     // (if it's a kit font) even before the user ever opens the popover.
-    S.fontsList = await api('/api/fonts').catch(() => ({ kit: [], system: [] }));
-    S.cues = await api('/api/captions');
-    S.candidates = await api('/api/candidates');
-    S.candidatesAll = await api('/api/candidates?all=1');
-    S.revisions = await api('/api/revisions');
+    S.fontsList = fontsList;
+    S.cues = cues;
+    S.candidates = candidates;
+    S.candidatesAll = candidatesAll;
+    S.revisions = revisions;
     ensureQueueSeenLoaded(); // IA v3 波A §1.1 — S.manifest/S.candidates が揃った直後(baseline seeding は現在の候補集合を必要とする)
     // W9: static-only QC pass (cheap — see daemon.ts's GET /api/qc doc), merged into renderInbox() below.
-    S.qc = await api('/api/qc').catch(() => ({ issues: [], counts: { errors: 0, warnings: 0, infos: 0 } }));
+    // A fetch failure is not a clean report: preserve it as an explicit,
+    // retryable state instead of fabricating zero issues.
+    S.qc = qcResult.value;
+    S.qcError = qcResult.error ? (qcResult.error?.message ?? String(qcResult.error)) : null;
     // IA v3 波B §8: プロジェクトメモ(read-only)。renderQueueSheetDesk が
     // policy/todo 先頭数件を「机」に載せる。
-    S.notes = await api('/api/notes').catch(() => []);
-    for (const src of S.manifest.sources) {
-      if (src.transcribed && !S.transcripts.has(src.id)) {
-        const t = await api(`/api/transcript?full=1&source=${src.id}`);
-        S.transcripts.set(src.id, t.words);
-      }
-      if (src.peaks && !S.peaks.has(src.id)) {
-        S.peaks.set(src.id, await api(`/media/peaks/${src.id}`));
-      }
-      try {
-        const f = await api(`/api/scenes?source=${src.id}&full=1`);
-        if (f.scenes && f.scenes.length) S.scenes.set(src.id, f.scenes);
-        else S.scenes.delete(src.id);
-      } catch {
-        S.scenes.delete(src.id); // no scenes detected yet for this source
-      }
+    S.notes = notes;
+    if (requestId !== reloadRequestSeq) return;
+    // The daemon can switch projects while the child requests above are in
+    // flight. Verify the identity and revision once more before committing a
+    // frame to the screen; if they changed, discard this assembled snapshot
+    // and enqueue a clean reload against the new project.
+    const verified = await api('/api/project');
+    if (requestId !== reloadRequestSeq) return;
+    const verifiedProjectDir = verified.projectDir ?? verified.manifest?.name ?? null;
+    if (verifiedProjectDir !== nextProjectDir || verified.manifest?.revision !== pr.manifest?.revision) {
+      setTimeout(() => reload().catch(() => {}), 0);
+      return;
     }
     S.loadState = 'ok';
-    renderAll();
+    S.sourceDetailsLoading = S.manifest.sources.length;
+    await renderAll();
+    // Latch project + revision + candidate set as one painted-frame identity.
+    // Any old handler that ran while the async assembly above was in flight
+    // still used the previous latch and therefore conflicts safely.
+    S.renderedProjectDir = nextProjectDir;
+    S.renderedRevision = pr.manifest?.revision ?? null;
+    S.renderedCandidateIds = new Set(S.candidates.map((candidate) => candidate.id));
+    setFrameAssembling(false);
+    await Promise.all([
+      fetchExportResults().catch(() => {}),
+      fetchExportJob().catch(() => {}),
+    ]);
     playLoadInAnimationOnce();
+    // Do not keep the entire editor blank behind 93-279 serial per-source
+    // requests.  The usable project shell is now painted; optional transcript,
+    // waveform and scene detail hydrates in a bounded pool and repaints only
+    // its dependent surfaces when complete.
+    hydrateSourceDetails({
+      requestId,
+      projectDir: nextProjectDir,
+      revision: pr.manifest?.revision,
+      sources: [...S.manifest.sources],
+    }).catch((error) => {
+      if (requestId !== reloadRequestSeq) return;
+      S.sourceDetailsLoading = 0;
+      toast(`素材の詳細を読み込めませんでした: ${error?.message ?? error}`, { type: 'error' });
+    });
   } catch (e) {
+    if (requestId !== reloadRequestSeq) return;
     S.loadState = 'error';
     renderStageState();
+    setFrameAssembling(false);
     throw e;
   }
+}
+
+function clearTranscriptInteractionState(sourceIds = null) {
+  const affected = sourceIds ? new Set(sourceIds) : null;
+  const keyIsAffected = (key) => !affected || affected.has(String(key ?? '').split(':', 1)[0]);
+  if (!affected) S.transcripts = new Map();
+  else for (const sourceId of affected) S.transcripts.delete(sourceId);
+  for (const key of [...S.selWords]) if (keyIsAffected(key)) S.selWords.delete(key);
+  for (const key of [...S.showWordKeys]) if (keyIsAffected(key)) S.showWordKeys.delete(key);
+  if (keyIsAffected(S.selAnchor)) S.selAnchor = null;
+  if (!affected || affected.has(S.selSourceId)) S.selSourceId = null;
+  if (keyIsAffected(S.focusKey)) S.focusKey = null;
+  if (keyIsAffected(S.activeWordKey)) S.activeWordKey = null;
+  if (!affected) S.takesCache = new Map();
+  else for (const sourceId of affected) S.takesCache.delete(sourceId);
+}
+
+function invalidateTranscriptCacheForRevision(nextProjectDir, nextRevision, revisions) {
+  if (nextProjectDir !== S.renderedProjectDir || S.renderedRevision == null) {
+    clearTranscriptInteractionState();
+    return;
+  }
+  if (nextRevision === S.renderedRevision) return;
+  if (!Number.isInteger(nextRevision) || nextRevision < S.renderedRevision) {
+    clearTranscriptInteractionState();
+    return;
+  }
+  const entries = (revisions ?? []).filter((entry) => (
+    entry.rev > S.renderedRevision && entry.rev <= nextRevision
+  ));
+  // A compacted/missing history cannot prove the cache is unchanged.
+  if (entries.length !== nextRevision - S.renderedRevision) {
+    clearTranscriptInteractionState();
+    return;
+  }
+  if (entries.some((entry) => entry.op === 'restore')) {
+    clearTranscriptInteractionState();
+    return;
+  }
+  const changed = new Set();
+  for (const entry of entries) {
+    if (entry.op !== 'transcribe') continue;
+    const sourceId = entry.params?.sourceId;
+    if (typeof sourceId !== 'string' || !sourceId) {
+      clearTranscriptInteractionState();
+      return;
+    }
+    changed.add(sourceId);
+  }
+  if (changed.size) clearTranscriptInteractionState(changed);
+}
+
+function resetProjectScopedState() {
+  S.sourceDetailAbort?.abort();
+  S.sourceDetailAbort = null;
+  for (const audio of S.musicEls.values()) audio.pause?.();
+  S.transcripts = new Map();
+  S.peaks = new Map();
+  S.scenes = new Map();
+  S.sceneDetailsLoaded = new Set();
+  S.sourceDetailErrors = new Map();
+  S.sourceDetailDirty = new Set();
+  S.takesCache = new Map();
+  S.musicEls = new Map();
+  S.expandedScenes = new Set();
+  S.expandedMedia = new Set();
+  S.mediaSearchQuery = '';
+  S.mediaVisibleLimit = MEDIA_PAGE_SIZE;
+  S.sourceDetailsLoading = 0;
+  S.sceneFocus = new Map();
+  S.showWordKeys = new Set();
+  S.exportResults = [];
+  S.exportResultsStale = false;
+  S.exportJob = null;
+  S.exportJobUnavailable = false;
+  S.activeTasks.clear();
+  S.activeTask = null;
+  S.activeTaskOrder = 0;
+  S.transcribeJobs = new Map();
+  S.transcribeStartInFlight = new Set();
+  S.detectRun = null;
+  S.qc = { issues: [], counts: { errors: 0, warnings: 0, infos: 0 } };
+  S.qcError = null;
+  S.selection = null;
+  S.sourcePreview = null;
+  S.prevRevCache = null;
+  S.comparingPrev = false;
+  S.lastSeenRevision = null;
+  S.lastSeenCandidateIds = null;
+  S.lastSeenProjectKey = null;
+  S.renderedRevision = null;
+  S.renderedCandidateIds = new Set();
 }
 
 // ---------- IA v3 波A §1.1: キューシート「前回の確認」トラッキング ----------
 // localStorage キー: `vedit.queueSheetSeen.<projectKey>` に
 // { revision, candidateIds } を保存する。
 //
-// projectKey について: 仕様は `lastSeenRevision[projectDir]` と書いているが、
-// /api/project は絶対パスの projectDir を web へ一切返さない(daemon は
-// 単一プロジェクトを開いた状態で応答する設計 — HANDOFF §5「複数プロジェクト
-// 同時編集は未検証」)。このため manifest.name(Project.create に渡される
-// プロジェクト名。通常はディレクトリ名由来)を projectDir の代替
-// identifier として使う — 実装判断としてここと最終報告に明記する。
+// projectKey は /api/project の projectDir を使い、同名プロジェクト間でも
+// 既読候補・revisionを混ぜない。古いdaemonとの互換時だけmanifest.nameへ
+// fallbackする(queueSeenProjectKey参照)。
 const QUEUE_SEEN_LS_PREFIX = 'vedit.queueSheetSeen.';
 function queueSeenStorageKey(projectKey) {
   return `${QUEUE_SEEN_LS_PREFIX}${projectKey}`;
 }
 function queueSeenProjectKey() {
-  return S.manifest?.name ?? '__unknown__';
+  return S.projectDir ?? S.manifest?.name ?? '__unknown__';
 }
 function loadQueueSeenState(projectKey) {
   try {
@@ -326,12 +711,17 @@ function ensureQueueSeenLoaded() {
 // renderInbox() が同期的に DOM を作り直しても、クリックされた要素自身の
 // onclick は(既に解決済みの経路をたどって)問題なく発火する。
 function markQueueSheetSeenIfVisible() {
-  if (!S.manifest) return;
+  if (!S.manifest || S.renderedRevision == null) return;
   if (S.rightMode !== 'claude') return; // ドリルインシート表示中はキューシート自体が不可視
-  if (!$('nowPanel')?.classList.contains('active')) return; // 履歴タブ表示中は対象外(新着マークは会話タブの中身)
+  const queueView = $('claudeView');
+  if (!queueView || queueView.hidden || queueView.getClientRects().length === 0) return;
+  if (isNarrowRightSheet() && !$('rightPanel').classList.contains('sheetOpen')) return;
   const key = queueSeenProjectKey();
-  const curRev = S.manifest.revision;
-  const curIds = new Set(S.candidates.map((c) => c.id));
+  // The visible queue, not an in-progress reload snapshot, is what the user
+  // can actually have seen. Advancing this marker from live S.* while the old
+  // DOM is still painted would silently mark unseen candidates as read.
+  const curRev = S.renderedRevision;
+  const curIds = new Set(S.renderedCandidateIds);
   if (S.lastSeenProjectKey === key && S.lastSeenRevision === curRev && setsEqual(S.lastSeenCandidateIds, curIds)) return;
   S.lastSeenRevision = curRev;
   S.lastSeenCandidateIds = curIds;
@@ -376,7 +766,7 @@ function renderStageState() {
     el.hidden = false;
     logo.hidden = false;
     addLine('最初の動画を追加', 'stageEmptyLead');
-    addLine('ここに動画をドロップするか、Claude に「この動画を編集して」と伝えてください');
+    addLine('ここに動画をドロップするか、AI に「この動画を編集して」と伝えてください');
     addLine('元動画は変更しません');
     retry.hidden = true;
   } else {
@@ -403,6 +793,12 @@ function loadSeg(i, { play = false, offset = 0 } = {}) {
   const s = S.segments[i];
   if (!s) return;
   S.currentSeg = i;
+  const source = S.manifest?.sources.find((candidate) => candidate.id === s.sourceId);
+  // An explicitly muted element is exempt from Chromium's autoplay gate.
+  // Sources with no audio stream are silent by definition, so muting them
+  // changes no output while keeping one-click playback reliable in embedded
+  // browsers.  Audio-bearing sources are always restored to audible mode.
+  video.muted = !source?.hasAudio;
   const url = proxyUrl(s.sourceId);
   const target = s.srcStart + offset;
   const apply = () => {
@@ -544,6 +940,7 @@ function applyCompositionMode() {
 // next animation frame (see seekTl's comment on F-s3-3/F-s3-4).
 function renderCompositionFrame(tl) {
   $('playhead').style.left = `${(tl / Math.max(1e-6, S.duration)) * 100}%`;
+  if (S.playing && S.timelineAutoFollow) ensurePlayheadVisible(tl);
   renderTimecode(tl, S.duration);
   $('headerTc').textContent = fmt(tl);
   renderCompositionBackground(tl);
@@ -651,6 +1048,7 @@ function tick() {
 function renderPlaybackFrame(tl) {
   const s = S.segments[S.currentSeg];
   $('playhead').style.left = `${(tl / S.duration) * 100}%`;
+  if (S.playing && S.timelineAutoFollow) ensurePlayheadVisible(tl);
   renderTimecode(tl, S.duration);
   $('headerTc').textContent = fmt(tl);
   renderCaption(tl);
@@ -906,8 +1304,25 @@ function renderPlayability() {
 function tryPlay(el) {
   const p = el.play();
   if (p && typeof p.catch === 'function') {
-    p.catch(() => {
-      if (el === video) { S.playing = false; setPlayBtnState(false); }
+    p.catch((error) => {
+      if (el === video) {
+        // Changing `src`/seeking while Chromium is still satisfying play()
+        // rejects that particular promise with AbortError.  It is a hand-off
+        // between two playback attempts, not a final playback failure.  The
+        // loadedmetadata handler (source switch) or the frame-loop stall
+        // recovery retries once media data is ready, so keep the user's play
+        // intent and the transport state intact here.
+        if (error?.name === 'AbortError' && S.playing) return;
+        S.playing = false;
+        setPlayBtnState(false);
+        // An interrupted play during a deliberate source/seek change is
+        // expected. Policy/codec/device failures are not: keeping those
+        // silent made a working-looking play button appear dead.
+        if (error?.name !== 'AbortError') {
+          const detail = error?.message ? `: ${error.message}` : '';
+          toast(`再生できませんでした${detail}`, { type: 'error' });
+        }
+      }
     });
   }
   return p;
@@ -975,12 +1390,28 @@ function globalShortcutsBlocked(target) {
   return !!target?.closest?.('button, select, [role="tab"], [role="button"], dialog');
 }
 document.addEventListener('keydown', (e) => {
-  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.isContentEditable) return;
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT' || e.target.isContentEditable) return;
+  const key = e.key.toLowerCase();
+  const modifier = e.metaKey || e.ctrlKey;
+  const undoShortcut = modifier && !e.altKey && !e.shiftKey && key === 'z';
+  const redoShortcut = !e.altKey && (
+    (modifier && e.shiftKey && key === 'z')
+    || (e.ctrlKey && !e.metaKey && !e.shiftKey && key === 'y')
+  );
+  if ((undoShortcut || redoShortcut) && !e.target.closest?.('dialog[open]')) {
+    e.preventDefault();
+    if (!e.repeat) $(redoShortcut ? 'redoBtn' : 'undoBtn').click();
+    return;
+  }
+  if (e.altKey && e.key.toLowerCase() === 'r') {
+    e.preventDefault();
+    openRightSheet({ focus: true });
+    return;
+  }
   if (globalShortcutsBlocked(e.target)) return;
   if (e.code === 'Space') { e.preventDefault(); $('playBtn').click(); return; }
   if (e.code === 'ArrowLeft') { seekTl(tlNow() - (e.shiftKey ? 1 / S.manifest.fps : 1)); return; }
   if (e.code === 'ArrowRight') { seekTl(tlNow() + (e.shiftKey ? 1 / S.manifest.fps : 1)); return; }
-  const key = e.key.toLowerCase();
   if (key === 'k') { e.preventDefault(); stopPlayback(); return; }
   if (key === 'l') { e.preventDefault(); cycleRate(); return; }
   if (key === 'j') { e.preventDefault(); jumpBackPlay(); return; }
@@ -988,6 +1419,22 @@ document.addEventListener('keydown', (e) => {
   if (e.key === '.') { e.preventDefault(); seekTl(tlNow() + 1 / S.manifest.fps); return; }
   if (key === 'i') { e.preventDefault(); setRangePoint('in'); return; }
   if (key === 'o') { e.preventDefault(); setRangePoint('out'); return; }
+  if (e.key === '+' || e.key === '=') {
+    e.preventDefault();
+    const range = $('tlZoomRange');
+    range.value = String(Math.min(100, Number(range.value) + 10));
+    S.timelineAutoFollow = true;
+    applyTimelineZoom();
+    return;
+  }
+  if (e.key === '-' || e.key === '_') {
+    e.preventDefault();
+    const range = $('tlZoomRange');
+    range.value = String(Math.max(0, Number(range.value) - 10));
+    S.timelineAutoFollow = true;
+    applyTimelineZoom();
+    return;
+  }
   if (e.key === '?') { e.preventDefault(); toggleShortcuts(); return; }
   if (e.code === 'Escape') {
     e.preventDefault();
@@ -997,6 +1444,7 @@ document.addEventListener('keydown', (e) => {
     // 右パネル常設ビューへ移した後も同じ到達性を保つ。
     if (S.rightMode === 'caption') { closeCaptionStylePopover(); return; }
     if (S.rightMode === 'export') { closeExportView(); return; }
+    if (S.rightMode === 'settings') { closeSettingsView(); return; }
     if (S.selection) { deselect(); return; }
     clearRange();
     return;
@@ -1015,11 +1463,59 @@ video.addEventListener('ended', () => {
 // unchanged; only the containing block moved one level deeper, so this is
 // the one place that needs to know that.
 const tlEl = $('timelineTracks');
+const timelineViewport = $('timelineViewport');
+
+function timelineZoomFromControl() {
+  const value = Number($('tlZoomRange')?.value ?? 0);
+  return 1 + (Math.max(0, Math.min(100, value)) / 100) * 5;
+}
+function applyTimelineZoom({ keepPlayhead = true } = {}) {
+  S.timelineZoom = timelineZoomFromControl();
+  const width = `${S.timelineZoom * 100}%`;
+  tlEl.style.width = width;
+  $('timeRuler').style.width = width;
+  if (S.timelineZoom === 1) timelineViewport.scrollLeft = 0;
+  drawWave();
+  renderRuler();
+  if (keepPlayhead) ensurePlayheadVisible(tlNow(), { center: true });
+}
+function ensurePlayheadVisible(tl, { center = false } = {}) {
+  if (!timelineViewport || !S.duration || S.timelineZoom <= 1) return;
+  const x = (tl / S.duration) * tlEl.scrollWidth;
+  const left = timelineViewport.scrollLeft;
+  const right = left + timelineViewport.clientWidth;
+  const pad = Math.min(90, timelineViewport.clientWidth * 0.18);
+  if (!center && x >= left + pad && x <= right - pad) return;
+  const target = Math.max(0, x - timelineViewport.clientWidth * (center ? 0.5 : 0.72));
+  S.timelineProgrammaticScroll = true;
+  timelineViewport.scrollLeft = target;
+  requestAnimationFrame(() => { S.timelineProgrammaticScroll = false; });
+}
+$('tlZoomRange').oninput = () => { S.timelineAutoFollow = true; applyTimelineZoom(); };
+$('tlFitBtn').onclick = () => {
+  $('tlZoomRange').value = '0';
+  S.timelineAutoFollow = true;
+  applyTimelineZoom();
+};
+timelineViewport.addEventListener('scroll', () => {
+  if (!S.timelineProgrammaticScroll) S.timelineAutoFollow = false;
+}, { passive: true });
+timelineViewport.addEventListener('wheel', (e) => {
+  if (!e.shiftKey) return;
+  e.preventDefault();
+  const range = $('tlZoomRange');
+  range.value = String(Math.max(0, Math.min(100, Number(range.value) - Math.sign(e.deltaY) * 8)));
+  S.timelineAutoFollow = true;
+  applyTimelineZoom();
+}, { passive: false });
+
 tlEl.addEventListener('pointerdown', (e) => {
   const move = (ev) => {
     const r = tlEl.getBoundingClientRect();
     seekTl(((ev.clientX - r.left) / r.width) * S.duration, { play: false });
   };
+  tlEl.focus({ preventScroll: true });
+  S.timelineAutoFollow = false;
   move(e);
   const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
   window.addEventListener('pointermove', move);
@@ -1377,6 +1873,58 @@ function makeBlockKeyboardActivatable(el, onActivate) {
   });
 }
 
+function setCandidateHot(id, hot) {
+  for (const el of document.querySelectorAll(`[data-candidate-id="${CSS.escape(id)}"]`)) {
+    el.classList.toggle('hot', hot);
+  }
+}
+function focusCandidateInQueue(id) {
+  openRightSheet();
+  if (S.rightMode !== 'claude') {
+    S.selection = null;
+    S.rightMode = 'claude';
+    renderInspector();
+  }
+  const row = document.querySelector(`#inboxList .cand[data-candidate-id="${CSS.escape(id)}"]`);
+  if (!row) return;
+  for (const other of document.querySelectorAll('#inboxList .cand.expanded')) other.classList.remove('expanded');
+  row.classList.add('expanded');
+  row.scrollIntoView({ block: 'nearest', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
+  row.focus({ preventScroll: true });
+  setCandidateHot(id, true);
+}
+function renderCandidateLane() {
+  const lane = $('candLane');
+  if (!lane) return;
+  lane.innerHTML = '';
+  const hasCandidates = S.candidates.length > 0 && S.duration > 0;
+  $('timeline').classList.toggle('has-candidates', hasCandidates);
+  if (!hasCandidates) return;
+  for (const c of S.candidates) {
+    const win = candidateTlWindow(c);
+    if (!win) continue;
+    const marker = document.createElement('button');
+    marker.type = 'button';
+    marker.className = `candMarker ${c.kind}`;
+    marker.dataset.candidateId = c.id;
+    marker.style.left = `${(win.tlStart / S.duration) * 100}%`;
+    marker.style.width = `${Math.max(0.35, ((win.tlEnd - win.tlStart) / S.duration) * 100)}%`;
+    const dur = Math.max(0, c.t1 - c.t0);
+    marker.title = `${KIND_LABEL[c.kind] ?? c.kind}: ${slimBarLabel(c)}(−${dur.toFixed(1)}秒)`;
+    marker.setAttribute('aria-label', marker.title);
+    marker.onpointerdown = (e) => e.stopPropagation();
+    marker.onclick = () => {
+      seekTl(win.tlStart, { play: false });
+      focusCandidateInQueue(c.id);
+    };
+    marker.onmouseenter = () => setCandidateHot(c.id, true);
+    marker.onmouseleave = () => setCandidateHot(c.id, false);
+    marker.onfocus = () => setCandidateHot(c.id, true);
+    marker.onblur = () => setCandidateHot(c.id, false);
+    lane.appendChild(marker);
+  }
+}
+
 function renderTimeline() {
   const clips = $('clips');
   clips.innerHTML = '';
@@ -1478,6 +2026,7 @@ function renderTimeline() {
   renderBgRow();
   renderDialogueRow();
   renderCaptionRow();
+  renderCandidateLane();
   drawWave();
   renderRuler();
   renderTrackGutter();
@@ -1580,8 +2129,8 @@ function renderIntentZoneRow() {
     // protecting it (removal is structural — see #intentZonesInfo's
     // "Claude に頼む" chip in the 確認 tab instead of a UI control here).
     d.title = zone.kind === 'quiet'
-      ? `Claude が守っている無音: ${zone.label} — クリックでシーク`
-      : `Claude が保持している区間: ${zone.label} — クリックでシーク`;
+      ? `AI が守っている無音: ${zone.label} — クリックでシーク`
+      : `AI が保持している区間: ${zone.label} — クリックでシーク`;
     d.tabIndex = 0;
     d.setAttribute('role', 'button');
     d.onclick = () => seekTl(r.tlStart, { play: false });
@@ -1770,7 +2319,6 @@ function renderCaptionRow() {
 }
 
 // ---------- W-UI IA v2 波2 §2: 時間目盛り + トラックラベルガター ----------
-const RULER_NICE_STEPS = [0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900];
 function renderRuler() {
   const el = $('timeRuler');
   if (!el) return;
@@ -1779,8 +2327,7 @@ function renderRuler() {
   const width = tlEl.getBoundingClientRect().width || el.getBoundingClientRect().width;
   if (!width) return;
   const targetPx = 70; // aim for a tick roughly every 70px, never crowded
-  const rawStep = S.duration / Math.max(1, width / targetPx);
-  const step = RULER_NICE_STEPS.find((s) => s >= rawStep) ?? RULER_NICE_STEPS[RULER_NICE_STEPS.length - 1];
+  const step = rulerStepFor(S.duration, width, targetPx);
   for (let t = 0; t <= S.duration + 1e-6; t += step) {
     const tick = document.createElement('div');
     tick.className = 'rulerTick';
@@ -1814,20 +2361,25 @@ function renderTrackGutter() {
     Object.assign(d.style, style);
     el.appendChild(d);
   };
-  if (S.overlays.length > 0) addLabel('B-ROLL', '#4d8d88', { top: '4px', height: '22px' });
+  const rowStyle = (id) => {
+    const row = $(id);
+    return row ? { top: `${row.offsetTop}px`, height: `${row.offsetHeight}px` } : {};
+  };
+  if (S.candidates.length > 0) addLabel('候補', '#d9a45f', rowStyle('candLane'));
+  if (S.overlays.length > 0) addLabel('B-ROLL', '#4d8d88', rowStyle('overlayRow'));
   const hasClips = S.segments.length > 0;
-  if (!composition && hasClips) addLabel('本編', '#8f8f96', { top: '30px', height: '58px' });
-  if (!composition && S.manifest?.captions?.enabled) addLabel('テロップ', '#6d7f9e', { top: '94px', height: '20px' });
-  if ((S.manifest?.timeline.motion ?? []).length > 0) addLabel('モーション', '#7d70a3', { top: '120px', height: '20px' });
-  if ((S.manifest?.timeline.music ?? []).length > 0) addLabel('BGM', '#52886a', { top: '146px', height: '26px' });
+  if (!composition && hasClips) addLabel('本編', '#8f8f96', rowStyle('clips'));
+  if (!composition && S.manifest?.captions?.enabled) addLabel('テロップ', '#6d7f9e', rowStyle('captionRow'));
+  if ((S.manifest?.timeline.motion ?? []).length > 0) addLabel('モーション', '#7d70a3', rowStyle('motionRow'));
+  if ((S.manifest?.timeline.music ?? []).length > 0) addLabel('BGM', '#52886a', rowStyle('musicRow'));
 
   const hasSprites = S.sprites.length > 0;
   const hasBg = composition && S.backgroundIntervals.length > 0;
   const hasDialogue = (S.dialogue ?? []).length > 0;
   $('timeline')?.classList.toggle('tl-extra', hasSprites || hasBg || hasDialogue);
-  if (hasSprites) addLabel('スプライト', '#d65ac8', { top: '178px', height: '18px' });
-  if (hasBg) addLabel('紙芝居', '#5c86a8', { top: '202px', height: '18px' });
-  if (hasDialogue) addLabel('セリフ', '#ffffff', { top: '226px', height: '18px' });
+  if (hasSprites) addLabel('スプライト', '#d65ac8', rowStyle('spriteRow'));
+  if (hasBg) addLabel('紙芝居', '#5c86a8', rowStyle('bgRow'));
+  if (hasDialogue) addLabel('セリフ', '#ffffff', rowStyle('dialogueRow'));
 }
 
 // W-POLISH High-1: #wave の canvas 自体は #timelineTracks 全体(inset:0)を
@@ -1837,8 +2389,6 @@ function renderTrackGutter() {
 // 62%位置・最大55%で描いていたため、テロップ行(top:94px)まで波形が
 // はみ出して重なって見えていた。色/バー幅(1.4px)はv2.dc.htmlのdrawWaveと
 // 揃える。
-const WAVE_ROW_TOP = 30;
-const WAVE_ROW_HEIGHT = 58;
 function drawWave() {
   const c = $('wave');
   const r = tlEl.getBoundingClientRect();
@@ -1848,8 +2398,11 @@ function drawWave() {
   g.scale(devicePixelRatio, devicePixelRatio);
   g.clearRect(0, 0, r.width, r.height);
   g.fillStyle = 'rgba(255, 255, 255, 0.5)';
-  const bandTop = WAVE_ROW_TOP + WAVE_ROW_HEIGHT * 0.68; // 本編行の下部32%開始
-  const bandHeight = WAVE_ROW_HEIGHT * 0.30;
+  const clipsRow = $('clips');
+  const waveRowTop = clipsRow?.offsetTop ?? 36;
+  const waveRowHeight = clipsRow?.offsetHeight ?? 74;
+  const bandTop = waveRowTop + waveRowHeight * 0.68;
+  const bandHeight = waveRowHeight * 0.30;
   for (const s of S.segments) {
     const pk = S.peaks.get(s.sourceId);
     if (!pk) continue;
@@ -1986,7 +2539,8 @@ function renderPreviewBanner() {
   for (const r of document.querySelectorAll('#mediaList .srcRow')) {
     const previewing = S.sourcePreview?.sourceId === r.dataset.source;
     r.classList.toggle('previewing', previewing);
-    r.setAttribute('aria-selected', String(previewing));
+    if (previewing) r.setAttribute('aria-current', 'true');
+    else r.removeAttribute('aria-current');
   }
 }
 // Switch #video to source `sourceId`'s raw proxy at source-time `at` (default
@@ -2011,15 +2565,32 @@ function enterSourcePreview(sourceId, { at = 0 } = {}) {
   const mo = $('motionLayer'); mo.innerHTML = ''; mo.dataset.cur = '';
   const sp = $('spriteLayer'); if (sp) { sp.innerHTML = ''; sp.dataset.cur = ''; } // W8 sprites don't apply to raw source preview either
   video.style.objectPosition = '50% 50%';
+  video.muted = !src.hasAudio;
   video.pause();
   if (!videoOverlay.hidden) { videoOverlay.hidden = true; videoOverlay.pause(); } // B-roll V2 preview doesn't apply to raw source preview
 
   const url = proxyUrl(sourceId);
-  const apply = () => { video.currentTime = at; tryPlay(video); };
-  if (!video.src.endsWith(url)) { video.src = url; video.addEventListener('loadedmetadata', apply, { once: true }); }
-  else apply();
+  // Record intent before the first play() promise can settle.  A new source
+  // may abort that promise as metadata/seek state changes; the metadata
+  // callback below then resumes the same one-click request.
   S.playing = true;
   setPlayBtnState(true);
+  if (!video.src.endsWith(url)) {
+    video.src = url;
+    // `play()` must be requested synchronously from the click/keypress that
+    // opened the source. Waiting for loadedmetadata first loses transient
+    // user activation for audio-bearing clips in Chromium, turning the
+    // first "再生" press into a load-only no-op. The play promise itself may
+    // wait for media data; loadedmetadata only performs the requested seek.
+    video.addEventListener('loadedmetadata', () => {
+      video.currentTime = at;
+      if (S.sourcePreview?.sourceId === sourceId && S.playing && video.paused) tryPlay(video);
+    }, { once: true });
+    tryPlay(video);
+  } else {
+    video.currentTime = at;
+    tryPlay(video);
+  }
 }
 function exitSourcePreview() {
   if (!S.sourcePreview) return;
@@ -2090,7 +2661,9 @@ function toggleScenes(sourceId) {
 function sceneGridRow(src, scenes) {
   const wrap = document.createElement('div');
   wrap.className = 'sceneGrid';
-  wrap.setAttribute('role', 'group');
+  // #mediaList is a semantic list. Scene details are a second list item
+  // associated by their accessible label, never a non-list child.
+  wrap.setAttribute('role', 'listitem');
   wrap.setAttribute('aria-label', `${basename(src.path)} のシーン一覧`);
   let focusId = S.sceneFocus.get(src.id);
   if (!focusId || !scenes.some((sc) => sc.id === focusId)) focusId = scenes[0]?.id;
@@ -2102,6 +2675,18 @@ function sceneGridRow(src, scenes) {
     item.dataset.source = src.id;
     item.dataset.scene = sc.id;
     item.tabIndex = sc.id === focusId ? 0 : -1;
+
+    // Scene selection is a visual judgment.  The detector already renders a
+    // thumbnail for every scene; showing only ids/durations here forced users
+    // to audition dozens of clips one by one and made culling effectively
+    // blind.  Keep the image decorative (the adjacent seek button carries
+    // the useful accessible name) and lazy-load it for large scene sets.
+    const thumb = document.createElement('img');
+    thumb.className = 'sceneThumb';
+    thumb.alt = '';
+    thumb.loading = 'lazy';
+    thumb.src = `/media/scene-thumb/${encodeURIComponent(src.id)}/${encodeURIComponent(sc.id)}`;
+    item.appendChild(thumb);
 
     const reviewRow = document.createElement('div');
     reviewRow.className = 'sceneReview';
@@ -2163,6 +2748,34 @@ function toggleMediaDetail(sourceId) {
   renderMediaPanel();
   document.querySelector(`.srcRow[data-source="${CSS.escape(sourceId)}"]`)?.focus();
 }
+async function retrySourceDetails(sourceId, trigger) {
+  const src = S.manifest?.sources.find((source) => source.id === sourceId);
+  if (!src) return;
+  const projectDir = S.projectDir;
+  const revision = S.manifest.revision;
+  const requestId = reloadRequestSeq;
+  if (trigger) trigger.disabled = true;
+  S.sourceDetailErrors.delete(sourceId);
+  S.sourceDetailsLoading += 1;
+  scheduleSourceDetailRender();
+  const controller = new AbortController();
+  try {
+    const detail = await fetchSourceDetail(src, controller.signal);
+    if (
+      requestId !== reloadRequestSeq
+      || S.projectDir !== projectDir
+      || S.manifest?.revision !== revision
+    ) return;
+    applySourceDetail(detail);
+  } catch (error) {
+    S.sourceDetailErrors.set(sourceId, ['詳細']);
+    toast(`素材の詳細を読み込めませんでした: ${error?.message ?? error}`, { type: 'error' });
+  } finally {
+    S.sourceDetailsLoading = Math.max(0, S.sourceDetailsLoading - 1);
+    scheduleSourceDetailRender();
+    if (trigger?.isConnected) trigger.disabled = false;
+  }
+}
 function mediaRow(src) {
   const name = basename(src.path);
   const expanded = S.expandedMedia.has(src.id);
@@ -2170,8 +2783,8 @@ function mediaRow(src) {
   const row = document.createElement('div');
   row.className = 'srcRow' + (S.sourcePreview?.sourceId === src.id ? ' previewing' : '');
   row.dataset.source = src.id;
-  row.setAttribute('role', 'option');
-  row.setAttribute('aria-selected', String(S.sourcePreview?.sourceId === src.id));
+  row.setAttribute('role', 'listitem');
+  if (S.sourcePreview?.sourceId === src.id) row.setAttribute('aria-current', 'true');
   row.tabIndex = src.id === S.mediaFocusKey ? 0 : -1;
 
   // W-POLISH Mid-6: colorConverted は常設メタ行(下記)と展開時バッジの両方が
@@ -2216,11 +2829,16 @@ function mediaRow(src) {
     // that appears once done — S.transcribing is populated from
     // /api/project's `transcribing` field plus live transcribe-progress/
     // -done/-error WS messages (see connectWs below).
-    const transcribeBadge = src.transcribed
+    const transcribeState = sourceTranscribeStatus(src);
+    const transcribeBadge = transcribeState === 'done'
       ? '<span class="badge ok">文字起こし: 済</span>'
-      : S.transcribing.has(src.id)
-        ? '<span class="badge warn">文字起こし: 処理中</span>'
-        : '<span class="badge">文字起こし: なし</span>';
+      : transcribeState === 'processing' || transcribeState === 'starting'
+        ? `<span class="badge warn">文字起こし: ${transcribeState === 'starting' ? '開始中' : '処理中'}</span>`
+        : transcribeState === 'failed'
+          ? '<span class="badge warn">文字起こし: 失敗</span>'
+          : transcribeState === 'cancelled'
+            ? '<span class="badge">文字起こし: 中止</span>'
+            : '<span class="badge">文字起こし: なし</span>';
     badges.innerHTML = [
       transcribeBadge,
       !src.hasAudio ? '<span class="badge warn">音声なし</span>' : '',
@@ -2229,6 +2847,14 @@ function mediaRow(src) {
         ? '<span class="badge ok">変換済み</span>'
         : needsColorTransform(src.color) ? '<span class="badge warn">要色変換</span>' : '',
     ].join('');
+    const detailErrors = S.sourceDetailErrors.get(src.id);
+    if (detailErrors?.length) {
+      const failed = document.createElement('span');
+      failed.className = 'badge warn';
+      failed.textContent = '詳細読込失敗';
+      failed.title = `${detailErrors.join('・')}を読み込めませんでした`;
+      badges.appendChild(failed);
+    }
     if (S.scenes.has(src.id)) {
       const c = cullingCounts(src.id);
       const cullBadge = document.createElement('span');
@@ -2279,6 +2905,14 @@ function mediaRow(src) {
     scenesBtn.setAttribute('aria-label', `${name} のシーンを${scenesExpanded ? '閉じる' : '見る'}`);
     scenesBtn.onclick = (e) => { e.stopPropagation(); toggleScenes(src.id); };
     actions.appendChild(scenesBtn);
+  }
+  if (expanded && S.sourceDetailErrors.has(src.id)) {
+    const retryBtn = document.createElement('button');
+    retryBtn.className = 'btn-retrySourceDetails';
+    retryBtn.textContent = '再読込';
+    retryBtn.setAttribute('aria-label', `${name} の詳細を再読み込み`);
+    retryBtn.onclick = (e) => { e.stopPropagation(); retrySourceDetails(src.id, retryBtn); };
+    actions.appendChild(retryBtn);
   }
 
   row.append(thumbWrap, info, actions);
@@ -2387,10 +3021,13 @@ $('musicAddCancel').onclick = () => {
   $('musicAddSfx').checked = false;
 };
 async function submitMusicAdd(fileOrPath) {
+  const expectedProjectDir = S.renderedProjectDir;
   let filePath = fileOrPath;
   if (fileOrPath instanceof File) {
     try {
-      filePath = (await api(`/api/upload?${new URLSearchParams({ name: fileOrPath.name })}`, { method: 'POST', body: fileOrPath })).path;
+      filePath = (await api(`/api/upload?${new URLSearchParams({ name: fileOrPath.name })}`, {
+        method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: fileOrPath, expectedProjectDir,
+      })).path;
     } catch (e) {
       toast(`音声ファイルの取り込みに失敗しました: ${e.message}`, { type: 'error' });
       return;
@@ -2401,7 +3038,11 @@ async function submitMusicAdd(fileOrPath) {
   const sfx = $('musicAddSfx').checked;
   const body = { op: 'music-add', path: filePath, tlStart: tlNow() };
   if (sfx) Object.assign(body, { duck: false, fadeIn: 0.03, fadeOut: 0.03, role: 'sfx' });
-  const { ok } = await mutate(body, { conflictMessage: 'BGM/SEの追加は反映されませんでした。最新状態を確認してもう一度実行してください', trigger: $('musicAddSubmit') });
+  const { ok } = await mutate(body, {
+    expectedProjectDir,
+    conflictMessage: 'BGM/SEの追加は反映されませんでした。最新状態を確認してもう一度実行してください',
+    trigger: $('musicAddSubmit'),
+  });
   if (ok) { $('musicAddForm').hidden = true; $('musicAddPath').value = ''; $('musicAddSfx').checked = false; }
 }
 $('musicAddSubmit').onclick = () => submitMusicAdd($('musicAddPath').value);
@@ -2435,12 +3076,71 @@ $('takesCheckBtn').onclick = async () => {
   toast('言い直し候補は見つかりませんでした');
 };
 
+function clearMediaSearch({ focus = true } = {}) {
+  S.mediaSearchQuery = '';
+  S.mediaVisibleLimit = MEDIA_PAGE_SIZE;
+  renderMediaPanel();
+  if (focus) $('mediaSearchInput').focus();
+}
+
+function updateMediaSearchStatus(total, matchedCount, visibleCount) {
+  const status = $('mediaSearchStatus');
+  const displayed = visibleCount < matchedCount ? ` · ${visibleCount}件を表示` : '';
+  const loading = S.sourceDetailsLoading > 0 ? ' · 詳細をバックグラウンドで読み込み中' : '';
+  const text = `${matchedCount}件 / 全${total}件${displayed}${loading}`;
+  // Repeated detail/job redraws should not re-announce an unchanged count.
+  if (status.textContent !== text) status.textContent = text;
+}
+
+function mediaSearchEmptyRow() {
+  const empty = document.createElement('div');
+  empty.className = 'mediaEmptyHint mediaNoResults';
+  empty.setAttribute('role', 'listitem');
+  const lead = document.createElement('span');
+  lead.className = 'mediaEmptyLead';
+  lead.textContent = '一致する素材がありません';
+  const sub = document.createElement('span');
+  sub.className = 'mediaEmptyHintSub';
+  sub.textContent = '素材名またはフォルダ名を変えて検索してください';
+  const clear = document.createElement('button');
+  clear.type = 'button';
+  clear.textContent = '検索をクリア';
+  clear.onclick = () => clearMediaSearch();
+  empty.append(lead, sub, clear);
+  return empty;
+}
+
+function mediaLoadMoreRow(page) {
+  const row = document.createElement('div');
+  row.className = 'mediaLoadMore';
+  row.setAttribute('role', 'listitem');
+  const button = document.createElement('button');
+  button.type = 'button';
+  const revealCount = Math.min(MEDIA_PAGE_SIZE, page.hiddenCount);
+  button.textContent = `さらに${revealCount}件表示`;
+  button.setAttribute('aria-label', `素材をさらに${revealCount}件表示（残り${page.hiddenCount}件）`);
+  button.onclick = () => {
+    const firstNewSource = page.matched[page.visible.length];
+    S.mediaVisibleLimit += MEDIA_PAGE_SIZE;
+    renderMediaPanel();
+    if (firstNewSource) setMediaFocus(firstNewSource.id);
+  };
+  row.appendChild(button);
+  return row;
+}
+
 function renderMediaPanel() {
   renderKitStatus();
   renderAudioPanel();
   const el = $('mediaList');
   el.innerHTML = '';
   const sources = S.manifest.sources;
+  const search = $('mediaSearchInput');
+  if (search.value !== S.mediaSearchQuery) search.value = S.mediaSearchQuery;
+  $('mediaSearchClear').hidden = S.mediaSearchQuery.length === 0;
+  const page = mediaPage(sources, S.mediaSearchQuery, S.mediaVisibleLimit);
+  updateMediaSearchStatus(sources.length, page.matched.length, page.visible.length);
+  el.setAttribute('aria-label', `素材、${page.matched.length}件 / 全${sources.length}件`);
   // W-UI IA v2 用語表: 「keepだけで仮タイムライン作成」→「採用シーンで仮編集
   // を作る」、採用>0 のときだけ表示(0のときは押しても意味のあるものが
   // 何もない — 空の仮タイムラインを作られても困惑するだけなので隠す)。
@@ -2449,19 +3149,39 @@ function renderMediaPanel() {
     // W-POLISH Mid-9: README/v2.dc.html の空状態(白16% dashed、radius8、
     // padding28px 16px)へ — 実装にファイル選択クリックは無いので「クリック
     // して選択」は謳わず、既存のドラッグ&ドロップ文言のまま2行に分ける。
-    el.innerHTML = '<div class="mediaEmptyHint"><span class="mediaEmptyLead">まだ素材がありません</span><span class="mediaEmptyHintSub">ここに動画をドラッグして取り込み</span></div>';
+    el.innerHTML = '<div class="mediaEmptyHint" role="listitem"><span class="mediaEmptyLead">まだ素材がありません</span><span class="mediaEmptyHintSub">ここに動画をドラッグして取り込み</span></div>';
+    S.mediaFocusKey = null;
     return;
   }
-  if (S.mediaFocusKey && !sources.some((s) => s.id === S.mediaFocusKey)) S.mediaFocusKey = null;
-  if (!S.mediaFocusKey) S.mediaFocusKey = sources[0].id;
-  for (const src of sources) {
+  const visibleIds = page.visible.map((source) => source.id);
+  S.mediaFocusKey = repairMediaFocus(visibleIds, S.mediaFocusKey);
+  if (page.matched.length === 0) {
+    el.appendChild(mediaSearchEmptyRow());
+    return;
+  }
+  for (const src of page.visible) {
     el.appendChild(mediaRow(src));
     if (S.expandedScenes.has(src.id)) {
       const scenes = S.scenes.get(src.id);
       if (scenes) el.appendChild(sceneGridRow(src, scenes));
     }
   }
+  if (page.hiddenCount > 0) el.appendChild(mediaLoadMoreRow(page));
 }
+
+function applyMediaSearch(value) {
+  S.mediaSearchQuery = value;
+  S.mediaVisibleLimit = MEDIA_PAGE_SIZE;
+  renderMediaPanel();
+}
+$('mediaSearchInput').addEventListener('input', (event) => applyMediaSearch(event.currentTarget.value));
+// Safari/WebKit dispatches `search` for the native clear affordance; avoid a
+// second render in browsers that already emitted `input` for the same value.
+$('mediaSearchInput').addEventListener('search', (event) => {
+  if (event.currentTarget.value !== S.mediaSearchQuery) applyMediaSearch(event.currentTarget.value);
+});
+$('mediaSearchClear').onclick = () => clearMediaSearch();
+$('mediaSearchClear').setAttribute('aria-label', '素材検索をクリア');
 // Scene-grid nav (←→, K/X/U) is scoped to a focused .sceneItem so it never
 // collides with the global JKL/arrow-seek shortcuts on document — those are
 // blocked while focus sits inside a <button> (see globalShortcutsBlocked),
@@ -2499,14 +3219,15 @@ $('mediaList').addEventListener('keydown', (e) => {
   if (sceneItem) { handleSceneItemKeydown(e, sceneItem); return; }
   const row = e.target.closest('.srcRow');
   if (!row) return;
-  const sources = S.manifest.sources;
-  const idx = sources.findIndex((s) => s.id === row.dataset.source);
-  if (idx < 0) return;
-  if (e.key === 'ArrowDown') { e.preventDefault(); setMediaFocus(sources[Math.min(idx + 1, sources.length - 1)].id); }
-  else if (e.key === 'ArrowUp') { e.preventDefault(); setMediaFocus(sources[Math.max(idx - 1, 0)].id); }
-  else if (e.key === 'Home') { e.preventDefault(); setMediaFocus(sources[0].id); }
-  else if (e.key === 'End') { e.preventDefault(); setMediaFocus(sources[sources.length - 1].id); }
-  else if (e.key === 'Enter') { e.preventDefault(); toggleMediaDetail(row.dataset.source); }
+  const visibleIds = [...$('mediaList').querySelectorAll('.srcRow')].map((item) => item.dataset.source);
+  if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(e.key)) {
+    e.preventDefault(); e.stopPropagation();
+    const target = mediaFocusTarget(visibleIds, row.dataset.source, e.key);
+    if (target) setMediaFocus(target);
+  } else if (e.key === 'Enter') {
+    e.preventDefault(); e.stopPropagation();
+    toggleMediaDetail(row.dataset.source);
+  }
 });
 // W-UI IA v2 用語表: keep/reject/未確認 → 採用/不採用/未確認。「採用」に
 // 設定した合計シーン数 — buildSelectsBtn の表示条件(採用>0のときだけ表示)
@@ -2559,6 +3280,7 @@ function selectItem(kind, id) {
   else if (S.rightMode === 'clip') S.rightMode = 'claude';
   renderTimeline(); // updates .sel highlight classes on the timeline blocks
   renderInspector();
+  if (S.selection) openRightSheet();
 }
 function deselect() { selectItem(null, null); }
 function isSelected(kind, id) {
@@ -2859,7 +3581,7 @@ const INSPECTOR_TITLE = { clip: 'クリップ', broll: 'B-roll', motion: 'モー
 // (selectItem/openCaptionStylePopover/closeCaptionStylePopover/
 // openExportView/closeExportView)は S.rightMode を設定してからこれを呼ぶ。
 function renderInspector() {
-  const views = { claude: $('claudeView'), clip: $('inspectorView'), caption: $('captionView'), export: $('exportView') };
+  const views = { claude: $('claudeView'), clip: $('inspectorView'), caption: $('captionView'), export: $('exportView'), settings: $('settingsView') };
   for (const [mode, el] of Object.entries(views)) {
     if (el) el.hidden = mode !== S.rightMode;
   }
@@ -2877,6 +3599,7 @@ function renderInspector() {
     renderExportAskRow();
     renderExportResultCard();
   }
+  renderPendingTallies();
 }
 
 // ---------- W8 kit: caption style palette/font + sprite stage rendering ----------
@@ -3146,7 +3869,8 @@ function startCaptionTextEdit(cue, span) {
   };
   const onKeydown = (e) => {
     e.stopPropagation(); // never let this reach the document-level 1-letter shortcut handler
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.isComposing || e.keyCode === 229) return;
+    if (shouldCommitInlineEdit(e)) {
       e.preventDefault();
       commit();
     } else if (e.key === 'Escape') {
@@ -3366,6 +4090,7 @@ function openCaptionStylePopover(cue) {
   S.rightMode = 'caption';
   renderTimeline();
   renderInspector();
+  openRightSheet();
 }
 function closeCaptionStylePopover() {
   if (S.rightMode !== 'caption') return;
@@ -3786,19 +4511,73 @@ function motionNode(spec) {
   const d = document.createElement('div');
   const p = spec.params || {};
   if (spec.type === 'custom-html' && spec.html) {
-    d.innerHTML = spec.html; // local-only project data
-    return d;
+    return customHtmlMotionFrame(spec.html);
   }
   d.className = `mo-${spec.type}`;
   if (spec.type === 'chapter-card') {
-    d.innerHTML = `<h1>${esc(p.text ?? '')}</h1><div class="bar"></div>${p.subtitle ? `<p>${esc(p.subtitle)}</p>` : ''}`;
+    d.innerHTML = `<div class="motionTitle">${esc(p.text ?? '')}</div><div class="bar"></div>${p.subtitle ? `<p>${esc(p.subtitle)}</p>` : ''}`;
   } else if (spec.type === 'lower-third') {
-    d.innerHTML = `<h1>${esc(p.text ?? '')}</h1>${p.subtitle ? `<p>${esc(p.subtitle)}</p>` : ''}`;
+    d.innerHTML = `<div class="motionTitle">${esc(p.text ?? '')}</div>${p.subtitle ? `<p>${esc(p.subtitle)}</p>` : ''}`;
   } else {
     d.textContent = p.text ?? '';
   }
   if (p.palette) d.style.setProperty('--accent', p.palette);
   return d;
+}
+
+const CUSTOM_HTML_BLOCKED_ELEMENTS = 'script,iframe,frame,object,embed,link,meta,base,form';
+const CUSTOM_HTML_URL_ATTRIBUTES = new Set(['src', 'href', 'xlink:href', 'poster', 'action', 'formaction']);
+const CUSTOM_HTML_FRAME_CSP = [
+  "default-src 'none'",
+  "script-src 'none'",
+  "connect-src 'none'",
+  "object-src 'none'",
+  "frame-src 'none'",
+  "img-src data: blob:",
+  "media-src data: blob:",
+  "font-src data:",
+  "style-src 'unsafe-inline'",
+  "form-action 'none'",
+  "base-uri 'none'",
+].join('; ');
+
+/**
+ * custom-html remains a flexible visual-only preview surface, but it is not
+ * trusted application markup. The sanitizer removes active/navigation
+ * primitives before the fragment is placed in an opaque-origin iframe; the
+ * iframe sandbox and its CSP are independent enforcement layers that keep a
+ * missed event handler or future HTML feature from calling the daemon API.
+ */
+function sanitizeCustomHtml(html) {
+  const template = document.createElement('template');
+  template.innerHTML = String(html);
+  template.content.querySelectorAll(CUSTOM_HTML_BLOCKED_ELEMENTS).forEach((el) => el.remove());
+  template.content.querySelectorAll('*').forEach((el) => {
+    for (const attr of [...el.attributes]) {
+      const name = attr.name.toLowerCase();
+      if (name.startsWith('on') || name === 'srcdoc' || name === 'srcset') {
+        el.removeAttribute(attr.name);
+        continue;
+      }
+      if (CUSTOM_HTML_URL_ATTRIBUTES.has(name)) {
+        const value = attr.value.trim().toLowerCase();
+        const safeFragment = name === 'href' && value.startsWith('#');
+        const safeVisualData = name !== 'href' && /^(data:(?:image|video|audio|font)\/|blob:)/.test(value);
+        if (!safeFragment && !safeVisualData) el.removeAttribute(attr.name);
+      }
+    }
+  });
+  return template.innerHTML;
+}
+
+function customHtmlMotionFrame(html) {
+  const frame = document.createElement('iframe');
+  frame.className = 'motionCustomHtml';
+  frame.title = 'カスタムHTMLモーション';
+  frame.setAttribute('sandbox', ''); // deliberately no allow-scripts or allow-same-origin
+  frame.setAttribute('referrerpolicy', 'no-referrer');
+  frame.srcdoc = `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${CUSTOM_HTML_FRAME_CSP}"><style>html,body{width:100%;height:100%;margin:0;overflow:hidden;background:transparent;color:white;font-family:system-ui,sans-serif}*,*::before,*::after{box-sizing:border-box}</style></head><body>${sanitizeCustomHtml(html)}</body></html>`;
+  return frame;
 }
 async function loadMotionSpecs() {
   S.motionSpecs = {};
@@ -3835,10 +4614,71 @@ function rejectedWordMap() {
 }
 
 // W-UI IA v2 §5b: 素材ごとの文字起こし状況 — 未実行/処理中/完了の3状態。
-const TRANSCRIBE_STATUS_LABEL = { done: '完了', processing: '処理中', pending: '未実行' };
+const TRANSCRIBE_STATUS_LABEL = {
+  done: '完了', starting: '開始中', processing: '処理中', failed: '失敗', cancelled: '中止', pending: '未実行',
+};
+const ACTIVE_TRANSCRIBE_STATUSES = new Set(['queued', 'running', 'cancelling']);
+function latestTranscribeJobFor(sourceId) {
+  return [...S.transcribeJobs.values()]
+    .filter((job) => job.sourceId === sourceId)
+    .sort((a, b) => String(b.startedAt ?? '').localeCompare(String(a.startedAt ?? '')))[0];
+}
+function transcribeTaskLabel(job) {
+  const src = S.manifest?.sources.find((source) => source.id === job.sourceId);
+  const name = basename(src?.path ?? job.sourceId);
+  if (job.status === 'queued') return `文字起こし待機中: ${name} …`;
+  if (job.status === 'cancelling') return `文字起こし中: ${name} — 中止処理中…`;
+  return `文字起こし中: ${name} …`;
+}
+function rememberTranscribeJob(job) {
+  if (!job?.taskId) return job ?? null;
+  const merged = mergeTranscribeJob(S.transcribeJobs.get(job.taskId), job);
+  S.transcribeJobs.set(job.taskId, merged);
+  return merged;
+}
+function syncTranscribeJobTruth(jobs, legacyActiveSourceIds = []) {
+  for (const [taskId, task] of S.activeTasks) {
+    if (task.kind === 'transcribe') S.activeTasks.delete(taskId);
+  }
+  // /api/project is a snapshot assembled independently of WS delivery. Merge
+  // it into, rather than replacing, newer terminal events already observed.
+  const mergedJobs = new Map(S.transcribeJobs);
+  for (const job of jobs ?? []) {
+    mergedJobs.set(job.taskId, mergeTranscribeJob(mergedJobs.get(job.taskId), job));
+  }
+  S.transcribeJobs = mergedJobs;
+  S.transcribing = new Set(legacyActiveSourceIds ?? []);
+  for (const job of S.transcribeJobs.values()) {
+    if (!ACTIVE_TRANSCRIBE_STATUSES.has(job.status)) continue;
+    S.transcribing.add(job.sourceId);
+    clearTranscriptInteractionState([job.sourceId]);
+    S.activeTasks.set(job.taskId, {
+      label: transcribeTaskLabel(job),
+      kind: 'transcribe',
+      order: ++S.activeTaskOrder,
+    });
+  }
+  // Recompute the presence strip/header once from the reconciled map. This
+  // is what makes a tab opened mid-job truthful even without a WS start event.
+  const tasks = [...S.activeTasks.values()].sort((a, b) => a.order - b.order);
+  const latest = tasks[tasks.length - 1];
+  S.activeTask = latest ? { label: latest.label, count: tasks.length } : null;
+  const strip = $('claudeStrip');
+  strip.hidden = !latest;
+  if (latest) {
+    $('claudeStripText').textContent = tasks.length > 1
+      ? `${latest.label}（ほか${tasks.length - 1}件）`
+      : latest.label;
+  }
+}
 function sourceTranscribeStatus(src) {
-  if (src.transcribed) return 'done';
+  if (S.transcribeStartInFlight.has(src.id)) return 'starting';
   if (S.transcribing.has(src.id)) return 'processing';
+  const latest = latestTranscribeJobFor(src.id);
+  if (ACTIVE_TRANSCRIBE_STATUSES.has(latest?.status)) return 'processing';
+  if (src.transcribed) return 'done';
+  if (latest?.status === 'error') return 'failed';
+  if (latest?.status === 'cancelled') return 'cancelled';
   return 'pending';
 }
 /**
@@ -3852,15 +4692,46 @@ function sourceTranscribeStatus(src) {
  * not just whenever the first WS progress message happens to land.
  */
 async function startTranscribe(sourceId) {
+  if (S.transcribeStartInFlight.has(sourceId) || S.transcribing.has(sourceId)) return;
+  S.transcribeStartInFlight.add(sourceId);
+  // Re-transcription replaces the word-id namespace. The old transcript is
+  // not an editable fallback while that replacement is in flight.
+  clearTranscriptInteractionState([sourceId]);
+  renderTranscript();
+  renderMediaPanelPreservingView();
   try {
-    const r = await api('/api/transcribe', { method: 'POST', body: JSON.stringify({ sourceId }) });
-    if (r.started?.includes(sourceId)) {
+    const r = await api('/api/transcribe', {
+      method: 'POST',
+      body: JSON.stringify({ sourceId, baseRev: S.renderedRevision, actor: 'ui' }),
+    });
+    for (const job of r.jobs ?? []) {
+      const merged = rememberTranscribeJob(job);
+      if (ACTIVE_TRANSCRIBE_STATUSES.has(merged?.status)) {
+        setClaudeTask(transcribeTaskLabel(merged), merged.taskId, 'transcribe');
+      }
+    }
+    const latest = latestTranscribeJobFor(sourceId);
+    if (r.started?.includes(sourceId) && !isTerminalTranscribeJob(latest)) {
       S.transcribing.add(sourceId);
       renderTranscript();
-      renderMediaPanel();
+      renderMediaPanelPreservingView();
     }
   } catch (e) {
     toast(e.message, { type: 'error' });
+  } finally {
+    S.transcribeStartInFlight.delete(sourceId);
+    renderTranscript();
+    renderMediaPanelPreservingView();
+  }
+}
+async function cancelTranscribe(sourceId, trigger) {
+  if (trigger) trigger.disabled = true;
+  try {
+    await api(`/api/transcribe-jobs?${new URLSearchParams({ sourceId })}`, { method: 'DELETE' });
+    toast('文字起こしを中止しています');
+  } catch (e) {
+    toast(e.message, { type: 'error' });
+    if (trigger?.isConnected) trigger.disabled = false;
   }
 }
 // One source's 未実行/処理中/完了 row — 未実行 sources (with audio) get a
@@ -3873,12 +4744,12 @@ function transcribeStatusRow(src) {
   const label = document.createElement('span');
   label.textContent = `${basename(src.path)}: ${TRANSCRIBE_STATUS_LABEL[status]}`;
   row.appendChild(label);
-  if (status === 'pending') {
+  if (status === 'pending' || status === 'failed' || status === 'cancelled') {
     if (src.hasAudio) {
       const btn = document.createElement('button');
       btn.className = 'btn-transcribeSource';
-      btn.textContent = 'この素材を文字起こし';
-      btn.setAttribute('aria-label', `${basename(src.path)} を文字起こし`);
+      btn.textContent = status === 'pending' ? 'この素材を文字起こし' : '再試行';
+      btn.setAttribute('aria-label', `${basename(src.path)} の文字起こしを${status === 'pending' ? '開始' : '再試行'}`);
       btn.onclick = () => startTranscribe(src.id);
       row.appendChild(btn);
     } else {
@@ -3887,6 +4758,21 @@ function transcribeStatusRow(src) {
       note.textContent = '(音声なし)';
       row.appendChild(note);
     }
+    const job = latestTranscribeJobFor(src.id);
+    if (status === 'failed' && job?.error) {
+      const reason = document.createElement('span');
+      reason.className = 'hintText';
+      reason.textContent = job.error;
+      reason.title = job.error;
+      row.appendChild(reason);
+    }
+  } else if (status === 'processing') {
+    const btn = document.createElement('button');
+    btn.className = 'btn-transcribeSource';
+    btn.textContent = '中止';
+    btn.setAttribute('aria-label', `${basename(src.path)} の文字起こしを中止`);
+    btn.onclick = () => cancelTranscribe(src.id, btn);
+    row.appendChild(btn);
   }
   return row;
 }
@@ -3908,10 +4794,31 @@ function renderTranscriptEmptyState(el) {
   const msg = document.createElement('div');
   msg.className = 'hintText';
   msg.style.padding = '8px';
-  msg.textContent = S.transcribing.size > 0
+  msg.textContent = S.transcribing.size > 0 || S.transcribeStartInFlight.size > 0
     ? '文字起こし中です — 完了までお待ちください'
-    : '文字起こしは任意です(字幕づくりやこのタブでの発言単位の編集に使います)。上のボタンで直接始めるか、Claude に「この素材を文字起こしして」と伝えてください';
+    : '文字起こしは任意です(字幕づくりやこのタブでの発言単位の編集に使います)。上のボタンで直接始めるか、AI に「この素材を文字起こしして」と伝えてください';
   el.appendChild(msg);
+}
+function transcriptDecisionChip(c) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'transcriptDecision';
+  btn.dataset.candidateId = c.id;
+  const dur = Math.max(0, c.t1 - c.t0);
+  const needsQuestion = isAiQuestionCandidate(c);
+  btn.textContent = `${KIND_LABEL[c.kind] ?? '候補'} ${dur.toFixed(1)}秒 · ${needsQuestion ? '確認' : 'カット'}`;
+  btn.title = needsQuestion
+    ? `AIが止めた理由を確認: ${candidateQuestionReason(c)}`
+    : `${slimBarLabel(c)}をその場でカット(取り消し可能)`;
+  btn.onpointerdown = (e) => e.stopPropagation();
+  btn.onclick = async (e) => {
+    e.stopPropagation();
+    if (needsQuestion) focusCandidateForDecision(c);
+    else await decide([c.id], 'approve');
+  };
+  btn.onmouseenter = () => setCandidateHot(c.id, true);
+  btn.onmouseleave = () => setCandidateHot(c.id, false);
+  return btn;
 }
 function renderTranscript() {
   const el = $('words');
@@ -3939,6 +4846,10 @@ function renderTranscript() {
     heading.title = basename(src.path);
     el.appendChild(heading);
     const kept = keptSet(src.id);
+    const sourceCandidates = S.candidates
+      .filter((c) => c.sourceId === src.id)
+      .sort((a, b) => a.t0 - b.t0);
+    const insertedCandidates = new Set();
     let prev = null;
     for (const w of words) {
       if (prev && w.t0 - prev.t1 >= 0.7) {
@@ -3947,6 +4858,14 @@ function renderTranscript() {
         g.setAttribute('role', 'presentation');
         g.textContent = `〔${(w.t0 - prev.t1).toFixed(1)}s〕`;
         el.appendChild(g);
+      }
+      for (const c of sourceCandidates) {
+        if (insertedCandidates.has(c.id)) continue;
+        const targetsWord = (c.wordIds ?? []).includes(w.id);
+        const reachesWord = c.t0 <= w.t1 && (!prev || c.t1 >= prev.t1);
+        if (!targetsWord && !reachesWord) continue;
+        el.appendChild(transcriptDecisionChip(c));
+        insertedCandidates.add(c.id);
       }
       const key = `${src.id}:${w.id}`;
       const cand = ignored.get(key);
@@ -3966,6 +4885,9 @@ function renderTranscript() {
         : `${w.t0.toFixed(2)}–${w.t1.toFixed(2)}s`;
       el.appendChild(s);
       prev = w;
+    }
+    for (const c of sourceCandidates) {
+      if (!insertedCandidates.has(c.id)) el.appendChild(transcriptDecisionChip(c));
     }
   }
   // W-UI IA v2 §5b: some (not all) sources transcribed — a compact status
@@ -4311,9 +5233,13 @@ function renderSlimBarFor(c, state) {
   } else {
     textEl.textContent = label;
     actionsEl.hidden = false;
-    // 承認/却下は候補カード(candRow)と全く同じ decide() 呼び出し —
-    // 「同一データ・同一状態」(片方で承認すれば両方から消える)の実体。
-    $('slimBarCut').onclick = () => decide([c.id], 'approve');
+    const needsQuestion = isAiQuestionCandidate(c);
+    $('slimBarKeep').hidden = needsQuestion;
+    $('slimBarCut').textContent = needsQuestion ? '理由を確認' : 'カットする';
+    $('slimBarCut').onclick = () => {
+      if (needsQuestion) focusCandidateForDecision(c);
+      else decide([c.id], 'approve');
+    };
     $('slimBarKeep').onclick = () => decide([c.id], 'reject');
   }
 }
@@ -4390,10 +5316,12 @@ function markupPaperLabel(escapedLabel) {
 }
 function candRow(c) {
   const d = document.createElement('div');
-  d.className = `cand${isNewCandidate(c.id) ? ' candNew' : ''}`;
+  d.className = 'cand';
+  d.dataset.candidateId = c.id;
   d.tabIndex = 0;
   const dur = Math.max(0, c.t1 - c.t0);
   const label = humanizeCandidateLabel(c.label, dur);
+  const compactLabel = slimBarLabel(c);
   const src = S.manifest.sources.find((s) => s.id === c.sourceId);
   const srcName = sourceLabel(src);
   const srcTitle = src ? basename(src.path) : c.sourceId;
@@ -4403,7 +5331,7 @@ function candRow(c) {
   // the full sentence one hover away too (natural wrap can still run long).
   d.innerHTML = `<span class="kind ${c.kind}">${esc(KIND_LABEL[c.kind] ?? c.kind)}</span>
     <div class="candTop">
-      <span class="lbl" title="${esc(label)}">${markupPaperLabel(esc(label))}</span>
+      <span class="lbl" title="${esc(label)}">${markupPaperLabel(esc(compactLabel))}</span>
       <span class="dur">−${dur.toFixed(1)}秒</span>
     </div>
     <div class="candBottom">
@@ -4415,10 +5343,20 @@ function candRow(c) {
     const tl = candidateTl(c.t0, c);
     if (tl != null) seekTl(Math.max(0, Math.min(tl, S.duration - 0.1)), { play: false });
   };
-  d.onclick = seekHere;
-  d.onkeydown = (e) => {
-    if (e.key === 'Enter' || e.code === 'Space') { e.preventDefault(); seekHere(); }
+  d.onclick = () => {
+    const wasExpanded = d.classList.contains('expanded');
+    for (const other of document.querySelectorAll('#inboxList .cand.expanded')) other.classList.remove('expanded');
+    d.classList.toggle('expanded', !wasExpanded);
+    seekHere();
   };
+  d.onkeydown = (e) => {
+    if (e.target !== d) return; // child buttons own Enter/Space; never toggle the row a second time via bubbling
+    if (e.key === 'Enter' || e.code === 'Space') { e.preventDefault(); d.click(); }
+  };
+  d.onmouseenter = () => setCandidateHot(c.id, true);
+  d.onmouseleave = () => setCandidateHot(c.id, false);
+  d.onfocus = () => setCandidateHot(c.id, true);
+  d.onblur = (e) => { if (!d.contains(e.relatedTarget)) setCandidateHot(c.id, false); };
   const preview = document.createElement('button');
   preview.className = 'btn-preview';
   preview.textContent = '前後を再生';
@@ -4452,7 +5390,10 @@ function candRow(c) {
   const group = document.createElement('div');
   group.className = 'candActionsGroup';
   group.append(ng, ok);
-  d.querySelector('.candBottom').append(preview, group);
+  const reason = document.createElement('div');
+  reason.className = 'candReason';
+  reason.textContent = `${isAiQuestionCandidate(c) ? 'AIが確認する理由' : '候補の理由'}: ${candidateQuestionReason(c)}`;
+  d.querySelector('.candBottom').append(reason, preview, group);
   return d;
 }
 
@@ -4500,34 +5441,210 @@ function inboxWarningRow(text, opts = {}) {
 // button's result-explicit label uses (W-UI IA v2 §2: 「無音候補2件をカット
 // (−2.4秒)」replaces the old static「まとめて承認」).
 const KIND_CANDIDATE_NOUN = Object.fromEntries(Object.entries(KIND_LABEL).map(([k, v]) => [k, `${v}候補`]));
+
+function candidateQuestionReason(c) {
+  if (c.aiReview?.disposition === 'question' && c.aiReview.reason) return c.aiReview.reason;
+  if (c.aiReview?.disposition === 'auto-applied' && c.status === 'proposed') {
+    return '一度自動編集した箇所が戻されたため、再適用するか確認してください';
+  }
+  if (c.kind !== 'silence') return '話し方やテンポの好みで結果が分かれるため';
+  if (c.evidence?.edge === 'leading' || c.evidence?.edge === 'trailing') return '冒頭・末尾の間は演出判断になるため';
+  if (c.evidence?.transcriptConflict) return '波形と文字起こしが一致していないため';
+  if (!c.evidence?.transcriptGap || !c.evidence?.waveform) return '文字起こしと波形の両方では裏づけられていないため';
+  return '周囲の構成への影響をAIだけでは確定できなかったため';
+}
+
+function candidateDecisionTradeoff(c, dur) {
+  const saved = `${dur.toFixed(1)}秒`;
+  if (c.aiReview?.reasonCode === 'fragmentation-risk') {
+    return `カット: ${saved}以上短くなる可能性がありますが、隣の短い断片も吸収します ／ 残す: 断片を含む現在のつながりを維持します`;
+  }
+  if (c.kind === 'filler' || c.kind === 'retake') {
+    return `カット: ${saved}詰めてテンポを上げます ／ 残す: 話し方の自然さや間を維持します`;
+  }
+  if (c.evidence?.edge === 'leading' || c.evidence?.edge === 'trailing') {
+    return `カット: 冒頭・末尾を${saved}引き締めます ／ 残す: 入り・余韻の演出を維持します`;
+  }
+  if (c.evidence?.transcriptConflict || !c.evidence?.transcriptGap || !c.evidence?.waveform) {
+    return `カット: ${saved}短くできますが、根拠が一致していません ／ 残す: 内容を欠くリスクを避けます`;
+  }
+  return `カット: ${saved}短くしてテンポを上げます ／ 残す: 現在の呼吸と文脈を維持します`;
+}
+
+function isAiQuestionCandidate(candidate) {
+  return candidate.aiReview?.disposition === 'question'
+    || (candidate.aiReview?.disposition === 'auto-applied' && candidate.status === 'proposed');
+}
+
+function focusCandidateForDecision(candidate) {
+  showDecisionView();
+  requestAnimationFrame(() => {
+    const row = document.querySelector(`.cand[data-candidate-id="${CSS.escape(candidate.id)}"]`);
+    if (!row) {
+      toast('この候補は最新の確認一覧にありません。画面を更新してください', { type: 'error' });
+      return;
+    }
+    for (const other of document.querySelectorAll('#inboxList .cand.expanded')) other.classList.remove('expanded');
+    row.classList.add('expanded');
+    row.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    row.focus({ preventScroll: true });
+  });
+}
+
+function latestAutonomousDraftRevision() {
+  return [...S.revisions].reverse().find((r) => r.op === 'apply-candidates' && r.params?.mode === 'autonomous') ?? null;
+}
+
+function latestCandidateReviewBatch() {
+  const reviewed = S.candidatesAll.filter((c) => c.aiReview?.reviewId && c.aiReview?.evaluatedAt);
+  if (!reviewed.length) return null;
+  reviewed.sort((a, b) => String(b.aiReview.evaluatedAt).localeCompare(String(a.aiReview.evaluatedAt)));
+  const reviewId = reviewed[0].aiReview.reviewId;
+  const candidates = reviewed.filter((c) => c.aiReview.reviewId === reviewId);
+  return { at: reviewed[0].aiReview.evaluatedAt, candidates };
+}
+
+function revisionStateContains(targetRev, currentRev) {
+  const byRev = new Map(S.revisions.map((r) => [r.rev, r]));
+  const seen = new Set();
+  let rev = currentRev;
+  while (Number.isFinite(rev) && rev > 0 && !seen.has(rev)) {
+    if (rev === targetRev) return true;
+    seen.add(rev);
+    const entry = byRev.get(rev);
+    if (!entry) return false;
+    rev = entry.op === 'restore' && Number.isFinite(Number(entry.params?.rev))
+      ? Number(entry.params.rev)
+      : entry.baseRev;
+  }
+  return false;
+}
+
+function hasAiReviewedCandidates() {
+  return S.candidates.some(isAiQuestionCandidate);
+}
+
+function renderAiWorkSummary() {
+  const el = $('aiWorkSummary');
+  if (!el) return;
+  const r = latestAutonomousDraftRevision();
+  const review = latestCandidateReviewBatch();
+  const reviewIsNewer = review && (!r || String(review.at).localeCompare(String(r.ts)) > 0);
+  if (reviewIsNewer) {
+    const questions = review.candidates.filter((c) => c.aiReview.disposition === 'question' && c.status === 'proposed').length;
+    const auto = review.candidates.filter((c) => c.aiReview.disposition === 'auto-applied').length;
+    el.hidden = false;
+    el.innerHTML = '';
+    const head = document.createElement('div');
+    head.className = 'aiWorkSummaryHead';
+    head.textContent = '✳ AIが候補を確認しました';
+    const meta = document.createElement('div');
+    meta.className = 'aiWorkSummaryMeta';
+    meta.textContent = `自動編集 ${auto}件 · 判断が必要 ${questions}件 · 理由を各候補に表示`;
+    el.append(head, meta);
+    return;
+  }
+  if (!r) { el.hidden = true; el.innerHTML = ''; return; }
+  const ids = Array.isArray(r.params?.ids) ? r.params.ids : [];
+  const active = revisionStateContains(r.rev, S.manifest.revision);
+  const count = Number(r.params?.autoApplied) || ids.length;
+  const questionCount = review
+    ? review.candidates.filter((candidate) => (
+        candidate.aiReview.disposition === 'question' && candidate.status === 'proposed'
+      )).length
+    : Number(r.params?.questionCount) || 0;
+  const seconds = Number(r.summary.match(/-([\d.]+)s/)?.[1]);
+  el.hidden = false;
+  el.innerHTML = '';
+
+  const head = document.createElement('div');
+  head.className = 'aiWorkSummaryHead';
+  head.textContent = active ? `✳ AIが${count}箇所を自律編集しました` : `↩ AIの自律編集${count}箇所は戻されています`;
+  const meta = document.createElement('div');
+  meta.className = 'aiWorkSummaryMeta';
+  const bits = [];
+  if (Number.isFinite(seconds)) bits.push(`${seconds.toFixed(1)}秒短縮`);
+  bits.push('文字起こし＋波形で二重確認');
+  bits.push(active && S.manifest.revision === r.rev ? '1回で戻せる履歴' : active ? '履歴から戻せる' : '履歴に記録済み');
+  if (questionCount > 0) bits.push(`判断が必要 ${questionCount}件`);
+  meta.textContent = bits.join(' · ');
+  el.append(head, meta);
+
+  const latest = S.revisions.at(-1);
+  const canUndo = active && r.baseRev > 0 && (
+    S.manifest.revision === r.rev
+    || (
+      latest?.rev === S.manifest.revision
+      && latest.op === 'restore'
+      && latest.params?.cause === 'redo'
+    )
+  );
+  if (canUndo) {
+    const actions = document.createElement('div');
+    actions.className = 'aiWorkSummaryActions';
+    const undo = document.createElement('button');
+    undo.className = 'btn-wash';
+    undo.textContent = 'この自動編集を戻す';
+    undo.onclick = async () => {
+      if (!confirm(`AIが行った${count}箇所の編集を戻しますか？`)) return;
+      await logicalUndo(undo);
+    };
+    actions.appendChild(undo);
+    el.appendChild(actions);
+  } else {
+    const canRedo = latest
+      && latest.rev === S.manifest.revision
+      && latest.op === 'restore'
+      && latest.params?.cause === 'undo'
+      && latest.baseRev === r.rev;
+    if (canRedo) {
+      const actions = document.createElement('div');
+      actions.className = 'aiWorkSummaryActions';
+      const redo = document.createElement('button');
+      redo.className = 'btn-approve';
+      redo.textContent = 'この自動編集をやり直す';
+      redo.onclick = () => logicalRedo(redo);
+      actions.appendChild(redo);
+      el.appendChild(actions);
+    }
+  }
+}
 /**
  * Builds the "Claude の編集提案" group's content: one sub-group per
  * candidate kind (unchanged structure), OR — when there are zero pending
- * candidates — one of 4 distinguishable empty messages (W-UI IA v2 §5c).
- * The 4th state's distinction from the 1st is a best-effort approximation:
- * the daemon has no "has detection ever run" flag, so a fresh page load
- * that has never seen a completed /api/detect this session defaults to
- * "未検出" even if Claude ran `vedit detect` (found nothing) in an earlier
- * session — see S.detecting/S.detectRanEmpty's doc at the top of the file.
+ * candidates — one of the durable empty states (W-UI IA v2 §5c). The daemon
+ * persists the last successful run separately from candidates.json, so a
+ * zero-result run survives reload and is never inferred from a failed call.
  */
 function renderCandidatesGroup(el) {
   el.innerHTML = '';
   const candCount = S.candidates.length;
-  $('detectSettings').hidden = candCount === 0;
+  const hasAutonomousDraft = hasAiReviewedCandidates();
+  $('candidatesHeadingLabel').textContent = hasAutonomousDraft ? 'AIから確認' : '編集候補';
+  $('candidateQuestionIntro').hidden = !(hasAutonomousDraft && candCount > 0);
+  renderAiWorkSummary();
+  // A completed/stale run always keeps its retry controls reachable. The
+  // untouched "not run yet" state stays quiet and AI-first.
+  $('detectSettings').hidden = candCount === 0 && !S.detectRun;
   if (candCount === 0) {
     const msg = document.createElement('div');
     msg.className = 'hintText inboxEmpty';
     if (S.detecting) {
-      msg.textContent = 'Claude が無音や言い直しを確認しています…';
+      msg.textContent = '編集エンジンが無音や言い直しを確認しています…';
+    } else if (S.detectRun?.stale) {
+      msg.textContent = '前回の候補検出後に編集内容が変わりました — 最新の状態で候補を作り直せます';
+    } else if (S.detectRun?.proposalCount === 0) {
+      msg.textContent = '無音や言い直しなどの編集提案は見つかりませんでした';
     } else if (S.candidatesAll.length > 0) {
       msg.textContent = '✓ 提案はすべて確認済みです';
-    } else if (S.detectRanEmpty) {
-      msg.textContent = '無音や言い直しなどの編集提案は見つかりませんでした';
+    } else if (S.detectRun) {
+      msg.textContent = '前回の候補を読み出せませんでした — この条件で候補を作り直してください';
     } else {
-      msg.textContent = '編集提案はまだ作られていません — Claude に「動画を編集して」のように伝えてください';
+      msg.textContent = '編集提案はまだ作られていません — AIに「動画を編集して」のように伝えてください';
     }
     el.appendChild(msg);
     $('candidatesCount').textContent = '';
+    renderDecisionBar();
     return;
   }
   const byKind = new Map();
@@ -4539,50 +5656,59 @@ function renderCandidatesGroup(el) {
     const ia = KIND_ORDER.indexOf(a), ib = KIND_ORDER.indexOf(b);
     return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
   });
-  for (const kind of kinds) {
-    const list = byKind.get(kind);
-    const totalDur = list.reduce((sum, c) => sum + Math.max(0, c.t1 - c.t0), 0);
-    const group = document.createElement('div');
-    group.className = 'candGroup';
-    const header = document.createElement('div');
-    header.className = 'candGroupHeader';
-    header.innerHTML = `<span class="kind ${kind}">${KIND_LABEL[kind] ?? kind}</span><span class="spacer"></span>`;
-    // W-UI IA v2 §2: the group's ONE bulk action is a result-explicit label
-    // ("無音候補2件をカット(−2.4秒)") instead of a plain "まとめて承認" —
-    // what it does and what it's worth are both readable without a click.
-    const approveBtn = document.createElement('button');
-    approveBtn.className = 'btn-approve';
-    approveBtn.textContent = `${KIND_CANDIDATE_NOUN[kind] ?? `${KIND_LABEL[kind] ?? kind}候補`}${list.length}件をカット(−${totalDur.toFixed(1)}秒)`;
-    approveBtn.onclick = () => decide(list.map((c) => c.id), 'approve');
-    const rejectBtn = document.createElement('button');
-    rejectBtn.className = 'btn-wash';
-    rejectBtn.textContent = 'まとめて残す';
-    rejectBtn.onclick = () => decide(list.map((c) => c.id), 'reject');
-    header.append(approveBtn, rejectBtn);
-    group.appendChild(header);
-    for (const c of list) group.appendChild(candRow(c));
-    el.appendChild(group);
-  }
-  // W-DESIGN: README「5件すべて適用(−3.5秒)」— 全種別まとめての白プライマリ
-  // ボタン。旧「すべて承認」は種別ごとの結果明示ボタンに置き換えられていた
-  // (誤って全部まとめて承認してしまう事故を避けるため)が、hifi はこの一括
-  // ボタンを明示的に要求しているので、破壊的操作として confirm() を挟んだ
-  // 上で復活させる(decide() は既存の承認フローそのもの、2件以上のときだけ
-  // 表示 — 1件なら候補行自体のボタンで足りる)。
-  if (kinds.length > 1 || candCount > 1) {
-    const totalDurAll = S.candidates.reduce((sum, c) => sum + Math.max(0, c.t1 - c.t0), 0);
-    const allBtn = document.createElement('button');
-    allBtn.className = 'btn-applyAllCandidates';
-    allBtn.textContent = `${candCount}件すべて適用(−${totalDurAll.toFixed(1)}秒)`;
-    allBtn.onclick = async () => {
-      if (!confirm(`Claude の編集提案${candCount}件をすべてカットします(合計 −${totalDurAll.toFixed(1)}秒)。よろしいですか？`)) return;
-      await decide(S.candidates.map((c) => c.id), 'approve');
-    };
-    el.appendChild(allBtn);
-  }
+  for (const kind of kinds) for (const c of byKind.get(kind)) el.appendChild(candRow(c));
   const parts = kinds.map((k) => `${KIND_LABEL[k] ?? k}${byKind.get(k).length}`);
   $('candidatesCount').textContent = `${candCount}件(${parts.join('・')})`;
+  renderDecisionBar();
 }
+
+function renderDecisionBar() {
+  const bar = $('decisionBar');
+  if (!bar) return;
+  const paintedCandidates = [...S.candidates];
+  const paintedIds = paintedCandidates.map((candidate) => candidate.id);
+  const paintedRevision = S.manifest?.revision ?? null;
+  const count = paintedCandidates.length;
+  bar.hidden = count === 0;
+  if (!count) return;
+  const totalDur = paintedCandidates.reduce((sum, c) => sum + Math.max(0, c.t1 - c.t0), 0);
+  const fragmentationRisks = paintedCandidates.filter((c) => c.aiReview?.reasonCode === 'fragmentation-risk').length;
+  const hasQuestions = paintedCandidates.some(isAiQuestionCandidate);
+  $('decisionBarSummary').textContent = hasQuestions
+    ? `AIから確認 ${count}件 · 最大 −${totalDur.toFixed(1)}秒`
+    : `残り${count}件 · −${totalDur.toFixed(1)}秒`;
+  // Capture the exact ids and revision represented by this paint. Candidate
+  // detection is a sidecar update and may replace S.candidates without a
+  // manifest revision; recomputing here could decide an unseen replacement
+  // set from an old button.
+  $('decisionKeepAll').onclick = () => decide(paintedIds, 'reject', { expectedRevision: paintedRevision });
+  $('decisionCutAll').hidden = hasQuestions;
+  $('decisionCutAll').onclick = async () => {
+    const fragmentNote = fragmentationRisks > 0
+      ? `\nうち${fragmentationRisks}件は、カット後に残る短い断片も一緒に吸収する可能性があります。実際の削減量は実行後に表示します。`
+      : '';
+    if (!confirm(`編集候補${count}件をすべてカットします(候補範囲 −${totalDur.toFixed(1)}秒)。${fragmentNote}\nよろしいですか？`)) return;
+    await decide(paintedIds, 'approve', { expectedRevision: paintedRevision });
+  };
+}
+
+async function retryQc(button) {
+  if (button) {
+    button.disabled = true;
+    button.textContent = '確認中…';
+  }
+  try {
+    S.qc = await api('/api/qc');
+    S.qcError = null;
+  } catch (e) {
+    S.qc = { issues: [], counts: { errors: 0, warnings: 0, infos: 0 } };
+    S.qcError = e?.message ?? String(e);
+    toast(`品質チェックを更新できませんでした: ${S.qcError}`, { type: 'error' });
+  }
+  renderInbox();
+  renderClaudeStatus();
+}
+
 /**
  * Builds the "対応が必要" group: anchor-lost B-roll/sprites, color warnings,
  * low-confidence-transcript warnings, and the 3 QC categories not already
@@ -4593,6 +5719,22 @@ function renderWarningsGroup(el) {
   el.innerHTML = '';
   let count = 0;
   const kindCounts = { anchor: 0, color: 0, transcript: 0, qc: 0 };
+
+  if (S.qcError) {
+    count++; kindCounts.qc++;
+    const row = inboxWarningRow('品質チェックの結果を読み込めませんでした。問題がないとは判定していません。');
+    row.dataset.qcError = 'true';
+    row.title = S.qcError;
+    const actions = document.createElement('div');
+    actions.className = 'candActions';
+    const retry = document.createElement('button');
+    retry.className = 'btn-wash';
+    retry.textContent = '品質チェックを再試行';
+    retry.onclick = () => retryQc(retry);
+    actions.appendChild(retry);
+    row.appendChild(actions);
+    el.appendChild(row);
+  }
 
   // orphaned B-roll / sprites — display term "配置先を見失った" (W-UI IA v2
   // 用語表: アンカー切れ → 配置先を見失った B-roll/画像); "orphan"/anchor
@@ -4607,7 +5749,7 @@ function renderWarningsGroup(el) {
     // W-POLISH High-3: 行頭の絵文字「⚠」は廃止 — CSS側(.inboxWarn::before)の
     // 6px琥珀ドットが同じ役割を担う(意味色を面ではなくドットだけに絞る)。
     el.appendChild(inboxWarningRow(
-      `配置先を見失ったB-roll: ${sourceDisplayName(ov.sourceId)} — 元の位置(${sourceDisplayName(ov.anchor.sourceId)} ${ov.anchor.srcTime.toFixed(2)}秒)がカットで失われました。Claude に伝えて配置し直してください`,
+      `配置先を見失ったB-roll: ${sourceDisplayName(ov.sourceId)} — 元の位置(${sourceDisplayName(ov.anchor.sourceId)} ${ov.anchor.srcTime.toFixed(2)}秒)がカットで失われました。AI に伝えて配置し直してください`,
     ));
   }
   for (const r of S.sprites) {
@@ -4615,7 +5757,7 @@ function renderWarningsGroup(el) {
     count++; kindCounts.anchor++;
     const sp = r.sprite;
     el.appendChild(inboxWarningRow(
-      `配置先を見失ったキャラクター: ${sp.assetId} — 元の位置(${sourceDisplayName(sp.anchor.sourceId)} ${sp.anchor.srcTime.toFixed(2)}秒)がカットで失われました。Claude に伝えて配置し直してください`,
+      `配置先を見失ったキャラクター: ${sp.assetId} — 元の位置(${sourceDisplayName(sp.anchor.sourceId)} ${sp.anchor.srcTime.toFixed(2)}秒)がカットで失われました。AI に伝えて配置し直してください`,
     ));
   }
 
@@ -4660,16 +5802,9 @@ function renderWarningsGroup(el) {
   el.hidden = count === 0;
   return count;
 }
-// ---------- 波2.5: 「最後の書き出し」カード ----------
-// GET /api/export-results is read-only (docs/product-bet-sensory-vs-
-// structural.md: 構造系〔書き出し〕に必要なのは操作ではなく結果の可視化) —
-// no export-trigger UI lives here, on purpose. `vedit export *` /
-// `vedit publish-pack` (CLI-only) are what actually write a record; this
-// just surfaces the latest one. Fetched on 確認 tab display + a light 30s
-// poll while that tab stays active (see fetchExportResults' one caller at
-// the bottom of this file and activateTab above) — NOT tied to reload()/WS,
-// since exports don't go through mutate() and polling every commit would be
-// wasted work for something this low-frequency.
+// ---------- 最終書き出し: app-owned job + result card ----------
+// AIが現在版を準備し、ローカルMP4という外部作用は人間が明示ボタンで確定
+// する。公開/送信は行わず、保存先も daemon が project/exports 内に固定する。
 const EXPORT_KIND_LABEL = {
   render: 'MP4書き出し',
   otio: 'OTIO(Resolve)',
@@ -4679,16 +5814,119 @@ const EXPORT_KIND_LABEL = {
   'publish-pack': '公開パック',
 };
 async function fetchExportResults() {
+  const projectDir = S.projectDir;
   try {
-    S.exportResults = await api('/api/export-results?n=1');
+    const results = await api('/api/export-results?n=1');
+    if (S.projectDir !== projectDir) return;
+    S.exportResults = results;
     S.exportResultsStale = false;
   } catch {
+    if (S.projectDir !== projectDir) return;
     // best-effort: keep whatever was last successfully fetched instead of
     // wiping the card (Codex 統合レビュー P2-6) — renderExportResultCard
     // appends a small "更新できませんでした" note when this flag is set.
     S.exportResultsStale = true;
   }
   renderExportResultCard();
+}
+
+async function fetchExportJob() {
+  const projectDir = S.projectDir;
+  try {
+    const body = await api('/api/export-job');
+    if (S.projectDir !== projectDir) return;
+    S.exportJob = body.job ?? null;
+    S.exportJobUnavailable = false;
+  } catch (e) {
+    if (S.projectDir !== projectDir) return;
+    if (e.status === 404 || e.status === 405) S.exportJobUnavailable = true;
+    else throw e;
+  }
+  renderExportAskRow();
+}
+
+const EXPORT_PHASE_LABEL = {
+  preparing: '素材と設定を準備中',
+  encoding: 'MP4を書き出し中',
+  finalizing: 'ファイルを確定中',
+};
+
+function renderExportJobCard() {
+  const el = $('exportJobCard');
+  if (!el) return;
+  el.innerHTML = '';
+  const job = S.exportJob;
+  if (!job) return;
+  const card = document.createElement('div');
+  card.className = `exportJobState ${job.status}`;
+  const title = document.createElement('div');
+  title.className = 'showCardLbl';
+  if (job.status === 'running') title.textContent = EXPORT_PHASE_LABEL[job.phase] ?? 'MP4を書き出し中';
+  else if (job.status === 'success') title.textContent = '✓ MP4を書き出しました';
+  else if (job.status === 'cancelled') title.textContent = '書き出しを中止しました';
+  else if (job.status === 'interrupted') title.textContent = '書き出しが中断されました';
+  else title.textContent = 'MP4を書き出せませんでした';
+  card.appendChild(title);
+
+  const meta = document.createElement('div');
+  meta.className = 'hintText';
+  const bits = [`版 ${job.revision}`];
+  if (job.status === 'running' && job.partialBytes > 0) bits.push(`${formatBytes(job.partialBytes)} 作成済み`);
+  if (job.status === 'success') bits.push(basename(job.file));
+  meta.textContent = bits.join(' · ');
+  meta.title = job.file;
+  card.appendChild(meta);
+  if (job.error) {
+    const error = document.createElement('div');
+    error.className = 'hintText';
+    error.textContent = job.error;
+    card.appendChild(error);
+  }
+  if (job.status === 'running') {
+    card.setAttribute('aria-busy', 'true');
+    const actions = document.createElement('div');
+    actions.className = 'exportJobActions';
+    const stop = document.createElement('button');
+    stop.className = 'btn-wash';
+    stop.textContent = '中止';
+    stop.onclick = async () => {
+      stop.disabled = true;
+      try {
+        await api(`/api/export-job/${encodeURIComponent(job.id)}`, { method: 'DELETE' });
+        toast('書き出しを停止しています');
+      } catch (e) {
+        toast(e.message, { type: 'error' });
+        stop.disabled = false;
+      }
+    };
+    actions.appendChild(stop);
+    card.appendChild(actions);
+  }
+  el.appendChild(card);
+}
+
+async function startExportJob(button) {
+  const baseRev = S.renderedRevision;
+  button.disabled = true;
+  try {
+    if (baseRev == null) throw Object.assign(new Error('表示中の版を確認できません。画面を再読み込みしてください'), { status: 409 });
+    const body = await api('/api/export-job', {
+      method: 'POST',
+      body: JSON.stringify({ baseRev }),
+    });
+    S.exportJob = body.job;
+    renderExportAskRow();
+  } catch (e) {
+    if (e.status === 404 || e.status === 405) {
+      S.exportJobUnavailable = true;
+      renderExportAskRow();
+    } else {
+      toast(e.status === 409 ? `${e.message} 最新状態を読み込みます` : e.message, { type: 'error' });
+      if (e.status === 409) await reload().catch(() => {});
+    }
+  } finally {
+    button.disabled = false;
+  }
 }
 // IA v3 波A §1.1「紙を白紙にしない」: 定常状態のキューシートにも同じ
 // 「最後の書き出し」ミニカードを載せる(#deskExportCard)。データソース
@@ -4765,8 +6003,7 @@ function renderExportResultCardInto(elId) {
   // まだ反映されていない古い版の書き出し(--tally, 警告専用トーン)。
   if (S.manifest && rec.revision !== S.manifest.revision) {
     el.appendChild(inboxWarningRow(
-      '古い版の書き出しです — 最新の内容で書き出すには Claude に伝えてください',
-      { askPrompt: 'MP4を書き出して' },
+      '古い版の書き出しです — この画面のボタンから最新の版を書き出せます',
     ));
   }
   // Codex 統合レビュー P2-6: 直近の再取得(30秒ポーリング等)が失敗していても
@@ -4778,28 +6015,269 @@ function renderExportResultCardInto(elId) {
     el.appendChild(stale);
   }
 }
-// W-DESIGN ディレクター適応1: ヘッダー「書き出し」ボタンは実行しない —
-// クリックで右パネルに「書き出し」ビューを開き、既存の最後の書き出しカード
-// (renderExportResultCard、read-only)+「Cowork に頼む」コピーチップ(古い版
-// 警告は exportResultCard 側に既にある)を見せるだけ。既存の30秒ポーリングの
-// 発火条件を「確認タブが active」から「S.rightMode==='export'」へ差し替える
-// (setInterval のガードは下の起動処理を参照)。
 function renderExportAskRow() {
   const el = $('exportAskRow');
   if (!el) return;
   el.innerHTML = '';
+  renderExportJobCard();
+  if (S.exportJobUnavailable) {
+    const fallback = document.createElement('span');
+    fallback.className = 'hintText';
+    fallback.textContent = 'この編集エンジンはアプリ内書き出しに未対応です。AIへの依頼文をコピーできます';
+    el.append(fallback, askClaudeChip('MP4を書き出して'));
+    return;
+  }
+  if (S.exportJob?.status === 'running') {
+    const note = document.createElement('span');
+    note.className = 'hintText';
+    note.textContent = 'この画面を閉じても処理は続きます。外部には送信しません';
+    el.appendChild(note);
+    return;
+  }
   const label = document.createElement('span');
   label.className = 'hintText';
-  label.textContent = '書き出すには、Cowork の会話で頼んでください';
+  label.textContent = 'プロジェクトの exports フォルダへ保存します。外部には送信しません';
+  const button = document.createElement('button');
+  button.className = 'exportJobPrimary';
+  button.textContent = S.exportJob?.status === 'error' || S.exportJob?.status === 'interrupted' || S.exportJob?.status === 'cancelled'
+    ? 'もう一度書き出す'
+    : S.exportJob?.status === 'success'
+      ? '最新の版をもう一度書き出す'
+      : 'MP4をこのMacに書き出す';
+  button.onclick = () => startExportJob(button);
   el.appendChild(label);
-  el.appendChild(askClaudeChip('MP4を書き出して'));
+  el.appendChild(button);
+}
+function isNarrowRightSheet() {
+  return matchMedia('(max-width: 1259px)').matches;
+}
+function isMobileLeftDrawer() {
+  return matchMedia('(max-width: 700px)').matches;
+}
+
+let rightSheetInvoker = null;
+let leftPanelInvoker = null;
+
+function setInert(el, inert) {
+  if (!el) return;
+  el.toggleAttribute('inert', inert);
+  el.inert = inert;
+}
+
+function focusableWithin(panel) {
+  if (!panel) return [];
+  return [...panel.querySelectorAll(
+    'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [contenteditable="true"], [tabindex]:not([tabindex="-1"])',
+  )].filter((el) => !el.closest('[hidden]') && el.getClientRects().length > 0);
+}
+
+/**
+ * Keep both responsive panels honest in the accessibility tree. The narrow
+ * right decision sheet is deliberately modeless: the timeline, preview and
+ * sheet are three synchronized views of one decision, so users must be able
+ * to click between them. The phone-sized left media drawer is modal because
+ * it covers the work surface. Closed off-canvas panels are always inert.
+ */
+function syncResponsivePanelsA11y() {
+  const header = document.querySelector('header');
+  const left = $('leftPanel');
+  const right = $('rightPanel');
+  const narrowRight = isNarrowRightSheet();
+  const mobileLeft = isMobileLeftDrawer();
+
+  document.documentElement.style.setProperty('--app-header-height', `${Math.ceil(header?.getBoundingClientRect().height || 46)}px`);
+
+  // A panel that becomes inline after a resize must not reopen itself when
+  // the viewport is narrowed again later.
+  if (!narrowRight) right.classList.remove('sheetOpen');
+  if (!mobileLeft) left.classList.remove('drawerOpen');
+
+  let rightModalOpen = narrowRight && right.classList.contains('sheetOpen');
+  let leftModalOpen = mobileLeft && left.classList.contains('drawerOpen');
+  // Defensive exclusivity: there is only one modal interaction surface.
+  if (rightModalOpen && leftModalOpen) {
+    left.classList.remove('drawerOpen');
+    leftModalOpen = false;
+  }
+
+  const rightVisible = !narrowRight || rightModalOpen;
+  const leftVisible = !mobileLeft || leftModalOpen;
+  const blockingDrawerOpen = leftModalOpen;
+
+  // Release the old modal background before moving focus out of a panel
+  // that has just closed. This avoids leaving focus inside a subtree at the
+  // moment it becomes aria-hidden/inert.
+  if (!blockingDrawerOpen) {
+    setInert($('stage'), false);
+    setInert($('paneDivider'), false);
+    if (!rightVisible && right.contains(document.activeElement)) $('claudeStatus').focus();
+    if (!leftVisible && left.contains(document.activeElement)) $('leftPanelToggle').focus();
+  }
+
+  right.setAttribute('aria-hidden', String(!rightVisible));
+  left.setAttribute('aria-hidden', String(!leftVisible));
+  $('claudeStatus').setAttribute('aria-expanded', String(rightVisible));
+  $('leftPanelToggle').setAttribute('aria-expanded', String(leftVisible));
+  $('leftPanelToggle').setAttribute(
+    'aria-label',
+    leftModalOpen ? '素材と文字起こしを閉じる' : '素材と文字起こしを開く',
+  );
+
+  for (const [panel, active] of [[right, rightModalOpen], [left, leftModalOpen]]) {
+    if (active) {
+      panel.setAttribute('role', 'dialog');
+      if (panel === left) panel.setAttribute('aria-modal', 'true');
+      else panel.removeAttribute('aria-modal');
+    } else {
+      panel.removeAttribute('role');
+      panel.removeAttribute('aria-modal');
+    }
+  }
+
+  // The right sheet remains interoperable with the editing surface. Only the
+  // phone media drawer blocks the rest of the app.
+  setInert(header, false);
+  setInert($('stage'), blockingDrawerOpen);
+  setInert($('paneDivider'), blockingDrawerOpen);
+  setInert(right, !rightVisible || leftModalOpen);
+  setInert(left, !leftVisible);
+  document.body.classList.toggle('hasPanelOverlay', blockingDrawerOpen);
+}
+
+function trapResponsivePanelFocus(e) {
+  const rightSheet = isNarrowRightSheet() && $('rightPanel').classList.contains('sheetOpen')
+    ? $('rightPanel')
+    : null;
+  const activePanel = isMobileLeftDrawer() && $('leftPanel').classList.contains('drawerOpen')
+    ? $('leftPanel')
+    : null;
+  if (rightSheet && !activePanel && e.key === 'Escape' && rightSheet.contains(document.activeElement)) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    closeRightSheet();
+    return;
+  }
+  if (!activePanel) return;
+  if (e.isComposing || e.keyCode === 229) return;
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    if (activePanel === $('rightPanel')) closeRightSheet();
+    else closeLeftPanel();
+    return;
+  }
+  if (e.key !== 'Tab') return;
+  const focusable = focusableWithin(activePanel);
+  if (focusable.length === 0) {
+    e.preventDefault();
+    activePanel.focus?.();
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  const current = document.activeElement;
+  if (e.shiftKey && (current === first || !activePanel.contains(current))) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && (current === last || !activePanel.contains(current))) {
+    e.preventDefault();
+    first.focus();
+  }
+}
+document.addEventListener('keydown', trapResponsivePanelFocus, true);
+
+function openRightSheet({ focus = false } = {}) {
+  const panel = $('rightPanel');
+  const narrow = isNarrowRightSheet();
+  const wasOpen = !narrow || panel.classList.contains('sheetOpen');
+  if (narrow && !wasOpen) {
+    rightSheetInvoker = document.activeElement instanceof HTMLElement ? document.activeElement : $('claudeStatus');
+    panel.classList.add('sheetOpen');
+    panel.removeAttribute('inert');
+    panel.inert = false;
+    panel.setAttribute('aria-hidden', 'false');
+  }
+  if (narrow && (focus || !wasOpen)) $('rightPanelClose').focus();
+  else if (focus) {
+    const view = { claude: $('claudeView'), clip: $('inspectorView'), caption: $('captionView'), export: $('exportView'), settings: $('settingsView') }[S.rightMode];
+    const target = view?.querySelector('button:not([hidden]), [tabindex="0"]');
+    target?.focus?.();
+  }
+  syncResponsivePanelsA11y();
+}
+function closeRightSheet({ restoreFocus = true } = {}) {
+  if (!isNarrowRightSheet()) return;
+  if (S.rightMode === 'caption') closeCaptionStylePopover();
+  $('rightPanel').classList.remove('sheetOpen');
+  syncResponsivePanelsA11y();
+  if (restoreFocus) {
+    const target = rightSheetInvoker?.isConnected ? rightSheetInvoker : $('claudeStatus');
+    target?.focus?.();
+  }
+  rightSheetInvoker = null;
+}
+function openLeftPanel() {
+  if (!isMobileLeftDrawer()) return;
+  const panel = $('leftPanel');
+  const wasOpen = panel.classList.contains('drawerOpen');
+  if (!wasOpen) {
+    leftPanelInvoker = document.activeElement instanceof HTMLElement ? document.activeElement : $('leftPanelToggle');
+    panel.classList.add('drawerOpen');
+    panel.removeAttribute('inert');
+    panel.inert = false;
+    panel.setAttribute('aria-hidden', 'false');
+  }
+  $('leftPanelClose').focus();
+  syncResponsivePanelsA11y();
+}
+function closeLeftPanel({ restoreFocus = true } = {}) {
+  if (!isMobileLeftDrawer()) return;
+  $('leftPanel').classList.remove('drawerOpen');
+  syncResponsivePanelsA11y();
+  if (restoreFocus) {
+    const target = leftPanelInvoker?.isConnected ? leftPanelInvoker : $('leftPanelToggle');
+    target?.focus?.();
+  }
+  leftPanelInvoker = null;
+}
+function showDecisionView() {
+  if (S.rightMode === 'caption') closeCaptionStylePopover();
+  S.selection = null;
+  S.rightMode = 'claude';
+  renderTimeline();
+  renderInspector();
+  openRightSheet();
+}
+function renderPendingTallies() {
+  const badge = $('inboxCount');
+  const pending = badge && !badge.hidden ? Number(badge.textContent || '0') : 0;
+  for (const btn of document.querySelectorAll('.pendingTally')) {
+    btn.hidden = pending === 0;
+    btn.textContent = pending > 0 ? `確認待ち ${pending}件` : '';
+    btn.onclick = showDecisionView;
+  }
+}
+function openSettingsView() {
+  if (S.selection) S.selection = null;
+  if (S.rightMode === 'caption') closeCaptionStylePopover();
+  S.rightMode = 'settings';
+  renderTimeline();
+  renderInspector();
+  openRightSheet();
+}
+function closeSettingsView() {
+  if (S.rightMode !== 'settings') return;
+  S.rightMode = 'claude';
+  renderInspector();
 }
 function openExportView() {
   if (S.selection) deselect();
   if (S.rightMode === 'caption') closeCaptionStylePopover();
   S.rightMode = 'export';
   renderInspector();
+  openRightSheet();
   fetchExportResults().catch(() => {});
+  fetchExportJob().catch((e) => toast(e.message, { type: 'error' }));
 }
 function closeExportView() {
   if (S.rightMode !== 'export') return;
@@ -4808,9 +6286,22 @@ function closeExportView() {
 }
 $('exportBtn').onclick = openExportView;
 $('exportBackBtn').onclick = closeExportView;
-// 「Cowork を開く」— OS/アプリ間の連携APIが無いため、実際にCoworkアプリを
-// 起動することはできない(嘘の機能を置かない)。案内トーストのみ。
-$('openCoworkBtn').onclick = () => toast('Cowork アプリ側でこの続きを伝えてください');
+$('settingsBtn').onclick = openSettingsView;
+$('settingsBackBtn').onclick = closeSettingsView;
+$('rightPanelClose').onclick = closeRightSheet;
+$('leftPanelToggle').onclick = () => {
+  if ($('leftPanel').classList.contains('drawerOpen')) closeLeftPanel();
+  else openLeftPanel();
+};
+$('leftPanelClose').onclick = closeLeftPanel;
+$('claudeStatus').onclick = () => {
+  if (isNarrowRightSheet() && $('rightPanel').classList.contains('sheetOpen')) closeRightSheet();
+  else openRightSheet({ focus: true });
+};
+// OS/アプリ間deep linkは無いので、押下結果を正確に「依頼文のコピー」にする。
+$('openCoworkBtn').onclick = () => copyToClipboard(
+  aiRequestEnvelope('このプロジェクトを確認して編集を進めてください。'),
+);
 
 // W-DESIGN: 会話タブ冒頭の Cowork 会話合成表示(README 69行目 —
 // revision log の actor=Claude から合成でよい)。実在しないユーザー発言は
@@ -4820,12 +6311,12 @@ function renderClaudeConversation() {
   if (!el) return;
   el.innerHTML = '';
   if (isProjectEmpty()) return;
-  const hasClaudeRevision = S.revisions.some((r) => r.actor === 'claude');
-  if (!hasClaudeRevision && S.candidates.length === 0) return;
+  const hasAgentRevision = S.revisions.some((r) => r.actor === 'agent' || r.actor === 'claude');
+  if (!hasAgentRevision && S.candidates.length === 0) return;
 
   const caption = document.createElement('div');
   caption.className = 'coworkCaption';
-  caption.textContent = 'COWORK セッション';
+  caption.textContent = 'AI セッション';
   el.appendChild(caption);
 
   const bits = [];
@@ -4833,7 +6324,7 @@ function renderClaudeConversation() {
   if (S.candidates.length > 0) {
     const totalDur = S.candidates.reduce((sum, c) => sum + Math.max(0, c.t1 - c.t0), 0);
     bits.push(`カットできそうな箇所が${S.candidates.length}件(合計 −${totalDur.toFixed(1)}秒)見つかったので、確認してください`);
-  } else if (hasClaudeRevision) {
+  } else if (hasAgentRevision) {
     bits.push('提案はすべて確認済みです');
   }
   if (bits.length === 0) return;
@@ -4883,30 +6374,30 @@ function newSinceLastSeenRevisions() {
 }
 function renderQueueSheetNew() {
   const el = $('queueSheetNew');
+  const summary = $('queueNewSummary');
   if (!el) return;
   el.innerHTML = '';
-  if (isProjectEmpty()) { el.hidden = true; return; }
+  el.hidden = true;
+  if (isProjectEmpty()) { if (summary) summary.hidden = true; return; }
   const entries = newSinceLastSeenRevisions();
-  if (entries.length === 0) { el.hidden = true; return; }
-  el.hidden = false;
-  const divider = document.createElement('div');
-  divider.className = 'queueNewDivider';
-  divider.id = 'queueNewDivider';
-  divider.textContent = `― 前回の確認から ${entries.length}件 ―`;
-  el.appendChild(divider);
-  const list = document.createElement('div');
-  list.className = 'queueNewList';
-  list.id = 'queueNewList';
-  for (const r of [...entries].reverse()) list.appendChild(queueRevisionRow(r, { newMark: true })); // 新しい順
-  el.appendChild(list);
+  el.hidden = entries.length === 0;
+  for (const entry of entries.slice(-5).reverse()) el.appendChild(queueRevisionRow(entry));
+  if (summary) {
+    summary.hidden = entries.length === 0;
+    summary.textContent = entries.length > 0 ? `前回から ${entries.length}件` : '';
+  }
 }
 // 「次の一手」チップの導出(状態から、最大2枚)。askClaudeChip の既存の
 // コピー導線をそのまま使う — 構造編集は会話側という製品の賭けに合わせ、
 // ここでも実行ボタンではなく「Cowork に頼む」コピーチップのみを置く。
 function nextMoveChipPrompts() {
   const out = [];
-  if (S.manifest.sources.some((s) => !s.transcribed && !S.transcribing.has(s.id))) out.push('文字起こしを頼む');
-  if ((S.manifest.timeline.music ?? []).length === 0) out.push('BGMを頼む');
+  if (S.manifest.sources.some((s) => s.hasAudio && !s.transcribed && !S.transcribing.has(s.id))) {
+    out.push('音声のある未処理素材を確認し、発話素材だけ文字起こしして');
+  }
+  // Absence of BGM is not a defect and adding it is a taste decision. Do not
+  // nudge every project toward music without a kit/brief/user intent saying
+  // so; the normal AI request can still add it when that intent exists.
   return out;
 }
 // IA v3 波B §8: プロジェクトメモ(GET /api/notes、S.notes — read-only)の
@@ -4954,7 +6445,7 @@ function renderQueueSheetNotes() {
 function renderQueueSheetDesk() {
   const el = $('queueSheetDesk');
   if (!el) return;
-  const showDesk = !isProjectEmpty() && S.candidates.length === 0 && newSinceLastSeenRevisions().length === 0;
+  const showDesk = !isProjectEmpty();
   el.hidden = !showDesk;
   if (!showDesk) return;
 
@@ -4978,7 +6469,6 @@ function renderInbox() {
   // yet — the whole 確認 tab collapses to one sentence instead of showing
   // two empty groups + detection controls that don't apply yet.
   const projectEmpty = isProjectEmpty();
-  renderClaudeConversation();
   renderQueueSheetNew();
   $('confirmEmptyProject').hidden = !projectEmpty;
   $('candidatesSection').hidden = projectEmpty;
@@ -4992,12 +6482,30 @@ function renderInbox() {
   // ここで1回呼べば足りる。
   renderQueueSheetDesk();
   const badge = $('inboxCount');
-  if (projectEmpty) { badge.hidden = true; return; }
+  if (projectEmpty) {
+    // Hidden DOM from the previous project must not retain stale candidate
+    // buttons/handlers after switching to an empty project.
+    $('inboxList').replaceChildren();
+    $('warningsList').replaceChildren();
+    $('aiWorkSummary').replaceChildren();
+    $('aiWorkSummary').hidden = true;
+    $('candidateQuestionIntro').hidden = true;
+    $('candidatesCount').textContent = '0件';
+    badge.hidden = true;
+    $('decisionBar').hidden = true;
+    renderPendingTallies();
+    return;
+  }
 
   renderCandidatesGroup($('inboxList'));
   const warnCount = renderWarningsGroup($('warningsList'));
   const total = S.candidates.length + warnCount;
   if (total > 0) { badge.hidden = false; badge.textContent = String(total); } else { badge.hidden = true; }
+  // Progressive hydration may replace candidates after renderInspector() has
+  // already painted a drill-in view. Update every view-local tally from the
+  // newly authoritative badge in the same pass instead of waiting for an
+  // unrelated status render or WebSocket event.
+  renderPendingTallies();
 }
 
 // ---------- detection threshold ----------
@@ -5008,18 +6516,28 @@ $('minGapRange').oninput = (e) => {
 $('redetectBtn').onclick = async () => {
   S.detecting = true;
   renderInbox();
+  let completed;
   try {
-    await api('/api/detect', { method: 'POST', body: JSON.stringify({ minGap: S.detectMinGap }) });
+    completed = await api('/api/detect', { method: 'POST', body: JSON.stringify({ minGap: S.detectMinGap }) });
+    S.detectRun = completed.detectRun ?? S.detectRun;
     toast(`最短時間 ${S.detectMinGap.toFixed(1)}秒でこの条件の候補を作り直しました`);
+    if (completed.warnings?.length) toast(completed.warnings.join(' / '), { type: 'warn' });
   } catch (e) {
     toast(e.message, { type: 'error' });
   }
   S.detecting = false;
-  await reload().catch(() => {});
-  // reload() re-fetches S.candidates — a completed run that still landed on
-  // zero pending (and nothing in candidatesAll either) is the "問題なし" empty
-  // state; see renderCandidatesGroup's doc for why this is session-local only.
-  if (S.candidates.length === 0 && S.candidatesAll.length === 0) S.detectRanEmpty = true;
+  try {
+    await reload();
+  } catch (e) {
+    // The detect response already proves completion; retain its marker so a
+    // refresh failure cannot turn success back into "not run yet" locally.
+    if (completed?.detectRun) {
+      S.detectRun = completed.detectRun;
+      toast('候補検出は完了しましたが、画面を更新できませんでした。ページを再読み込みしてください', { type: 'warn' });
+    } else {
+      toast('最新の候補状態を読み込めませんでした。ページを再読み込みしてください', { type: 'error' });
+    }
+  }
   renderInbox();
 };
 
@@ -5032,25 +6550,52 @@ function focusAfterCandidateDecision(anchorIdx) {
   const idx = Math.max(0, Math.min(anchorIdx, rows.length - 1));
   rows[idx].focus();
 }
-async function decide(ids, decision) {
-  const idList = ids === 'all' ? S.candidates.map((c) => c.id) : ids;
+let candidateDecisionInFlight = false;
+function setCandidateDecisionBusy(busy) {
+  for (const button of document.querySelectorAll(
+    '#inboxList .cand button, #decisionBar button, #slimBarActions button',
+  )) button.disabled = busy;
+}
+async function decide(ids, decision, opts = {}) {
+  if (candidateDecisionInFlight) return;
+  candidateDecisionInFlight = true;
+  setCandidateDecisionBusy(true);
+  const baseRev = opts.expectedRevision ?? S.renderedRevision;
+  // Never send the server-side "all" sentinel from a painted control: an
+  // exact list is the receipt for what the user saw. Keep accepting it as an
+  // internal compatibility input, but resolve it from the painted latch.
+  const idList = ids === 'all' ? [...S.renderedCandidateIds] : [...ids];
   const lastId = idList[idList.length - 1];
   const anchorIdx = Math.max(0, S.candidates.findIndex((c) => c.id === lastId));
+  let outcome = null;
   try {
-    await api('/api/candidates/decide', {
+    if (baseRev == null) throw Object.assign(new Error('表示中の版を確認できません。画面を再読み込みしてください'), { status: 409 });
+    outcome = await api('/api/candidates/decide', {
       method: 'POST',
-      body: JSON.stringify({ ids, decision, actor: 'ui', baseRev: S.manifest.revision }),
+      body: JSON.stringify({ ids: idList, decision, actor: 'ui', baseRev }),
     });
   } catch (e) {
     toast(e.status === 409 ? '他の編集と競合しました。最新状態を再読込します' : e.message, { type: 'error' });
   }
   await reload().catch(() => {});
+  if (outcome && decision === 'approve') {
+    const absorbed = Array.isArray(outcome.fragmentsAbsorbed) ? outcome.fragmentsAbsorbed : [];
+    const absorbedSeconds = absorbed.reduce((sum, fragment) => sum + (Number(fragment.seconds) || 0), 0);
+    const detail = absorbed.length > 0
+      ? `。短い断片${absorbed.length}件・${absorbedSeconds.toFixed(1)}秒も吸収しました`
+      : '';
+    toast(`${outcome.decided}件をカットし、実際に${Number(outcome.removedSeconds || 0).toFixed(1)}秒短縮しました${detail}。必要なら「戻す」で取り消せます`);
+  } else if (outcome && decision === 'reject') {
+    toast(`${outcome.decided}件を残しました。必要なら「戻す」で取り消せます`);
+  }
   focusAfterCandidateDecision(anchorIdx);
   hideCandidateCard();
+  candidateDecisionInFlight = false;
+  setCandidateDecisionBusy(false);
 }
 
 // ---------- activity feed / undo (W-UI IA v2 §1: 独立した「履歴」タブの中身 — 各エントリは "rev" を表示上「変更 #」と呼ぶ。CLI/API の語彙(rev/r12)はそのまま) ----------
-const ACTOR_LABEL = { claude: 'Claude', ui: 'あなた', system: 'システム' };
+const ACTOR_LABEL = { agent: 'AI', claude: 'AI', ui: 'あなた', system: 'システム' };
 
 // ---------- op -> human-readable Japanese summary (W-UI redesign §4) ----------
 // `entry.op`/`entry.params` are exactly the wire vocabulary daemon.ts's
@@ -5129,7 +6674,13 @@ function humanizeRevision(entry) {
       // W-UI IA v2 用語表: 承認/却下 → カットする/残す — 履歴の表示も「承認」
       // を使わない言い回しに揃える。
       const bits = [ids.length > 0 ? `${ids.length}件` : '', secs ? `−${secs}秒` : ''].filter(Boolean).join(', ');
-      return `${label}候補をカット${bits ? `(${bits})` : ''}`;
+      return p.mode === 'autonomous'
+        ? `AIが明白な無音を自律編集${bits ? `(${bits})` : ''}`
+        : `${label}候補をカット${bits ? `(${bits})` : ''}`;
+    }
+    case 'reject-candidates': {
+      const ids = Array.isArray(p.ids) ? p.ids : [];
+      return `編集候補を残す判断${ids.length ? `(${ids.length}件)` : ''}`;
     }
     case 'remove-words': {
       const secs = summary.match(/\(([\d.]+)s\)/)?.[1];
@@ -5265,6 +6816,82 @@ async function restoreToRevision(rev, trigger) {
   // failure.
   focusAfterHistoryAction();
 }
+
+let historyActionInFlight = false;
+function renderHistoryControls() {
+  const { canUndo, canRedo } = historyControlState(S.revisions);
+  const undo = $('undoBtn');
+  const redo = $('redoBtn');
+  undo.disabled = historyActionInFlight || !canUndo;
+  redo.disabled = historyActionInFlight || !canRedo;
+  undo.title = canUndo ? '直前の編集を元に戻す (Cmd/Ctrl+Z)' : '元に戻せる編集はありません';
+  redo.title = canRedo ? '元に戻した編集をやり直す (Cmd/Ctrl+Shift+Z)' : 'やり直せる編集はありません';
+}
+
+function focusAfterLogicalHistoryAction(trigger, preferredId) {
+  const fromHeader = trigger === $('undoBtn') || trigger === $('redoBtn');
+  if (!fromHeader) {
+    focusAfterHistoryAction();
+    return;
+  }
+  const preferred = $(preferredId);
+  const fallback = $(preferredId === 'undoBtn' ? 'redoBtn' : 'undoBtn');
+  if (!preferred.disabled) preferred.focus();
+  else if (!fallback.disabled) fallback.focus();
+  else document.querySelector('.historyControls')?.focus();
+}
+
+async function logicalUndo(trigger) {
+  if (historyActionInFlight) return;
+  historyActionInFlight = true;
+  const baseRev = S.renderedRevision;
+  renderHistoryControls();
+  if (trigger && trigger !== $('undoBtn') && trigger !== $('redoBtn')) trigger.disabled = true;
+  try {
+    if (baseRev == null) throw Object.assign(new Error('表示中の版を確認できません。画面を再読み込みしてください'), { status: 409 });
+    await api('/api/undo', {
+      method: 'POST',
+      body: JSON.stringify({ actor: 'ui', baseRev }),
+    });
+    await reload();
+    toast('変更を元に戻しました');
+  } catch (error) {
+    toast(error.status === 409 ? '他の編集と競合しました。最新状態を再読込します' : error.message, { type: 'error' });
+    await reload().catch(() => {});
+  } finally {
+    historyActionInFlight = false;
+    if (trigger?.isConnected && trigger !== $('undoBtn') && trigger !== $('redoBtn')) trigger.disabled = false;
+    renderHistoryControls();
+  }
+  focusAfterLogicalHistoryAction(trigger, 'undoBtn');
+}
+
+async function logicalRedo(trigger) {
+  if (historyActionInFlight) return;
+  historyActionInFlight = true;
+  const baseRev = S.renderedRevision;
+  renderHistoryControls();
+  if (trigger && trigger !== $('undoBtn') && trigger !== $('redoBtn')) trigger.disabled = true;
+  try {
+    if (baseRev == null) throw Object.assign(new Error('表示中の版を確認できません。画面を再読み込みしてください'), { status: 409 });
+    await api('/api/redo', {
+      method: 'POST',
+      body: JSON.stringify({ actor: 'ui', baseRev }),
+    });
+    await reload();
+    toast('変更をやり直しました');
+  } catch (error) {
+    toast(error.status === 409 ? '他の編集と競合しました。最新状態を再読込します' : error.message, { type: 'error' });
+    await reload().catch(() => {});
+  } finally {
+    historyActionInFlight = false;
+    if (trigger?.isConnected && trigger !== $('undoBtn') && trigger !== $('redoBtn')) trigger.disabled = false;
+    renderHistoryControls();
+  }
+  focusAfterLogicalHistoryAction(trigger, 'redoBtn');
+}
+$('undoBtn').onclick = () => logicalUndo($('undoBtn'));
+$('redoBtn').onclick = () => logicalRedo($('redoBtn'));
 /**
  * Best-effort "where did this change happen" -> a timeline range, from a
  * revision entry's recorded op params — powers each activity-feed card's
@@ -5384,15 +7011,21 @@ function renderActivityFeed() {
 // before the first round-trip resolves; re-enabled once settled (a no-op if
 // reload()'s re-render already replaced/detached the element).
 async function mutate(body, opts = {}) {
+  const baseRev = opts.expectedRevision ?? S.renderedRevision;
+  const expectedProjectDir = opts.expectedProjectDir ?? S.renderedProjectDir;
   const triggers = opts.trigger ? (Array.isArray(opts.trigger) ? opts.trigger : [opts.trigger]) : [];
   for (const el of triggers) if (el) el.disabled = true;
   try {
     // ---- idle -> pending -> (failed-before-commit | committed) ----
     let res;
     try {
+      if (baseRev == null || !expectedProjectDir) {
+        throw Object.assign(new Error('表示中のプロジェクトと版を確認できません。画面を再読み込みしてください'), { status: 409 });
+      }
       res = await api('/api/edit', {
         method: 'POST',
-        body: JSON.stringify({ baseRev: S.manifest.revision, actor: 'ui', ...body }),
+        body: JSON.stringify({ ...body, baseRev, actor: 'ui' }),
+        expectedProjectDir,
       });
     } catch (e) {
       // failed-before-commit: the server never applied this op — nothing
@@ -5484,6 +7117,13 @@ async function copyToClipboard(text) {
     return false;
   }
 }
+function aiRequestEnvelope(request) {
+  return buildAiRequestEnvelope({
+    projectDir: S.renderedProjectDir ?? S.projectDir,
+    revision: S.renderedRevision ?? S.manifest?.revision,
+    request,
+  });
+}
 function askClaudeChip(promptText) {
   const btn = document.createElement('button');
   btn.className = 'askChip';
@@ -5492,9 +7132,9 @@ function askClaudeChip(promptText) {
   // 固定プレフィックスで可視化する。W-DESIGN: デザインの用語(Cowork 常設)に
   // 合わせ「Claude に頼む」→「Cowork に頼む」に改称(README ディレクター
   // 適応欄の許可どおり)。
-  btn.textContent = `Cowork に頼む: 「${promptText}」をコピー`;
-  btn.title = 'クリックでこの依頼文をクリップボードにコピーします。Cowork に伝えてください';
-  btn.onclick = (e) => { e.stopPropagation(); copyToClipboard(promptText); };
+  btn.textContent = `AIへの依頼をコピー: 「${promptText}」`;
+  btn.title = 'クリックで依頼文をコピーし、CodexやClaude Codeなどお使いのAIに貼り付けます';
+  btn.onclick = (e) => { e.stopPropagation(); copyToClipboard(aiRequestEnvelope(promptText)); };
   return btn;
 }
 
@@ -5554,6 +7194,7 @@ function handleShowDirective(d) {
   if (S.selection) deselect();
   if (S.rightMode === 'caption') closeCaptionStylePopover();
   if (S.rightMode === 'export') closeExportView();
+  if (S.rightMode === 'settings') closeSettingsView();
   if (d.kind === 'range') return showRangeDirective(d);
   if (d.kind === 'words') return showWordsDirective(d);
   if (d.kind === 'candidate') return showCandidateDirective(d);
@@ -5615,6 +7256,15 @@ function renderCandidateCard(c) {
   body.innerHTML = `<div><span class="kind ${c.kind}">${esc(KIND_LABEL[c.kind] ?? c.kind)}</span></div>` +
     `<div class="showCardLbl">${esc(label)}</div>` +
     `<div class="hintText" title="${esc(srcTitle)}">${esc(srcName)} ${fmt(c.t0)}–${fmt(c.t1)}</div>`;
+  if (isAiQuestionCandidate(c)) {
+    const reason = document.createElement('div');
+    reason.className = 'candReason showCandidateReason';
+    reason.textContent = `AIが確認を求める理由: ${candidateQuestionReason(c)}`;
+    const tradeoff = document.createElement('div');
+    tradeoff.className = 'hintText showCandidateTradeoff';
+    tradeoff.textContent = candidateDecisionTradeoff(c, dur);
+    body.append(reason, tradeoff);
+  }
   const actions = document.createElement('div');
   actions.className = 'candActions';
   const preview = document.createElement('button');
@@ -5637,7 +7287,9 @@ function renderCandidateCard(c) {
   ng.className = 'btn-wash'; // 候補カード: 残すは状態色ではなくニュートラル(--wash)。「カットする」(btn-approve)も raised(#2e2e33)の無彩色 — W-DESIGN 意味色規律
   ng.textContent = '残す';
   ng.onclick = async () => { await decide([c.id], 'reject'); };
-  actions.append(preview, ok, ng);
+  // Keep the explicit neutral/raised pair adjacent, with the consequential
+  // cut action last as on the canonical inbox card.
+  actions.append(preview, ng, ok);
   body.appendChild(actions);
   $('candidateCard').hidden = false;
 }
@@ -5758,14 +7410,33 @@ function showSourceDirective(d) {
 
 // ---------- Claude presence strip (W-UI §1) ----------
 // Surfaces ingest/transcribe/upload/color-transform progress at the top of
-// the いま tab's feed, from the same WS progress events the stage's
-// #ingestOverlay spinner already listens to.
-function setClaudeTask(label) {
-  S.activeTask = label ? { label } : null;
+// the いま tab's feed. Tasks are keyed: one failed upload must not clear a
+// second ingest/transcription that is still running.
+function setClaudeTask(label, taskId = null, kind = 'other') {
+  if (label) {
+    const key = taskId ?? `legacy:${kind}`;
+    S.activeTasks.set(key, { label, kind, order: ++S.activeTaskOrder });
+  } else if (taskId) {
+    S.activeTasks.delete(taskId);
+  } else {
+    S.activeTasks.clear();
+    S.activeTaskOrder = 0;
+  }
+  const tasks = [...S.activeTasks.values()].sort((a, b) => a.order - b.order);
+  const latest = tasks[tasks.length - 1];
+  S.activeTask = latest ? { label: latest.label, count: tasks.length } : null;
   const strip = $('claudeStrip');
-  strip.hidden = !label;
-  if (label) $('claudeStripText').textContent = label;
+  strip.hidden = !latest;
+  if (latest) {
+    $('claudeStripText').textContent = tasks.length > 1
+      ? `${latest.label}（ほか${tasks.length - 1}件）`
+      : latest.label;
+  }
   renderClaudeStatus();
+}
+
+function hasActiveTaskKind(kind) {
+  return [...S.activeTasks.values()].some((task) => task.kind === kind);
 }
 
 // ---------- W-UI IA v2 波2 §3: Claude 状態の常設表示(ヘッダー) ----------
@@ -5789,37 +7460,48 @@ function renderClaudeStatus() {
   const subEl = $('claudeSubline');
   const empty = isProjectEmpty();
   let state, label, title, subline;
+  const connection = S.wsConnected ? '編集エンジン接続済み' : '編集エンジンへ再接続中';
   if (S.activeTask) {
+    const more = S.activeTask.count > 1 ? `（ほか${S.activeTask.count - 1}件）` : '';
     state = 'busy';
-    label = `Claude: 編集中 — ${S.activeTask.label}`;
-    title = S.activeTask.label;
-    subline = 'Cowork 接続中 · 編集中…';
+    label = `編集エンジン: 処理中 — ${S.activeTask.label}${more}`;
+    title = `${S.activeTask.label}${more}`;
+    subline = `${connection} · 編集中${more}…`;
   } else {
     const badge = $('inboxCount');
     const pending = badge && !badge.hidden ? Number(badge.textContent || '0') : 0;
     if (empty) {
       state = 'idle';
-      label = 'Claude: 待機中 — 動画を取り込むと編集を始められます';
+      label = '編集エンジン: 待機中 — 動画を取り込むと編集を始められます';
       title = '';
-      subline = 'Cowork 接続中 · 待機中';
+      subline = `${connection} · 待機中`;
     } else if (pending > 0) {
       // 「pending」は編集提案(候補)+対応が必要(警告)の合算(旧 renderClaudeStatus
       // と同じ導出 — README「claudeStatus...旧 renderClaudeStatus と同じ導出」)。
       state = 'waiting';
-      label = `Claude: 確認待ち ${pending}件`;
-      title = `${pending}件の確認待ち — 会話タブを開いてください`;
-      subline = `Cowork 接続中 · 確認待ち ${pending}件`;
+      label = `編集エンジン: 確認待ち ${pending}件`;
+      title = `${pending}件の確認待ち — クリックして「決める」を開く`;
+      subline = `${connection} · 確認待ち ${pending}件`;
     } else {
       state = 'idle';
-      label = 'Claude: 待機中';
+      label = '編集エンジン: 待機中';
       title = '';
-      subline = 'Cowork 接続中 · 待機中';
+      subline = `${connection} · 待機中`;
     }
   }
   el.className = `claudeStatus ${state}`;
   el.title = title;
   if (textEl) textEl.textContent = label;
   if (subEl) subEl.textContent = subline;
+  const footer = document.querySelector('.claudeFooter');
+  const footerText = footer?.querySelector('.footerText');
+  if (footerText) {
+    footerText.textContent = S.wsConnected
+      ? '編集エンジン接続済み — AIへの依頼文はコピーできます'
+      : '編集エンジンへ再接続中 — 表示を更新できません';
+  }
+  footer?.classList.toggle('offline', !S.wsConnected);
+  renderPendingTallies();
 }
 
 // ---------- websocket live updates ----------
@@ -5832,73 +7514,171 @@ let wsEverConnected = false;
 function connectWs() {
   const ws = new WebSocket(`ws://${location.host}/ws`);
   ws.onopen = () => {
+    S.wsConnected = true;
     const el = $('conn');
     el.classList.add('up');
     el.title = '接続済み';
     el.setAttribute('aria-label', '接続状態: 接続済み');
     if (wsEverConnected) {
       S.transcribing = new Set();
+      // Scene sidecars have no manifest revision. A `scenes` event missed
+      // while disconnected cannot be detected from revision alone, so a WS
+      // reconnect deliberately revalidates every cached scene result.
+      S.scenes = new Map();
+      S.sceneDetailsLoaded = new Set();
       setClaudeTask(null);
       $('ingestOverlay').hidden = true;
       $('stage').removeAttribute('aria-busy');
       if (S.manifest) reload().catch((e) => toast(e.message, { type: 'error' }));
     }
     wsEverConnected = true;
+    renderClaudeStatus();
   };
   ws.onclose = () => {
+    S.wsConnected = false;
     const el = $('conn');
     el.classList.remove('up');
     el.title = '再接続中';
     el.setAttribute('aria-label', '接続状態: 再接続中');
+    renderClaudeStatus();
     setTimeout(connectWs, 1500);
   };
   ws.onmessage = async (ev) => {
     const msg = JSON.parse(ev.data);
+    if (
+      msg.type !== 'project'
+      && msg.projectDir
+      && S.projectDir
+      && msg.projectDir !== S.projectDir
+    ) return;
     if (msg.type === 'show') { handleShowDirective(msg.directive); return; }
     if (msg.type === 'ingest-start') {
+      const taskId = msg.taskId ?? `ingest:${msg.file ?? ''}`;
       $('ingestOverlay').hidden = false;
       $('ingestStep').textContent = '取り込み中...';
       $('stage').setAttribute('aria-busy', 'true');
-      setClaudeTask(`取り込み中: ${basename(msg.file ?? '')}`);
+      setClaudeTask(`取り込み中: ${basename(msg.file ?? '')}`, taskId, 'ingest');
     }
     if (msg.type === 'ingest-progress') {
+      const taskId = msg.taskId ?? `ingest:${msg.file ?? ''}`;
       $('ingestStep').textContent = msg.step;
-      setClaudeTask(msg.step);
+      setClaudeTask(msg.step, taskId, 'ingest');
     }
-    if (msg.type === 'upload-start') setClaudeTask(`取り込み中(アップロード): ${msg.name}`);
+    if (msg.type === 'ingest-done') {
+      const taskId = msg.taskId ?? `ingest:${msg.file ?? ''}`;
+      setClaudeTask(null, taskId);
+      if (!hasActiveTaskKind('ingest')) {
+        $('ingestOverlay').hidden = true;
+        $('stage').removeAttribute('aria-busy');
+      }
+    }
+    if (msg.type === 'ingest-error') {
+      const taskId = msg.taskId ?? `ingest:${msg.file ?? ''}`;
+      setClaudeTask(null, taskId);
+      if (!hasActiveTaskKind('ingest')) {
+        $('ingestOverlay').hidden = true;
+        $('stage').removeAttribute('aria-busy');
+      }
+      toast(`${basename(msg.file ?? '素材')} の取り込みを完了できませんでした: ${msg.error}`, { type: 'error' });
+    }
+    if (msg.type === 'upload-start') {
+      setClaudeTask(`取り込み中(アップロード): ${msg.name}`, msg.taskId ?? `upload:${msg.name ?? ''}`, 'upload');
+    }
     if (msg.type === 'upload-progress') {
-      if (msg.done) setClaudeTask(null);
-      else setClaudeTask(`取り込み中(アップロード): ${msg.name} — ${formatBytes(msg.bytes ?? 0)}`);
+      const taskId = msg.taskId ?? `upload:${msg.name ?? ''}`;
+      if (msg.done) setClaudeTask(null, taskId);
+      else setClaudeTask(`取り込み中(アップロード): ${msg.name} — ${formatBytes(msg.bytes ?? 0)}`, taskId, 'upload');
     }
-    if (msg.type === 'color-transform-progress') setClaudeTask(`色変換中: ${msg.sourceId} — ${msg.step}`);
+    if (msg.type === 'upload-error') {
+      setClaudeTask(null, msg.taskId ?? `upload:${msg.name ?? ''}`);
+      toast(`${msg.name ?? '素材'} のアップロードを完了できませんでした: ${msg.error}`, { type: 'error' });
+    }
+    if (msg.type === 'color-transform-progress') {
+      setClaudeTask(`色変換中: ${sourceDisplayName(msg.sourceId)} — ${msg.step}`, msg.taskId ?? `color:${msg.sourceId ?? ''}`, 'color');
+    }
+    if (msg.type === 'color-transform-done') setClaudeTask(null, msg.taskId ?? `color:${msg.sourceId ?? ''}`);
+    if (msg.type === 'color-transform-error') {
+      setClaudeTask(null, msg.taskId ?? `color:${msg.sourceId ?? ''}`);
+      const lead = msg.committed
+        ? '色変換の設定は保存されましたが、プレビューを更新できませんでした'
+        : '色変換を完了できませんでした';
+      toast(`${lead} (${sourceDisplayName(msg.sourceId)}): ${msg.error}`, { type: 'error' });
+    }
     // W-LAZY: `vedit transcribe` background job progress (POST
     // /api/transcribe in daemon.ts). transcribe-done is always followed by a
-    // separate 'update' broadcast (the source.transcribed=true commit),
-    // which the generic handler below already reloads+clears the strip for
-    // — S.transcribing is updated here too just so the media-pool badge and
+    // separate 'update' broadcast (the source.transcribed=true commit).
+    // The explicit done event clears only this source's keyed task; the
+    // generic update must not erase other concurrent work. S.transcribing is
+    // updated here too just so the media-pool badge and
     // Transcript-tab empty state flip instantly instead of waiting on that
     // second message. transcribe-error has no accompanying commit/'update',
     // so it clears the strip and surfaces the failure itself.
     if (msg.type === 'transcribe-progress') {
-      S.transcribing.add(msg.sourceId);
       const src = S.manifest?.sources.find((s) => s.id === msg.sourceId);
-      setClaudeTask(`文字起こし中: ${basename(src ? src.path : msg.sourceId)} …`);
-      if (S.manifest) { renderMediaPanel(); renderTranscript(); }
+      const taskId = msg.taskId ?? `transcribe:${msg.sourceId}`;
+      const merged = msg.job ? rememberTranscribeJob(msg.job) : null;
+      if (isTerminalTranscribeJob(merged)) {
+        S.transcribing.delete(msg.sourceId);
+        setClaudeTask(null, taskId);
+        return;
+      }
+      S.transcribing.add(msg.sourceId);
+      clearTranscriptInteractionState([msg.sourceId]);
+      const suffix = msg.status === 'cancelling' ? ' — 中止処理中…' : ' …';
+      const verb = msg.status === 'queued' ? '文字起こし待機中' : '文字起こし中';
+      setClaudeTask(`${verb}: ${basename(src ? src.path : msg.sourceId)}${suffix}`, taskId, 'transcribe');
+      if (S.manifest) { renderMediaPanelPreservingView(); renderTranscript(); }
     }
     if (msg.type === 'transcribe-done') {
       S.transcribing.delete(msg.sourceId);
-      if (S.manifest) renderMediaPanel();
+      if (msg.job) rememberTranscribeJob(msg.job);
+      clearTranscriptInteractionState([msg.sourceId]);
+      setClaudeTask(null, msg.taskId ?? `transcribe:${msg.sourceId}`);
+      if (S.manifest) { renderMediaPanelPreservingView(); renderTranscript(); }
+      // Do not depend solely on the following generic update event: a socket
+      // interruption between the two must still fetch the committed words.
+      await reload().catch((e) => toast(e.message, { type: 'error' }));
     }
     if (msg.type === 'transcribe-error') {
       S.transcribing.delete(msg.sourceId);
-      setClaudeTask(null);
-      if (S.manifest) { renderMediaPanel(); renderTranscript(); }
-      toast(`文字起こしに失敗しました (${msg.sourceId}): ${msg.error}`, { type: 'error' });
+      if (msg.job) rememberTranscribeJob(msg.job);
+      setClaudeTask(null, msg.taskId ?? `transcribe:${msg.sourceId}`);
+      if (S.manifest) { renderMediaPanelPreservingView(); renderTranscript(); }
+      if (msg.cancelled) toast(`文字起こしを中止しました (${msg.sourceId})`);
+      else toast(`文字起こしに失敗しました (${msg.sourceId}): ${msg.error}`, { type: 'error' });
+      // A failed re-transcribe leaves the prior committed transcript as the
+      // source of truth. Rehydrate it only after terminal failure is known.
+      await reload().catch(() => {});
+    }
+    if (msg.type === 'export-job') {
+      if (msg.projectDir && S.projectDir && msg.projectDir !== S.projectDir) return;
+      S.exportJob = msg.job ?? null;
+      renderExportAskRow();
+      if (msg.job?.status === 'success' || msg.job?.status === 'error') {
+        fetchExportResults().catch(() => {});
+      }
+      return;
+    }
+    if (msg.type === 'scenes') {
+      // Scene detection/notes are sidecar updates and intentionally do not
+      // create a manifest revision. Invalidate only the announced sources;
+      // the progressive reload will refetch those while retaining known
+      // empty/results for every other source (critical for 93-source projects).
+      for (const sourceId of msg.sources ?? []) {
+        S.sceneDetailsLoaded.delete(sourceId);
+        S.scenes.delete(sourceId);
+      }
+      await reload().catch((e) => toast(e.message, { type: 'error' }));
+      return;
     }
     if (msg.type === 'update' || msg.type === 'candidates' || msg.type === 'project') {
-      $('ingestOverlay').hidden = true;
-      $('stage').removeAttribute('aria-busy');
-      setClaudeTask(null);
+      if (msg.type === 'candidates' && msg.detectRun) S.detectRun = msg.detectRun;
+      if (msg.type === 'candidates' && msg.warning) toast(msg.warning, { type: 'warn' });
+      if (msg.type === 'project') {
+        $('ingestOverlay').hidden = true;
+        $('stage').removeAttribute('aria-busy');
+        setClaudeTask(null);
+      }
       // tlNow() assumes #video is playing the timeline mix; during source
       // preview mode it plays an unrelated source proxy, so fall back to the
       // saved pre-preview position instead of deriving a bogus value from it.
@@ -6017,15 +7797,26 @@ function hideIngestFlowCard() {
 }
 $('ingestFlowClose').onclick = hideIngestFlowCard;
 
-async function ingestByLink(path) {
-  await api('/api/ingest', { method: 'POST', body: JSON.stringify({ file: path }) });
+async function ingestByLink(path, expectedProjectDir) {
+  await api('/api/ingest', {
+    method: 'POST', body: JSON.stringify({ file: path }), expectedProjectDir,
+  });
 }
-async function ingestByUpload(file) {
-  const uploaded = await api(`/api/upload?${new URLSearchParams({ name: file.name })}`, { method: 'POST', body: file });
-  await api('/api/ingest', { method: 'POST', body: JSON.stringify({ file: uploaded.path }) });
+async function ingestByUpload(file, expectedProjectDir) {
+  const uploaded = await api(`/api/upload?${new URLSearchParams({ name: file.name })}`, {
+    method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: file, expectedProjectDir,
+  });
+  if (uploaded.projectDir !== expectedProjectDir) {
+    throw new Error('アップロード中にプロジェクトが切り替わりました。取り込みは中止しました');
+  }
+  await api('/api/ingest', {
+    method: 'POST',
+    body: JSON.stringify({ file: uploaded.path, uploadToken: uploaded.uploadToken }),
+    expectedProjectDir,
+  });
 }
 
-async function startSingleFileIngestFlow(file) {
+async function startSingleFileIngestFlow(file, expectedProjectDir) {
   renderIngestFlowCard(`${file.name} を確認しています…`, []);
   let fp;
   try {
@@ -6040,6 +7831,7 @@ async function startSingleFileIngestFlow(file) {
     located = await api('/api/locate-media', {
       method: 'POST',
       body: JSON.stringify({ name: file.name, size: fp.size, mtime: file.lastModified, headSha256: fp.headSha256, tailSha256: fp.tailSha256 }),
+      expectedProjectDir,
     });
   } catch { /* locate is best-effort; fall through to the upload offer */ }
 
@@ -6049,7 +7841,7 @@ async function startSingleFileIngestFlow(file) {
         label: '取り込む', primary: true,
         onClick: async () => {
           hideIngestFlowCard();
-          try { await ingestByLink(located.path); toast(`${file.name} を取り込みました(コピーなし)`); }
+          try { await ingestByLink(located.path, expectedProjectDir); toast(`${file.name} を取り込みました(コピーなし)`); }
           catch (e) { toast(`${file.name} の取り込みに失敗しました: ${e.message}`, { type: 'error' }); }
         },
       },
@@ -6061,27 +7853,30 @@ async function startSingleFileIngestFlow(file) {
         label: `コピーして取り込む(${formatBytes(fp.size)} 使用)`, primary: true,
         onClick: async () => {
           hideIngestFlowCard();
-          try { await ingestByUpload(file); toast(`${file.name} を取り込みました(コピー)`); }
+          try { await ingestByUpload(file, expectedProjectDir); toast(`${file.name} を取り込みました(コピー)`); }
           catch (e) { toast(`${file.name} のアップロードに失敗しました: ${e.message}`, { type: 'error' }); }
         },
       },
       {
-        label: 'Claude に場所を伝える',
-        onClick: () => { hideIngestFlowCard(); toast('チャットで元ファイルの場所を伝えてください — Claude が取り込みます'); },
+        label: 'AIへの依頼をコピー',
+        onClick: () => {
+          hideIngestFlowCard();
+          copyToClipboard(aiRequestEnvelope(`${file.name} の元ファイルは手元にあります。場所を確認して取り込んでください。`));
+        },
       },
       { label: 'キャンセル', onClick: hideIngestFlowCard },
     ]);
   }
 }
 
-async function startMultiFileIngestFlow(files) {
+async function startMultiFileIngestFlow(files, expectedProjectDir) {
   const summary = planSummary(files);
   renderIngestFlowCard(`${summary.count}件・合計 ${summary.totalBytesLabel} を取り込みますか？(手元にある素材はコピーせずリンク、無ければコピー)`, [
-    { label: '取り込む', primary: true, onClick: () => runMultiFileIngest(files) },
+    { label: '取り込む', primary: true, onClick: () => runMultiFileIngest(files, expectedProjectDir) },
     { label: 'キャンセル', onClick: hideIngestFlowCard },
   ]);
 }
-async function runMultiFileIngest(files) {
+async function runMultiFileIngest(files, expectedProjectDir) {
   let done = 0;
   const failed = [];
   for (const file of files) {
@@ -6093,10 +7888,11 @@ async function runMultiFileIngest(files) {
         located = await api('/api/locate-media', {
           method: 'POST',
           body: JSON.stringify({ name: file.name, size: fp.size, mtime: file.lastModified, headSha256: fp.headSha256, tailSha256: fp.tailSha256 }),
+          expectedProjectDir,
         });
       } catch { /* fall back to upload below */ }
-      if (located.found) await ingestByLink(located.path);
-      else await ingestByUpload(file);
+      if (located.found) await ingestByLink(located.path, expectedProjectDir);
+      else await ingestByUpload(file, expectedProjectDir);
       done++;
     } catch (e) {
       failed.push({ name: file.name, error: e?.message ?? String(e) });
@@ -6126,15 +7922,16 @@ window.addEventListener('dragleave', (e) => {
 window.addEventListener('drop', async (e) => {
   if (!e.dataTransfer?.types?.includes('Files')) return;
   e.preventDefault();
+  const expectedProjectDir = S.renderedProjectDir;
   dropDragCounter = 0;
   $('dropOverlay').hidden = true;
   const files = await collectDroppedVideoFiles(e.dataTransfer);
   if (files.length === 0) {
-    toast('動画ファイル(.mp4/.mov/.m4v)が見つかりませんでした', { type: 'error' });
+    toast('対応する動画ファイルが見つかりませんでした', { type: 'error' });
     return;
   }
-  if (files.length === 1) startSingleFileIngestFlow(files[0]);
-  else startMultiFileIngestFlow(files);
+  if (files.length === 1) startSingleFileIngestFlow(files[0], expectedProjectDir);
+  else startMultiFileIngestFlow(files, expectedProjectDir);
 });
 
 // ---------- render root ----------
@@ -6185,6 +7982,7 @@ async function renderAll() {
   renderTranscript();
   renderInbox();
   renderActivityFeed();
+  renderHistoryControls();
   renderMediaPanel();
   renderRange();
   updateFraming();
@@ -6205,23 +8003,30 @@ async function renderAll() {
   updatePrevRevAvailability();
 }
 
-window.addEventListener('resize', () => { drawWave(); renderRuler(); });
+window.addEventListener('resize', () => {
+  drawWave();
+  renderRuler();
+  syncResponsivePanelsA11y();
+});
 // Connect the socket and start the frame loop unconditionally — tick() is a
 // no-op until a segment is loaded — so that if the initial /api/project call
 // fails (e.g. "no project open"), the UI still hears about a project being
 // opened later (via `vedit open`) instead of being stuck until a manual
 // browser refresh.
 connectWs();
-// 波2.5: 起動直後に1回フェッチしておく(exportResultCard 自体は書き出し
-// ビューを開くまで非表示だが、renderInbox からも呼ばれるので DOM は先に
-// 埋めておく)。その後は30秒ごとに書き出しビューが表示中のときだけポーリング
-// (「軽い」— 他のビューを見ている間は叩かない。W-DESIGN ディレクター適応1:
-// ガード条件を旧「確認タブ active」から S.rightMode==='export' へ差し替え)。
-fetchExportResults().catch(() => {});
+// Last-result is fetched by the initial reload after project identity is
+// known. Active job state is polled once a second only while its view is open
+// (WS normally updates it instantly; polling covers a socket reconnect and
+// provides honest partial-byte progress).
 setInterval(() => {
   if (S.rightMode === 'export') fetchExportResults().catch(() => {});
 }, 30000);
+setInterval(() => {
+  if (S.rightMode === 'export') fetchExportJob().catch(() => {});
+}, 1000);
 requestAnimationFrame(tick);
+applyTimelineZoom({ keepPlayhead: false });
+syncResponsivePanelsA11y();
 reload().then(() => {
   if (S.segments.length) loadSeg(0, { play: false });
 }).catch((e) => toast(e.message, { type: 'error' }));

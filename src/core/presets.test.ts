@@ -5,18 +5,21 @@ import path from 'node:path';
 import { listPresets, loadPreset, savePreset } from './presets.js';
 import type { CaptionSettings } from './types.js';
 
-let home: string;
-let realHome: string | undefined;
+let stateRoot: string;
+let presetsPath: string;
+let presetsPathBeforeTest: string | undefined;
 
 beforeEach(() => {
-  home = mkdtempSync(path.join(tmpdir(), 'vedit-home-'));
-  realHome = process.env.HOME;
-  process.env.HOME = home;
+  stateRoot = mkdtempSync(path.join(tmpdir(), 'vedit-presets-state-'));
+  presetsPath = path.join(stateRoot, 'presets.json');
+  presetsPathBeforeTest = process.env.VEDIT_PRESETS_PATH;
+  process.env.VEDIT_PRESETS_PATH = presetsPath;
 });
 
 afterEach(() => {
-  process.env.HOME = realHome;
-  rmSync(home, { recursive: true, force: true });
+  if (presetsPathBeforeTest === undefined) delete process.env.VEDIT_PRESETS_PATH;
+  else process.env.VEDIT_PRESETS_PATH = presetsPathBeforeTest;
+  rmSync(stateRoot, { recursive: true, force: true });
 });
 
 const captions: CaptionSettings = { enabled: true, style: 'bold', maxChars: 20 };

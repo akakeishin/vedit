@@ -1,6 +1,6 @@
 import { promises as fs } from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
+import { resolvePresetsPath } from './statePaths.js';
 import type { CaptionSettings } from './types.js';
 
 // Style presets are global (not per-project) so a caption look can be
@@ -14,20 +14,16 @@ export interface Preset {
   savedAt: string;
 }
 
-function presetsPath(): string {
-  return path.join(os.homedir(), '.config', 'vedit', 'presets.json');
-}
-
 async function readAll(): Promise<Record<string, Preset>> {
   try {
-    return JSON.parse(await fs.readFile(presetsPath(), 'utf8'));
+    return JSON.parse(await fs.readFile(resolvePresetsPath(), 'utf8'));
   } catch {
     return {};
   }
 }
 
 async function writeAll(presets: Record<string, Preset>): Promise<void> {
-  const p = presetsPath();
+  const p = resolvePresetsPath();
   await fs.mkdir(path.dirname(p), { recursive: true });
   await fs.writeFile(p, JSON.stringify(presets, null, 2));
 }

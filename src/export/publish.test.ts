@@ -393,7 +393,7 @@ describe('publishPack', () => {
     const m = baseManifest({ srcDuration: 20, clipOut: 20 });
     await project.writeScenes({
       sourceId: 's1',
-      scenes: [{ id: 's0001', t0: 8, t1: 12, thumb: 'x', hasSpeech: true, energy: 0.1, note: { text: 'From scenes', by: 'user', at: 'now' } }],
+      scenes: [{ id: 's0001', t0: 8, t1: 12, thumb: 'x', hasSpeech: true, energy: 0.1, note: { text: 'From scenes', by: 'user', at: '2026-07-18T00:00:00.000Z' } }],
     });
     const outdir = path.join(project.dir, 'pack-out');
     const result = await publishPack(project, m, [], outdir, { thumbs: 1 });
@@ -456,5 +456,82 @@ describe('publishPack', () => {
       expect(args).toContain(renderedFile);
       expect(args).not.toContain('-vf'); // no cropGeometry for a rendered-file extraction
     }
+  });
+
+  it('replaces a reused output as one generation, removing stale chapters and thumbnails', async () => {
+    runMock.mockClear();
+    const project = await makeProject();
+    const m = baseManifest({ srcDuration: 20, clipOut: 20 });
+    const outdir = path.join(project.dir, 'pack-out');
+    await fs.mkdir(path.join(outdir, 'thumbnails'), { recursive: true });
+    await fs.writeFile(path.join(outdir, 'chapters.txt'), '0:00 STALE CHAPTER\n');
+    await fs.writeFile(path.join(outdir, 'thumbnails', 'thumb-99-t99.0.jpg'), 'stale thumb');
+    await fs.writeFile(path.join(outdir, 'materials.json'), '{"stale":true}');
+
+    const result = await publishPack(project, m, [], outdir, { thumbs: 0 });
+
+    expect(result.outdir).toBe(outdir);
+    expect(result.chaptersFile).toBeNull();
+    await expect(fs.access(path.join(outdir, 'chapters.txt'))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await fs.readdir(path.join(outdir, 'thumbnails'))).toEqual([]);
+    const materials = JSON.parse(await fs.readFile(path.join(outdir, 'materials.json'), 'utf8'));
+    expect(materials.stale).toBeUndefined();
+    expect(materials.duration).toBe(20);
+    expect(result.files.every((file) => file.startsWith(outdir + path.sep))).toBe(true);
+    expect(JSON.parse(await fs.readFile(path.join(outdir, '.vedit-publish-pack.json'), 'utf8')))
+      .toMatchObject({ kind: 'vedit-publish-pack', version: 1, revision: m.revision });
+  });
+
+  it('refuses to replace an arbitrary non-pack directory and preserves every user file', async () => {
+    runMock.mockClear();
+    const project = await makeProject();
+    const m = baseManifest({ srcDuration: 20, clipOut: 20 });
+    const outdir = path.join(project.dir, 'not-a-pack');
+    await fs.mkdir(outdir);
+    await fs.writeFile(path.join(outdir, 'personal-notes.txt'), 'do not delete');
+
+    await expect(publishPack(project, m, [], outdir, { thumbs: 0 }))
+      .rejects.toThrow(/refusing to replace non-vedit files/);
+
+    await expect(fs.readFile(path.join(outdir, 'personal-notes.txt'), 'utf8')).resolves.toBe('do not delete');
+    expect(await fs.readdir(outdir)).toEqual(['personal-notes.txt']);
+  });
+
+  it('refuses the project directory itself as output without moving or modifying the project', async () => {
+    runMock.mockClear();
+    const project = await makeProject();
+    const before = await project.manifest();
+
+    await expect(publishPack(project, before, [], project.dir, { thumbs: 0 }))
+      .rejects.toThrow(/must not be the project directory/);
+
+    expect(await project.manifest()).toEqual(before);
+    await expect(fs.access(path.join(project.dir, 'project.json'))).resolves.toBeUndefined();
+  });
+
+  it('leaves the previous complete pack untouched when staging fails midway', async () => {
+    runMock.mockClear();
+    const project = await makeProject();
+    const m = baseManifest({ srcDuration: 20, clipOut: 20 });
+    m.timeline.motion = [{ id: 'mo1', spec: 'motion/mo1.json', tlStart: 0, duration: 2 }];
+    await fs.writeFile(
+      project.motionSpecPath('mo1'),
+      JSON.stringify({ id: 'mo1', type: 'chapter-card', params: { text: 'New chapter' } }),
+    );
+    const outdir = path.join(project.dir, 'pack-out');
+    await fs.mkdir(path.join(outdir, 'thumbnails'), { recursive: true });
+    await fs.writeFile(path.join(outdir, 'chapters.txt'), '0:00 PREVIOUS\n');
+    await fs.writeFile(path.join(outdir, 'thumbnails', 'previous.jpg'), 'previous thumb');
+    await fs.writeFile(path.join(outdir, 'materials.json'), '{"generation":"previous"}');
+    runMock.mockRejectedValueOnce(new Error('synthetic thumbnail failure'));
+
+    await expect(publishPack(project, m, [], outdir, { thumbs: 1 }))
+      .rejects.toThrow(/synthetic thumbnail failure/);
+
+    await expect(fs.readFile(path.join(outdir, 'chapters.txt'), 'utf8')).resolves.toBe('0:00 PREVIOUS\n');
+    await expect(fs.readFile(path.join(outdir, 'thumbnails', 'previous.jpg'), 'utf8')).resolves.toBe('previous thumb');
+    await expect(fs.readFile(path.join(outdir, 'materials.json'), 'utf8')).resolves.toBe('{"generation":"previous"}');
+    const leftovers = (await fs.readdir(project.dir)).filter((name) => name.includes('.vedit-publish-'));
+    expect(leftovers).toEqual([]);
   });
 });

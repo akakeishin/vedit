@@ -7,17 +7,17 @@
 「検証で確実に踏む」P0/P1 を消化**し、L サイズ提案は S/M の代替設計で痛みを
 先に消す。✅=着地済み。
 
-**Fix 波A — 検証前必須(進行中)**
+**Fix 波A — 検証前必須(完了)**
 - ✅ セリフ吹き出しの ASS 描画(BorderStyle=3 セマンティクス+可視上端アンカー)
 - ✅ breathe がレンダー無動作(scale=eval=frame で式消費、emote も自前プラン)
 - ✅ Selects が keep シーン内の word 編集を巻き戻す(交差保持、--raw で旧動作)
 - ✅ export-guide 実装追随(A2 制限/V2/スプライト/マーカー)
 - ✅ レジストリ汚染(テスト HOME 隔離+並列剪定)
 - ✅ publish-pack がコンポジションでサムネ0枚(bg境界+登場時刻、renderedFile 抽出)
-- ⏳ **P0: compose 再実行が backgroundTrack を消す**(保持スプレッド+範囲外切替点の除去)
-- ⏳ **P1: スプライト z 順の web/render 不一致**(配列順=z順に統一)
-- ⏳ CLI 配線残: publish-pack --render / W7 motionSpecs(loadMotionSpecs)/ selects --raw の daemon 配線
-- ⏳ smoke:compose(実レンダー統合検知 — loudnorm/breathe 級のバグの恒久対策)
+- ✅ **P0: compose 再実行が backgroundTrack を消す**(保持スプレッド+範囲外切替点の除去)
+- ✅ **P1: スプライト z 順の web/render 不一致**(配列順=z順に統一)
+- ✅ CLI 配線: publish-pack --render / W7 motionSpecs(loadMotionSpecs)/ selects --raw の daemon 配線
+- ✅ smoke:compose(実レンダー統合検知 — loudnorm/breathe 級のバグの恒久対策)
 
 **再発防止の規律(Codex 3分類レビュー 2026-07-17 採用 — 検証ループ後に導入)**
 - **Capability Registry**: 全機能に uiExposure
@@ -92,7 +92,7 @@ QC・アーカイブ)を先に埋める。✅=実装済み。
    (プロキシ生成時に適用しプレビューも正しい見た目に)、露出/WB/彩度の
    3パラメータのみ提供、代表フレームのヒストグラム差からショットマッチ候補
    を提案(承認制)。LUT はユーザー提供 or 標準変換式のみ
-6. W6: 横→縦の派生プロジェクト(variant fork、revision 固定、hardlink)
+6. W6: 横→縦の派生プロジェクト(variant fork、revision 固定、独立 CoW clone/copy)
 7. ✅ W7: モーションの最終レンダー焼き込み(4プリセット→ASS/ffmpeg 変換のみ、
    custom-html は対象外と明示)
 8. **W8: キット(プロジェクト横断の制作設定)** — 仕様確定:
@@ -136,7 +136,7 @@ QC・アーカイブ)を先に埋める。✅=実装済み。
 - [ ] `<video>` 二重化による次クリップ先読み+境界スワップ
       (目標: シーク P95 < 150ms、境界 gap < 1フレーム)
 - [ ] 上記でも不足なら MSE/WebCodecs フレームキューへ段階移行
-- [ ] タイムラインのズーム/横スクロール(長尺での精密シーク)
+- [x] タイムラインのズーム/横スクロール(長尺での精密シーク)
 
 ## 字幕(Codex 採点 2/5 → H で CPS/スタイル一致は対応済み)
 
@@ -163,14 +163,14 @@ QC・アーカイブ)を先に埋める。✅=実装済み。
 
 ## UX(Codex レビューから見送り分)
 
-- [ ] 論理 undo/redo スタック(現状は restore ベース+ラベル改善のみ)
+- [x] 論理 undo/redo スタック(UI常設ボタン+標準ショートカットを含む)
 - [ ] CLI `--json` グローバルフラグと `{ok,data,hint,error}` 統一封筒
 - [ ] 接続断時の編集ブロック(現状は再接続表示のみ)
 - [ ] ソースドロワー(シーンサムネの ✓/✕ culling UI — scene index 設計の後続)
 
 ## revision store(Wave F で対応中 → 残り)
 
-- [ ] revisions.jsonl の世代圧縮(snapshot 全量保存の肥大対策。
+- [x] revisions.jsonl の世代圧縮(snapshot 全量保存の肥大対策。
       直近 N 件は全量、それ以前は間引き)
 
 ## スキル運用

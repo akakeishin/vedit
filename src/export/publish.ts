@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import {
   backgroundIntervals,
   COMP_SOURCE_ID,
@@ -15,6 +16,9 @@ import type { Manifest, SceneFile, Transcript } from '../core/types.js';
 import type { Peaks } from '../core/detect.js';
 import type { Project } from '../core/project.js';
 import { run } from '../ingest/run.js';
+
+const PUBLISH_PACK_MARKER = '.vedit-publish-pack.json';
+const PUBLISH_PACK_MARKER_KIND = 'vedit-publish-pack';
 
 /**
  * `vedit publish-pack` — read-only publish material generator (no --base,
@@ -322,7 +326,7 @@ export interface PublishPackResult {
  * zero thumbnails. Entirely read-only with respect to the project (no
  * manifest mutation, no --base needed).
  */
-export async function publishPack(
+async function buildPublishPackInDirectory(
   project: Project,
   m: Manifest,
   transcripts: Transcript[],
@@ -427,5 +431,222 @@ export async function publishPack(
   await fs.writeFile(materialsFile, JSON.stringify(materials, null, 2));
   files.push(materialsFile);
 
+  // Ownership marker for safe reuse. A later run may replace this directory
+  // only because this marker proves it is a generated pack, not an arbitrary
+  // user folder that happened to be chosen as an output destination.
+  await fs.writeFile(path.join(outdir, PUBLISH_PACK_MARKER), JSON.stringify({
+    kind: PUBLISH_PACK_MARKER_KIND,
+    version: 1,
+    projectDir: path.resolve(project.dir),
+    revision: m.revision,
+    generatedAt: new Date().toISOString(),
+  }, null, 2));
+
   return { outdir, files, chaptersFile, chaptersReason, thumbnails, thumbnailsReason, materialsFile };
+}
+
+function rebasedPackResult(
+  result: PublishPackResult,
+  stagingDir: string,
+  finalDir: string,
+): PublishPackResult {
+  const rebase = (file: string): string => path.join(finalDir, path.relative(stagingDir, file));
+  return {
+    ...result,
+    outdir: finalDir,
+    files: result.files.map(rebase),
+    chaptersFile: result.chaptersFile ? rebase(result.chaptersFile) : null,
+    thumbnails: result.thumbnails.map(rebase),
+    materialsFile: rebase(result.materialsFile),
+  };
+}
+
+async function processIsAlive(pid: number): Promise<boolean> {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error: any) {
+    // EPERM still means a process owns that pid; ESRCH means it is gone.
+    return error?.code !== 'ESRCH';
+  }
+}
+
+async function acquirePublishLock(lockDir: string): Promise<() => Promise<void>> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await fs.mkdir(lockDir);
+      try {
+        await fs.writeFile(
+          path.join(lockDir, 'owner.json'),
+          JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }),
+        );
+      } catch (error) {
+        await fs.rm(lockDir, { recursive: true, force: true }).catch(() => {});
+        throw error;
+      }
+      return async () => { await fs.rm(lockDir, { recursive: true, force: true }); };
+    } catch (error: any) {
+      if (error?.code !== 'EEXIST') throw error;
+      let ownerPid = NaN;
+      let ownerKnown = false;
+      try {
+        ownerPid = Number(JSON.parse(await fs.readFile(path.join(lockDir, 'owner.json'), 'utf8')).pid);
+        ownerKnown = Number.isSafeInteger(ownerPid) && ownerPid > 0;
+      } catch { /* an interrupted process may have died before owner.json */ }
+      // mkdir and owner.json are necessarily two filesystem operations. If
+      // another writer observes the directory in that tiny gap, its recent
+      // mtime makes it active rather than "stale"; only an old owner-less
+      // lock, or a lock whose recorded pid is definitely dead, is reclaimed.
+      const lockAgeMs = await fs.stat(lockDir)
+        .then((stat) => Date.now() - stat.mtimeMs)
+        .catch(() => 0);
+      const reclaimable = ownerKnown
+        ? !(await processIsAlive(ownerPid))
+        : lockAgeMs > 60_000;
+      if (attempt === 0 && reclaimable) {
+        await fs.rm(lockDir, { recursive: true, force: true });
+        continue;
+      }
+      throw new Error(`publish-pack is already running for ${path.basename(lockDir).replace(/^\./, '').replace(/\.vedit-publish-lock$/, '')}`);
+    }
+  }
+  throw new Error('could not acquire publish-pack output lock');
+}
+
+async function assertGeneratedPackDirectory(dir: string): Promise<void> {
+  const names = await fs.readdir(dir);
+  if (names.length === 0) return;
+
+  const allowedTopLevel = new Set([PUBLISH_PACK_MARKER, 'chapters.txt', 'materials.json', 'thumbnails', '.DS_Store']);
+  const unexpected = names.filter((name) => !allowedTopLevel.has(name));
+  if (unexpected.length > 0) {
+    throw new Error(
+      `refusing to replace non-vedit files in publish-pack output ${dir}: ${unexpected.join(', ')}`,
+    );
+  }
+
+  if (names.includes(PUBLISH_PACK_MARKER)) {
+    let marker: any;
+    try {
+      marker = JSON.parse(await fs.readFile(path.join(dir, PUBLISH_PACK_MARKER), 'utf8'));
+    } catch (error: any) {
+      throw new Error(`publish-pack ownership marker is unreadable in ${dir}: ${error?.message ?? error}`);
+    }
+    if (marker?.kind !== PUBLISH_PACK_MARKER_KIND || marker?.version !== 1) {
+      throw new Error(`publish-pack ownership marker is invalid in ${dir}`);
+    }
+  } else if (!names.includes('materials.json')) {
+    // Pre-marker packs are accepted only under their exact legacy shape.
+    // materials.json was always mandatory, so its absence means this could
+    // simply be an unrelated directory with a coincidental thumbnails name.
+    throw new Error(`refusing to replace an unmarked directory that is not a legacy vedit publish pack: ${dir}`);
+  }
+
+  for (const name of names) {
+    if (name === '.DS_Store') continue;
+    const full = path.join(dir, name);
+    const stat = await fs.lstat(full);
+    if (stat.isSymbolicLink()) {
+      throw new Error(`refusing to replace publish-pack output containing a symlink: ${full}`);
+    }
+    if (name === 'thumbnails') {
+      if (!stat.isDirectory()) throw new Error(`publish-pack thumbnails path is not a directory: ${full}`);
+      const thumbNames = await fs.readdir(full);
+      const unexpectedThumbs = thumbNames.filter(
+        (thumb) => thumb !== '.DS_Store' && !/^thumb-\d+-t\d+(?:\.\d+)?\.jpg$/.test(thumb),
+      );
+      if (unexpectedThumbs.length > 0) {
+        throw new Error(
+          `refusing to replace non-vedit files in publish-pack thumbnails ${full}: ${unexpectedThumbs.join(', ')}`,
+        );
+      }
+    } else if (!stat.isFile()) {
+      throw new Error(`unexpected non-file in publish-pack output: ${full}`);
+    }
+  }
+}
+
+async function replacePackDirectory(stagingDir: string, finalDir: string): Promise<void> {
+  let backupDir: string | null = null;
+  try {
+    const existing = await fs.lstat(finalDir);
+    if (existing.isSymbolicLink()) {
+      throw new Error(`publish-pack output must not be a symlink: ${finalDir}`);
+    }
+    if (!existing.isDirectory()) {
+      throw new Error(`publish-pack output exists and is not a directory: ${finalDir}`);
+    }
+    await assertGeneratedPackDirectory(finalDir);
+    backupDir = path.join(
+      path.dirname(finalDir),
+      `.${path.basename(finalDir)}.vedit-publish-backup-${process.pid}-${randomUUID()}`,
+    );
+    await fs.rename(finalDir, backupDir);
+  } catch (error: any) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+
+  try {
+    await fs.rename(stagingDir, finalDir);
+  } catch (error: any) {
+    if (backupDir) {
+      try {
+        await fs.rename(backupDir, finalDir);
+        backupDir = null;
+      } catch (rollbackError: any) {
+        throw new Error(
+          `publish-pack replacement failed (${error?.message ?? error}) and rollback failed (${rollbackError?.message ?? rollbackError}); previous pack remains at ${backupDir}`,
+        );
+      }
+    }
+    throw error;
+  }
+
+  if (backupDir) {
+    await fs.rm(backupDir, { recursive: true, force: true }).catch((error: any) => {
+      // The committed pack is complete and visible. A hidden backup cleanup
+      // problem must not turn that successful output into a reported failure.
+      console.error(`警告: 古い公開パックのバックアップを削除できませんでした (${backupDir}): ${error?.message ?? error}`);
+    });
+  }
+}
+
+/**
+ * Build the complete pack off to the side, then switch directories. Reusing
+ * an output path therefore cannot retain old chapters/thumbnails, and a
+ * failed thumbnail extraction leaves the previous complete pack untouched.
+ * A per-output lock rejects concurrent writers instead of exposing a mix of
+ * two generations.
+ */
+export async function publishPack(
+  project: Project,
+  m: Manifest,
+  transcripts: Transcript[],
+  outdir: string,
+  opts: { thumbs?: number; renderedFile?: string } = {},
+): Promise<PublishPackResult> {
+  const finalDir = path.resolve(outdir);
+  if (finalDir === path.parse(finalDir).root) {
+    throw new Error(`refusing to use a filesystem root as publish-pack output: ${finalDir}`);
+  }
+  const projectDir = path.resolve(project.dir);
+  if (projectDir === finalDir || projectDir.startsWith(finalDir + path.sep)) {
+    throw new Error(`publish-pack output must not be the project directory or one of its ancestors: ${finalDir}`);
+  }
+  const parent = path.dirname(finalDir);
+  const base = path.basename(finalDir);
+  await fs.mkdir(parent, { recursive: true });
+  const lockDir = path.join(parent, `.${base}.vedit-publish-lock`);
+  const release = await acquirePublishLock(lockDir);
+  const stagingDir = path.join(parent, `.${base}.vedit-publish-stage-${process.pid}-${randomUUID()}`);
+  try {
+    await fs.mkdir(stagingDir);
+    const staged = await buildPublishPackInDirectory(project, m, transcripts, stagingDir, opts);
+    await replacePackDirectory(stagingDir, finalDir);
+    return rebasedPackResult(staged, stagingDir, finalDir);
+  } finally {
+    await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => {});
+    await release().catch(() => {});
+  }
 }

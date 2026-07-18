@@ -58,6 +58,21 @@ test.describe.serial('vedit web UI', () => {
     expect(consoleErrors, `console errors:\n${consoleErrors.join('\n')}`).toEqual([]);
   });
 
+  test('素材プレビュー: 音声付き素材の「再生」は初回クリックだけで実際に再生を開始する', async ({ page }) => {
+    await openApp(page);
+    const playSource = page.getByRole('button', { name: 'clip.mp4 を再生' });
+    await expect(playSource).toBeVisible();
+    await playSource.click();
+    await expect(page.locator('#previewBanner')).toBeVisible();
+    await expect.poll(
+      () => page.locator('#video').evaluate((el: HTMLVideoElement) => ({ paused: el.paused, readyState: el.readyState })),
+      { timeout: 5_000 },
+    ).toMatchObject({ paused: false, readyState: 4 });
+    await expect(page.locator('#toast')).not.toContainText('再生できませんでした');
+    await page.locator('#previewBannerExit').click();
+    await expect(page.locator('#previewBanner')).toBeHidden();
+  });
+
   // ---- b: シーク同期(F-s3-2/3 回帰) ----
   test('シーク同期: 文字起こしタブで単語クリック→現在タイムコードが即時更新される', async ({ page }) => {
     await openApp(page);

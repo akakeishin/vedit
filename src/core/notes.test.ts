@@ -95,6 +95,19 @@ describe('notes: appendNote / readNotes round trip', () => {
     const notes = await readNotes(dir);
     expect(notes.map((n) => n.type)).toEqual(['policy', 'todo', 'pref']);
   });
+
+  it('keeps every entry from concurrent writers instead of losing a read-modify-write update', async () => {
+    const dir = freshDir();
+    const count = 24;
+    await Promise.all(Array.from({ length: count }, (_, index) => (
+      appendNote(dir, { type: 'decision', text: `decision-${index}`, rev: index })
+    )));
+    const notes = await readNotes(dir);
+    expect(notes).toHaveLength(count);
+    expect(new Set(notes.map((note) => note.text))).toEqual(
+      new Set(Array.from({ length: count }, (_, index) => `decision-${index}`)),
+    );
+  });
 });
 
 describe('notes: tolerant parsing of a hand-edited NOTES.md', () => {
@@ -198,5 +211,19 @@ describe('notes: markTodoDone', () => {
   it('throws a clear error when NOTES.md does not exist yet', async () => {
     const dir = freshDir();
     await expect(markTodoDone(dir, 1)).rejects.toThrow(/NOTES\.md/);
+  });
+
+  it('serializes todo completion with a concurrent preference append so neither update disappears', async () => {
+    const dir = freshDir();
+    await appendNote(dir, { type: 'todo', text: '仕上げを確認する' });
+    await Promise.all([
+      markTodoDone(dir, 1),
+      appendNote(dir, { type: 'pref', text: '余韻は長めに残す' }),
+    ]);
+    const notes = await readNotes(dir);
+    expect(notes.find((note) => note.type === 'todo')?.todos).toEqual([
+      { done: true, text: '仕上げを確認する' },
+    ]);
+    expect(notes.some((note) => note.type === 'pref' && note.text === '余韻は長めに残す')).toBe(true);
   });
 });
