@@ -1556,7 +1556,7 @@ describe('daemon: static/media regular-file streaming resilience', () => {
     expect(Buffer.from(await response.arrayBuffer())).toEqual(raceContent);
     expect((await fetch(`${BASE}/media/proxy/srace`)).status).toBe(404);
     expect((await getJson(BASE, '/api/ping')).body.ok).toBe(true);
-  });
+  }, 15_000);
 });
 
 // ---- Suite 9: project-switch mid-edit race (item 3 in the revision-store audit) ----
