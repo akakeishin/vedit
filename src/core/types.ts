@@ -259,7 +259,12 @@ export interface Timeline {
  * the same MusicItem pipeline as background music/sound effects, just with
  * duck disabled and short anti-click fades instead of BGM-style ones) so
  * removing the dialogue line also removes its voice clip (see the daemon's
- * `dialogue-remove` op).
+ * `dialogue-remove` op). `pos`, when set, is a manual 0..1 normalized
+ * canvas position for the speech bubble's anchor — it takes priority over
+ * both the sprite-derived anchor AND the fixed top-center default (see
+ * dialogueAnchorPixels in render.ts). Absent means "auto-anchor as before
+ * this field existed" — full regression for every project that never sets
+ * it.
  */
 export interface DialogueItem {
   id: string;
@@ -268,6 +273,7 @@ export interface DialogueItem {
   duration: number;
   spriteId?: string;
   voiceMusicId?: string;
+  pos?: { x: number; y: number };
 }
 
 /**

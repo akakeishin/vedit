@@ -1,5 +1,5 @@
-import { keptWords, sourceTimeToTimeline, timelineDuration } from './ops.js';
-import type { Manifest, Transcript } from './types.js';
+import { segments, timelineDuration } from './ops.js';
+import type { Manifest, Transcript, Word } from './types.js';
 
 export interface CaptionCue {
   tlStart: number;
@@ -282,36 +282,61 @@ export function captionCuesWithExclusions(
 ): { cues: CaptionCue[]; excluded: NonSpeechExclusion[] } {
   if (!m.captions.enabled) return { cues: [], excluded: [] };
   const cues: CaptionCue[] = [];
+  const allSegments = segments(m);
   for (const t of transcripts) {
-    const words = keptWords(m, t.sourceId, t.words);
-    let buf: typeof words = [];
+    // Placement-aware word mapping (fixes: the same source placed twice on
+    // the timeline only ever got cues for its FIRST placement). Rather than
+    // filtering the transcript once per source (keptWords) and mapping each
+    // surviving word's time via sourceTimeToTimeline — which always resolves
+    // to whichever placement's Segment comes first, no matter how many
+    // placements a word's source-time actually falls inside — this walks
+    // this source's Segments directly (one per timeline placement, in
+    // timeline order) and re-derives each word's timeline time from the
+    // SPECIFIC segment it was found in. A word whose source time falls
+    // inside two placements is therefore visited twice, once per placement,
+    // each producing its own buffered cue.
+    const segsForSource = allSegments.filter((s) => s.sourceId === t.sourceId);
+    type BufWord = { word: Word; tl0: number; tl1: number };
+    let buf: BufWord[] = [];
     const flush = () => {
       if (buf.length === 0) return;
-      const tlStart = sourceTimeToTimeline(m, t.sourceId, (buf[0].t0 + buf[0].t1) / 2);
+      const first = buf[0];
       const last = buf[buf.length - 1];
-      const tlEnd = sourceTimeToTimeline(m, t.sourceId, (last.t0 + last.t1) / 2);
-      if (tlStart !== null && tlEnd !== null) {
-        const join = buf.some((w) => isCjk(w.text)) ? '' : ' ';
-        const text = sanitizeCaptionText(buf.map((w) => w.text).join(join));
-        if (text) {
-          cues.push({
-            tlStart,
-            tlEnd: Math.max(tlEnd + (last.t1 - last.t0) / 2 + 0.15, tlStart + 0.6),
-            text,
-            wordIds: buf.map((w) => w.id),
-            sourceId: t.sourceId,
-          });
-        }
+      // Matches the pre-fix arithmetic exactly (tlStart from the FIRST
+      // word's midpoint, tlEnd from the LAST word's end + 0.15s padding,
+      // floored at a 0.6s minimum) — only the source of tl0/tl1 changed
+      // (now per-segment, not a global sourceTimeToTimeline lookup).
+      const tlStart = (first.tl0 + first.tl1) / 2;
+      const tlEnd = Math.max(last.tl1 + 0.15, tlStart + 0.6);
+      const join = buf.some((x) => isCjk(x.word.text)) ? '' : ' ';
+      const text = sanitizeCaptionText(buf.map((x) => x.word.text).join(join));
+      if (text) {
+        cues.push({ tlStart, tlEnd, text, wordIds: buf.map((x) => x.word.id), sourceId: t.sourceId });
       }
       buf = [];
     };
-    for (let i = 0; i < words.length; i++) {
-      const w = words[i];
-      const prev = buf[buf.length - 1];
-      const lineLen = buf.reduce((a, x) => a + x.text.length, 0);
-      if (prev && (w.t0 - prev.t1 > 0.6 || lineLen + w.text.length > m.captions.maxChars)) flush();
-      buf.push(w);
-      if (/[。．.!?！？]$/u.test(w.text)) flush();
+    for (const seg of segsForSource) {
+      const segDur = seg.tlEnd - seg.tlStart;
+      for (const w of t.words) {
+        const mid = (w.t0 + w.t1) / 2;
+        if (mid < seg.srcStart || mid >= seg.srcStart + segDur) continue;
+        const tl0 = seg.tlStart + (w.t0 - seg.srcStart);
+        const tl1 = seg.tlStart + (w.t1 - seg.srcStart);
+        const prev = buf[buf.length - 1];
+        const lineLen = buf.reduce((a, x) => a + x.word.text.length, 0);
+        // Gap/line-length flush, unchanged in spirit from before: the gap
+        // check now compares TIMELINE time (tl0 - prev.tl1) rather than raw
+        // source time. Within one segment these are numerically identical
+        // (a fixed per-segment offset cancels out of the subtraction), so
+        // every existing single-placement test is unaffected; across a
+        // segment boundary this is what lets a ripple-cut mid-sentence
+        // (two adjacent segments from the same original placement) still
+        // read as one continuous cue, while two genuinely distant
+        // placements of the same source correctly start a fresh cue.
+        if (prev && (tl0 - prev.tl1 > 0.6 || lineLen + w.text.length > m.captions.maxChars)) flush();
+        buf.push({ word: w, tl0, tl1 });
+        if (/[。．.!?！？]$/u.test(w.text)) flush();
+      }
     }
     flush();
   }

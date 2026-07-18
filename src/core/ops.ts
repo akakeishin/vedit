@@ -70,10 +70,39 @@ export function sourceRangeToTimeline(m: Manifest, sourceId: string, t0: number,
   return start === null || end === null ? null : { tlStart: start, tlEnd: end };
 }
 
+/** Below this duration (seconds), a leftover split fragment is absorbed into the cut rather than kept — see removeSourceRange. */
+export const MIN_FRAGMENT_SECONDS = 0.35;
+
+/** One same-source fragment removeSourceRange swallowed into a cut because it fell under MIN_FRAGMENT_SECONDS — see removeSourceRange's `fragmentsAbsorbed` annotation. */
+export interface AbsorbedFragment {
+  /** Which side of the cut the fragment sat on. */
+  side: 'before' | 'after';
+  /** The absorbed fragment's own duration, in seconds. */
+  seconds: number;
+}
+
 /**
  * Remove a source-time range from every clip that references it.
  * Clips are split/trimmed; empty clips are dropped. Ripple layout means
  * downstream content shifts left automatically.
+ *
+ * F-s1-1: a split that would leave a sliver shorter than
+ * MIN_FRAGMENT_SECONDS on either side (e.g. a silence candidate starting
+ * 0.1s into a clip) absorbs that sliver into the cut instead of keeping it
+ * as its own tiny clip — those slivers are unwatchable/unusable and just
+ * clutter the timeline with 0.1–0.4s fragments (the exact symptom reported
+ * in verification). Only fragments PRODUCED BY THIS SPLIT are eligible: a
+ * clip that doesn't intersect [a,b) at all is pushed through untouched
+ * above, so a pre-existing short clip elsewhere on the timeline (one this
+ * operation didn't create) is never touched. When both sides of a single
+ * clip are absorbed, the whole clip is removed — same end state as a range
+ * that covers it outright. The absorbed fragments (if any) are attached as
+ * a non-enumerable `fragmentsAbsorbed` on the returned manifest — invisible
+ * to JSON.stringify/the persisted project.json, same pattern as
+ * buildSelectsTimeline's `.summary` — so callers that want to mention the
+ * absorption in a user-facing summary (see daemon.ts's remove-words/
+ * remove-range/apply-candidates) can inspect it without this function
+ * needing to know anything about how its result gets reported.
  */
 export function removeSourceRange(m: Manifest, sourceId: string, t0: number, t1: number): Manifest {
   if (!Number.isFinite(t0) || !Number.isFinite(t1)) {
@@ -86,17 +115,31 @@ export function removeSourceRange(m: Manifest, sourceId: string, t0: number, t1:
   // without removing time — a pure no-op with side effects. Refuse it.
   if (b - a < 0.5 / fps) return m;
   const next: VideoClip[] = [];
+  const fragmentsAbsorbed: AbsorbedFragment[] = [];
   for (const c of m.timeline.video) {
     if (c.sourceId !== sourceId || b <= c.srcIn || a >= c.srcOut) {
       next.push(c);
       continue;
     }
-    const left: VideoClip | null = a > c.srcIn ? { ...c, srcOut: Math.min(a, c.srcOut) } : null;
-    const right: VideoClip | null = b < c.srcOut ? { ...c, id: left ? freshId('c') : c.id, srcIn: Math.max(b, c.srcIn) } : null;
-    if (left && left.srcOut - left.srcIn > 1e-6) next.push(left);
-    if (right && right.srcOut - right.srcIn > 1e-6) next.push(right);
+    const leftCandidate: VideoClip | null = a > c.srcIn ? { ...c, srcOut: Math.min(a, c.srcOut) } : null;
+    const leftDur = leftCandidate ? leftCandidate.srcOut - leftCandidate.srcIn : 0;
+    const keepLeft = Boolean(leftCandidate) && leftDur > 1e-6 && leftDur >= MIN_FRAGMENT_SECONDS;
+    if (leftCandidate && leftDur > 1e-6 && !keepLeft) fragmentsAbsorbed.push({ side: 'before', seconds: leftDur });
+
+    const rightCandidate: VideoClip | null =
+      b < c.srcOut ? { ...c, id: keepLeft ? freshId('c') : c.id, srcIn: Math.max(b, c.srcIn) } : null;
+    const rightDur = rightCandidate ? rightCandidate.srcOut - rightCandidate.srcIn : 0;
+    const keepRight = Boolean(rightCandidate) && rightDur > 1e-6 && rightDur >= MIN_FRAGMENT_SECONDS;
+    if (rightCandidate && rightDur > 1e-6 && !keepRight) fragmentsAbsorbed.push({ side: 'after', seconds: rightDur });
+
+    if (keepLeft) next.push(leftCandidate!);
+    if (keepRight) next.push(rightCandidate!);
   }
-  return { ...m, timeline: { ...m.timeline, video: next } };
+  const result = { ...m, timeline: { ...m.timeline, video: next } } as Manifest & { fragmentsAbsorbed?: AbsorbedFragment[] };
+  if (fragmentsAbsorbed.length > 0) {
+    Object.defineProperty(result, 'fragmentsAbsorbed', { value: fragmentsAbsorbed, enumerable: false, configurable: true });
+  }
+  return result;
 }
 
 /** Remove the source range spanned by a contiguous run of words (with padding trimmed to word gaps). */
@@ -1807,11 +1850,11 @@ export function shiftComposition(
 // types.ts. Available on any project (not gated to composition), since
 // nothing about it depends on Manifest.composition.
 
-/** Add a speech-bubble line at an absolute timeline time. `spriteId`, when given, must reference an existing sprite (used only to aim the bubble's tail — see kit.ts's deriveSpeechBubbleStyle). */
+/** Add a speech-bubble line at an absolute timeline time. `spriteId`, when given, must reference an existing sprite (used only to aim the bubble's tail — see kit.ts's deriveSpeechBubbleStyle). `pos`, when given, is a manual 0..1 normalized canvas position that overrides the auto-anchor (see DialogueItem's doc). */
 export function addDialogue(
   m: Manifest,
   text: string,
-  opts: { tlStart: number; duration?: number; spriteId?: string; voiceMusicId?: string; id?: string },
+  opts: { tlStart: number; duration?: number; spriteId?: string; voiceMusicId?: string; pos?: { x: number; y: number }; id?: string },
 ): Manifest {
   if (typeof text !== 'string' || !text.trim()) throw new Error('dialogue-add: text is required');
   if (!Number.isFinite(opts.tlStart) || opts.tlStart < 0) {
@@ -1824,6 +1867,10 @@ export function addDialogue(
   if (opts.spriteId !== undefined && !(m.timeline.sprites ?? []).some((s) => s.id === opts.spriteId)) {
     throw new Error(`dialogue-add: unknown sprite: ${opts.spriteId}`);
   }
+  if (opts.pos !== undefined) {
+    assertUnit(opts.pos.x, 'dialogue-add', 'pos.x');
+    assertUnit(opts.pos.y, 'dialogue-add', 'pos.y');
+  }
   const dialogue = m.timeline.dialogue ?? [];
   const id = opts.id ?? freshId('dl');
   if (dialogue.some((d) => d.id === id)) throw new Error(`dialogue-add: id already exists: ${id}`);
@@ -1834,15 +1881,16 @@ export function addDialogue(
     duration,
     ...(opts.spriteId ? { spriteId: opts.spriteId } : {}),
     ...(opts.voiceMusicId ? { voiceMusicId: opts.voiceMusicId } : {}),
+    ...(opts.pos ? { pos: opts.pos } : {}),
   };
   return { ...m, timeline: { ...m.timeline, dialogue: [...dialogue, item] } };
 }
 
-/** Patch an existing dialogue line's text/placement/sprite reference (never its `voiceMusicId` — re-add with `--voice` to change the voice clip). `spriteId: null` clears the tail-direction reference. */
+/** Patch an existing dialogue line's text/placement/sprite reference/pos (never its `voiceMusicId` — re-add with `--voice` to change the voice clip). `spriteId: null` clears the tail-direction reference; `pos: null` clears the manual position back to auto-anchor. */
 export function updateDialogue(
   m: Manifest,
   id: string,
-  patch: { text?: string; tlStart?: number; duration?: number; spriteId?: string | null },
+  patch: { text?: string; tlStart?: number; duration?: number; spriteId?: string | null; pos?: { x: number; y: number } | null },
 ): Manifest {
   const dialogue = m.timeline.dialogue ?? [];
   const idx = dialogue.findIndex((d) => d.id === id);
@@ -1875,9 +1923,43 @@ export function updateDialogue(
       next.spriteId = patch.spriteId;
     }
   }
+  if (patch.pos !== undefined) {
+    if (patch.pos === null) {
+      delete next.pos;
+    } else {
+      assertUnit(patch.pos.x, 'dialogue-update', 'pos.x');
+      assertUnit(patch.pos.y, 'dialogue-update', 'pos.y');
+      next.pos = patch.pos;
+    }
+  }
   const out = [...dialogue];
   out[idx] = next;
   return { ...m, timeline: { ...m.timeline, dialogue: out } };
+}
+
+/**
+ * True when a candidate dialogue window [tlStart, tlStart+duration) overlaps
+ * an EXISTING dialogue item's window AND neither one specifies a manual
+ * `pos` — two auto-anchored speech bubbles at the same moment both fall
+ * back to the same fixed/sprite-derived anchor (see dialogueAnchorPixels in
+ * render.ts), so they're likely to visually collide. A candidate or an
+ * existing item that already has `pos` set is assumed to have been placed
+ * deliberately to avoid exactly this, so that pairing is never flagged.
+ * Pure query, used by the daemon's dialogue-add handler to build the
+ * "同時刻のセリフが重なる可能性" warning — never throws, never mutates.
+ */
+export function dialogueOverlapWithoutPosRisk(
+  m: Manifest,
+  candidate: { tlStart: number; duration: number; pos?: { x: number; y: number }; excludeId?: string },
+): boolean {
+  if (candidate.pos) return false;
+  const cEnd = candidate.tlStart + candidate.duration;
+  return (m.timeline.dialogue ?? []).some((d) => {
+    if (candidate.excludeId && d.id === candidate.excludeId) return false;
+    if (d.pos) return false;
+    const dEnd = d.tlStart + d.duration;
+    return candidate.tlStart < dEnd && d.tlStart < cEnd;
+  });
 }
 
 /** Remove a dialogue line. Does NOT remove its `voiceMusicId`'s MusicItem — that cascade (one commit, two ops.ts calls) is the daemon's job, keeping this a single-purpose mutator like removeSprite/removeMusic. */

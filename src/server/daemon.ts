@@ -9,6 +9,7 @@ import {
   addDialogue,
   addIntentZone,
   backgroundIntervals,
+  dialogueOverlapWithoutPosRisk,
   addMusic,
   addOverlay,
   addSprite,
@@ -56,7 +57,7 @@ import {
   updateSprite,
   wordRange,
 } from '../core/ops.js';
-import type { ShiftSummary } from '../core/ops.js';
+import type { AbsorbedFragment, ShiftSummary } from '../core/ops.js';
 import { upsertProject } from '../core/registry.js';
 import { captionCues } from '../core/captions.js';
 import { detectFillers, detectSilences, detectSilencesFromPeaks } from '../core/detect.js';
@@ -118,6 +119,19 @@ function json(res: http.ServerResponse, status: number, body: unknown) {
   const data = JSON.stringify(body, null, 1);
   res.writeHead(status, { 'content-type': 'application/json' });
   res.end(data);
+}
+
+/**
+ * F-s1-1: turns a removeSourceRange result's `fragmentsAbsorbed` annotation
+ * (see ops.ts) into a short human-readable suffix — used by remove-words/
+ * remove-range/apply-candidates below so a short leftover fragment getting
+ * swallowed into a cut shows up in the revision summary/CLI output instead
+ * of silently vanishing. '' (never absorbed anything) is the common case.
+ */
+function fragmentAbsorptionNote(fragments: AbsorbedFragment[] | undefined): string {
+  if (!fragments || fragments.length === 0) return '';
+  const totalSeconds = fragments.reduce((sum, f) => sum + f.seconds, 0);
+  return ` (${totalSeconds.toFixed(1)}秒の断片を${fragments.length}件吸収)`;
 }
 
 const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10MB
@@ -1112,10 +1126,15 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
           // commit a revision that changes nothing.
           return json(res, 400, { error: 'range does not intersect source media' });
         }
-        await mutate(p, actor, baseRev, 'remove-words', b, `removed ${removed} words (${removedSeconds.toFixed(1)}s): "${text.slice(0, 40)}"`, (m) =>
-          removeSourceRange(m, sourceId!, r.t0, r.t1),
+        // F-s1-1: surface any short-fragment absorption (see removeSourceRange)
+        // in both the revision summary and this response's own fields.
+        const fragmentsAbsorbed = (preview as Manifest & { fragmentsAbsorbed?: AbsorbedFragment[] }).fragmentsAbsorbed;
+        await mutate(
+          p, actor, baseRev, 'remove-words', b,
+          `removed ${removed} words (${removedSeconds.toFixed(1)}s): "${text.slice(0, 40)}"${fragmentAbsorptionNote(fragmentsAbsorbed)}`,
+          (m) => removeSourceRange(m, sourceId!, r.t0, r.t1),
         );
-        return json(res, 200, { removedSeconds, state: await stateSummary(p, ctx.transcribeJobs) });
+        return json(res, 200, { removedSeconds, ...(fragmentsAbsorbed ? { fragmentsAbsorbed } : {}), state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'remove-range') {
         let sourceId = b.sourceId as string | undefined;
@@ -1133,10 +1152,13 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         if (removedSeconds < 1 / m0.fps) {
           return json(res, 400, { error: 'range does not intersect source media' });
         }
-        await mutate(p, actor, baseRev, 'remove-range', b, `removed ${removedSeconds.toFixed(1)}s of source ${sourceId}`, (m) =>
-          removeSourceRange(m, sourceId!, b.t0, b.t1),
+        const fragmentsAbsorbed = (preview as Manifest & { fragmentsAbsorbed?: AbsorbedFragment[] }).fragmentsAbsorbed;
+        await mutate(
+          p, actor, baseRev, 'remove-range', b,
+          `removed ${removedSeconds.toFixed(1)}s of source ${sourceId}${fragmentAbsorptionNote(fragmentsAbsorbed)}`,
+          (m) => removeSourceRange(m, sourceId!, b.t0, b.t1),
         );
-        return json(res, 200, { removedSeconds, state: await stateSummary(p, ctx.transcribeJobs) });
+        return json(res, 200, { removedSeconds, ...(fragmentsAbsorbed ? { fragmentsAbsorbed } : {}), state: await stateSummary(p, ctx.transcribeJobs) });
       }
       if (b.op === 'trim') {
         await mutate(p, actor, baseRev, 'trim', b, `trim ${b.clipId} ${b.edge} ${b.frames}f`, (m) =>
@@ -1483,6 +1505,18 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         }
         const tlStart = Number(b.tlStart);
         const duration = b.duration !== undefined ? Number(b.duration) : undefined;
+        // --pos <x,y>: a manual 0..1 normalized bubble position (see
+        // DialogueItem.pos / dialogueAnchorPixels in render.ts) — actual
+        // range validation happens inside addDialogue below, same division
+        // of labor as every other numeric field here.
+        const pos: { x: number; y: number } | undefined =
+          b.pos && typeof b.pos === 'object' ? { x: Number(b.pos.x), y: Number(b.pos.y) } : undefined;
+        // Overlap warning (non-fatal — never blocks the add): two
+        // auto-anchored bubbles at the same moment are likely to collide.
+        // Computed against `m0` (before this add lands) since the new
+        // item's own window can't overlap itself.
+        const overlapRisk = dialogueOverlapWithoutPosRisk(m0, { tlStart, duration: duration ?? 2.5, pos });
+        const warnings: string[] = overlapRisk ? ['同時刻のセリフが重なる可能性(--pos で位置を分けられます)'] : [];
         const id = freshId('dl');
         let voicePath: string | undefined;
         let voiceMusicId: string | undefined;
@@ -1499,7 +1533,7 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         }
         await mutate(
           p, actor, baseRev, 'dialogue-add', b,
-          `dialogue-add "${String(b.text).slice(0, 20)}" at ${tlStart}s`,
+          `dialogue-add "${String(b.text).slice(0, 20)}" at ${tlStart}s${overlapRisk ? ' — 同時刻のセリフが重なる可能性' : ''}`,
           (m) => {
             let cur = m;
             if (voiceMusicId && voicePath) {
@@ -1511,10 +1545,13 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
                 id: voiceMusicId, tlStart, duration: duration ?? 2.5, gain: 0, fadeIn: 0.05, fadeOut: 0.05, duck: false,
               });
             }
-            return addDialogue(cur, b.text, { tlStart, duration, spriteId: b.spriteId, voiceMusicId, id });
+            return addDialogue(cur, b.text, { tlStart, duration, spriteId: b.spriteId, voiceMusicId, pos, id });
           },
         );
-        return json(res, 200, { id, ...(voiceMusicId ? { voiceMusicId } : {}), state: await stateSummary(p, ctx.transcribeJobs) });
+        return json(res, 200, {
+          id, ...(voiceMusicId ? { voiceMusicId } : {}), ...(warnings.length ? { warnings } : {}),
+          state: await stateSummary(p, ctx.transcribeJobs),
+        });
       }
       if (b.op === 'dialogue-update') {
         if (!(m0.timeline.dialogue ?? []).some((d) => d.id === b.id)) {
@@ -1523,8 +1560,10 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
         if (b.spriteId !== undefined && b.spriteId !== null && !(m0.timeline.sprites ?? []).some((s) => s.id === b.spriteId)) {
           return json(res, 400, { error: `dialogue-update: unknown sprite: ${b.spriteId}` });
         }
+        const pos: { x: number; y: number } | null | undefined =
+          b.pos === null ? null : b.pos && typeof b.pos === 'object' ? { x: Number(b.pos.x), y: Number(b.pos.y) } : undefined;
         await mutate(p, actor, baseRev, 'dialogue-update', b, `dialogue-update ${b.id}`, (m) =>
-          updateDialogue(m, b.id, { text: b.text, tlStart: b.tlStart, duration: b.duration, spriteId: b.spriteId }),
+          updateDialogue(m, b.id, { text: b.text, tlStart: b.tlStart, duration: b.duration, spriteId: b.spriteId, pos }),
         );
         return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
       }
@@ -1815,11 +1854,41 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       const merged = [...decided, ...fresh];
       await p.writeCandidates(merged);
       broadcast(ctx, { type: 'candidates', pending: fresh.length });
+      // F-s1-3: a soft, non-blocking hint — never refuses to detect, just
+      // flags when silence-cutting is likely to fragment the timeline into
+      // a lot of tiny slivers (the reported real case: a no-speech street
+      // walk turned into dozens of 0.1–0.4s clips). Two conservative,
+      // cheap-to-check triggers, either one is enough:
+      //   (a) no source has a transcript at all — silence detection on
+      //       material with no speech to anchor against is exactly the
+      //       "scenes/culling fits better" case from verification.
+      //   (b) there IS a transcript, but simulating this batch's freshly
+      //       proposed candidates against the CURRENT timeline (discarded
+      //       afterward — never persisted) trips removeSourceRange's own
+      //       F-s1-1 short-fragment absorption (see ops.ts) often enough
+      //       that the candidate set itself looks fragmentation-prone.
+      const detectWarnings: string[] = [];
+      if (b.silence !== false) {
+        const FRAGMENTATION_HINT = '発話が少ない素材では無音カットは断片化しやすい — シーン選別(カリング)の方が向いています';
+        if (transcripts.length === 0) {
+          detectWarnings.push(FRAGMENTATION_HINT);
+        } else {
+          let preview = m;
+          let absorbedCount = 0;
+          for (const c of fresh) {
+            preview = removeSourceRange(preview, c.sourceId, c.t0, c.t1);
+            const abs = (preview as Manifest & { fragmentsAbsorbed?: AbsorbedFragment[] }).fragmentsAbsorbed;
+            if (abs) absorbedCount += abs.length;
+          }
+          if (absorbedCount >= 3) detectWarnings.push(FRAGMENTATION_HINT);
+        }
+      }
       return json(res, 200, {
         pending: fresh.filter((c) => c.status === 'proposed'),
         summary: `${fresh.length} candidates (use approve/reject; approving applies the cut)`,
         revision: m.revision,
         ...(excludedByIntentZones > 0 ? { excludedByIntentZones } : {}),
+        ...(detectWarnings.length ? { warnings: detectWarnings } : {}),
       });
     }
     if (pathname === '/api/candidates/decide' && method === 'POST') {
@@ -1833,6 +1902,12 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       // so a concurrent /api/detect or another decide can't interleave a
       // stale read of candidates.json between "decide what to apply" and
       // "write the result".
+      // F-s1-1: fragmentsAbsorbed across every candidate's removeSourceRange
+      // call in this approve batch — populated inside commitFor's closure
+      // below (the only place with access to each intermediate `preview`),
+      // then reused after decideCandidates returns for both the broadcast
+      // summary and this response's own field.
+      let approveFragmentsAbsorbed: AbsorbedFragment[] = [];
       const result = await p.decideCandidates(
         (all) => (b.ids === 'all' ? all.filter((c) => c.status === 'proposed') : all.filter((c) => b.ids.includes(c.id))),
         b.decision,
@@ -1846,14 +1921,20 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
               // be thrown off by a concurrent write between "preview" and
               // "commit" (the bug this whole method exists to close).
               let preview = before;
-              for (const c of target) preview = removeSourceRange(preview, c.sourceId, c.t0, c.t1);
+              const fragmentsAbsorbed: AbsorbedFragment[] = [];
+              for (const c of target) {
+                preview = removeSourceRange(preview, c.sourceId, c.t0, c.t1);
+                const abs = (preview as Manifest & { fragmentsAbsorbed?: AbsorbedFragment[] }).fragmentsAbsorbed;
+                if (abs) fragmentsAbsorbed.push(...abs);
+              }
+              approveFragmentsAbsorbed = fragmentsAbsorbed;
               const removedSeconds = timelineDuration(before) - timelineDuration(preview);
               return {
                 baseRev,
                 actor,
                 op: 'apply-candidates',
                 params: { ids: target.map((c) => c.id) },
-                summary: `applied ${target.length} cuts (-${removedSeconds.toFixed(1)}s)`,
+                summary: `applied ${target.length} cuts (-${removedSeconds.toFixed(1)}s)${fragmentAbsorptionNote(fragmentsAbsorbed)}`,
                 mutate: (m: Manifest) => {
                   let cur = m;
                   for (const c of target) cur = removeSourceRange(cur, c.sourceId, c.t0, c.t1);
@@ -1869,11 +1950,15 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
           type: 'update',
           revision: result.manifest.revision,
           op: 'apply-candidates',
-          summary: `applied ${result.target.length} cuts (-${removedSeconds.toFixed(1)}s)`,
+          summary: `applied ${result.target.length} cuts (-${removedSeconds.toFixed(1)}s)${fragmentAbsorptionNote(approveFragmentsAbsorbed)}`,
         });
       }
       broadcast(ctx, { type: 'candidates', pending: result.all.filter((c) => c.status === 'proposed').length });
-      return json(res, 200, { decided: result.target.length, state: await stateSummary(p, ctx.transcribeJobs) });
+      return json(res, 200, {
+        decided: result.target.length,
+        ...(approveFragmentsAbsorbed.length ? { fragmentsAbsorbed: approveFragmentsAbsorbed } : {}),
+        state: await stateSummary(p, ctx.transcribeJobs),
+      });
     }
 
     // ---- scene index (non-destructive: no baseRev, like candidates.json) ----

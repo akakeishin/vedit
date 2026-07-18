@@ -74,7 +74,7 @@ const BOOLEAN_FLAGS = new Set([
   'latest', 'full', 'all', 'burn-captions', 'no-burn-captions', 'no-duck',
   'no-repair', 'fast-loudnorm', 'deess', 'confirm',
   'plan', 'link', 'no-verify', 'force', 'flip', 'no-flip',
-  'clear', 'no-motion', 'no-sprite', 'raw', 'keep-duration', 'sfx',
+  'clear', 'no-motion', 'no-sprite', 'no-pos', 'raw', 'keep-duration', 'sfx',
 ]);
 const argv = process.argv.slice(2);
 const cmd = argv[0];
@@ -417,8 +417,10 @@ anime:     compose <dir> --duration 秒 --size WxH|比率 [--name n] [--backgrou
              # コンポジション(スプライトアニメ): 映像ソースなしの製作モード。ゆる紙芝居+キャラが緩く動くショート
            bg-set --at t --to <#hex|assetId|videoPath> --base <rev>   # 紙芝居の背景切替(t=0 は基本背景を置換)
            bg-remove --at t --base <rev>
-           dialogue-add "セリフ" --at t [--duration s] [--sprite <spriteItemId>] [--voice <音声ファイル>] --base <rev>
-           dialogue-update <id> ["新テキスト"] [--at t] [--duration s] [--sprite <id>|--no-sprite] --base <rev>
+           dialogue-add "セリフ" --at t [--duration s] [--sprite <spriteItemId>] [--pos x,y] [--voice <音声ファイル>] --base <rev>
+             # --pos は 0..1 正規化座標の手動アンカー(自動配置より優先)。同時刻の既存セリフと重なり、
+             # 双方に --pos が無い場合は warnings に重なり注意が出る(ブロックはしない)
+           dialogue-update <id> ["新テキスト"] [--at t] [--duration s] [--sprite <id>|--no-sprite] [--pos x,y|--no-pos] --base <rev>
            dialogue-remove <id> --base <rev>
            shift --from <t> --by <±秒> [--keep-duration] --base <rev>
              # 「間」の一括調整(コンポジション専用): t>=from の sprite/dialogue/music/背景切替を平行移動。
@@ -573,21 +575,35 @@ async function main() {
     }
 
     case 'dialogue-add': {
-      const USAGE = 'usage: vedit dialogue-add "text" --at <t> [--duration s] [--sprite <spriteItemId>] [--voice <audioFile>] --base <rev>';
+      const USAGE =
+        'usage: vedit dialogue-add "text" --at <t> [--duration s] [--sprite <spriteItemId>] [--pos x,y] [--voice <audioFile>] --base <rev>';
       const text = pos[0] ?? fail(USAGE);
       const tlStart = numFlag('at', flags.at) ?? fail(USAGE);
+      let dialoguePos: { x: number; y: number } | undefined;
+      if (flags.pos !== undefined) {
+        const [xs, ys] = String(flags.pos).split(',');
+        dialoguePos = { x: numArg('--pos x', xs), y: numArg('--pos y', ys) };
+      }
       return edit({
         op: 'dialogue-add',
         text,
         tlStart,
         duration: numFlag('duration', flags.duration),
         spriteId: flags.sprite,
+        pos: dialoguePos,
         voice: flags.voice ? path.resolve(String(flags.voice)) : undefined,
       });
     }
 
     case 'dialogue-update': {
-      const id = pos[0] ?? fail('usage: vedit dialogue-update <id> ["text"] [--at t] [--duration s] [--sprite <id>|--no-sprite] --base <rev>');
+      const id = pos[0] ?? fail('usage: vedit dialogue-update <id> ["text"] [--at t] [--duration s] [--sprite <id>|--no-sprite] [--pos x,y|--no-pos] --base <rev>');
+      let dialoguePos: { x: number; y: number } | null | undefined;
+      if (flags['no-pos']) {
+        dialoguePos = null;
+      } else if (flags.pos !== undefined) {
+        const [xs, ys] = String(flags.pos).split(',');
+        dialoguePos = { x: numArg('--pos x', xs), y: numArg('--pos y', ys) };
+      }
       return edit({
         op: 'dialogue-update',
         id,
@@ -595,6 +611,7 @@ async function main() {
         tlStart: numFlag('at', flags.at),
         duration: numFlag('duration', flags.duration),
         spriteId: flags['no-sprite'] ? null : flags.sprite,
+        pos: dialoguePos,
       });
     }
 

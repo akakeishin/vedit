@@ -150,18 +150,20 @@ function speechBubbleAssStyle(bubble: SpeechBubbleStyle, outputHeight: number): 
 }
 
 /**
- * Pixel anchor for one dialogue line's speech bubble: above the referenced
- * sprite's head (via the SAME spriteGeometry math render/web use for
- * placement) when `spriteId` resolves to both a real sprite AND its kit
- * asset, else a fixed top-center default. Pure given an already-loaded
- * `kit` (or none).
+ * Pixel anchor for one dialogue line's speech bubble: a manual `pos` (0..1
+ * normalized canvas position — see DialogueItem's doc), when set, always
+ * wins; otherwise above the referenced sprite's head (via the SAME
+ * spriteGeometry math render/web use for placement) when `spriteId`
+ * resolves to both a real sprite AND its kit asset, else a fixed top-center
+ * default. Pure given an already-loaded `kit` (or none).
  */
 function dialogueAnchorPixels(
   m: Manifest,
-  d: { spriteId?: string },
+  d: { spriteId?: string; pos?: { x: number; y: number } },
   kit: KitFile | null | undefined,
   output: { width: number; height: number },
 ): { x: number; y: number } {
+  if (d.pos) return { x: d.pos.x * output.width, y: d.pos.y * output.height };
   const sprite = d.spriteId ? (m.timeline.sprites ?? []).find((s) => s.id === d.spriteId) : undefined;
   const asset = sprite ? kit?.assets?.find((a) => a.id === sprite.assetId) : undefined;
   if (sprite && asset) {
@@ -1263,6 +1265,18 @@ export async function renderFinal(
   // sprite decoration. Every project without `manifest.kit` set never
   // enters this block at all — full regression.
   const warnings = [...params.warnings];
+  // HANDOFF §5 known compromise, now surfaced as a warning instead of a
+  // silent gap: buildFilterGraph (this pipeline) composites sprites at a
+  // fixed STATIC position/frame always — see its W8 block above, which
+  // never touches spriteMotionPlan's motion-aware x/y/scale expressions
+  // (those only run in buildCompositionFilterGraph, the composition-mode
+  // pipeline). So any sprite overlay here — whether or not it has a
+  // `.motion` preset configured — renders as a still image; every existing
+  // non-composition project without sprites is unaffected (empty array,
+  // condition false).
+  if ((effectiveM.timeline.sprites ?? []).length > 0) {
+    warnings.push('スプライト/モーションのアニメーションは通常プロジェクトの書き出しでは静止画になります');
+  }
   let kit: import('../core/types.js').KitFile | null = null;
   if (effectiveM.kit) {
     try {

@@ -18,10 +18,12 @@ import {
   cropOffset,
   cropWindow,
   cullingStats,
+  dialogueOverlapWithoutPosRisk,
   emoteWindows,
   expandWordIds,
   intentZonesForSource,
   keptWords,
+  MIN_FRAGMENT_SECONDS,
   moveClip,
   needsColorTransform,
   orphanedOverlays,
@@ -130,6 +132,75 @@ describe('removeSourceRange', () => {
     const m = removeSourceRange(manifest(), 's1', 10.0001, 20.0166);
     expect(m.timeline.video[0].srcOut).toBeCloseTo(10, 5);
     expect(m.timeline.video[1].srcIn).toBeCloseTo(Math.round(20.0166 * 30) / 30, 5);
+  });
+
+  describe('F-s1-1: short-fragment absorption', () => {
+    it('a candidate starting 0.1s into the clip absorbs the resulting head fragment (< 0.35s) into the cut', () => {
+      const m = removeSourceRange(manifest(), 's1', 0.1, 5);
+      expect(m.timeline.video).toHaveLength(1);
+      expect(m.timeline.video[0]).toMatchObject({ srcIn: 5, srcOut: 60 });
+      const absorbed = (m as any).fragmentsAbsorbed;
+      expect(absorbed).toHaveLength(1);
+      expect(absorbed[0].side).toBe('before');
+      expect(absorbed[0].seconds).toBeCloseTo(0.1);
+    });
+
+    it('leaves both sides untouched when both surviving fragments are healthy-length (>= 0.35s)', () => {
+      const m = removeSourceRange(manifest(), 's1', 10, 20);
+      expect(m.timeline.video).toHaveLength(2);
+      expect(m.timeline.video[0]).toMatchObject({ srcIn: 0, srcOut: 10 });
+      expect(m.timeline.video[1]).toMatchObject({ srcIn: 20, srcOut: 60 });
+      expect((m as any).fragmentsAbsorbed).toBeUndefined();
+    });
+
+    it('absorbs slivers on BOTH sides, removing the clip entirely (equivalent to a full-cover cut)', () => {
+      const m = removeSourceRange(manifest(), 's1', 0.1, 59.9);
+      expect(m.timeline.video).toHaveLength(0);
+      const absorbed = (m as any).fragmentsAbsorbed;
+      expect(absorbed).toHaveLength(2);
+      expect(absorbed.map((a: any) => a.side).sort()).toEqual(['after', 'before']);
+    });
+
+    it('does not absorb a pre-existing short clip that this cut does not intersect', () => {
+      // A deliberate 0.2s clip elsewhere on the timeline (not touched by this
+      // op at all) survives untouched — only fragments produced by THIS split
+      // are eligible for absorption.
+      let m = manifest();
+      m = { ...m, timeline: { ...m.timeline, video: [...m.timeline.video, { id: 'short', sourceId: 's1', srcIn: 40, srcOut: 40.2 }] } };
+      const out = removeSourceRange(m, 's1', 10, 20);
+      expect(out.timeline.video.some((c) => c.id === 'short')).toBe(true);
+      expect((out as any).fragmentsAbsorbed).toBeUndefined();
+    });
+
+    it('a fragment at/above the MIN_FRAGMENT_SECONDS threshold is kept (absorption is a strict "<" test)', () => {
+      // fps=30 snaps the cut boundary to the frame grid, so pick a
+      // frame-aligned t0 comfortably >= MIN_FRAGMENT_SECONDS rather than
+      // asserting against the raw constant.
+      const t0 = Math.ceil(MIN_FRAGMENT_SECONDS * 30) / 30; // first frame boundary >= 0.35s
+      expect(t0).toBeGreaterThanOrEqual(MIN_FRAGMENT_SECONDS);
+      const m = removeSourceRange(manifest(), 's1', t0, 5);
+      expect(m.timeline.video).toHaveLength(2);
+      expect(m.timeline.video[0]).toMatchObject({ srcIn: 0, srcOut: t0 });
+      expect((m as any).fragmentsAbsorbed).toBeUndefined();
+    });
+
+    it('a bulk apply loop (sequential removeSourceRange calls, like candidates/decide approving multiple candidates) absorbs each cut\'s own fragment independently', () => {
+      // Two candidates approved back-to-back against the SAME clip, exactly
+      // how daemon.ts's apply-candidates loop calls removeSourceRange
+      // repeatedly against the evolving manifest: the first cut is healthy
+      // on both sides; the second cut's own head lands 0.1s after the first
+      // cut's new boundary, leaving a sub-threshold sliver that must be
+      // absorbed by that SECOND call.
+      let m = removeSourceRange(manifest(), 's1', 10, 20); // -> [0,10), [20,60)
+      expect(m.timeline.video).toHaveLength(2);
+      m = removeSourceRange(m, 's1', 20.1, 30); // sliver [20,20.1) on the second clip
+      expect(m.timeline.video).toHaveLength(2);
+      expect(m.timeline.video[0]).toMatchObject({ srcIn: 0, srcOut: 10 });
+      expect(m.timeline.video[1]).toMatchObject({ srcIn: 30, srcOut: 60 });
+      const absorbed = (m as any).fragmentsAbsorbed;
+      expect(absorbed).toHaveLength(1);
+      expect(absorbed[0]).toMatchObject({ side: 'before', seconds: expect.closeTo(0.1, 5) });
+    });
   });
 });
 
@@ -2042,6 +2113,13 @@ describe('dialogue (addDialogue / updateDialogue / removeDialogue)', () => {
     expect(r.timeline.dialogue![0].voiceMusicId).toBe('mu1');
   });
 
+  it('addDialogue validates and stores an optional 0..1 normalized pos', () => {
+    const r = addDialogue(compositionManifest(), 'hi', { tlStart: 1, pos: { x: 0.2, y: 0.8 } });
+    expect(r.timeline.dialogue![0].pos).toEqual({ x: 0.2, y: 0.8 });
+    expect(() => addDialogue(compositionManifest(), 'hi', { tlStart: 1, pos: { x: 1.5, y: 0.5 } })).toThrow(/pos\.x.*between 0 and 1/);
+    expect(() => addDialogue(compositionManifest(), 'hi', { tlStart: 1, pos: { x: 0.5, y: -0.1 } })).toThrow(/pos\.y.*between 0 and 1/);
+  });
+
   it('updateDialogue patches text/tlStart/duration/spriteId; spriteId:null clears it', () => {
     let m = compositionManifest();
     m = addSprite(m, 'c1', { id: 'sp1', anchor: { sourceId: COMP_SOURCE_ID, srcTime: 0 } });
@@ -2052,6 +2130,47 @@ describe('dialogue (addDialogue / updateDialogue / removeDialogue)', () => {
     expect(r.timeline.dialogue![0].spriteId).toBeUndefined();
     expect(() => updateDialogue(r, 'nope', { text: 'x' })).toThrow(/unknown dialogue item/);
     expect(() => updateDialogue(r, 'dl1', { text: '' })).toThrow(/non-empty string/);
+  });
+
+  it('updateDialogue patches pos; pos:null clears it back to auto-anchor; out-of-range throws', () => {
+    let r = addDialogue(compositionManifest(), 'hi', { tlStart: 1, id: 'dl1' });
+    r = updateDialogue(r, 'dl1', { pos: { x: 0.1, y: 0.9 } });
+    expect(r.timeline.dialogue![0].pos).toEqual({ x: 0.1, y: 0.9 });
+    r = updateDialogue(r, 'dl1', { pos: null });
+    expect(r.timeline.dialogue![0].pos).toBeUndefined();
+    expect(() => updateDialogue(r, 'dl1', { pos: { x: 2, y: 0.5 } })).toThrow(/pos\.x.*between 0 and 1/);
+  });
+
+  describe('dialogueOverlapWithoutPosRisk', () => {
+    it('flags an overlapping window when neither item specifies pos', () => {
+      let m = compositionManifest();
+      m = addDialogue(m, 'first', { tlStart: 0, duration: 2, id: 'dl1' });
+      expect(dialogueOverlapWithoutPosRisk(m, { tlStart: 1, duration: 2 })).toBe(true);
+    });
+
+    it('does not flag a non-overlapping window', () => {
+      let m = compositionManifest();
+      m = addDialogue(m, 'first', { tlStart: 0, duration: 2, id: 'dl1' });
+      expect(dialogueOverlapWithoutPosRisk(m, { tlStart: 5, duration: 2 })).toBe(false);
+    });
+
+    it('does not flag an overlap when the CANDIDATE has pos', () => {
+      let m = compositionManifest();
+      m = addDialogue(m, 'first', { tlStart: 0, duration: 2, id: 'dl1' });
+      expect(dialogueOverlapWithoutPosRisk(m, { tlStart: 1, duration: 2, pos: { x: 0.2, y: 0.2 } })).toBe(false);
+    });
+
+    it('does not flag an overlap when the EXISTING item already has pos', () => {
+      let m = compositionManifest();
+      m = addDialogue(m, 'first', { tlStart: 0, duration: 2, id: 'dl1', pos: { x: 0.2, y: 0.2 } });
+      expect(dialogueOverlapWithoutPosRisk(m, { tlStart: 1, duration: 2 })).toBe(false);
+    });
+
+    it('excludeId lets an item ignore its own pre-existing window (e.g. when re-checking itself during an update)', () => {
+      let m = compositionManifest();
+      m = addDialogue(m, 'first', { tlStart: 0, duration: 2, id: 'dl1' });
+      expect(dialogueOverlapWithoutPosRisk(m, { tlStart: 1, duration: 2, excludeId: 'dl1' })).toBe(false);
+    });
   });
 
   it('removeDialogue drops the item; unknown id throws', () => {

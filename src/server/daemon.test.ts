@@ -3036,6 +3036,89 @@ describe('daemon: /api/detect excludes silence candidates inside intent zones', 
   });
 });
 
+// ---- F-s1-3: /api/detect's non-blocking "silence cut fragments this
+// material" hint (verification: a no-speech street-walk source turned into
+// dozens of 0.1-0.4s clips; scenes/culling fits that footage better) ----
+describe('daemon: /api/detect fragmentation hint (F-s1-3)', () => {
+  const PORT = 18253;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-detect-hint-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'detect-hint');
+    await project.commit(0, 'system', 'setup', {}, 'seed source', (m) => ({
+      ...m,
+      fps: 30,
+      // No transcript at all — untranscribed source (the street-walk case).
+      sources: [{ id: 's1', path: '/media/one.mp4', duration: 12, fps: 30, width: 1920, height: 1080, hasAudio: true }],
+      timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 12 }], motion: [] },
+    }));
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('hints at scene culling when no source has a transcript at all — never blocks the detect', async () => {
+    const { status, body } = await postJson(BASE, '/api/detect', {});
+    expect(status).toBe(200); // advisory only — detect still runs and returns normally
+    expect(body.warnings).toEqual(['発話が少ない素材では無音カットは断片化しやすい — シーン選別(カリング)の方が向いています']);
+  });
+
+  it('the hint is absent when --no-silence is passed (nothing to forecast fragmentation for)', async () => {
+    const { status, body } = await postJson(BASE, '/api/detect', { silence: false });
+    expect(status).toBe(200);
+    expect(body.warnings).toBeUndefined();
+  });
+});
+
+// ---- F-s1-3: the same hint via the OTHER trigger — a transcript exists,
+// but this batch of freshly proposed silence candidates would fragment the
+// timeline into a lot of sub-threshold slivers (forecast via removeSourceRange's
+// own F-s1-1 absorption, simulated against the current timeline and discarded) ----
+describe('daemon: /api/detect fragmentation hint (F-s1-3) — candidate-fragmentation forecast', () => {
+  const PORT = 18256;
+  const BASE = `http://localhost:${PORT}`;
+  let server: Server;
+
+  beforeAll(async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'vedit-daemon-detect-hint2-'));
+    const dir = path.join(root, 'proj');
+    const project = await Project.create(dir, 'detect-hint2');
+    // 8 very short (0.02s) "blip" words spaced 1s apart: each inter-word gap
+    // (0.98s) clears detectSilences' default minGap (0.7s), so 7 silence
+    // candidates get proposed. The island of untouched material LEFT
+    // BETWEEN two consecutive candidates is (word duration + 2*pad) =
+    // 0.02 + 0.24 = 0.26s — comfortably under removeSourceRange's 0.35s
+    // absorption floor even after frame-snap rounding, so applying this
+    // candidate batch sequentially (the forecast simulation) absorbs a
+    // fragment at nearly every step.
+    const words: Word[] = Array.from({ length: 8 }, (_, i) => ({
+      id: `w${i}`, text: `blip${i}`, t0: i * 1.0, t1: i * 1.0 + 0.02, p: 0.9,
+    }));
+    await project.writeTranscript({ sourceId: 's1', language: 'en', words });
+    await project.commit(0, 'system', 'setup', {}, 'seed source', (m) => ({
+      ...m,
+      fps: 30,
+      sources: [{ id: 's1', path: '/media/one.mp4', duration: 8, fps: 30, width: 1920, height: 1080, hasAudio: true, transcribed: true }],
+      timeline: { video: [{ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 8 }], motion: [] },
+    }));
+    const started = await startDaemon({ port: PORT, projectDir: dir });
+    server = started.server;
+  });
+
+  afterAll(() => server.close());
+
+  it('hints at scene culling when the freshly proposed candidate batch would fragment the timeline, even though a transcript exists', async () => {
+    const { status, body } = await postJson(BASE, '/api/detect', {});
+    expect(status).toBe(200);
+    expect(body.pending.length).toBeGreaterThanOrEqual(6); // 7 gap candidates expected
+    expect(body.warnings).toEqual(['発話が少ない素材では無音カットは断片化しやすい — シーン選別(カリング)の方が向いています']);
+  });
+});
+
 // ---- W-INTENT: music-add/-update duck warning near a 'quiet' zone (never rejects) ----
 describe('daemon: music duck warning near a quiet intent zone', () => {
   const PORT = 18242;
@@ -3458,6 +3541,55 @@ describe('daemon: W-ANIME composition', () => {
     });
     expect(noAudio.status).toBe(400);
     expect(noAudio.body.error).toMatch(/no audio stream/);
+  });
+
+  it('dialogue-add stores an optional --pos and warns when it overlaps an existing pos-less dialogue window', async () => {
+    // dialogueId (added above at tlStart=2, duration=2.5 -> window [2,4.5))
+    // still has no pos at this point in the sequence.
+    const state = (await getJson(BASE, '/api/state')).body;
+    const overlapping = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'dialogue-add', text: 'overlap', tlStart: 3, duration: 1,
+    });
+    expect(overlapping.status).toBe(200);
+    expect(overlapping.body.warnings).toEqual(['同時刻のセリフが重なる可能性(--pos で位置を分けられます)']);
+
+    const state2 = (await getJson(BASE, '/api/state')).body;
+    const withPos = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state2.revision, op: 'dialogue-add', text: 'positioned',
+      tlStart: 3.2, duration: 1, pos: { x: 0.1, y: 0.1 },
+    });
+    expect(withPos.status).toBe(200);
+    expect(withPos.body.warnings).toBeUndefined(); // this one specifies pos -> no collision risk flagged
+    const project = (await getJson(BASE, '/api/project')).body;
+    const dl = project.dialogue.find((d: any) => d.id === withPos.body.id);
+    expect(dl.pos).toEqual({ x: 0.1, y: 0.1 });
+
+    const invalidPos = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: (await getJson(BASE, '/api/state')).body.revision,
+      op: 'dialogue-add', text: 'bad', tlStart: 10, pos: { x: 1.5, y: 0.5 },
+    });
+    expect(invalidPos.status).toBe(400);
+    expect(invalidPos.body.error).toMatch(/pos\.x/);
+  });
+
+  it('dialogue-update patches pos; pos:null clears it back to auto-anchor', async () => {
+    const state = (await getJson(BASE, '/api/state')).body;
+    const added = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state.revision, op: 'dialogue-add', text: 'movable', tlStart: 15,
+    });
+    const id = added.body.id;
+    const state2 = (await getJson(BASE, '/api/state')).body;
+    const patched = await postJson(BASE, '/api/edit', {
+      actor: 'claude', baseRev: state2.revision, op: 'dialogue-update', id, pos: { x: 0.3, y: 0.4 },
+    });
+    expect(patched.status).toBe(200);
+    let project = (await getJson(BASE, '/api/project')).body;
+    expect(project.dialogue.find((d: any) => d.id === id).pos).toEqual({ x: 0.3, y: 0.4 });
+
+    const state3 = (await getJson(BASE, '/api/state')).body;
+    await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state3.revision, op: 'dialogue-update', id, pos: null });
+    project = (await getJson(BASE, '/api/project')).body;
+    expect(project.dialogue.find((d: any) => d.id === id).pos).toBeUndefined();
   });
 
   it('dialogue-update patches text/timing and can clear spriteId', async () => {

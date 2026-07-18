@@ -125,6 +125,50 @@ describe('captionCues', () => {
     });
   });
 
+  describe('same source placed twice on the timeline (polish-backlog regression)', () => {
+    it('gets a cue for EACH placement, not just the first (was: sourceTimeToTimeline only ever resolves the first match)', () => {
+      // Same 5s source range used twice: once at tl 0-5, again at tl 5-10.
+      const m = manifest([{ srcIn: 0, srcOut: 5 }, { srcIn: 0, srcOut: 5 }]);
+      const words: Word[] = [{ id: 'w0', text: 'Hello.', t0: 1.0, t1: 1.5, p: 0.9 }];
+      const t: Transcript = { sourceId: 's1', language: 'en', words };
+      const cues = captionCues(m, [t]);
+      expect(cues).toHaveLength(2);
+      expect(cues[0].text).toBe('Hello.');
+      expect(cues[1].text).toBe('Hello.');
+      // First placement: word midpoint 1.25 maps directly (segment tlStart=0).
+      expect(cues[0].tlStart).toBeCloseTo(1.25);
+      // Second placement: same source time, but this segment's tlStart is 5.
+      expect(cues[1].tlStart).toBeCloseTo(6.25);
+      expect(cues[0].wordIds).toEqual(['w0']);
+      expect(cues[1].wordIds).toEqual(['w0']);
+    });
+
+    it('three placements of the same short source each get their own cue, in timeline order', () => {
+      const m = manifest([{ srcIn: 0, srcOut: 3 }, { srcIn: 0, srcOut: 3 }, { srcIn: 0, srcOut: 3 }]);
+      const words: Word[] = [{ id: 'w0', text: 'Hi.', t0: 1.0, t1: 1.2, p: 0.9 }];
+      const t: Transcript = { sourceId: 's1', language: 'en', words };
+      const cues = captionCues(m, [t]);
+      expect(cues).toHaveLength(3);
+      expect(cues.map((c) => Math.round(c.tlStart * 100) / 100)).toEqual([1.1, 4.1, 7.1]);
+    });
+
+    it('a ripple-cut mid-sentence (two adjacent segments from the SAME placement) still merges into one cue — no false split from the per-segment rewrite', () => {
+      // One clip, but split into two adjacent VideoClip entries at src=5
+      // (e.g. a filler word removed right in the middle) — ripple layout
+      // keeps them back-to-back on the timeline (tl 0-5, tl 5-9).
+      const m = manifest([{ srcIn: 0, srcOut: 5 }, { srcIn: 6, srcOut: 10 }]);
+      const words: Word[] = [
+        { id: 'w0', text: 'Hello', t0: 4.5, t1: 4.9, p: 0.9 }, // just before the cut (segment 1)
+        { id: 'w1', text: 'world.', t0: 6.1, t1: 6.5, p: 0.9 }, // just after the cut (segment 2)
+      ];
+      const t: Transcript = { sourceId: 's1', language: 'en', words };
+      const cues = captionCues(m, [t]);
+      expect(cues).toHaveLength(1);
+      expect(cues[0].text).toBe('Hello world.');
+      expect(cues[0].wordIds).toEqual(['w0', 'w1']);
+    });
+  });
+
   describe('sourceId/key (W-CAP)', () => {
     it('every cue carries sourceId and a key of `${sourceId}:${wordIds[0]}`', () => {
       const m = manifest([{ srcIn: 0, srcOut: 20 }]);

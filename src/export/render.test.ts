@@ -366,6 +366,23 @@ describe('toAss: W-ANIME dialogue speech bubbles', () => {
     expect(p1[1]).not.toBe(p2[1]); // x differs: anchored to the sprite's x=0.8 position instead of the 50% default
   });
 
+  it('a manual DialogueItem.pos overrides both the sprite-derived anchor and the fixed default', () => {
+    const kit: KitFile = {
+      version: 'vedit-kit/v1',
+      assets: [{ id: 'char1', path: 'assets/characters/char1.png', type: 'sprite', width: 200, height: 400 }],
+    };
+    let m = manifest('clean');
+    m = addSprite(m, 'char1', { id: 'sp1', anchor: { sourceId: 's1', srcTime: 1 }, position: { x: 0.8, y: 0.9 }, scale: 0.3 });
+    // pos is explicit and deliberately far from both the sprite anchor and
+    // the fixed top-center default (x=50%,y=15%).
+    m = addDialogue(m, 'hi', { tlStart: 1, duration: 1, id: 'dl1', spriteId: 'sp1', pos: { x: 0.1, y: 0.05 } });
+    const posOf = (ass: string) => ass.split('\n').find((l) => l.includes(',dialogue,,'))!.match(/\\pos\((\d+),(\d+)\)/)!;
+    const [, x, y] = posOf(toAss(m, [], kit));
+    const { width, height } = { width: 1920, height: 1080 };
+    expect(Number(x)).toBeCloseTo(0.1 * width, 0);
+    expect(Number(y)).toBeCloseTo(0.05 * height, 0);
+  });
+
   it('a kit style tagged use_for:["dialogue"] wins over the active captions style for the bubble palette', () => {
     let m = manifest('clean');
     m = addDialogue(m, 'hi', { tlStart: 0, duration: 1, id: 'dl1' });
@@ -1468,6 +1485,27 @@ describe('renderFinal: W8 kit (styles + sprites)', () => {
     expect(args[pngIdx - 3]).toBe('-loop');
     const graph = args[args.indexOf('-filter_complex') + 1];
     expect(graph).toMatch(/overlay=x=\d+:y=\d+:enable='between\(t,2,5\)'/);
+  });
+
+  it('warns that sprite/motion animation renders static in a normal (non-composition) project export (HANDOFF §5)', async () => {
+    runMock.mockClear();
+    runCaptureMock.mockClear();
+    let m = baseManifest();
+    m = addSprite(m, 'char1', {
+      id: 'sp1',
+      anchor: { sourceId: 's1', srcTime: 1 },
+      duration: 2,
+      motion: { loop: 'bob' }, // even with a motion preset configured, this pipeline never animates it
+    });
+    const res = await renderFinal(m, [], outPathIn('/tmp'));
+    expect(res.warnings).toContain('スプライト/モーションのアニメーションは通常プロジェクトの書き出しでは静止画になります');
+  });
+
+  it('does not warn about sprite/motion staticness when the project has no sprites at all', async () => {
+    runMock.mockClear();
+    runCaptureMock.mockClear();
+    const res = await renderFinal(baseManifest(), [], outPathIn('/tmp'));
+    expect(res.warnings.some((w) => w.includes('静止画になります'))).toBe(false);
   });
 
   it('burnCaptions with a kit style carrying a font passes fontsdir= pointing at the kit\'s font directory', async () => {
