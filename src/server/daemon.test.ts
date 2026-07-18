@@ -535,6 +535,39 @@ describe('daemon: clip ops and reframe', () => {
     expect(status).toBe(400);
     expect(body.error).toMatch(/x \(1\.5\)/);
   });
+
+  it('clip-audio sets gainDb and muted on one clip, and muted:false clears the flag again', async () => {
+    let state = (await getJson(BASE, '/api/state')).body;
+    let project = (await getJson(BASE, '/api/project')).body;
+    const clipId = project.manifest.timeline.video[0].id;
+
+    let r = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'clip-audio', clipId, gainDb: -6, muted: true });
+    expect(r.status).toBe(200);
+    project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.timeline.video[0]).toMatchObject({ gainDb: -6, muted: true });
+
+    state = (await getJson(BASE, '/api/state')).body;
+    r = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'clip-audio', clipId, muted: false });
+    expect(r.status).toBe(200);
+    project = (await getJson(BASE, '/api/project')).body;
+    expect(project.manifest.timeline.video[0].gainDb).toBe(-6); // untouched by the muted-only patch
+    expect(project.manifest.timeline.video[0].muted).toBeUndefined();
+  });
+
+  it('clip-audio rejects an out-of-range gainDb and an unknown clip', async () => {
+    let state = (await getJson(BASE, '/api/state')).body;
+    const project = (await getJson(BASE, '/api/project')).body;
+    const clipId = project.manifest.timeline.video[0].id;
+
+    let r = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'clip-audio', clipId, gainDb: 20 });
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/gainDb \(20\)/);
+
+    state = (await getJson(BASE, '/api/state')).body;
+    r = await postJson(BASE, '/api/edit', { actor: 'claude', baseRev: state.revision, op: 'clip-audio', clipId: 'nope', gainDb: -3 });
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/unknown clip/);
+  });
 });
 
 // ---- Suite 3b: trim validation ----
@@ -2898,6 +2931,57 @@ describe('daemon: transcribe job (W-LAZY)', () => {
       const last = revs.body[revs.body.length - 1];
       expect(last.actor).toBe('system');
       expect(last.op).toBe('transcribe');
+    } finally {
+      ws.close();
+    }
+  });
+
+  it('accepts an explicit glossary (array), persists it to the manifest, and passes it to transcribe()', async () => {
+    const ws = await openWs(BASE);
+    try {
+      const done = nextWsMessage(ws, (m) => m.type === 'transcribe-done' && m.sourceId === 's1');
+      const { status, body } = await postJson(BASE, '/api/transcribe', { sourceId: 's1', glossary: ['Claude', 'vedit'] });
+      expect(status).toBe(200);
+      expect(body.glossary).toEqual(['Claude', 'vedit']);
+      await done;
+
+      expect(transcribeMock).toHaveBeenCalledWith('/media/s1.mp4', 's1', expect.objectContaining({ glossary: ['Claude', 'vedit'] }));
+
+      const project = (await getJson(BASE, '/api/project')).body;
+      expect(project.manifest.transcription).toEqual({ glossary: ['Claude', 'vedit'] });
+    } finally {
+      ws.close();
+    }
+  });
+
+  it('accepts a comma-separated glossary string (same shape the CLI\'s --glossary flag sends)', async () => {
+    const ws = await openWs(BASE);
+    try {
+      const done = nextWsMessage(ws, (m) => m.type === 'transcribe-done' && m.sourceId === 's1');
+      const { status, body } = await postJson(BASE, '/api/transcribe', { sourceId: 's1', glossary: ' Anthropic , Cowork ' });
+      expect(status).toBe(200);
+      expect(body.glossary).toEqual(['Anthropic', 'Cowork']);
+      await done;
+
+      expect(transcribeMock).toHaveBeenCalledWith('/media/s1.mp4', 's1', expect.objectContaining({ glossary: ['Anthropic', 'Cowork'] }));
+
+      const project = (await getJson(BASE, '/api/project')).body;
+      expect(project.manifest.transcription).toEqual({ glossary: ['Anthropic', 'Cowork'] });
+    } finally {
+      ws.close();
+    }
+  });
+
+  it('falls back to the manifest\'s already-stored glossary when the request omits it', async () => {
+    const ws = await openWs(BASE);
+    try {
+      const done = nextWsMessage(ws, (m) => m.type === 'transcribe-done' && m.sourceId === 's1');
+      const { status, body } = await postJson(BASE, '/api/transcribe', { sourceId: 's1' });
+      expect(status).toBe(200);
+      expect(body.glossary).toEqual(['Anthropic', 'Cowork']); // carried over from the previous test, unchanged
+      await done;
+
+      expect(transcribeMock).toHaveBeenCalledWith('/media/s1.mp4', 's1', expect.objectContaining({ glossary: ['Anthropic', 'Cowork'] }));
     } finally {
       ws.close();
     }

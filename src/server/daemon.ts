@@ -42,11 +42,13 @@ import {
   setAudioMix,
   setAudioRepair,
   setBackgroundAt,
+  setClipAudio,
   setClipCrop,
   setColorAdjust,
   setColorTransform,
   setComposition,
   setSceneReview,
+  setTranscriptionGlossary,
   shiftComposition,
   sourceRangeToTimeline,
   timelineDuration,
@@ -573,13 +575,13 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
    * job can be retried and /api/state's `transcribing` flag never gets
    * stuck true.
    */
-  async function runTranscribeJob(p: Project, sourceId: string, language?: string) {
+  async function runTranscribeJob(p: Project, sourceId: string, language?: string, glossary?: string[]) {
     try {
       broadcast(ctx, { type: 'transcribe-progress', sourceId, step: 'transcribing (whisper)' });
       const m0 = await p.manifest();
       const src = m0.sources.find((s) => s.id === sourceId);
       if (!src) throw new Error(`unknown source: ${sourceId}`); // shouldn't happen: caller resolved this against a manifest read moments earlier
-      const t = await transcribe(src.path, sourceId, { language, sourceDuration: src.duration });
+      const t = await transcribe(src.path, sourceId, { language, sourceDuration: src.duration, glossary });
       await p.writeTranscript(t);
       ctx.takesCache.delete(sourceId); // a re-transcribe invalidates any memoized take groups for this source (see Ctx.takesCache's doc)
       const MAX_STALE_RETRIES = 20;
@@ -957,12 +959,40 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       if (requested !== 'all' && alreadyRunning.length > 0) {
         return json(res, 400, { error: `already transcribing: ${requested}` });
       }
+
+      // roadmap "whisper 用語集プロンプト": b.glossary, if present, is this
+      // request's explicit glossary (the CLI's `vedit transcribe --glossary`
+      // already resolves "omitted -> reuse stored" client-side and always
+      // sends the resolved array — see cli.ts's transcribe case — but a
+      // direct API caller may also pass a raw comma-separated string, same
+      // shape as the CLI's own --glossary flag value). When present, persist
+      // it via setTranscriptionGlossary — same --base optimistic-lock
+      // convention as /api/edit (b.baseRev, falling back to the manifest
+      // revision just read) — so it keeps applying to future transcribes
+      // without re-specifying it. When absent, fall back to whatever the
+      // manifest already has stored.
+      const explicitGlossary: string[] | undefined = b.glossary == null
+        ? undefined
+        : Array.isArray(b.glossary)
+          ? b.glossary.map((t: unknown) => String(t))
+          : String(b.glossary).split(',').map((t) => t.trim()).filter(Boolean);
+      if (explicitGlossary !== undefined) {
+        const actor = b.actor ?? 'claude';
+        const baseRev = typeof b.baseRev === 'number' ? b.baseRev : m.revision;
+        await mutate(
+          p, actor, baseRev, 'glossary-set', b,
+          `glossary set (${explicitGlossary.length} term${explicitGlossary.length === 1 ? '' : 's'})`,
+          (mm) => setTranscriptionGlossary(mm, explicitGlossary),
+        );
+      }
+      const glossary = explicitGlossary ?? m.transcription?.glossary;
+
       const toStart = targets.filter((id) => !ctx.transcribeJobs.has(id));
       for (const id of toStart) {
         ctx.transcribeJobs.add(id);
-        void runTranscribeJob(p, id, b.language);
+        void runTranscribeJob(p, id, b.language, glossary);
       }
-      return json(res, 200, { started: toStart, skipped: alreadyRunning });
+      return json(res, 200, { started: toStart, skipped: alreadyRunning, glossary: glossary ?? [] });
     }
 
     // ---- drag-and-drop ingest (W-UI §4): locate the dropped file's real
@@ -1720,6 +1750,12 @@ export async function startDaemon(opts: { port?: number; projectDir?: string } =
       if (b.op === 'clip-crop') {
         await mutate(p, actor, baseRev, 'clip-crop', b, `clip-crop ${b.clipId} x=${b.x ?? '-'} y=${b.y ?? '-'}`, (m) =>
           setClipCrop(m, b.clipId, { x: b.x, y: b.y }),
+        );
+        return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
+      }
+      if (b.op === 'clip-audio') {
+        await mutate(p, actor, baseRev, 'clip-audio', b, `clip-audio ${b.clipId} gainDb=${b.gainDb ?? '-'} muted=${b.muted ?? '-'}`, (m) =>
+          setClipAudio(m, b.clipId, { gainDb: b.gainDb, muted: b.muted }),
         );
         return json(res, 200, { state: await stateSummary(p, ctx.transcribeJobs) });
       }
