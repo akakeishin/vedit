@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { mkdtempSync, promises as fsp } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { Project } from './project.js';
+import { Project, resolveRedoTarget, resolveUndoRedoStacks, resolveUndoTarget, type UndoLogEntry } from './project.js';
 import type { CutCandidate, Manifest, RevisionEntry } from './types.js';
 
 function freshDir(prefix: string): string {
@@ -414,5 +414,168 @@ describe('Project: compact()', () => {
     const restored = await p.restore(21, 'ui', 130); // rev21 kept its snapshot (older-subset position 20); baseRev=130 matches seedRevisions' project.json
     expect(restored.revision).toBe(131); // restore is itself a new revision
     expect(restored.name).toBe('rev21'); // fixtureManifest(21)'s content
+  });
+});
+
+// ---- E-1 (波E NLE操作性パック): logical undo/redo ----
+
+describe('Project: restore() cause tagging', () => {
+  it('records { rev, cause } in params when a cause is given', async () => {
+    const dir = freshDir('restore-cause');
+    const p = await Project.create(dir, 'restore-cause');
+    await p.commit(0, 'ui', 'a', {}, 'a', (m) => ({ ...m, name: 'a' })); // rev1
+    await p.restore(1, 'claude', 1, 'undo'); // rev2
+    const revs = await p.revisions();
+    expect(revs.at(-1)).toMatchObject({ op: 'restore', params: { rev: 1, cause: 'undo' } });
+  });
+
+  it('omitting cause records bare { rev } — the pre-E-1 shape every existing caller (daemon.ts) still uses', async () => {
+    const dir = freshDir('restore-no-cause');
+    const p = await Project.create(dir, 'restore-no-cause');
+    await p.commit(0, 'ui', 'a', {}, 'a', (m) => ({ ...m, name: 'a' })); // rev1
+    await p.restore(1, 'ui', 1); // rev2, no cause — same call shape as before this feature
+    const revs = await p.revisions();
+    expect(revs.at(-1)?.params).toEqual({ rev: 1 });
+  });
+});
+
+describe('resolveUndoRedoStacks / resolveUndoTarget / resolveRedoTarget (pure — replay-based reconstruction)', () => {
+  /** Build a synthetic linear entry list; each element is either a plain edit ('e') or a restore with a cause. rev/baseRev are assigned sequentially starting at 1. */
+  function entries(spec: Array<'edit' | { restore: number; cause?: 'undo' | 'redo' | 'manual' }>): UndoLogEntry[] {
+    const out: UndoLogEntry[] = [];
+    let rev = 0;
+    for (const s of spec) {
+      const baseRev = rev;
+      rev += 1;
+      if (s === 'edit') {
+        out.push({ rev, baseRev, op: 'some-edit' });
+      } else {
+        out.push({ rev, baseRev, op: 'restore', params: s.cause ? { rev: s.restore, cause: s.cause } : { rev: s.restore } });
+      }
+    }
+    return out;
+  }
+
+  it('three edits: first undo targets the state after edit 2 (rev2)', () => {
+    const e = entries(['edit', 'edit', 'edit']); // rev1=A rev2=B rev3=C
+    expect(resolveUndoTarget(e)).toBe(2);
+  });
+
+  it('CRITICAL: consecutive undo calls walk further back each time, not "undo of undo" ping-pong', () => {
+    // rev1=A rev2=B rev3=C, then two undos issued back-to-back (as the CLI
+    // would, using each resolved target to build the NEXT restore entry).
+    let e = entries(['edit', 'edit', 'edit']);
+    const t1 = resolveUndoTarget(e); // -> 2 (undo C, back to "A+B")
+    expect(t1).toBe(2);
+    e = [...e, { rev: 4, baseRev: 3, op: 'restore', params: { rev: t1, cause: 'undo' } }];
+    const t2 = resolveUndoTarget(e); // must be 1 (undo B too, back to "A" alone) — NOT 3 (that would restore C right back)
+    expect(t2).toBe(1);
+    e = [...e, { rev: 5, baseRev: 4, op: 'restore', params: { rev: t2, cause: 'undo' } }];
+    // A third undo would only leave revision 0 (pristine project) — not a real restorable target.
+    expect(() => resolveUndoTarget(e)).toThrow(/nothing to undo/);
+  });
+
+  it('redo after a single undo brings back the undone edit', () => {
+    let e = entries(['edit', 'edit', 'edit']); // rev1=A rev2=B rev3=C
+    const undoTarget = resolveUndoTarget(e); // 2
+    e = [...e, { rev: 4, baseRev: 3, op: 'restore', params: { rev: undoTarget, cause: 'undo' } }];
+    const redoTarget = resolveRedoTarget(e);
+    expect(redoTarget).toBe(3); // back to C
+  });
+
+  it('two undos then one redo returns to the state after the FIRST undo, not all the way back to the latest edit', () => {
+    let e = entries(['edit', 'edit', 'edit']); // rev1=A rev2=B rev3=C
+    const t1 = resolveUndoTarget(e); // 2
+    e = [...e, { rev: 4, baseRev: 3, op: 'restore', params: { rev: t1, cause: 'undo' } }];
+    const t2 = resolveUndoTarget(e); // 1
+    e = [...e, { rev: 5, baseRev: 4, op: 'restore', params: { rev: t2, cause: 'undo' } }];
+    const redoTarget = resolveRedoTarget(e);
+    expect(redoTarget).toBe(4); // rev4's snapshot === rev2's snapshot ("A+B") — undoing the SECOND undo only
+  });
+
+  it('redo is discarded once an ordinary edit lands after an undo', () => {
+    let e = entries(['edit', 'edit', 'edit']); // rev1=A rev2=B rev3=C
+    const t1 = resolveUndoTarget(e);
+    e = [...e, { rev: 4, baseRev: 3, op: 'restore', params: { rev: t1, cause: 'undo' } }];
+    expect(resolveRedoTarget(e)).toBe(3); // redo available right after the undo
+    e = [...e, { rev: 5, baseRev: 4, op: 'edit', params: {} }]; // a normal edit (D) lands
+    expect(() => resolveRedoTarget(e)).toThrow(/nothing to redo/);
+  });
+
+  it('redo is discarded by an explicit manual restore (vedit undo --rev N / a UI "restore old revision" action), same as any edit', () => {
+    let e = entries(['edit', 'edit', 'edit']);
+    const t1 = resolveUndoTarget(e);
+    e = [...e, { rev: 4, baseRev: 3, op: 'restore', params: { rev: t1, cause: 'undo' } }];
+    // A manual jump to an arbitrary older revision, tagged cause:'manual'.
+    e = [...e, { rev: 5, baseRev: 4, op: 'restore', params: { rev: 1, cause: 'manual' } }];
+    expect(() => resolveRedoTarget(e)).toThrow(/nothing to redo/);
+  });
+
+  it('a legacy restore entry with no cause field (pre-E-1 shape) is treated the same as "manual" — invalidates redo, becomes undo-able itself', () => {
+    let e = entries(['edit', 'edit', 'edit']);
+    const t1 = resolveUndoTarget(e);
+    e = [...e, { rev: 4, baseRev: 3, op: 'restore', params: { rev: t1, cause: 'undo' } }];
+    expect(resolveRedoTarget(e)).toBe(3);
+    // Untagged restore (exactly what daemon.ts's /api/edit issues today, since it doesn't forward `cause` yet).
+    e = [...e, { rev: 5, baseRev: 4, op: 'restore', params: { rev: 1 } }];
+    expect(() => resolveRedoTarget(e)).toThrow(/nothing to redo/);
+    // And it's itself a valid undo target, like any ordinary edit would be.
+    expect(resolveUndoTarget(e)).toBe(4);
+  });
+
+  it('resolveUndoTarget throws "nothing to undo" on an empty log (pristine project)', () => {
+    expect(() => resolveUndoTarget([])).toThrow(/nothing to undo/);
+  });
+
+  it('resolveRedoTarget throws "nothing to redo" when no undo has ever happened', () => {
+    const e = entries(['edit', 'edit']);
+    expect(() => resolveRedoTarget(e)).toThrow(/nothing to redo/);
+  });
+
+  it('resolveUndoRedoStacks exposes the full stacks for callers that want more than just the top', () => {
+    const e = entries(['edit', 'edit', 'edit']); // rev1=A rev2=B rev3=C
+    const { undoStack, redoStack } = resolveUndoRedoStacks(e);
+    expect(undoStack).toEqual([0, 1, 2]);
+    expect(redoStack).toEqual([]);
+  });
+});
+
+describe('Project.undo / Project.redo (E-1 integration — real commits, not synthetic entries)', () => {
+  it('undo/redo/undo walks a real 3-edit history correctly, including the "undo of undo" regression', async () => {
+    const dir = freshDir('undo-redo-integration');
+    const p = await Project.create(dir, 'undo-redo-integration');
+    await p.commit(0, 'ui', 'a', {}, 'edit A', (m) => ({ ...m, name: 'A' })); // rev1
+    await p.commit(1, 'ui', 'b', {}, 'edit B', (m) => ({ ...m, name: 'B' })); // rev2
+    await p.commit(2, 'ui', 'c', {}, 'edit C', (m) => ({ ...m, name: 'C' })); // rev3
+
+    let m = await p.undo('claude', 3); // rev4: back to "B"
+    expect(m.revision).toBe(4);
+    expect(m.name).toBe('B');
+
+    m = await p.undo('claude', 4); // rev5: back to "A" — must NOT bounce back to "C"
+    expect(m.revision).toBe(5);
+    expect(m.name).toBe('A');
+
+    m = await p.redo('claude', 5); // rev6: forward to "B"
+    expect(m.revision).toBe(6);
+    expect(m.name).toBe('B');
+
+    // A fresh edit now discards the remaining redo (back to "C" is no longer reachable via redo).
+    await p.commit(6, 'ui', 'd', {}, 'edit D', (m2) => ({ ...m2, name: 'D' })); // rev7
+    await expect(p.redo('claude', 7)).rejects.toThrow(/nothing to redo/);
+  });
+
+  it('undo throws a clear error on a pristine project (nothing to undo)', async () => {
+    const dir = freshDir('undo-pristine');
+    const p = await Project.create(dir, 'undo-pristine');
+    await expect(p.undo('claude', 0)).rejects.toThrow(/nothing to undo/);
+  });
+
+  it('undo() still enforces optimistic concurrency via the underlying restore()', async () => {
+    const dir = freshDir('undo-stale');
+    const p = await Project.create(dir, 'undo-stale');
+    await p.commit(0, 'ui', 'a', {}, 'a', (m) => ({ ...m, name: 'a' }));
+    await p.commit(1, 'ui', 'b', {}, 'b', (m) => ({ ...m, name: 'b' }));
+    await expect(p.undo('claude', 0)).rejects.toMatchObject({ code: 'STALE_REVISION' });
   });
 });

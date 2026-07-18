@@ -7,6 +7,7 @@ import {
   isNonSpeechAnnotation,
   sanitizeCaptionText,
 } from './captions.js';
+import { splitClip } from './ops.js';
 import type { Manifest, Transcript, Word } from './types.js';
 
 function manifest(clips: { srcIn: number; srcOut: number }[] = [{ srcIn: 0, srcOut: 20 }]): Manifest {
@@ -166,6 +167,25 @@ describe('captionCues', () => {
       expect(cues).toHaveLength(1);
       expect(cues[0].text).toBe('Hello world.');
       expect(cues[0].wordIds).toEqual(['w0', 'w1']);
+    });
+
+    it('E-1: splitClip() at a mid-sentence timeline point produces IDENTICAL caption cues to the unsplit clip (natural follow via per-segment cue generation, no daemon/caption-side change needed)', () => {
+      const before = manifest([{ srcIn: 0, srcOut: 10 }]); // one clip, tl[0,10)
+      const words: Word[] = [
+        { id: 'w0', text: 'Hello', t0: 3.5, t1: 3.9, p: 0.9 },
+        { id: 'w1', text: 'world.', t0: 4.1, t1: 4.5, p: 0.9 },
+      ];
+      const t: Transcript = { sourceId: 's1', language: 'en', words };
+      const cuesBefore = captionCues(before, [t]);
+      expect(cuesBefore).toHaveLength(1);
+      expect(cuesBefore[0].text).toBe('Hello world.');
+
+      // Split the clip right between the two words (tl=4.0), same as the
+      // web timeline's "S key at playhead" / right-click "ここで分割" would do.
+      const after = splitClip(before, before.timeline.video[0].id, 4.0);
+      expect(after.timeline.video).toHaveLength(2); // boundary added, content unchanged
+      const cuesAfter = captionCues(after, [t]);
+      expect(cuesAfter).toEqual(cuesBefore); // byte-for-byte identical cue set
     });
   });
 

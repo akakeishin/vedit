@@ -4,7 +4,7 @@ import { promises as fs, existsSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { startDaemon } from './server/daemon.js';
-import { Project } from './core/project.js';
+import { Project, resolveRedoTarget, resolveUndoTarget } from './core/project.js';
 import {
   buildSelectsTimeline,
   COMP_SOURCE_ID,
@@ -372,7 +372,11 @@ const HELP = `vedit — conversational local NLE
 
 usage: vedit <command> [args] [--project <dir>]
 
-project:   create <dir> [--name n] | status | resume | revisions | undo [--rev N] | open | projects
+project:   create <dir> [--name n] | status | resume | revisions | undo [--rev N] | redo | open | projects
+             # undo/redo は --base 不要(常に最新に対して)。--rev 無しの undo/redo は連打可能な論理
+             # undo/redo スタック(revision ログの形から都度再計算、実装は core/project.ts の
+             # resolveUndoTarget/resolveRedoTarget)。redo は直前が undo の時だけ有効 — 間に通常編集や
+             # --rev 指定の手動 restore が入ると破棄される。--rev N は従来どおり指定revisionへ直接ジャンプ
            fork --project <src> --to <dir> [--name n]   # 派生プロジェクト作成(revision 独立、cache/transcriptをhardlink流用)
 maintenance: compact [--dry-run]   # revisions.jsonl の世代圧縮(直近100件は全量、以降は10件毎に1件のみ全量保持)
            gc [--yes]              # cache/ の孤児(未参照プロキシ・波形・シーンサムネ等)+ orphan transcript を列挙/削除(既定 dry-run)
@@ -397,6 +401,8 @@ cut:       remove-words <w1 w5..w9 ...> [--source id] [--pad 0.08] | remove-rang
 clips:     clip-add <sourceId> [--in s] [--out s] [--at index] | clip-remove <clipId>
            clip-move <clipId> --before <clipId|end>
            clip-audio <clipId> [--gain -30..12] [--mute|--no-mute] --base <rev>   # クリップ単位の音量/ミュート(プレビュー未反映、書き出しで確認)
+           split <clipId> --at <tl秒> --base <rev>       # タイムライン時刻で2分割(内容不変・境界追加のみ)。クリップ端/端から1フレーム未満はエラー
+           duplicate <clipId> --base <rev>                # 直後に同一ソース範囲を複製配置(新id)
 scenes:    scenes detect [--source id] [--sensitivity 0.3] [--max-len 12] [--min-len 1.5]
            scenes [--source id]                    # packed scene list (id/range/hasSpeech/energy/[keep|reject]/note)
            scenes sheet [--source id] [--cols n]    # contact sheet PNG (prints path; Read it)
@@ -485,9 +491,9 @@ misc:      doctor [--download-model [name]] | serve [--port]
 
 Mutating commands REQUIRE --base <rev> (or --latest to explicitly use the
 current one); if the project changed since that revision the edit is
-REJECTED (409) — re-read state first. Exception: \`undo\` never needs --base —
-it always bases itself on the current revision, since undoing inherently
-means "from here, go back one step".`;
+REJECTED (409) — re-read state first. Exception: \`undo\`/\`redo\` never need
+--base — they always base themselves on the current revision, since undoing/
+redoing inherently means "from here, go back/forward one logical step".`;
 
 /** "1:23.4" — same compact timestamp convention as qc.ts's fmtTl / takes.ts's ts. */
 function tsFmt(t: number): string {
@@ -1132,6 +1138,15 @@ async function main() {
       if (gainDb === undefined && muted === undefined) fail('usage: vedit clip-audio <clipId> [--gain -30..12] [--mute|--no-mute] --base <rev> (at least one of --gain/--mute/--no-mute is required)');
       return edit({ op: 'clip-audio', clipId: pos[0], gainDb, muted });
     }
+
+    case 'split': {
+      if (pos.length === 0 || flags.at === undefined) fail('usage: vedit split <clipId> --at <tl秒> --base <rev>');
+      return edit({ op: 'split', clipId: pos[0], at: numFlag('at', flags.at) });
+    }
+
+    case 'duplicate':
+      if (pos.length === 0) fail('usage: vedit duplicate <clipId> --base <rev>');
+      return edit({ op: 'duplicate', clipId: pos[0] });
 
     case 'scenes': {
       const sub = pos[0];
@@ -1824,13 +1839,36 @@ async function main() {
     case 'undo': {
       // Unlike other mutating commands, undo doesn't need --base/--latest —
       // it always bases itself on whatever the current revision is, since
-      // "undo" inherently means "from here, go back one step".
+      // "undo" inherently means "from here, go back one step". Without
+      // --rev this is the LOGICAL undo (E-1): resolveUndoTarget replays the
+      // revision log's shape (see core/project.ts) so repeated `vedit undo`
+      // correctly walks further back each time instead of bouncing between
+      // two states ("undo の undo"). `--rev N` bypasses resolution entirely
+      // and jumps straight to an explicit old revision — a "manual" restore
+      // (same as before this feature), which also discards any pending
+      // redo, same as any other edit would.
+      const dir = projectDir();
+      await ensureDaemon(dir);
+      const state = await api('/api/state');
+      if (flags.rev !== undefined) {
+        return editRaw(Number(state.revision), { op: 'restore', rev: numFlag('rev', flags.rev)! });
+      }
+      const revs = await api('/api/revisions');
+      const target = resolveUndoTarget(revs);
+      return editRaw(Number(state.revision), { op: 'restore', rev: target, cause: 'undo' });
+    }
+
+    case 'redo': {
+      // Mirror of undo(): only valid immediately after an undo, with
+      // nothing else (no ordinary edit, no manual restore) committed since
+      // — see resolveRedoTarget/core/project.ts. Always bases itself on the
+      // current revision, same as undo (never needs --base).
       const dir = projectDir();
       await ensureDaemon(dir);
       const state = await api('/api/state');
       const revs = await api('/api/revisions');
-      const target = flags.rev !== undefined ? numFlag('rev', flags.rev)! : Math.max(1, (revs.at(-1)?.rev ?? 1) - 1);
-      return editRaw(Number(state.revision), { op: 'restore', rev: target });
+      const target = resolveRedoTarget(revs);
+      return editRaw(Number(state.revision), { op: 'restore', rev: target, cause: 'redo' });
     }
 
     case 'revisions': {

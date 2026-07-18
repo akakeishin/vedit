@@ -62,6 +62,96 @@ export async function resolveWithinDir(dir: string, rel: string): Promise<string
   return full;
 }
 
+// ---- logical undo/redo (E-1, 波E NLE操作性パック) ----
+//
+// The revision log is strictly linear (every commit's baseRev is enforced
+// to equal the current revision — see commitLocked's STALE_REVISION check),
+// so "current state" is fully described by the highest revision number and
+// there is never more than one path through the log. That makes it safe to
+// derive undo/redo purely by REPLAYING the log's shape on every call — no
+// separate persisted pointer/stack file, so nothing can drift out of sync
+// with revisions.jsonl (which stays the single source of truth, and every
+// undo/redo still lands there as an ordinary, visible 'restore' revision —
+// same transparency the UI history tab already relies on).
+//
+// Design (see Project.restore's `cause` param): every 'restore' revision
+// carries params.cause — 'undo' | 'redo' | 'manual' (or absent, read the
+// same as 'manual' — the shape every restore had before this feature and
+// every restore daemon.ts's `/api/edit` issues today, since it doesn't
+// forward a cause yet). Replaying the whole entries list in rev order
+// reconstructs two stacks:
+//   - a normal edit, OR a 'manual' restore: push its baseRev onto undoStack
+//     (that's the state undoing it would return to) and clear redoStack
+//     (spec: "通常編集で破棄" — redo dies the moment anything but a plain
+//     undo/redo happens, and a manual jump to an arbitrary old revision
+//     counts as "anything but").
+//   - an 'undo' restore: pop undoStack (consume the target this undo just
+//     moved TO — without popping, a second undo would re-resolve the SAME
+//     top-of-stack value and restore right back to where the first undo
+//     landed: "undo の undo" ping-pong instead of walking further back) and
+//     push its baseRev onto redoStack (the state being left behind becomes
+//     redo-able).
+//   - a 'redo' restore: the mirror — pop redoStack, push baseRev onto
+//     undoStack.
+// The top of undoStack/redoStack after a full replay is exactly the target
+// the NEXT undo/redo call should restore to. Revision 0 (the pristine,
+// pre-first-edit project) is never a valid restore target (Project.restore
+// rejects it outright — "re-ingest instead"), so a resolved target of 0 is
+// treated as "nothing left to undo", not surfaced as a real target.
+
+export type RestoreCause = 'undo' | 'redo' | 'manual';
+
+/** The subset of a revision-log entry undo/redo resolution needs — matches Project.revisions()'s element shape (and therefore the daemon's `/api/revisions` JSON) structurally, so either can be passed directly. */
+export interface UndoLogEntry {
+  rev: number;
+  baseRev: number;
+  op: string;
+  params?: unknown;
+}
+
+/** Reconstruct the undo/redo stacks by replaying `entries` (any order; sorted by rev internally) — see the design note above. Exported mainly for direct unit testing; callers wanting a target should use resolveUndoTarget/resolveRedoTarget. */
+export function resolveUndoRedoStacks(entries: UndoLogEntry[]): { undoStack: number[]; redoStack: number[] } {
+  const undoStack: number[] = [];
+  const redoStack: number[] = [];
+  const sorted = [...entries].sort((a, b) => a.rev - b.rev);
+  for (const e of sorted) {
+    const cause = e.op === 'restore' ? (e.params as { cause?: RestoreCause } | undefined)?.cause : undefined;
+    if (cause === 'undo') {
+      undoStack.pop();
+      redoStack.push(e.baseRev);
+    } else if (cause === 'redo') {
+      redoStack.pop();
+      undoStack.push(e.baseRev);
+    } else {
+      // Ordinary edit, or a 'restore' with cause 'manual'/absent — both
+      // extend the linear undo history and invalidate any pending redo.
+      undoStack.push(e.baseRev);
+      redoStack.length = 0;
+    }
+  }
+  return { undoStack, redoStack };
+}
+
+/** Resolve what `Project.undo()` should restore to, or throw a clear "nothing to undo" error. */
+export function resolveUndoTarget(entries: UndoLogEntry[]): number {
+  const { undoStack } = resolveUndoRedoStacks(entries);
+  const target = undoStack.at(-1);
+  if (target === undefined || target === 0) {
+    throw new Error('nothing to undo');
+  }
+  return target;
+}
+
+/** Resolve what `Project.redo()` should restore to, or throw a clear "nothing to redo" error. */
+export function resolveRedoTarget(entries: UndoLogEntry[]): number {
+  const { redoStack } = resolveUndoRedoStacks(entries);
+  const target = redoStack.at(-1);
+  if (target === undefined) {
+    throw new Error('nothing to redo (undo something first — a normal edit or manual restore since the last undo discards it)');
+  }
+  return target;
+}
+
 /**
  * Project store on disk. One directory per project:
  *   project.json / revisions.jsonl / transcript-<sourceId>.json /
@@ -347,7 +437,25 @@ export class Project {
    * at runtime and fails with a "nearest restorable revision" pointer
    * instead of restoring `undefined`.
    */
-  async restore(rev: number, actor: RevisionEntry['actor'], baseRev: number): Promise<Manifest> {
+  /**
+   * `cause`, when given, is stamped onto the recorded restore's `params` as
+   * `{ rev, cause }` — see resolveUndoTarget/resolveRedoTarget below, which
+   * read it back out of `revisions()` to tell a logical-undo-produced
+   * restore apart from a logical-redo-produced one and from an arbitrary
+   * ("manual") jump to an old revision, e.g. the existing `vedit undo --rev
+   * N` / a UI "restore this old revision" action. Omitted (the pre-E-1
+   * call shape every existing caller — including daemon.ts's `/api/edit`
+   * 'restore' branch — still uses) records bare `{ rev }`, exactly as
+   * before; resolveUndoTarget/resolveRedoTarget treat that the same as
+   * `cause: 'manual'` (see their doc), so this is purely additive and
+   * every pre-E-1 revisions.jsonl still replays correctly.
+   */
+  async restore(
+    rev: number,
+    actor: RevisionEntry['actor'],
+    baseRev: number,
+    cause?: RestoreCause,
+  ): Promise<Manifest> {
     return this.withLock(async () => {
       if (rev === 0) {
         throw new Error('cannot restore revision 0 (empty project); re-ingest instead');
@@ -385,12 +493,38 @@ export class Project {
         baseRev,
         actor,
         'restore',
-        { rev },
+        cause ? { rev, cause } : { rev },
         `restored revision ${rev}`,
         () => ({ ...snap }),
         target.motionSpecs,
       );
     });
+  }
+
+  /**
+   * Logical undo (E-1, 波E NLE操作性パック): restore to "the state one
+   * effective edit before the current one", correctly walking further back
+   * on each successive call rather than flip-flopping between two states
+   * (see resolveUndoTarget's doc for why a naive "restore rev N-1" breaks
+   * on the second press). `baseRev` follows the same optimistic-concurrency
+   * contract as every other mutation; `actor` is recorded on the resulting
+   * restore revision like any other. Throws when there is nothing left to
+   * undo (a pristine project, or every prior edit already undone).
+   */
+  async undo(actor: RevisionEntry['actor'], baseRev: number): Promise<Manifest> {
+    const target = resolveUndoTarget(await this.revisions());
+    return this.restore(target, actor, baseRev, 'undo');
+  }
+
+  /**
+   * Logical redo (E-1): the mirror of undo(), valid only while the tail of
+   * the log is an unbroken run of undos with nothing else (no ordinary
+   * edit, no manual restore) committed since — see resolveRedoTarget's doc.
+   * Throws when there is nothing to redo.
+   */
+  async redo(actor: RevisionEntry['actor'], baseRev: number): Promise<Manifest> {
+    const target = resolveRedoTarget(await this.revisions());
+    return this.restore(target, actor, baseRev, 'redo');
   }
 
   /**

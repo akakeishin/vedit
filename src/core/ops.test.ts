@@ -19,6 +19,7 @@ import {
   cropWindow,
   cullingStats,
   dialogueOverlapWithoutPosRisk,
+  duplicateClip,
   emoteWindows,
   expandWordIds,
   intentZonesForSource,
@@ -63,6 +64,7 @@ import {
   shiftComposition,
   sliceTimelineRange,
   sourceTimeToTimeline,
+  splitClip,
   spriteGeometry,
   spriteMotionPlan,
   timelineDuration,
@@ -503,6 +505,128 @@ describe('addClip / removeClip / moveClip', () => {
     expect(() => addClip(manifest(), 's1', { at: 0.5 })).toThrow(/at \(0\.5\)/);
     expect(() => addClip(manifest(), 's1', { at: -1 })).toThrow(/at \(-1\)/);
     expect(() => addClip(manifest(), 's1', { at: 99 })).toThrow(/at \(99\)/);
+  });
+});
+
+// ---- E-1 (波E NLE操作性パック): splitClip / duplicateClip ----
+
+describe('splitClip', () => {
+  it('splits a clip in two at the given timeline time; content (total coverage) is unchanged', () => {
+    const m = splitClip(manifest(), 'c1', 20); // c1: src[0,60) -> tl[0,60)
+    expect(m.timeline.video).toHaveLength(2);
+    expect(m.timeline.video[0]).toMatchObject({ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 20 });
+    expect(m.timeline.video[1]).toMatchObject({ sourceId: 's1', srcIn: 20, srcOut: 60 });
+    expect(m.timeline.video[1].id).not.toBe('c1');
+    expect(timelineDuration(m)).toBeCloseTo(60); // unchanged — only a boundary was added
+  });
+
+  it('the left piece keeps the original clip id; the right piece gets a fresh one', () => {
+    const m = splitClip(manifest(), 'c1', 30);
+    expect(m.timeline.video[0].id).toBe('c1');
+    expect(m.timeline.video[1].id).not.toBe('c1');
+  });
+
+  it('preserves crop/gainDb/muted onto both resulting pieces', () => {
+    let m = manifest();
+    m = { ...m, timeline: { ...m.timeline, video: [{ ...m.timeline.video[0], crop: { x: 0.2 }, gainDb: -6, muted: true }] } };
+    const r = splitClip(m, 'c1', 20);
+    expect(r.timeline.video[0]).toMatchObject({ crop: { x: 0.2 }, gainDb: -6, muted: true });
+    expect(r.timeline.video[1]).toMatchObject({ crop: { x: 0.2 }, gainDb: -6, muted: true });
+  });
+
+  it('rejects a split exactly on the clip start/end edge (boundary value)', () => {
+    expect(() => splitClip(manifest(), 'c1', 0)).toThrow(/too close to clip/);
+    expect(() => splitClip(manifest(), 'c1', 60)).toThrow(/too close to clip/);
+  });
+
+  it('rejects a split point less than one frame from either edge', () => {
+    // fps=30 -> 1 frame ~= 0.0333s; 0.01/59.99 snap onto the exact edge, which
+    // is exactly the "less than a frame away" case (there is no non-edge
+    // value strictly between 0 and one frame once snapped to the grid).
+    expect(() => splitClip(manifest(), 'c1', 0.01)).toThrow(/too close to clip/);
+    expect(() => splitClip(manifest(), 'c1', 59.99)).toThrow(/too close to clip/);
+  });
+
+  it('accepts a split exactly one frame from either edge', () => {
+    const m1 = splitClip(manifest(), 'c1', 1 / 30);
+    expect(m1.timeline.video[0].srcOut).toBeCloseTo(1 / 30);
+    const m2 = splitClip(manifest(), 'c1', 60 - 1 / 30);
+    expect(m2.timeline.video[1].srcIn).toBeCloseTo(60 - 1 / 30);
+  });
+
+  it('throws on an unknown clip', () => {
+    expect(() => splitClip(manifest(), 'nope', 10)).toThrow(/unknown clip/);
+  });
+
+  it('throws on a non-finite tlTime', () => {
+    expect(() => splitClip(manifest(), 'c1', NaN)).toThrow(/invalid tlTime/);
+  });
+
+  it('splitting one clip only affects that clip — others on the timeline are untouched', () => {
+    let m = addClip(manifest(), 's1', { in: 0, out: 10 }); // c1[0,60) then a second clip[0,10)
+    const secondId = m.timeline.video[1].id;
+    m = splitClip(m, 'c1', 20);
+    expect(m.timeline.video).toHaveLength(3);
+    expect(m.timeline.video[2]).toMatchObject({ id: secondId, srcIn: 0, srcOut: 10 });
+  });
+
+  it('an anchored B-roll overlay keeps resolving to the same timeline position across a split, whichever side of the split it lands on', () => {
+    const base = manifest();
+    const withSource = {
+      ...base,
+      sources: [...base.sources, { id: 's2', path: '/b.mp4', duration: 10, fps: 30, width: 1920, height: 1080, hasAudio: true }],
+    };
+    const m = addOverlay(withSource, 's2', { id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 25 } });
+    expect(resolveOverlays(m)[0].tlStart).toBeCloseTo(25);
+    // Split BEFORE the anchor (tl=10) — the anchored instant now lives in the right (new-id) piece.
+    const splitBefore = splitClip(m, 'c1', 10);
+    expect(resolveOverlays(splitBefore)[0].tlStart).toBeCloseTo(25);
+    // Split AFTER the anchor (tl=40) — the anchored instant stays in the left (original-id) piece.
+    const splitAfter = splitClip(m, 'c1', 40);
+    expect(resolveOverlays(splitAfter)[0].tlStart).toBeCloseTo(25);
+  });
+});
+
+describe('duplicateClip', () => {
+  it('inserts an identical copy (fresh id) immediately after the original', () => {
+    const m = duplicateClip(manifest(), 'c1');
+    expect(m.timeline.video).toHaveLength(2);
+    expect(m.timeline.video[0]).toMatchObject({ id: 'c1', sourceId: 's1', srcIn: 0, srcOut: 60 });
+    expect(m.timeline.video[1]).toMatchObject({ sourceId: 's1', srcIn: 0, srcOut: 60 });
+    expect(m.timeline.video[1].id).not.toBe('c1');
+    expect(timelineDuration(m)).toBeCloseTo(120); // ripple layout: back-to-back, no gap
+  });
+
+  it('the duplicate lands immediately after the original even with other clips around it', () => {
+    let m = addClip(manifest(), 's1', { in: 0, out: 5 }); // c1, then a second clip
+    const secondId = m.timeline.video[1].id;
+    m = duplicateClip(m, 'c1');
+    expect(m.timeline.video.map((c) => c.id)[0]).toBe('c1');
+    expect(m.timeline.video.map((c) => c.id)[2]).toBe(secondId);
+    expect(m.timeline.video[1].id).not.toBe('c1');
+  });
+
+  it('preserves crop/gainDb/muted on the duplicate', () => {
+    let m = manifest();
+    m = { ...m, timeline: { ...m.timeline, video: [{ ...m.timeline.video[0], crop: { y: 0.5 }, gainDb: 3, muted: true }] } };
+    const r = duplicateClip(m, 'c1');
+    expect(r.timeline.video[1]).toMatchObject({ crop: { y: 0.5 }, gainDb: 3, muted: true });
+  });
+
+  it('throws on an unknown clip', () => {
+    expect(() => duplicateClip(manifest(), 'nope')).toThrow(/unknown clip/);
+  });
+
+  it('an anchored overlay keeps resolving to the ORIGINAL occurrence, not the duplicate (segments() returns the first array match)', () => {
+    const base = manifest();
+    const withSource = {
+      ...base,
+      sources: [...base.sources, { id: 's2', path: '/b.mp4', duration: 10, fps: 30, width: 1920, height: 1080, hasAudio: true }],
+    };
+    const m = addOverlay(withSource, 's2', { id: 'ov1', srcIn: 0, srcOut: 2, anchor: { sourceId: 's1', srcTime: 25 } });
+    expect(resolveOverlays(m)[0].tlStart).toBeCloseTo(25);
+    const dup = duplicateClip(m, 'c1');
+    expect(resolveOverlays(dup)[0].tlStart).toBeCloseTo(25); // unchanged
   });
 });
 

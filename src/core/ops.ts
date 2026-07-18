@@ -320,6 +320,73 @@ export function moveClip(m: Manifest, clipId: string, beforeClipId: string | 'en
   return { ...m, timeline: { ...m.timeline, video: rest } };
 }
 
+/**
+ * Split one clip into two at a timeline time (E-1, 波E NLE操作性パック).
+ * Content is unchanged — only a clip boundary is added at `tlTime` — so the
+ * total source coverage (and therefore segments()/timelineDuration, caption
+ * cues built off segments() in captions.ts, and any B-roll/sprite/dialogue
+ * anchor resolved via sourceTimeToTimeline) is exactly the same before and
+ * after: the left piece keeps `clipId` (same convention as
+ * removeSourceRange's surviving-left-fragment case), the right piece gets a
+ * fresh id and is spliced in immediately after it, contiguous (no gap, no
+ * overlap) — see captionCuesWithExclusions' `tl0 - prev.tl1 > 0.6` gap
+ * check, which is why a caption cue keeps buffering seamlessly across the
+ * new boundary instead of splitting.
+ *
+ * `tlTime` is snapped to the timeline frame grid (m.fps), same as every
+ * other frame-domain op (removeSourceRange/trimClip). A split that would
+ * leave either resulting piece shorter than one frame — including `tlTime`
+ * landing exactly on the clip's own start/end — is refused: unlike
+ * removeSourceRange's MIN_FRAGMENT_SECONDS absorption (which silently
+ * swallows a REMOVAL's leftover sliver), a user-requested split point that
+ * can't produce two real clips is a mistake, not something to paper over.
+ */
+export function splitClip(m: Manifest, clipId: string, tlTime: number): Manifest {
+  if (!Number.isFinite(tlTime)) throw new Error(`split: invalid tlTime (${tlTime})`);
+  const idx = m.timeline.video.findIndex((c) => c.id === clipId);
+  if (idx < 0) throw new Error(`unknown clip: ${clipId}`);
+  const seg = segments(m).find((s) => s.clipId === clipId);
+  if (!seg) throw new Error(`clip has no timeline extent: ${clipId}`);
+  const fps = m.fps;
+  const t = snap(tlTime, fps);
+  const minFrame = 1 / fps;
+  const leftDur = t - seg.tlStart;
+  const rightDur = seg.tlEnd - t;
+  if (leftDur < minFrame - 1e-9 || rightDur < minFrame - 1e-9) {
+    throw new Error(
+      `split: ${tlTime}s is too close to clip ${clipId}'s edge (need at least one frame of ${minFrame.toFixed(4)}s on both sides; clip spans ${seg.tlStart.toFixed(3)}..${seg.tlEnd.toFixed(3)})`,
+    );
+  }
+  const clip = m.timeline.video[idx];
+  const srcSplit = seg.srcStart + (t - seg.tlStart);
+  const left: VideoClip = { ...clip, srcOut: srcSplit };
+  const right: VideoClip = { ...clip, id: freshId('c'), srcIn: srcSplit };
+  const video = [...m.timeline.video];
+  video.splice(idx, 1, left, right);
+  return { ...m, timeline: { ...m.timeline, video } };
+}
+
+/**
+ * Duplicate a clip in place (E-1): an identical copy (same sourceId/srcIn/
+ * srcOut/crop/gainDb/muted, fresh id) is spliced in immediately after the
+ * original in `timeline.video`. Ripple layout schedules clips back-to-back
+ * with no gap, so the duplicate's timeline start equals the original's
+ * timeline end automatically (see segments()) — no explicit placement math
+ * needed here. Anchored B-roll/sprites/dialogue keep resolving to the
+ * ORIGINAL occurrence's timeline position: sourceTimeToTimeline/segments()
+ * return the FIRST clip in array order that covers a given source instant,
+ * and the original stays earlier in the array than its duplicate.
+ */
+export function duplicateClip(m: Manifest, clipId: string): Manifest {
+  const idx = m.timeline.video.findIndex((c) => c.id === clipId);
+  if (idx < 0) throw new Error(`unknown clip: ${clipId}`);
+  const clip = m.timeline.video[idx];
+  const dup: VideoClip = { ...clip, id: freshId('c') };
+  const video = [...m.timeline.video];
+  video.splice(idx + 1, 0, dup);
+  return { ...m, timeline: { ...m.timeline, video } };
+}
+
 // ---- 9:16 / arbitrary-aspect reframe ----
 
 /** Parse a reframe target: "9:16"/"1:1"/"16:9" ratios, or literal "WxH" pixels. */
